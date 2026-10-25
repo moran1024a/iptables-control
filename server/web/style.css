@@ -320,6 +320,8 @@ details[open] > :not(summary) { animation: fade 0.25s ease both; }
   border-radius: 8px;
 }
 .path .arrow { color: var(--muted); }
+.entry { display: flex; align-items: center; gap: 10px; margin: -2px 0 12px; flex-wrap: wrap; font-size: 13px; }
+.entry code { font-size: 14px; font-weight: 600; padding: 3px 10px; color: var(--text); }
 .chain-side { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .chain-actions { display: flex; gap: 6px; }
 
@@ -338,6 +340,19 @@ details[open] > :not(summary) { animation: fade 0.25s ease both; }
 
 .pending { margin-top: 10px; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }
 .pending .who { display: inline-flex; align-items: center; gap: 5px; color: var(--text); }
+
+/* ------------------------------------------------ 页脚 */
+
+footer {
+  max-width: 980px;
+  margin: -40px auto 0;
+  padding: 0 18px 28px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.8;
+  opacity: 0.85;
+}
 
 /* ------------------------------------------------ 表单与按钮 */
 

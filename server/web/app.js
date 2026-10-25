@@ -69,6 +69,12 @@ function nodeSub(n) {
   return `<div class="sub node-sub"><span class="mono">${esc(n.addr)}</span>${note}</div>`;
 }
 
+// 页脚：登录后显示版本号，登录页只显示名称
+function footer(withVersion) {
+  $("#footer-title").textContent = withVersion && me?.version
+    ? `ictl v${me.version} · 轻量的中心化 iptables 端口转发管理` : "ictl";
+}
+
 function emptyState(icon, text) {
   return `<div class="empty"><div class="empty-icon">${icon}</div>${text}</div>`;
 }
@@ -240,6 +246,7 @@ async function route() {
   if (me.must_change) return showChangeAccount();
 
   document.body.classList.remove("auth-page");
+  footer(true);
   $("#nav").hidden = false;
   const [page, id] = (location.hash || "#/nodes").replace(/^#\/?/, "").split("/");
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === page));
@@ -259,6 +266,7 @@ function showLogin() {
   if (document.body.classList.contains("auth-page") && $('#app .auth[data-form="login"]')) return;   // 已显示时不重建，保留已输入内容
   $("#nav").hidden = true;
   document.body.classList.add("auth-page");
+  footer(false);
   fullRender = true;
   render(`
     <form class="auth panel" data-form="login">
@@ -288,6 +296,7 @@ function showChangeAccount() {
   if (document.body.classList.contains("auth-page") && $('#app .auth[data-form="account"]')) return;   // 已显示时不重建，保留已输入内容
   $("#nav").hidden = true;
   document.body.classList.add("auth-page");
+  footer(false);
   fullRender = true;
   render(`
     <form class="auth panel" data-form="account">
@@ -413,6 +422,10 @@ async function chainList() {
   const cards = d.chains.map((c) => {
     const path = c.hops.map((h) => `<span class="hop">${dot(h.status)}${esc(h.name)}:${h.port}</span>`);
     path.push(`<span class="hop mono">${esc(c.target_host)}:${c.target_port}</span>`);
+    const first = c.hops[0];
+    const entry = first ? `${first.addr}:${first.port}` : "";
+    const entryLine = entry ? `<div class="entry"><span class="muted">入口</span><code>${esc(entry)}</code>${c.deleting
+      ? "" : `<button class="small" data-action="copy" data-text="${esc(entry)}">复制</button>`}</div>` : "";
     let badge, actions;
     if (c.deleting) {
       badge = `<span class="badge removing"><i class="spinner"></i>删除中…</span>`;
@@ -430,6 +443,7 @@ async function chainList() {
           <div class="title">${esc(c.remark)}</div>
           <div class="chain-side">${badge}<div class="chain-actions">${actions}</div></div>
         </div>
+        ${entryLine}
         <div class="path">${path.join(`<span class="arrow">→</span>`)}</div>
         ${pendingLine(c)}
       </div>`;
@@ -607,8 +621,8 @@ function showFormError(form, err) {
 
 const FORMS = {
   async login(form, data) {
-    const r = await api("POST", "login", { username: data.username, password: data.password });
-    me = { username: data.username, must_change: r.must_change };
+    await api("POST", "login", { username: data.username, password: data.password });
+    me = null;   // 由 route() 重新获取，带上版本号
     if (location.hash === "") location.hash = "#/nodes";
     route();
   },
@@ -619,7 +633,7 @@ const FORMS = {
       current_password: data.current_password, username: data.username, password: data.password,
     });
     const first = me?.must_change;
-    me = { username: r.username, must_change: false };
+    me = { ...me, username: r.username, must_change: false };
     toast("账号已更新");
     if (first) return route();
     form.reset();

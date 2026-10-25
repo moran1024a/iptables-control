@@ -3,7 +3,7 @@
 
 set -u
 
-VERSION="0.1.3"
+VERSION="0.1.4"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/bin/ictl"
@@ -514,11 +514,16 @@ quick_setup() {
   save_server "$url" "$key"
 }
 
+# $1 是否比 $2 新
+version_gt() {
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
+}
+
 # 从 GitHub Release 下载最新版本替换自身；参数 --mirror 时经加速代理下载。更新成功返回 0
 update_agent() {
   title "更新节点端"
-  local tmp="$BIN.download" new url="$LATEST_URL"
-  [ "${1:-}" = "--mirror" ] && url="$GH_PROXY$LATEST_URL"
+  local tmp="$BIN.download" new url="$LATEST_URL?t=$(date +%s)"   # 时间戳避免拿到代理缓存的旧文件
+  [ "${1:-}" = "--mirror" ] && url="$GH_PROXY$url"
   mkdir -p "$(dirname "$BIN")"
   if ! curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$tmp"; then
     rm -f "$tmp"
@@ -532,9 +537,13 @@ update_agent() {
     err "下载的文件无效"
     return 1
   fi
-  if [ "$new" = "$VERSION" ] && [ -f "$BIN" ]; then
+  if [ -f "$BIN" ] && ! version_gt "$new" "$VERSION"; then
     rm -f "$tmp"
-    ok "已是最新版本 $VERSION"
+    if [ "$new" = "$VERSION" ]; then
+      ok "已是最新版本 $VERSION"
+    else
+      warn "下载到的版本 $new 低于当前版本 $VERSION（可能是下载缓存），未做改动"
+    fi
     return 1
   fi
   chmod 755 "$tmp"

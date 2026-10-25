@@ -7,14 +7,14 @@
 #   首次运行：创建容器，默认对外端口 8730。
 #   再次运行：检查版本，有新版本时更新；沿用现有容器的端口，数据卷保留。
 #   --port       指定对外端口（更新时也可用来修改端口）
-#   --force      版本相同也重新创建容器
+#   --force      版本相同（或低于当前版本）也重新创建容器
 #   --mirror     从国内镜像站 ghcr.nju.edu.cn 拉取镜像；已用镜像站部署的容器更新时自动沿用
 #   --uninstall  删除容器和镜像，保留数据卷
 #   --purge      与 --uninstall 一起使用，同时删除数据卷（所有数据）
 
 set -euo pipefail
 
-VERSION="0.1.3"
+VERSION="0.1.4"
 REGISTRY="ghcr.io"
 MIRROR_REGISTRY="ghcr.nju.edu.cn"
 REPO="moran1024a/ictl-server"
@@ -76,6 +76,10 @@ fi
 BIND_IP=""
 if current_image="$(docker container inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null)"; then
   current="${current_image##*:}"
+  if [ "$FORCE" -eq 0 ] && [ "$current" != "$VERSION" ] &&
+    [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n 1)" = "$current" ]; then
+    die "当前版本 $current 比本脚本的版本 $VERSION 新，未做改动。若通过加速代理下载，可能拿到了缓存的旧脚本，请稍后重试；确需降级请加 --force。"
+  fi
   [ "${current_image%%/*}" = "$MIRROR_REGISTRY" ] && REGISTRY="$MIRROR_REGISTRY"
   binding="$(docker container inspect -f '{{with index .HostConfig.PortBindings "8730/tcp"}}{{(index . 0).HostIp}}|{{(index . 0).HostPort}}{{end}}' "$NAME")"
   cur_ip="${binding%%|*}"

@@ -23,7 +23,7 @@ import threading
 import time
 from urllib.parse import parse_qs
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 REPO = "moran1024a/iptables-control"
 AGENT_URL = f"https://github.com/{REPO}/releases/download/v{VERSION}/ictl.sh"
 DB_PATH = os.environ.get("ICTL_DB", "/var/lib/ictl-server/ictl.db")
@@ -664,7 +664,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.cookies.append(self.session_cookie("", 0))
                 return self.send_json(200, {})
             if route == "me" and method == "GET":
-                return self.send_json(200, {"username": setting(conn, "admin_user"),
+                return self.send_json(200, {"username": setting(conn, "admin_user"), "version": VERSION,
                                             "must_change": setting(conn, "must_change") == "1"})
             if route == "account" and method == "POST":
                 return self.api_account(conn, body, session)
