@@ -12,7 +12,9 @@ const STATUS = {
   deleting: ["删除中", "grey"],
 };
 const LEVEL = { ok: "正常", fault: "故障", lost: "失联", none: "无数据" };
+const LIVE = new Set(["syncing", "deleting"]);   // 带呼吸动画的状态
 const REFRESH_MS = 5000;
+const LOGO = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h14l-3.5-3.5M20 16H6l3.5 3.5"/></svg>`;
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const app = $("#app");
@@ -21,7 +23,7 @@ let me = null;                    // {username, must_change}
 let currentView = null;           // 当前页面的渲染函数
 let refreshTimer = null;
 let currentNode = null;           // 详情页的节点
-let chainsById = {};              // 转发链列表，编辑时使用
+let chainsById = {};              // 转发列表，编辑时使用
 const openDetails = new Set();    // 已展开的折叠区，刷新后保持
 const revealedKeys = new Set();   // 已显示密钥的节点
 
@@ -51,14 +53,26 @@ function ago(ts, now) {
   return `${Math.floor(d / 86400)} 天前`;
 }
 
-function pill(status) {
-  const [label, color] = STATUS[status] || [status, "grey"];
-  return `<span class="pill"><i class="dot c-${color}"></i>${label}</span>`;
-}
-
 function dot(status) {
   const [label, color] = STATUS[status] || [status, "grey"];
-  return `<i class="dot c-${color}" title="${label}"></i>`;
+  return `<i class="dot c-${color}${LIVE.has(status) ? " live" : ""}" title="${label}"></i>`;
+}
+
+function pill(status) {
+  const [label, color] = STATUS[status] || [status, "grey"];
+  return `<span class="pill t-${color}">${dot(status)}${label}</span>`;
+}
+
+function emptyState(icon, text) {
+  return `<div class="empty"><div class="empty-icon">${icon}</div>${text}</div>`;
+}
+
+// 渲染页面。循环动画按当前时间设置负延迟，自动刷新替换 DOM 后动画仍然连续
+function render(html) {
+  app.style.setProperty("--phase", `-${Date.now() % 1600}ms`);
+  app.style.setProperty("--spin", `-${Date.now() % 800}ms`);
+  app.innerHTML = html;
+  app.querySelectorAll(".logo").forEach((el) => (el.innerHTML = LOGO));
 }
 
 function bar(b) {
@@ -154,7 +168,10 @@ async function safe(fn) {
 async function show(view, auto) {
   currentView = view;
   view.auto = auto;
+  app.classList.remove("view-enter");
   await safe(view);
+  void app.offsetWidth;
+  app.classList.add("view-enter");
   schedule();
 }
 
@@ -183,6 +200,7 @@ async function route() {
   }
   if (me.must_change) return showChangeAccount();
 
+  document.body.classList.remove("auth-page");
   $("#nav").hidden = false;
   const [page, id] = (location.hash || "#/nodes").replace(/^#\/?/, "").split("/");
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === page));
@@ -200,15 +218,17 @@ function showLogin() {
   clearTimeout(refreshTimer);
   closeModal();
   $("#nav").hidden = true;
-  app.innerHTML = `
+  document.body.classList.add("auth-page");
+  render(`
     <form class="auth panel" data-form="login">
+      <i class="logo"></i>
       <h1>ictl</h1>
       <p>登录管理面板</p>
       <label><span>用户名</span><input name="username" autocomplete="username" required autofocus></label>
       <label><span>密码</span><input name="password" type="password" autocomplete="current-password" required></label>
       <div class="form-error"></div>
       <button class="primary">登录</button>
-    </form>`;
+    </form>`);
 }
 
 function accountFields(username, first) {
@@ -225,14 +245,16 @@ function showChangeAccount() {
   clearTimeout(refreshTimer);
   closeModal();
   $("#nav").hidden = true;
-  app.innerHTML = `
+  document.body.classList.add("auth-page");
+  render(`
     <form class="auth panel" data-form="account">
+      <i class="logo"></i>
       <h1>修改默认账号</h1>
       <p>首次登录需要修改用户名和密码，两者都不能使用默认值。</p>
       ${accountFields("", true)}
       <button class="primary">保存并进入</button>
       <div class="form-actions"><button type="button" class="link" data-action="logout">退出登录</button></div>
-    </form>`;
+    </form>`);
 }
 
 // ------------------------------------------------------------ 节点列表
@@ -247,9 +269,10 @@ async function nodeList() {
       </div>
       ${bar(n.bar)}
     </a>`);
-  app.innerHTML = `
-    <div class="page-head"><h1>节点</h1><button class="primary" data-action="node-new">新增节点</button></div>
-    ${cards.join("") || `<div class="empty">还没有节点，点击右上角新增。</div>`}`;
+  render(`
+    <div class="page-head"><h1>节点<span class="count">${d.nodes.length || ""}</span></h1>
+      <button class="primary" data-action="node-new">新增节点</button></div>
+    ${cards.join("") || emptyState("◎", "还没有节点，点击右上角新增。")}`);
 }
 
 // ------------------------------------------------------------ 节点详情
@@ -275,9 +298,9 @@ async function nodeDetail(id) {
   const install = (key) => `curl -fsSL ${d.agent_url} -o ictl.sh && sudo bash ictl.sh --url '${url}' --key '${key}'`;
 
   const rules = d.rules.length
-    ? `<table><tr><th>入站端口</th><th>转发到</th><th>所属转发链</th></tr>${d.rules.map((r) => `
+    ? `<table><thead><tr><th>入站端口</th><th>转发到</th><th>所属转发</th></tr></thead><tbody>${d.rules.map((r) => `
         <tr><td class="mono">${r.port}</td><td class="mono">${esc(r.host)}:${r.tport}</td>
-        <td><a href="#/chains">${esc(r.chain_remark)}</a></td></tr>`).join("")}</table>`
+        <td><a href="#/chains">${esc(r.chain_remark)}</a></td></tr>`).join("")}</tbody></table>`
     : `<div class="muted">${n.status === "deleting" ? "正在删除，已下发空配置" : "没有转发规则"}</div>`;
 
   const skew = n.skew == null ? "-" : `${n.skew > 0 ? "+" : ""}${n.skew} 秒`;
@@ -291,14 +314,14 @@ async function nodeDetail(id) {
     <span>上报状态</span><span>${esc(n.state || "-")}</span>
     <span>错误信息</span><span>${esc(n.err || "-")}</span>
     <span>首次连接</span><span>${fmtTime(n.first_seen)}</span>
-    <span>使用该节点的链</span><span>${d.chains.map((c) => esc(c.remark)).join("、") || "-"}</span>
+    <span>使用该节点的转发</span><span>${d.chains.map((c) => esc(c.remark)).join("、") || "-"}</span>
   </div>`;
 
   const events = d.events.length
     ? `<ul class="events">${d.events.map((e) => `<li><time>${fmtTime(e.ts)}</time><span>${esc(e.text)}</span></li>`).join("")}</ul>`
     : `<div class="muted" style="padding-top:10px">暂无事件</div>`;
 
-  app.innerHTML = `
+  render(`
     <a class="back" href="#/nodes">← 节点列表</a>
     <div class="detail-head">
       <div><h1>${esc(n.remark)}</h1><div class="sub mono">${esc(n.addr)}</div></div>
@@ -325,10 +348,20 @@ async function nodeDetail(id) {
         : `<button class="danger" data-action="node-delete">删除</button>`}
     </div>
     ${detailsBlock(`more-${id}`, "更多信息", more)}
-    ${detailsBlock(`events-${id}`, "事件记录", events)}`;
+    ${detailsBlock(`events-${id}`, "事件记录", events)}`);
 }
 
-// ------------------------------------------------------------ 转发链
+// ------------------------------------------------------------ 转发
+
+// 等待确认的节点，附带离线、异常等状态
+function pendingLine(c) {
+  if (!c.pending.length) return "";
+  const who = c.pending.map((p) => {
+    const note = ["synced", "syncing"].includes(p.status) ? "" : `<span class="muted">（${STATUS[p.status]?.[0] || p.status}）</span>`;
+    return `<span class="who">${dot(p.status)}${esc(p.remark)}${note}</span>`;
+  });
+  return `<div class="pending">等待确认：${who.join("")}</div>`;
+}
 
 async function chainList() {
   const d = await api("GET", "chains");
@@ -336,21 +369,31 @@ async function chainList() {
   const cards = d.chains.map((c) => {
     const path = c.hops.map((h) => `<span class="hop">${dot(h.status)}${esc(h.remark)}:${h.port}</span>`);
     path.push(`<span class="hop mono">${esc(c.target_host)}:${c.target_port}</span>`);
+    let badge, actions;
+    if (c.deleting) {
+      badge = `<span class="badge removing"><i class="spinner"></i>删除中…</span>`;
+      actions = `<button class="small danger" data-action="chain-delete" data-id="${c.id}" data-force="1">强制删除</button>`;
+    } else {
+      badge = c.pending.length
+        ? `<span class="badge applying"><i class="spinner"></i>下发中…</span>`
+        : `<span class="badge applied">✓ 已生效</span>`;
+      actions = `<button class="small" data-action="chain-edit" data-id="${c.id}">编辑</button>
+        <button class="small danger" data-action="chain-delete" data-id="${c.id}">删除</button>`;
+    }
     return `
-      <div class="card">
+      <div class="card${c.deleting ? " dim" : ""}">
         <div class="card-head">
           <div class="title">${esc(c.remark)}</div>
-          <div class="chain-actions">
-            <button class="small" data-action="chain-edit" data-id="${c.id}">编辑</button>
-            <button class="small danger" data-action="chain-delete" data-id="${c.id}">删除</button>
-          </div>
+          <div class="chain-side">${badge}<div class="chain-actions">${actions}</div></div>
         </div>
-        <div class="path">${path.join("<span>→</span>")}</div>
+        <div class="path">${path.join(`<span class="arrow">→</span>`)}</div>
+        ${pendingLine(c)}
       </div>`;
   });
-  app.innerHTML = `
-    <div class="page-head"><h1>转发链</h1><button class="primary" data-action="chain-new">新增转发链</button></div>
-    ${cards.join("") || `<div class="empty">还没有转发链，点击右上角新增。</div>`}`;
+  render(`
+    <div class="page-head"><h1>转发<span class="count">${d.chains.length || ""}</span></h1>
+      <button class="primary" data-action="chain-new">新增转发</button></div>
+    ${cards.join("") || emptyState("⇄", "还没有转发，点击右上角新增。")}`);
 }
 
 // ------------------------------------------------------------ 设置
@@ -359,7 +402,7 @@ async function settingsPage() {
   const s = await api("GET", "settings");
   const theme = localStorage.getItem("ictl-theme") || "auto";
   const opt = (v, label) => `<option value="${v}" ${theme === v ? "selected" : ""}>${label}</option>`;
-  app.innerHTML = `
+  render(`
     <div class="page-head"><h1>设置</h1></div>
     <form class="panel" data-form="account">
       <h2>账号</h2>
@@ -384,7 +427,7 @@ async function settingsPage() {
         <span>面板路径</span><span class="mono">${esc(s.panel_path)}/</span>
         <span>版本</span><span>${esc(s.version)}</span>
       </div>
-    </div>`;
+    </div>`);
 }
 
 // ------------------------------------------------------------ 弹窗
@@ -459,7 +502,7 @@ function hopRow(nodes, hop = {}) {
 }
 
 function renumberHops() {
-  document.querySelectorAll("#modal .hop-row").forEach((r, i) => ($(".hop-no", r).textContent = `${i + 1}.`));
+  document.querySelectorAll("#modal .hop-row").forEach((r, i) => ($(".hop-no", r).textContent = `${i + 1}`));
 }
 
 async function chainForm(chain) {
@@ -467,7 +510,7 @@ async function chainForm(chain) {
   const nodes = d.nodes.filter((n) => n.status !== "deleting");
   const hops = chain ? chain.hops : [{}];
   openModal(`
-    <h2>${chain ? "编辑转发链" : "新增转发链"}</h2>
+    <h2>${chain ? "编辑转发" : "新增转发"}</h2>
     <form data-form="chain" data-id="${chain ? chain.id : ""}">
       <label><span>别名</span><input name="remark" value="${esc(chain?.remark)}" maxlength="64" required></label>
       <div class="hops">
@@ -572,7 +615,7 @@ const FORMS = {
     const body = { remark: data.remark, target_host: data.target_host, target_port: data.target_port, hops };
     await api(id ? "PATCH" : "POST", id ? `chains/${id}` : "chains", body);
     closeModal();
-    toast("已保存");
+    toast("已保存，正在下发到节点");
     refresh();
   },
 };
@@ -649,9 +692,13 @@ const ACTIONS = {
 
   async "chain-delete"(el) {
     const c = chainsById[el.dataset.id];
-    if (!(await confirmBox("删除转发链", `确定删除转发链 <b>${esc(c.remark)}</b>？相关节点会在下次同步时移除对应规则。`, "删除", true))) return;
-    await api("DELETE", `chains/${c.id}`);
-    toast("已删除");
+    const force = el.dataset.force === "1";
+    const text = force
+      ? `直接删除转发 <b>${esc(c.remark)}</b> 的记录。尚未确认的节点恢复连接后，会在同步时自动清除对应规则。`
+      : `将通知相关节点移除转发 <b>${esc(c.remark)}</b> 的规则，所有节点确认后自动删除。`;
+    if (!(await confirmBox(force ? "强制删除转发" : "删除转发", text, "删除", true))) return;
+    const r = await api("DELETE", `chains/${c.id}${force ? "?force=1" : ""}`);
+    toast(r.deleted ? "已删除" : "已通知节点，确认后自动删除");
     refresh();
   },
 
@@ -706,5 +753,6 @@ document.addEventListener("change", (e) => {
 if (location.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname)) {
   $("#http-warning").hidden = false;
 }
+document.querySelectorAll(".logo").forEach((el) => (el.innerHTML = LOGO));
 window.addEventListener("hashchange", route);
 route();

@@ -80,7 +80,8 @@ CREATE TABLE IF NOT EXISTS chains (
   id INTEGER PRIMARY KEY,
   remark TEXT NOT NULL,
   target_host TEXT NOT NULL,
-  target_port INTEGER NOT NULL
+  target_port INTEGER NOT NULL,
+  deleting INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS hops (
   id INTEGER PRIMARY KEY,
@@ -89,6 +90,11 @@ CREATE TABLE IF NOT EXISTS hops (
   node_id INTEGER NOT NULL REFERENCES nodes(id),
   port INTEGER NOT NULL,
   UNIQUE (node_id, port)
+);
+CREATE TABLE IF NOT EXISTS chain_pending (
+  chain_id INTEGER NOT NULL,
+  node_id INTEGER NOT NULL,
+  PRIMARY KEY (chain_id, node_id)
 );
 CREATE TABLE IF NOT EXISTS windows (
   node_id INTEGER NOT NULL,
@@ -133,6 +139,9 @@ def init_db():
     conn = db()
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    # 0.1.0 升级：chains 增加 deleting 字段
+    if "deleting" not in [r["name"] for r in conn.execute("PRAGMA table_info(chains)")]:
+        conn.execute("ALTER TABLE chains ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0")
     with conn:
         if not setting(conn, "sync_path"):
             set_setting(conn, "sync_path", "/" + secrets.token_hex(12))
@@ -169,7 +178,7 @@ def get_node(conn, node_id):
 def get_chain(conn, chain_id):
     chain = conn.execute("SELECT * FROM chains WHERE id = ?", (chain_id,)).fetchone()
     if not chain:
-        raise UserError("转发链不存在", status=404)
+        raise UserError("转发不存在", status=404)
     return chain
 
 
@@ -177,6 +186,28 @@ def delete_node(conn, node_id):
     conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
     conn.execute("DELETE FROM windows WHERE node_id = ?", (node_id,))
     conn.execute("DELETE FROM events WHERE node_id = ?", (node_id,))
+    conn.execute("DELETE FROM chain_pending WHERE node_id = ?", (node_id,))
+    finish_deleted_chains(conn)
+
+
+def delete_chain(conn, chain_id):
+    conn.execute("DELETE FROM hops WHERE chain_id = ?", (chain_id,))
+    conn.execute("DELETE FROM chain_pending WHERE chain_id = ?", (chain_id,))
+    conn.execute("DELETE FROM chains WHERE id = ?", (chain_id,))
+
+
+def mark_pending(conn, chain_id, node_ids):
+    """记录本次改动需要哪些节点确认。"""
+    for nid in set(node_ids):
+        conn.execute("INSERT OR IGNORE INTO chain_pending VALUES (?, ?)", (chain_id, nid))
+
+
+def finish_deleted_chains(conn):
+    """删除中的转发在所有相关节点确认后真正删除。"""
+    for r in conn.execute(
+            """SELECT id FROM chains WHERE deleting = 1
+               AND id NOT IN (SELECT chain_id FROM chain_pending)""").fetchall():
+        delete_chain(conn, r["id"])
 
 
 def add_event(conn, node_id, text, now=None):
@@ -299,12 +330,13 @@ def parse_hops(conn, hops, chain_id=None):
             raise UserError(f"第 {i} 跳：重复使用了节点 {node['remark']} 的端口 {port}", "hops")
         seen.add((node["id"], port))
         row = conn.execute(
-            """SELECT c.remark FROM hops h JOIN chains c ON c.id = h.chain_id
+            """SELECT c.remark || CASE c.deleting WHEN 1 THEN '（删除中）' ELSE '' END AS remark
+               FROM hops h JOIN chains c ON c.id = h.chain_id
                WHERE h.node_id = ? AND h.port = ? AND h.chain_id IS NOT ?""",
             (node["id"], port, chain_id),
         ).fetchone()
         if row:
-            raise UserError(f"第 {i} 跳：节点 {node['remark']} 的端口 {port} 已被转发链「{row['remark']}」使用", "hops")
+            raise UserError(f"第 {i} 跳：节点 {node['remark']} 的端口 {port} 已被转发「{row['remark']}」使用", "hops")
     return [(node["id"], port) for node, port in result]
 
 
@@ -331,7 +363,7 @@ def node_rule_rows(conn, node):
         JOIN chains c ON c.id = h.chain_id
         LEFT JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1
         LEFT JOIN nodes n2 ON n2.id = h2.node_id
-        WHERE h.node_id = ?
+        WHERE h.node_id = ? AND c.deleting = 0
         ORDER BY h.id
         """,
         (node["id"],),
@@ -583,6 +615,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 lines = node_rules(conn, node)
                 want = rules_version(lines)
 
+                if v == want and state != "init":
+                    conn.execute("DELETE FROM chain_pending WHERE node_id = ?", (node["id"],))
+                    finish_deleted_chains(conn)
+
                 if node["deleting"] and v == want and state == "ok":
                     delete_node(conn, node["id"])
                     out = "same\n"
@@ -798,6 +834,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 key = new_key()
                 conn.execute("UPDATE nodes SET key = ? WHERE id = ?", (key, node_id))
                 add_event(conn, node_id, f"入站地址 {n['addr']} → {addr}，已重新生成密钥")
+                for r in conn.execute(
+                        """SELECT h.chain_id, h.node_id FROM hops h
+                           JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1
+                           WHERE h2.node_id = ?""", (node_id,)).fetchall():
+                    mark_pending(conn, r["chain_id"], [r["node_id"]])
         return {"key": key, "upstream": upstream_nodes(conn, node_id) if key else []}
 
     def api_node_rekey(self, conn, body, node_id):
@@ -814,7 +855,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             """SELECT DISTINCT c.remark FROM hops h JOIN chains c ON c.id = h.chain_id
                WHERE h.node_id = ? ORDER BY c.id""", (node_id,))]
         if used:
-            raise UserError(f"节点仍被转发链使用：{'、'.join(used)}。请先删除或修改这些链。")
+            raise UserError(f"节点仍被转发使用：{'、'.join(used)}。请先删除或修改这些转发。")
         force = self.query.get("force") == ["1"]
         with conn:
             if force or not n["first_seen"]:
@@ -825,24 +866,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 add_event(conn, node_id, "开始删除，等待节点清空规则")
         return {"deleted": False}
 
-    # 转发链
+    # 转发
 
     def api_chains(self, conn, body):
         now = int(time.time())
         nodes = {n["id"]: n for n in conn.execute("SELECT * FROM nodes").fetchall()}
         status = {nid: node_status(conn, n, now) for nid, n in nodes.items()}
+        node_info = lambda nid: {"node_id": nid, "remark": nodes[nid]["remark"], "status": status[nid]}
         chains = []
         for c in conn.execute("SELECT * FROM chains ORDER BY id").fetchall():
-            hops = [{"node_id": h["node_id"], "remark": nodes[h["node_id"]]["remark"],
-                     "addr": nodes[h["node_id"]]["addr"], "port": h["port"], "status": status[h["node_id"]]}
+            hops = [{**node_info(h["node_id"]), "addr": nodes[h["node_id"]]["addr"], "port": h["port"]}
                     for h in conn.execute("SELECT * FROM hops WHERE chain_id = ? ORDER BY seq", (c["id"],))]
+            pending = [node_info(r["node_id"]) for r in conn.execute(
+                "SELECT node_id FROM chain_pending WHERE chain_id = ? ORDER BY node_id", (c["id"],))]
             chains.append({"id": c["id"], "remark": c["remark"], "target_host": c["target_host"],
-                           "target_port": c["target_port"], "hops": hops})
+                           "target_port": c["target_port"], "deleting": bool(c["deleting"]),
+                           "hops": hops, "pending": pending})
         return {"chains": chains}
 
+    def chain_spec(self, conn, chain_id):
+        """转发的实际内容（跳和目标），用于判断改动是否影响规则。"""
+        c = get_chain(conn, chain_id)
+        hops = [(h["node_id"], h["port"]) for h in conn.execute(
+            "SELECT node_id, port FROM hops WHERE chain_id = ? ORDER BY seq", (chain_id,))]
+        return hops, (c["target_host"], c["target_port"])
+
     def api_chain_save(self, conn, body, chain_id=None):
+        old = None
         if chain_id is not None:
-            get_chain(conn, chain_id)
+            if get_chain(conn, chain_id)["deleting"]:
+                raise UserError("该转发正在删除，不能修改")
+            old = self.chain_spec(conn, chain_id)
         remark = check_remark(body.get("remark"))
         hops = parse_hops(conn, body.get("hops"), chain_id)
         host = check_host(body.get("target_host"), "target_host")
@@ -855,14 +909,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.execute("UPDATE chains SET remark = ?, target_host = ?, target_port = ? WHERE id = ?",
                              (remark, host, port, chain_id))
             save_hops(conn, chain_id, hops)
+            # 规则有变化时，改动前后涉及的节点都需要确认（被移出的节点要清掉旧规则）
+            if old != (hops, (host, port)):
+                mark_pending(conn, chain_id, [nid for nid, _ in hops] + [nid for nid, _ in (old or ([], None))[0]])
         return {"id": chain_id}
 
     def api_chain_del(self, conn, body, chain_id):
         get_chain(conn, chain_id)
+        force = self.query.get("force") == ["1"]
         with conn:
-            conn.execute("DELETE FROM hops WHERE chain_id = ?", (chain_id,))
-            conn.execute("DELETE FROM chains WHERE id = ?", (chain_id,))
-        return {}
+            if force:
+                delete_chain(conn, chain_id)
+                return {"deleted": True}
+            conn.execute("UPDATE chains SET deleting = 1 WHERE id = ?", (chain_id,))
+            # 只需等待连接过的节点清理规则；之前未确认的改动一并以删除为准
+            conn.execute("DELETE FROM chain_pending WHERE chain_id = ?", (chain_id,))
+            mark_pending(conn, chain_id, [r[0] for r in conn.execute(
+                """SELECT h.node_id FROM hops h JOIN nodes n ON n.id = h.node_id
+                   WHERE h.chain_id = ? AND n.first_seen IS NOT NULL""", (chain_id,))])
+            finish_deleted_chains(conn)
+            deleted = not conn.execute("SELECT 1 FROM chains WHERE id = ?", (chain_id,)).fetchone()
+        return {"deleted": deleted}
 
     # 设置
 
