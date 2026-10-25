@@ -24,6 +24,7 @@ let currentView = null;           // 当前页面的渲染函数
 let refreshTimer = null;
 let currentNode = null;           // 详情页的节点
 let chainsById = {};              // 转发列表，编辑时使用
+let sortMode = null;              // 正在排序的列表："nodes" / "chains"
 const openDetails = new Set();    // 已展开的折叠区，刷新后保持
 const revealedKeys = new Set();   // 已显示密钥的节点
 
@@ -137,7 +138,7 @@ function toast(text, error = false) {
   t.className = error ? "error" : "";
   t.hidden = false;
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => (t.hidden = true), error ? 4000 : 2000);
+  toast.timer = setTimeout(() => (t.hidden = true), error ? 4000 : Math.max(2000, text.length * 100));
 }
 
 async function copy(text) {
@@ -224,7 +225,7 @@ function schedule() {
   clearTimeout(refreshTimer);
   if (!currentView?.auto) return;
   refreshTimer = setTimeout(async () => {
-    if ($("#modal").hidden && !document.hidden) await safe(currentView);
+    if ($("#modal").hidden && !document.hidden && !sortMode) await safe(currentView);
     schedule();
   }, REFRESH_MS);
 }
@@ -236,6 +237,7 @@ function refresh() {
 async function route() {
   clearTimeout(refreshTimer);
   closeModal();
+  sortMode = null;
   if (!me) {
     try {
       me = await api("GET", "me");
@@ -311,8 +313,32 @@ function showChangeAccount() {
 
 // ------------------------------------------------------------ 节点列表
 
+// 列表页标题栏：排序模式下显示「取消 / 完成」
+function listHead(title, count, kind, newAction, newLabel) {
+  const buttons = sortMode === kind
+    ? `<button data-action="sort-cancel">取消</button>
+       <button class="primary" data-action="sort-save" data-kind="${kind}">完成</button>`
+    : `${count > 1 ? `<button data-action="sort-start" data-kind="${kind}">排序</button>` : ""}
+       <button class="primary" data-action="${newAction}">${newLabel}</button>`;
+  return `<div class="page-head"><h1>${title}<span class="count">${count || ""}</span></h1>
+    <div class="head-actions">${buttons}</div></div>`;
+}
+
+// 排序模式：精简的卡片，左侧为拖动手柄
+function sortList(kind, items) {
+  return `<p class="hint sort-hint">按住左侧手柄拖动调整顺序，点「完成」保存。</p>
+    <div class="sort-list">${items.map(([id, inner]) => `
+      <div class="card sort-card" data-key="${kind}-${id}" data-id="${id}">
+        <span class="drag-handle" title="拖动排序">⠿</span><div class="sort-body">${inner}</div>
+      </div>`).join("")}</div>`;
+}
+
 async function nodeList() {
   const d = await api("GET", "nodes");
+  if (sortMode === "nodes") {
+    return render(listHead("节点", d.nodes.length, "nodes") +
+      sortList("node", d.nodes.map((n) => [n.id, `<div class="title">${esc(n.name)}</div>${nodeSub(n)}`])));
+  }
   const cards = d.nodes.map((n) => `
     <a class="card" href="#/nodes/${n.id}" data-key="node-${n.id}">
       <div class="card-head">
@@ -322,8 +348,7 @@ async function nodeList() {
       ${bar(n.bar)}
     </a>`);
   render(`
-    <div class="page-head"><h1>节点<span class="count">${d.nodes.length || ""}</span></h1>
-      <button class="primary" data-action="node-new">新增节点</button></div>
+    ${listHead("节点", d.nodes.length, "nodes", "node-new", "新增节点")}
     ${cards.join("") || emptyState("◎", "还没有节点，点击右上角新增。")}`);
 }
 
@@ -392,7 +417,7 @@ async function nodeDetail(id) {
         <button class="small" data-action="copy" data-text="${esc(install(n.key))}">复制</button></div>
       <p class="hint">在节点上执行一键接入命令即可完成安装和接入；也可以运行 <code>sudo ictl</code>，选择 1 手动填写同步地址和密钥。</p>
     </div>
-    <div class="panel"><h2>转发规则</h2>${rules}</div>
+    <div class="panel"><h2>转发规则<span class="count">允许端口 ${esc(n.ports)}</span></h2>${rules}</div>
     <div class="actions">
       <button data-action="node-edit">编辑</button>
       <button data-action="node-rekey">重置密钥</button>
@@ -419,6 +444,11 @@ function pendingLine(c) {
 async function chainList() {
   const d = await api("GET", "chains");
   chainsById = Object.fromEntries(d.chains.map((c) => [c.id, c]));
+  if (sortMode === "chains") {
+    return render(listHead("转发", d.chains.length, "chains") + sortList("chain", d.chains.map((c) => [c.id,
+      `<div class="title">${esc(c.remark)}</div>
+       <div class="sub">${c.hops.map((h) => esc(h.name)).join(" → ")} → <span class="mono">${esc(c.target_host)}:${c.target_port}</span></div>`])));
+  }
   const cards = d.chains.map((c) => {
     const path = c.hops.map((h) => `<span class="hop">${dot(h.status)}${esc(h.name)}:${h.port}</span>`);
     path.push(`<span class="hop mono">${esc(c.target_host)}:${c.target_port}</span>`);
@@ -449,8 +479,7 @@ async function chainList() {
       </div>`;
   });
   render(`
-    <div class="page-head"><h1>转发<span class="count">${d.chains.length || ""}</span></h1>
-      <button class="primary" data-action="chain-new">新增转发</button></div>
+    ${listHead("转发", d.chains.length, "chains", "chain-new", "新增转发")}
     ${cards.join("") || emptyState("⇄", "还没有转发，点击右上角新增。")}`);
 }
 
@@ -537,6 +566,8 @@ function nodeForm(node) {
       <label><span>备注（选填，节点的说明）</span><textarea name="note" rows="3" maxlength="500">${esc(node?.note)}</textarea></label>
       <label><span>入站地址（IPv4 或域名，其他节点通过它连接到该节点）</span>
         <input name="addr" value="${esc(node?.addr)}" class="mono" required></label>
+      <label><span>允许的入站端口（端口或范围，多个用逗号分隔，如 10000-20000,30000）</span>
+        <input name="ports" value="${esc(node?.ports ?? "10000-65535")}" class="mono" required></label>
       ${node ? `<p class="hint">修改入站地址会重新生成密钥。</p>` : ""}
       <div class="form-error"></div>
       <div class="form-actions">
@@ -548,12 +579,12 @@ function nodeForm(node) {
 
 function hopRow(nodes, hop = {}) {
   const options = nodes.map((n) =>
-    `<option value="${n.id}" ${hop.node_id === n.id ? "selected" : ""}>${esc(n.name)}（${esc(n.addr)}）</option>`);
+    `<option value="${n.id}" ${hop.node_id === n.id ? "selected" : ""}>${esc(n.name)}（${esc(n.addr)} · 端口 ${esc(n.ports)}）</option>`);
   return `
     <div class="hop-row">
       <span class="hop-no"></span>
       <select name="hop-node"><option value="">选择节点</option>${options.join("")}</select>
-      <input name="hop-port" value="${hop.port ?? ""}" placeholder="入站端口" inputmode="numeric">
+      <input name="hop-port" value="${hop.port ?? ""}" placeholder="留空自动分配" inputmode="numeric">
       <button type="button" data-action="hop-up" title="上移">↑</button>
       <button type="button" data-action="hop-down" title="下移">↓</button>
       <button type="button" data-action="hop-del" title="删除">✕</button>
@@ -573,7 +604,7 @@ async function chainForm(chain) {
     <form data-form="chain" data-id="${chain ? chain.id : ""}">
       <label><span>别名</span><input name="remark" value="${esc(chain?.remark)}" maxlength="64" required></label>
       <div class="hops">
-        <label style="margin-bottom:6px"><span>经过的节点（按顺序，每一跳填写该节点的入站端口）</span></label>
+        <label style="margin-bottom:6px"><span>经过的节点（按顺序，每一跳填写该节点的入站端口，留空则自动分配一个未使用的端口）</span></label>
         <div id="hop-list">${hops.map((h) => hopRow(nodes, h)).join("")}</div>
         <button type="button" class="small" data-action="hop-add">添加一跳</button>
         <div class="field-error" data-error="hops"></div>
@@ -649,12 +680,12 @@ const FORMS = {
   async node(form, data) {
     const id = form.dataset.id;
     if (!id) {
-      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr });
+      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr, ports: data.ports });
       closeModal();
       location.hash = `#/nodes/${r.id}`;
       return;
     }
-    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr });
+    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr, ports: data.ports });
     closeModal();
     if (r.key) {
       const ups = r.upstream.length ? `<p>以下节点的规则会自动更新：${r.upstream.map(esc).join("、")}</p>` : "";
@@ -672,9 +703,9 @@ const FORMS = {
       port: $("[name=hop-port]", r).value.trim(),
     }));
     const body = { remark: data.remark, target_host: data.target_host, target_port: data.target_port, hops };
-    await api(id ? "PATCH" : "POST", id ? `chains/${id}` : "chains", body);
+    const r = await api(id ? "PATCH" : "POST", id ? `chains/${id}` : "chains", body);
     closeModal();
-    toast("已保存，正在下发到节点");
+    toast(r.assigned.length ? `已保存，自动分配端口：${r.assigned.join("、")}` : "已保存，正在下发到节点");
     refresh();
   },
 };
@@ -746,6 +777,25 @@ const ACTIONS = {
     }
   },
 
+  "sort-start"(el) {
+    sortMode = el.dataset.kind;
+    clearTimeout(refreshTimer);
+    return refresh();
+  },
+  "sort-cancel"() {
+    sortMode = null;
+    refresh();
+    schedule();
+  },
+  async "sort-save"(el) {
+    const ids = [...app.querySelectorAll(".sort-card")].map((c) => Number(c.dataset.id));
+    await api("POST", `${el.dataset.kind}/order`, { ids });
+    sortMode = null;
+    toast("顺序已保存");
+    refresh();
+    schedule();
+  },
+
   "chain-new": () => chainForm(),
   "chain-edit": (el) => chainForm(chainsById[el.dataset.id]),
 
@@ -793,6 +843,60 @@ document.addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !$("#modal").hidden) closeModal();
 });
+
+// ------------------------------------------------------------ 拖动排序
+// 只能从手柄开始拖动（触屏上其余区域仍可正常滚动）；拖动时其他卡片平滑让位
+
+let drag = null;
+
+document.addEventListener("pointerdown", (e) => {
+  const handle = e.target.closest(".drag-handle");
+  if (!handle || e.button > 0) return;
+  e.preventDefault();
+  const card = handle.closest(".sort-card");
+  handle.setPointerCapture(e.pointerId);
+  drag = { card, offset: e.clientY - card.getBoundingClientRect().top };
+  card.classList.add("dragging");
+});
+
+document.addEventListener("pointermove", (e) => {
+  if (!drag) return;
+  const { card } = drag;
+  const list = card.parentNode;
+  const y = e.clientY;
+  if (y < 60) scrollBy(0, -12);
+  else if (y > innerHeight - 60) scrollBy(0, 12);
+
+  const others = [...list.children].filter((c) => c !== card);
+  const before = others.find((c) => {
+    const r = c.getBoundingClientRect();
+    return y < r.top + r.height / 2;
+  }) || null;
+  if (card.nextElementSibling !== before) {
+    const tops = new Map(others.map((c) => [c, c.getBoundingClientRect().top]));
+    list.insertBefore(card, before);
+    for (const [c, top] of tops) {
+      const dy = top - c.getBoundingClientRect().top;
+      if (!dy) continue;
+      c.style.transition = "none";
+      c.style.transform = `translateY(${dy}px)`;
+      void c.offsetWidth;
+      c.style.transition = "";
+      c.style.transform = "";
+    }
+  }
+  card.style.transform = "";
+  card.style.transform = `translateY(${y - drag.offset - card.getBoundingClientRect().top}px)`;
+});
+
+function endDrag() {
+  if (!drag) return;
+  drag.card.style.transform = "";
+  drag.card.classList.remove("dragging");
+  drag = null;
+}
+document.addEventListener("pointerup", endDrag);
+document.addEventListener("pointercancel", endDrag);
 
 // 记住折叠区的展开状态（toggle 事件不冒泡，用捕获）
 document.addEventListener("toggle", (e) => {

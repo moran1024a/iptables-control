@@ -3,7 +3,7 @@
 
 set -u
 
-VERSION="0.1.4"
+VERSION="0.1.5"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/bin/ictl"
@@ -403,7 +403,7 @@ daemon() {
   while true; do
     NEW=0
     with_lock cycle
-    [ "$NEW" -eq 1 ] || sleep $((5 + RANDOM % 6))
+    [ "$NEW" -eq 1 ] || sleep $((15 + RANDOM % 6))   # 15-20 秒
   done
 }
 

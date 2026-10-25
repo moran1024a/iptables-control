@@ -23,13 +23,13 @@ import threading
 import time
 from urllib.parse import parse_qs
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 REPO = "moran1024a/iptables-control"
 AGENT_URL = f"https://github.com/{REPO}/releases/download/v{VERSION}/ictl.sh"
 DB_PATH = os.environ.get("ICTL_DB", "/var/lib/ictl-server/ictl.db")
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
-OFFLINE_AFTER = 30          # 超过该秒数没有上报视为离线
+OFFLINE_AFTER = 60          # 超过该秒数没有上报视为离线（节点每 15-20 秒上报一次）
 MAX_SKEW = 60               # 节点时间允许的最大偏差（秒）
 MAX_BODY = 8192             # 同步请求体上限
 MAX_API_BODY = 65536        # 面板请求体上限
@@ -75,14 +75,17 @@ CREATE TABLE IF NOT EXISTS nodes (
   err TEXT,
   agent TEXT,
   skew INTEGER,
-  health TEXT
+  health TEXT,
+  sort INTEGER NOT NULL DEFAULT 0,
+  ports TEXT NOT NULL DEFAULT '10000-65535'
 );
 CREATE TABLE IF NOT EXISTS chains (
   id INTEGER PRIMARY KEY,
   remark TEXT NOT NULL,
   target_host TEXT NOT NULL,
   target_port INTEGER NOT NULL,
-  deleting INTEGER NOT NULL DEFAULT 0
+  deleting INTEGER NOT NULL DEFAULT 0,
+  sort INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS hops (
   id INTEGER PRIMARY KEY,
@@ -148,6 +151,15 @@ def init_db():
         conn.execute("ALTER TABLE nodes RENAME COLUMN remark TO name")
     if "note" not in cols("nodes"):
         conn.execute("ALTER TABLE nodes ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+    for t in ("nodes", "chains"):                          # 0.1.4：自定义排序，按原有顺序初始化
+        if "sort" not in cols(t):
+            conn.execute(f"ALTER TABLE {t} ADD COLUMN sort INTEGER NOT NULL DEFAULT 0")
+            conn.execute(f"UPDATE {t} SET sort = id")
+    if "ports" not in cols("nodes"):                      # 0.1.4：节点允许的端口，默认 10000-65535，并包含已在用的端口
+        conn.execute("ALTER TABLE nodes ADD COLUMN ports TEXT NOT NULL DEFAULT '10000-65535'")
+        conn.execute("""UPDATE nodes SET ports = (SELECT MIN(port) FROM hops WHERE hops.node_id = nodes.id) || '-65535'
+                        WHERE (SELECT MIN(port) FROM hops WHERE hops.node_id = nodes.id) < 10000""")
+    conn.commit()
     with conn:
         if not setting(conn, "sync_path"):
             set_setting(conn, "sync_path", "/" + secrets.token_hex(12))
@@ -312,6 +324,56 @@ def check_remark(s, field="remark", label="别名"):
     return s
 
 
+def parse_ports(s, field="ports"):
+    """解析允许的端口：逗号分隔的端口或范围，如 10000-20000,30000。返回排序合并后的 [(起始, 结束)]。"""
+    s = str(s or "").replace("，", ",").replace(" ", "")
+    if len(s) > 300:
+        raise UserError("允许的端口最长 300 个字符", field)
+    ranges = []
+    for item in filter(None, s.split(",")):
+        m = re.fullmatch(r"(\d{1,5})(?:-(\d{1,5}))?", item)
+        if not m:
+            raise UserError(f"格式错误：{item}（应为 端口 或 起始-结束，多个用逗号分隔）", field)
+        lo, hi = int(m[1]), int(m[2] or m[1])
+        if not 1 <= lo <= hi <= 65535:
+            raise UserError(f"范围无效：{item}（端口为 1-65535，起始不能大于结束）", field)
+        ranges.append((lo, hi))
+    if not ranges:
+        raise UserError("请填写允许的端口", field)
+    merged = []
+    for lo, hi in sorted(ranges):
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def format_ports(ranges):
+    return ",".join(str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in ranges)
+
+
+def in_ports(port, ranges):
+    return any(lo <= port <= hi for lo, hi in ranges)
+
+
+def pick_port(ranges, used):
+    """在允许的端口中随机选一个未使用的端口；没有可用端口时返回 None。"""
+    total = sum(hi - lo + 1 for lo, hi in ranges)
+    if total <= sum(1 for p in used if in_ports(p, ranges)):
+        return None
+    for _ in range(64):
+        k = secrets.randbelow(total)
+        for lo, hi in ranges:
+            if k <= hi - lo:
+                port = lo + k
+                break
+            k -= hi - lo + 1
+        if port not in used:
+            return port
+    return next(p for lo, hi in ranges for p in range(lo, hi + 1) if p not in used)
+
+
 def check_note(s):
     s = str(s or "").strip().replace("\r\n", "\n")
     if len(s) > 500:
@@ -320,7 +382,8 @@ def check_note(s):
 
 
 def parse_hops(conn, hops, chain_id=None):
-    """把 [{node_id, port}] 解析为 [(node_id, port)] 并检查端口冲突。"""
+    """把 [{node_id, port}] 解析为 [(node_id, port)]，检查端口冲突；端口留空时随机分配。
+    返回 (跳列表, 自动分配说明列表)。"""
     if not isinstance(hops, list) or not hops:
         raise UserError("至少需要一跳", "hops")
     result = []
@@ -331,14 +394,20 @@ def parse_hops(conn, hops, chain_id=None):
             raise UserError(f"第 {i} 跳：请选择节点", "hops")
         if node["deleting"]:
             raise UserError(f"第 {i} 跳：节点 {node['name']} 正在删除，不能使用", "hops")
-        try:
-            port = check_port(h.get("port"), "hops")
-        except UserError:
-            raise UserError(f"第 {i} 跳：端口必须是 1-65535 的整数", "hops")
-        result.append((node, port))
+        port = None
+        if str(h.get("port") or "").strip():
+            try:
+                port = check_port(h.get("port"), "hops")
+            except UserError:
+                raise UserError(f"第 {i} 跳：端口必须是 1-65535 的整数，或留空自动分配", "hops")
+            if not in_ports(port, parse_ports(node["ports"])):
+                raise UserError(f"第 {i} 跳：端口 {port} 不在节点 {node['name']} 允许的端口 {node['ports']} 内", "hops")
+        result.append([node, port])
 
     seen = set()
     for i, (node, port) in enumerate(result, 1):
+        if port is None:
+            continue
         if (node["id"], port) in seen:
             raise UserError(f"第 {i} 跳：重复使用了节点 {node['name']} 的端口 {port}", "hops")
         seen.add((node["id"], port))
@@ -350,7 +419,21 @@ def parse_hops(conn, hops, chain_id=None):
         ).fetchone()
         if row:
             raise UserError(f"第 {i} 跳：节点 {node['name']} 的端口 {port} 已被转发「{row['remark']}」使用", "hops")
-    return [(node["id"], port) for node, port in result]
+
+    # 留空的端口：避开该节点其他转发（含删除中）和本次已填写、已分配的端口
+    assigned = []
+    for i, item in enumerate(result, 1):
+        node, port = item
+        if port is not None:
+            continue
+        used = {r[0] for r in conn.execute(
+            "SELECT port FROM hops WHERE node_id = ? AND chain_id IS NOT ?", (node["id"], chain_id))}
+        used |= {p for n, p in result if n["id"] == node["id"] and p is not None}
+        item[1] = pick_port(parse_ports(node["ports"]), used)
+        if item[1] is None:
+            raise UserError(f"第 {i} 跳：节点 {node['name']} 允许的端口 {node['ports']} 已全部被占用", "hops")
+        assigned.append(f"{node['name']}:{item[1]}")
+    return [(node["id"], port) for node, port in result], assigned
 
 
 def save_hops(conn, chain_id, hops):
@@ -684,12 +767,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 handler = {"GET": self.api_chains, "POST": self.api_chain_save}.get(method)
             elif len(parts) == 2 and parts[0] == "chains" and parts[1].isdigit():
                 handler = {"PATCH": self.api_chain_save, "DELETE": self.api_chain_del}.get(method)
+            elif len(parts) == 2 and parts[0] in ("nodes", "chains") and parts[1] == "order":
+                handler = {"POST": self.api_order}.get(method)
+                parts = [parts[0]]   # 表名作为参数传入
             elif parts == ["settings"]:
                 handler = {"GET": self.api_settings, "PATCH": self.api_settings_save}.get(method)
             if not handler:
                 return self.send_json(404, {"error": "接口不存在"})
 
-            args = [int(parts[1])] if len(parts) > 1 else []
+            args = [int(parts[1])] if len(parts) > 1 else ([parts[0]] if handler == self.api_order else [])
             self.query = query
             self.send_json(200, handler(conn, body, *args))
         except UserError as e:
@@ -792,13 +878,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def node_brief(self, conn, n, now):
         return {"id": n["id"], "name": n["name"], "note": n["note"], "addr": n["addr"],
-                "status": node_status(conn, n, now),
+                "ports": n["ports"], "status": node_status(conn, n, now),
                 "last_seen": n["last_seen"]}
 
     def api_nodes(self, conn, body):
         now = int(time.time())
         nodes = []
-        for n in conn.execute("SELECT * FROM nodes ORDER BY id").fetchall():
+        for n in conn.execute("SELECT * FROM nodes ORDER BY sort, id").fetchall():
             nodes.append({**self.node_brief(conn, n, now), "bar": node_bar(conn, n, now)})
         return {"now": now, "nodes": nodes}
 
@@ -806,19 +892,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         name = check_remark(body.get("name"), "name", "名称")
         note = check_note(body.get("note"))
         addr = check_host(body.get("addr"), "addr")
+        ports = format_ports(parse_ports(body.get("ports", "10000-65535")))
         with conn:
-            cur = conn.execute("INSERT INTO nodes (name, note, addr, key) VALUES (?, ?, ?, ?)",
-                               (name, note, addr, new_key()))
+            cur = conn.execute(
+                """INSERT INTO nodes (name, note, addr, key, ports, sort)
+                   VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM nodes))""",
+                (name, note, addr, new_key(), ports))
             add_event(conn, cur.lastrowid, f"创建节点，入站地址 {addr}")
         return {"id": cur.lastrowid}
 
     def api_node_get(self, conn, body, node_id):
         now = int(time.time())
         n = get_node(conn, node_id)
-        rules = node_rule_rows(conn, n)
+        # 下发给节点的规则按规则 id 排序（影响版本号），这里只调整显示顺序
+        chain_sort = {r["id"]: (r["sort"], r["id"]) for r in conn.execute("SELECT id, sort FROM chains")}
+        rules = sorted(node_rule_rows(conn, n), key=lambda r: (chain_sort[r["chain_id"]], r["id"]))
         chains = conn.execute(
-            """SELECT DISTINCT c.id, c.remark FROM hops h JOIN chains c ON c.id = h.chain_id
-               WHERE h.node_id = ? ORDER BY c.id""", (node_id,)).fetchall()
+            """SELECT c.id, c.remark FROM hops h JOIN chains c ON c.id = h.chain_id
+               WHERE h.node_id = ? GROUP BY c.id ORDER BY c.sort, c.id""", (node_id,)).fetchall()
         events = conn.execute(
             "SELECT ts, text FROM events WHERE node_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
             (node_id, EVENTS_SHOWN)).fetchall()
@@ -844,9 +935,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         name = check_remark(body["name"], "name", "名称") if "name" in body else n["name"]
         note = check_note(body["note"]) if "note" in body else n["note"]
         addr = check_host(body["addr"], "addr") if "addr" in body else n["addr"]
+        ranges = parse_ports(body["ports"]) if "ports" in body else parse_ports(n["ports"])
+        outside = [r for r in conn.execute(
+            """SELECT c.remark, h.port FROM hops h JOIN chains c ON c.id = h.chain_id
+               WHERE h.node_id = ? ORDER BY h.port""", (node_id,)) if not in_ports(r["port"], ranges)]
+        if outside:
+            used = "、".join(f"「{r['remark']}」{r['port']}" for r in outside)
+            raise UserError(f"以下转发使用的端口不在新的允许范围内：{used}。请先修改这些转发。", "ports")
         key = None
         with conn:
-            conn.execute("UPDATE nodes SET name = ?, note = ?, addr = ? WHERE id = ?", (name, note, addr, node_id))
+            conn.execute("UPDATE nodes SET name = ?, note = ?, addr = ?, ports = ? WHERE id = ?",
+                         (name, note, addr, format_ports(ranges), node_id))
             if addr != n["addr"]:
                 key = new_key()
                 conn.execute("UPDATE nodes SET key = ? WHERE id = ?", (key, node_id))
@@ -891,7 +990,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         status = {nid: node_status(conn, n, now) for nid, n in nodes.items()}
         node_info = lambda nid: {"node_id": nid, "name": nodes[nid]["name"], "status": status[nid]}
         chains = []
-        for c in conn.execute("SELECT * FROM chains ORDER BY id").fetchall():
+        for c in conn.execute("SELECT * FROM chains ORDER BY sort, id").fetchall():
             hops = [{**node_info(h["node_id"]), "addr": nodes[h["node_id"]]["addr"], "port": h["port"]}
                     for h in conn.execute("SELECT * FROM hops WHERE chain_id = ? ORDER BY seq", (c["id"],))]
             pending = [node_info(r["node_id"]) for r in conn.execute(
@@ -915,13 +1014,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise UserError("该转发正在删除，不能修改")
             old = self.chain_spec(conn, chain_id)
         remark = check_remark(body.get("remark"))
-        hops = parse_hops(conn, body.get("hops"), chain_id)
+        hops, assigned = parse_hops(conn, body.get("hops"), chain_id)
         host = check_host(body.get("target_host"), "target_host")
         port = check_port(body.get("target_port"), "target_port")
         with conn:
             if chain_id is None:
-                chain_id = conn.execute("INSERT INTO chains (remark, target_host, target_port) VALUES (?, ?, ?)",
-                                        (remark, host, port)).lastrowid
+                chain_id = conn.execute(
+                    """INSERT INTO chains (remark, target_host, target_port, sort)
+                       VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM chains))""",
+                    (remark, host, port)).lastrowid
             else:
                 conn.execute("UPDATE chains SET remark = ?, target_host = ?, target_port = ? WHERE id = ?",
                              (remark, host, port, chain_id))
@@ -929,7 +1030,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # 规则有变化时，改动前后涉及的节点都需要确认（被移出的节点要清掉旧规则）
             if old != (hops, (host, port)):
                 mark_pending(conn, chain_id, [nid for nid, _ in hops] + [nid for nid, _ in (old or ([], None))[0]])
-        return {"id": chain_id}
+        return {"id": chain_id, "assigned": assigned}
 
     def api_chain_del(self, conn, body, chain_id):
         get_chain(conn, chain_id)
@@ -947,6 +1048,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             finish_deleted_chains(conn)
             deleted = not conn.execute("SELECT 1 FROM chains WHERE id = ?", (chain_id,)).fetchone()
         return {"deleted": deleted}
+
+    # 排序
+
+    def api_order(self, conn, body, table):
+        ids = body.get("ids")
+        existing = {r[0] for r in conn.execute(f"SELECT id FROM {table}")}
+        if not isinstance(ids, list) or len(ids) != len(existing) or set(ids) != existing:
+            raise UserError("列表已变化，请刷新后重试")
+        with conn:
+            for i, item_id in enumerate(ids):
+                conn.execute(f"UPDATE {table} SET sort = ? WHERE id = ?", (i + 1, item_id))
+        return {}
 
     # 设置
 
