@@ -27,7 +27,6 @@ VERSION = "0.1.0"
 REPO = "moran1024a/iptables-control"
 AGENT_URL = f"https://github.com/{REPO}/releases/download/v{VERSION}/ictl.sh"
 DB_PATH = os.environ.get("ICTL_DB", "/var/lib/ictl-server/ictl.db")
-TRUST_PROXY = os.environ.get("ICTL_TRUST_PROXY") == "1"   # 位于反向代理之后时，信任 X-Forwarded-For
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 OFFLINE_AFTER = 30          # 超过该秒数没有上报视为离线
@@ -508,10 +507,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
 
     def source_ip(self):
+        """真实来源 IP。直连来源为本机或内网（反向代理、Docker 网桥）时才信任 X-Forwarded-For，
+        公网客户端直连时自带的该请求头会被忽略，无法伪造。"""
         ip = self.client_address[0]
         xff = self.headers.get("X-Forwarded-For")
-        if xff and (TRUST_PROXY or ip in ("127.0.0.1", "::1")):
-            ip = xff.split(",")[-1].strip()
+        if xff:
+            peer = ipaddress.ip_address(ip)
+            if peer.is_private or peer.is_loopback:
+                ip = xff.split(",")[-1].strip()
         return ip
 
     def static(self, name):

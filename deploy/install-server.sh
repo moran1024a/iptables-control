@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 # ictl 服务端一键部署（Docker）。重复运行即更新到本脚本对应的版本，数据保留。
 #
-#   bash install-server.sh [--port 8730] [--trust-proxy]
-#
-#   --port         对外端口，默认 8730
-#   --trust-proxy  服务端位于反向代理之后时使用，信任 X-Forwarded-For 获取真实来源 IP
+#   bash install-server.sh [--port 8730]
 
 set -euo pipefail
 
@@ -13,7 +10,6 @@ IMAGE="ghcr.io/moran1024a/ictl-server:$VERSION"
 NAME="ictl-server"
 VOLUME="ictl-data"
 PORT=8730
-TRUST_PROXY=0
 
 die() {
   echo "错误：$*" >&2
@@ -23,7 +19,6 @@ die() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="${2:-}"; shift 2 ;;
-    --trust-proxy) TRUST_PROXY=1; shift ;;
     *) die "未知参数：$1" ;;
   esac
 done
@@ -44,10 +39,8 @@ if docker container inspect "$NAME" >/dev/null 2>&1; then
   docker rm -f "$NAME" >/dev/null
 fi
 
-env_args=()
-[ "$TRUST_PROXY" -eq 1 ] && env_args=(-e ICTL_TRUST_PROXY=1)
 docker run -d --name "$NAME" --restart unless-stopped \
-  -p "$PORT:8730" -v "$VOLUME:/data" ${env_args[@]+"${env_args[@]}"} "$IMAGE" >/dev/null
+  -p "$PORT:8730" -v "$VOLUME:/data" "$IMAGE" >/dev/null
 
 # 等待首次初始化完成
 for _ in $(seq 1 20); do

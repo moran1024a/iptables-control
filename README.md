@@ -31,12 +31,7 @@
 curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/install-server.sh | bash
 ```
 
-可选参数（追加在 `bash` 后面，如 `| bash -s -- --port 9000`）：
-
-| 参数 | 说明 |
-|---|---|
-| `--port <端口>` | 对外端口，默认 8730 |
-| `--trust-proxy` | 服务端位于反向代理之后时使用，从 `X-Forwarded-For` 获取真实来源 IP |
+对外端口默认 8730，可用 `| bash -s -- --port 9000` 修改。
 
 脚本会拉取 `ghcr.io/moran1024a/ictl-server` 镜像，创建容器 `ictl-server`，数据保存在 Docker 卷 `ictl-data` 中。首次启动会随机生成**面板路径**和**同步路径**并打印出来：
 
@@ -67,7 +62,7 @@ mkdir -p /opt/ictl && cp -r server/ictl-server.py server/web /opt/ictl/
 python3 /opt/ictl/ictl-server.py serve [--listen 0.0.0.0:8730]
 ```
 
-命令同上（`info`、`reset-admin`）。数据库默认 `/var/lib/ictl-server/ictl.db`，可用环境变量 `ICTL_DB` 覆盖；位于反向代理之后时设置环境变量 `ICTL_TRUST_PROXY=1`。数据库保存节点密钥原文，权限为 600，请妥善保管。
+命令同上（`info`、`reset-admin`）。数据库默认 `/var/lib/ictl-server/ictl.db`，可用环境变量 `ICTL_DB` 覆盖。数据库保存节点密钥原文，权限为 600，请妥善保管。
 
 ### HTTPS
 
@@ -79,7 +74,7 @@ panel.example.com {
 }
 ```
 
-此时用 `--trust-proxy` 部署（或设置 `ICTL_TRUST_PROXY=1`），面板中显示的节点来源 IP 和登录失败锁定才会按真实 IP 计算。配置好后可以用防火墙关闭 8730 端口的公网访问。
+服务端会自动识别反向代理：直接连接来自本机或内网地址（包括 Docker 网桥）时，从 `X-Forwarded-For` 获取真实来源 IP；公网客户端直连时忽略该请求头，无法伪造。配置好后可以用防火墙关闭 8730 端口的公网访问。
 
 ### 面板
 
