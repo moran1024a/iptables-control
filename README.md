@@ -2,12 +2,12 @@
 
 轻量的中心化 iptables 端口转发管理。
 
-- **服务端** `server/ictl-server.py`：管理节点和转发链，提供节点同步接口。Python 3 标准库 + SQLite + openssl 命令行，无第三方依赖。当前为原型，后续会加 WebUI。
+- **服务端** `server/`：Web 管理面板 + 节点同步接口，同一个端口。Python 3 标准库 + SQLite + openssl 命令行，无第三方依赖。
 - **节点端** `agent/ictl.sh`：从服务端拉取规则，应用到 iptables，上报结果。bash + curl + openssl。
 
 只由节点发起请求，服务端从不主动连接节点。请求和响应的内容都用节点密钥加密，HTTP 和 HTTPS 均可使用。`ipt.sh` 是旧的单机版脚本，保留备用，不要和 ictl 在同一台机器上同时使用。
 
-> 当前为早期版本：同步协议和节点端已基本定型，服务端是命令行原型，后续会重构并加入 WebUI。
+> 当前为早期版本，尚未经过真机长期运行验证。Docker 一键部署待完成。
 
 ## 概念
 
@@ -23,16 +23,25 @@
 
 ## 服务端
 
-### 部署
+### 运行
 
 ```bash
-mkdir -p /opt/ictl && cp server/ictl-server.py /opt/ictl/
-python3 /opt/ictl/ictl-server.py init https://sync.example.com     # 生成随机同步路径
+mkdir -p /opt/ictl && cp -r server/ictl-server.py server/web /opt/ictl/
+python3 /opt/ictl/ictl-server.py serve          # 默认监听 0.0.0.0:8730
 ```
 
-`init` 的地址是节点访问服务端用的对外地址，只用于生成同步地址。直接走 HTTP 时填 `http://<服务端IP>:8730`。需要 `openssl` 命令行。
+首次运行会自动初始化数据库，随机生成**面板路径**和**同步路径**，并打印到输出：
 
-systemd 服务 `/etc/systemd/system/ictl-server.service`：
+```
+ictl-server 0.2 监听 0.0.0.0:8730
+  面板：    http://<服务器地址>:8730/<面板路径>/
+  同步路径：/<同步路径>
+  默认账号：admin / admin_pass（首次登录后须修改）
+```
+
+面板和同步接口共用一个端口，其他任何路径都返回 404。用浏览器打开面板地址，用默认账号登录后必须同时修改用户名和密码。
+
+systemd 服务示例 `/etc/systemd/system/ictl-server.service`：
 
 ```ini
 [Unit]
@@ -47,37 +56,31 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-服务端默认只监听 `127.0.0.1:8730`。载荷已加密，可以直接用 `--listen 0.0.0.0:8730` 走 HTTP；推荐仍由反向代理提供 HTTPS，两层叠加。Caddy 示例（自动申请证书）：
-
-```
-sync.example.com {
-    handle /<同步路径> {
-        reverse_proxy 127.0.0.1:8730
-    }
-    handle {
-        respond 404
-    }
-}
-```
-
 ### 命令
 
 ```bash
-S="python3 /opt/ictl/ictl-server.py"
-
-$S node add 香港A 1.2.3.4            # 输出同步地址和密钥（只显示一次）
-$S node list                          # 状态：未连接 / 离线 / 时间不一致 / 同步中 / 已同步 / 失败 / 删除中
-$S node edit 1 --remark 新备注
-$S node edit 1 --addr 5.6.7.8         # 修改入站地址，重新生成密钥
-$S node rekey 1
-$S node del 1                         # 下发空配置，节点确认清空后才删除；--force 直接删除
-
-$S chain add 网站 1.2.3.4:443 1:10001                  # 单跳
-$S chain add 两跳 8.8.8.8:53 1:10002 2:20002          # 节点id:入站端口，依次排列
-$S chain list
-$S chain edit 2 --target 9.9.9.9:53 --hops 1:10002 3:30000
-$S chain del 2
+python3 /opt/ictl/ictl-server.py serve [--listen 0.0.0.0:8730]   # 运行服务
+python3 /opt/ictl/ictl-server.py info                             # 显示面板地址和同步路径
+python3 /opt/ictl/ictl-server.py reset-admin                      # 忘记密码时重置为默认账号
 ```
+
+数据库默认 `/var/lib/ictl-server/ictl.db`，可用环境变量 `ICTL_DB` 覆盖。数据库保存节点密钥原文，权限为 600，请妥善保管。
+
+### HTTPS
+
+同步载荷自带加密，走 HTTP 也不会泄露规则和密钥；但**面板登录在 HTTP 下是明文**，面板会在顶部给出提示。建议用反向代理提供 HTTPS，然后在面板「设置 → 对外地址」中填写 `https://域名`，节点的同步地址会随之更新。Caddy 示例：
+
+```
+panel.example.com {
+    reverse_proxy 127.0.0.1:8730
+}
+```
+
+### 面板
+
+- **节点**：每个节点显示备注、入站地址、状态、最后上报时间，以及最近 30 分钟的状态条（每格 30 秒：绿色正常、黄色故障、红色失联、灰色无数据）。点开查看详情：同步地址和密钥、转发规则、更多信息和事件记录（默认折叠）。可编辑、重置密钥、删除；修改入站地址会自动重新生成密钥。
+- **转发链**：每条链显示别名和经过的节点（带状态）。新增和编辑时依次选择节点并填写入站端口，最后填写目标地址和端口。
+- **设置**：修改账号密码、深色模式、对外地址。
 
 | 状态 | 含义 |
 |---|---|
@@ -86,10 +89,10 @@ $S chain del 2
 | 时间不一致 | 节点时间与服务端相差超过 60 秒，服务端不处理其请求 |
 | 同步中 | 节点上报的版本与应有版本不一致 |
 | 已同步 | 版本一致，规则全部应用成功 |
-| 失败 | 版本一致，但应用有问题（见错误列，如域名解析失败） |
-| 删除中 | 已下发空配置，等待节点确认 |
+| 失败 | 版本一致，但应用有问题（如域名解析失败） |
+| 删除中 | 已下发空配置，等待节点确认后自动删除 |
 
-数据库默认 `/var/lib/ictl-server/ictl.db`，可用环境变量 `ICTL_DB` 覆盖。数据库保存密钥原文，权限为 600，请妥善保管。
+状态条和事件记录保留 7 天。
 
 ## 节点端
 
@@ -99,7 +102,7 @@ $S chain del 2
 curl -fsSL https://raw.githubusercontent.com/moran1024a/iptables-control/main/agent/ictl.sh -o ictl.sh && sudo bash ictl.sh
 ```
 
-选 `1) 设置服务端地址和密钥`，填入服务端给出的同步地址和密钥。首次设置会安装 `/usr/local/bin/ictl` 和常驻服务 `ictl-agent`（开机自启）。之后用 `sudo ictl` 进入维护菜单：
+选 `1) 设置服务端地址和密钥`，填入面板节点详情页中的同步地址和密钥。首次设置会安装 `/usr/local/bin/ictl` 和常驻服务 `ictl-agent`（开机自启）。之后用 `sudo ictl` 进入维护菜单：
 
 ```
 1) 设置服务端地址和密钥

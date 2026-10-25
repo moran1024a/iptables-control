@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>ictl</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+<script>
+  // 先应用主题，避免页面闪烁
+  document.documentElement.dataset.theme = localStorage.getItem("ictl-theme") || "auto";
+</script>
+</head>
+<body>
+<div id="http-warning" class="banner" hidden>当前为 HTTP 连接，登录密码会以明文传输，建议配置 HTTPS。</div>
+<header id="nav" hidden>
+  <div class="nav-inner">
+    <span class="brand">ictl</span>
+    <nav>
+      <a href="#/nodes" data-nav="nodes">节点</a>
+      <a href="#/chains" data-nav="chains">转发链</a>
+      <a href="#/settings" data-nav="settings">设置</a>
+    </nav>
+    <button class="link" data-action="logout">退出</button>
+  </div>
+</header>
+<main id="app"></main>
+<div id="modal" hidden></div>
+<div id="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
