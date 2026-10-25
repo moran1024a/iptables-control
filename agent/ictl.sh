@@ -3,8 +3,9 @@
 
 set -u
 
-VERSION="0.1.2"
+VERSION="0.1.3"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
+GH_PROXY="https://gh-proxy.com/"   # --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/bin/ictl"
 CONF_DIR="/etc/ictl"
 CONF="$CONF_DIR/agent.conf"
@@ -513,14 +514,16 @@ quick_setup() {
   save_server "$url" "$key"
 }
 
-# 从 GitHub Release 下载最新版本替换自身；更新成功返回 0
+# 从 GitHub Release 下载最新版本替换自身；参数 --mirror 时经加速代理下载。更新成功返回 0
 update_agent() {
   title "更新节点端"
-  local tmp="$BIN.download" new
+  local tmp="$BIN.download" new url="$LATEST_URL"
+  [ "${1:-}" = "--mirror" ] && url="$GH_PROXY$LATEST_URL"
   mkdir -p "$(dirname "$BIN")"
-  if ! curl -fsSL --connect-timeout 10 --max-time 120 "$LATEST_URL" -o "$tmp"; then
+  if ! curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$tmp"; then
     rm -f "$tmp"
-    err "下载失败：$LATEST_URL"
+    err "下载失败：$url"
+    [ "${1:-}" = "--mirror" ] || note "国内服务器可使用加速下载：sudo ictl --update --mirror"
     return 1
   fi
   new="$(grep -m 1 '^VERSION=' "$tmp" | cut -d '"' -f 2)"
@@ -639,9 +642,9 @@ menu() {
 
 case "${1:-}" in
   --daemon) need_root; daemon ;;
-  --update) need_root; update_agent; exit 0 ;;
+  --update) need_root; update_agent "${2:-}"; exit 0 ;;
   --uninstall) need_root; uninstall "${2:-}" ;;
   --url|--key) need_root; quick_setup "$@" ;;
   "") need_root; menu ;;
-  *) echo "用法：ictl [--url <同步地址> --key <密钥> | --update | --uninstall [-y] | --daemon]" >&2; exit 1 ;;
+  *) echo "用法：ictl [--url <同步地址> --key <密钥> | --update [--mirror] | --uninstall [-y] | --daemon]" >&2; exit 1 ;;
 esac

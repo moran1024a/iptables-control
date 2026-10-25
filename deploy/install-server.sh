@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # ictl 服务端一键部署 / 更新 / 卸载（Docker）
 #
-#   bash install-server.sh [--port 8730] [--force]
+#   bash install-server.sh [--port 8730] [--force] [--mirror]
 #   bash install-server.sh --uninstall [--purge]
 #
 #   首次运行：创建容器，默认对外端口 8730。
 #   再次运行：检查版本，有新版本时更新；沿用现有容器的端口，数据卷保留。
 #   --port       指定对外端口（更新时也可用来修改端口）
 #   --force      版本相同也重新创建容器
+#   --mirror     从国内镜像站 ghcr.nju.edu.cn 拉取镜像；已用镜像站部署的容器更新时自动沿用
 #   --uninstall  删除容器和镜像，保留数据卷
 #   --purge      与 --uninstall 一起使用，同时删除数据卷（所有数据）
 
 set -euo pipefail
 
-VERSION="0.1.2"
-IMAGE="ghcr.io/moran1024a/ictl-server:$VERSION"
+VERSION="0.1.3"
+REGISTRY="ghcr.io"
+MIRROR_REGISTRY="ghcr.nju.edu.cn"
+REPO="moran1024a/ictl-server"
 NAME="ictl-server"
 VOLUME="ictl-data"
 PORT=""
@@ -33,6 +36,7 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
+    --mirror) REGISTRY="$MIRROR_REGISTRY"; shift ;;
     *) die "未知参数：$1" ;;
   esac
 done
@@ -72,6 +76,7 @@ fi
 BIND_IP=""
 if current_image="$(docker container inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null)"; then
   current="${current_image##*:}"
+  [ "${current_image%%/*}" = "$MIRROR_REGISTRY" ] && REGISTRY="$MIRROR_REGISTRY"
   binding="$(docker container inspect -f '{{with index .HostConfig.PortBindings "8730/tcp"}}{{(index . 0).HostIp}}|{{(index . 0).HostPort}}{{end}}' "$NAME")"
   cur_ip="${binding%%|*}"
   cur_port="${binding##*|}"
@@ -93,9 +98,13 @@ if current_image="$(docker container inspect -f '{{.Config.Image}}' "$NAME" 2>/d
   fi
 fi
 PORT="${PORT:-8730}"
+IMAGE="$REGISTRY/$REPO:$VERSION"
 
 echo "拉取镜像 $IMAGE"
-docker pull "$IMAGE" || die "镜像拉取失败，请检查网络能否访问 ghcr.io。"
+if ! docker pull "$IMAGE"; then
+  [ "$REGISTRY" = "$MIRROR_REGISTRY" ] && die "镜像拉取失败，请检查网络能否访问 $MIRROR_REGISTRY。"
+  die "镜像拉取失败，请检查网络能否访问 ghcr.io；国内服务器可加 --mirror 使用镜像站。"
+fi
 
 if docker container inspect "$NAME" >/dev/null 2>&1; then
   echo "替换已有容器 $NAME（数据卷 $VOLUME 保留）"

@@ -228,7 +228,6 @@ a.card:hover { border-color: color-mix(in srgb, var(--primary) 45%, var(--border
   border-radius: 50%;
   background: inherit;
   animation: pulse 1.6s ease-out infinite;
-  animation-delay: var(--phase, 0s);
 }
 
 .spinner {
@@ -238,7 +237,6 @@ a.card:hover { border-color: color-mix(in srgb, var(--primary) 45%, var(--border
   border: 2px solid currentColor;
   border-right-color: transparent;
   animation: spin 0.8s linear infinite;
-  animation-delay: var(--spin, 0s);
   flex: none;
 }
 
@@ -334,8 +332,8 @@ details[open] > :not(summary) { animation: fade 0.25s ease both; }
   border-radius: 999px;
   white-space: nowrap;
 }
-.badge.applying { background: rgba(224, 155, 0, 0.14); color: var(--yellow); animation: breathe 1.6s ease-in-out infinite; animation-delay: var(--phase, 0s); }
-.badge.removing { background: rgba(229, 72, 77, 0.12); color: var(--red); animation: breathe 1.6s ease-in-out infinite; animation-delay: var(--phase, 0s); }
+.badge.applying { background: rgba(224, 155, 0, 0.14); color: var(--yellow); animation: breathe 1.6s ease-in-out infinite; }
+.badge.removing { background: rgba(229, 72, 77, 0.12); color: var(--red); animation: breathe 1.6s ease-in-out infinite; }
 .badge.applied { background: rgba(34, 163, 90, 0.12); color: var(--green); }
 
 .pending { margin-top: 10px; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }

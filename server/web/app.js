@@ -73,12 +73,47 @@ function emptyState(icon, text) {
   return `<div class="empty"><div class="empty-icon">${icon}</div>${text}</div>`;
 }
 
-// 渲染页面。循环动画按当前时间设置负延迟，自动刷新替换 DOM 后动画仍然连续
+// 渲染页面：切换页面时整体替换并播放进入动画；刷新时只更新有变化的部分，
+// 已有元素保持不变，不会重放动画、丢失悬停状态或文字选区
+let fullRender = true;
+let enterTimer = null;
+
 function render(html) {
-  app.style.setProperty("--phase", `-${Date.now() % 1600}ms`);
-  app.style.setProperty("--spin", `-${Date.now() % 800}ms`);
-  app.innerHTML = html;
-  app.querySelectorAll(".logo").forEach((el) => (el.innerHTML = LOGO));
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  tpl.content.querySelectorAll(".logo").forEach((el) => (el.innerHTML = LOGO));
+  if (!fullRender && app.firstChild) {
+    morph(app, tpl.content);
+    return;
+  }
+  fullRender = false;
+  app.replaceChildren(tpl.content);
+  app.classList.remove("view-enter");
+  void app.offsetWidth;
+  app.classList.add("view-enter");
+  clearTimeout(enterTimer);
+  enterTimer = setTimeout(() => app.classList.remove("view-enter"), 600);
+}
+
+// 用新节点树更新现有节点的子节点：类型、标签或 data-key 不同时替换，否则就地更新
+function morph(from, to) {
+  const olds = [...from.childNodes];
+  const news = [...to.childNodes];
+  news.forEach((nb, i) => {
+    const na = olds[i];
+    if (!na) return from.appendChild(nb);
+    if (na.nodeName !== nb.nodeName || (na.nodeType === 1 && na.dataset.key !== nb.dataset.key)) {
+      return from.replaceChild(nb, na);
+    }
+    if (na.nodeType !== 1) {
+      if (na.nodeValue !== nb.nodeValue) na.nodeValue = nb.nodeValue;
+      return;
+    }
+    for (const { name } of [...na.attributes]) if (!nb.hasAttribute(name)) na.removeAttribute(name);
+    for (const { name, value } of [...nb.attributes]) if (na.getAttribute(name) !== value) na.setAttribute(name, value);
+    morph(na, nb);
+  });
+  for (let i = news.length; i < olds.length; i++) olds[i].remove();
 }
 
 function bar(b) {
@@ -174,10 +209,8 @@ async function safe(fn) {
 async function show(view, auto) {
   currentView = view;
   view.auto = auto;
-  app.classList.remove("view-enter");
+  fullRender = true;
   await safe(view);
-  void app.offsetWidth;
-  app.classList.add("view-enter");
   schedule();
 }
 
@@ -223,8 +256,10 @@ async function route() {
 function showLogin() {
   clearTimeout(refreshTimer);
   closeModal();
+  if (document.body.classList.contains("auth-page") && $('#app .auth[data-form="login"]')) return;   // 已显示时不重建，保留已输入内容
   $("#nav").hidden = true;
   document.body.classList.add("auth-page");
+  fullRender = true;
   render(`
     <form class="auth panel" data-form="login">
       <i class="logo"></i>
@@ -250,8 +285,10 @@ function accountFields(username, first) {
 function showChangeAccount() {
   clearTimeout(refreshTimer);
   closeModal();
+  if (document.body.classList.contains("auth-page") && $('#app .auth[data-form="account"]')) return;   // 已显示时不重建，保留已输入内容
   $("#nav").hidden = true;
   document.body.classList.add("auth-page");
+  fullRender = true;
   render(`
     <form class="auth panel" data-form="account">
       <i class="logo"></i>
@@ -268,7 +305,7 @@ function showChangeAccount() {
 async function nodeList() {
   const d = await api("GET", "nodes");
   const cards = d.nodes.map((n) => `
-    <a class="card" href="#/nodes/${n.id}">
+    <a class="card" href="#/nodes/${n.id}" data-key="node-${n.id}">
       <div class="card-head">
         <div class="node-head"><div class="title">${esc(n.name)}</div>${nodeSub(n)}</div>
         <div class="meta">${pill(n.status)}<span class="muted">${ago(n.last_seen, d.now)}</span></div>
@@ -388,7 +425,7 @@ async function chainList() {
         <button class="small danger" data-action="chain-delete" data-id="${c.id}">删除</button>`;
     }
     return `
-      <div class="card${c.deleting ? " dim" : ""}">
+      <div class="card${c.deleting ? " dim" : ""}" data-key="chain-${c.id}">
         <div class="card-head">
           <div class="title">${esc(c.remark)}</div>
           <div class="chain-side">${badge}<div class="chain-actions">${actions}</div></div>

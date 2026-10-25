@@ -31,7 +31,7 @@
 curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/install-server.sh | bash
 ```
 
-对外端口默认 8730，可用 `| bash -s -- --port 9000` 修改。
+对外端口默认 8730，可用 `| bash -s -- --port 9000` 修改。国内服务器见[国内加速](#国内加速)。
 
 脚本会拉取 `ghcr.io/moran1024a/ictl-server` 镜像，创建容器 `ictl-server`，数据保存在 Docker 卷 `ictl-data` 中。首次启动会随机生成**面板路径**和**同步路径**并打印出来：
 
@@ -153,7 +153,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/downlo
 sudo ictl --update
 ```
 
-检查 GitHub Release 上的最新版本，有新版本时替换 `/usr/local/bin/ictl` 并重启服务；已是最新版本时不做改动。服务端地址、密钥和本地缓存的规则都保留。也可以在菜单中选 4。面板的节点详情会显示节点端版本，与服务端不一致时给出提示。
+检查 GitHub Release 上的最新版本，有新版本时替换 `/usr/local/bin/ictl` 并重启服务（国内服务器可用 `sudo ictl --update --mirror`，见[国内加速](#国内加速)）；已是最新版本时不做改动。服务端地址、密钥和本地缓存的规则都保留。也可以在菜单中选 4。面板的节点详情会显示节点端版本，与服务端不一致时给出提示。
 
 ### 卸载
 
@@ -179,6 +179,35 @@ sudo ictl --uninstall        # 需要确认；加 -y 跳过确认
 | `/var/lib/ictl/` | 配置缓存、已应用规则、域名缓存、状态 |
 | `/etc/systemd/system/ictl-agent.service` | 常驻服务 |
 | `/etc/sysctl.d/99-ictl.conf` | `net.ipv4.ip_forward=1` |
+
+## 国内加速
+
+服务器访问 GitHub 或 ghcr.io 较慢时，可以使用加速源，用法与原版相同：
+
+- 脚本和节点端通过 [gh-proxy.com](https://gh-proxy.com/) 下载：在 GitHub 地址前加上 `https://gh-proxy.com/`；
+- 服务端镜像从南京大学镜像站 `ghcr.nju.edu.cn` 拉取：部署时加 `--mirror`。
+
+**服务端部署 / 更新**
+
+```bash
+curl -fsSL https://gh-proxy.com/https://github.com/moran1024a/iptables-control/releases/latest/download/install-server.sh | bash -s -- --mirror
+```
+
+使用 `--mirror` 部署后，之后更新时不加参数也会自动沿用镜像站。其他参数（`--port`、`--force`、`--uninstall`、`--purge`）用法不变。
+
+**节点一键接入**：复制面板中的一键接入命令，把其中的 `https://github.com/` 改为 `https://gh-proxy.com/https://github.com/`：
+
+```bash
+curl -fsSL https://gh-proxy.com/https://github.com/moran1024a/iptables-control/releases/download/v<版本>/ictl.sh -o ictl.sh && sudo bash ictl.sh --url '<同步地址>' --key '<密钥>'
+```
+
+**节点更新**
+
+```bash
+sudo ictl --update --mirror
+```
+
+加速源均为第三方公益服务，可用性不由本项目保证；gh-proxy.com 不可用时，也可以换成其他 GitHub 代理（如 `https://ghfast.top/`）。节点与服务端之间的同步通信不经过这些服务。
 
 ## 同步协议
 
