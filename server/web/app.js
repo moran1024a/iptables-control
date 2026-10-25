@@ -63,6 +63,12 @@ function pill(status) {
   return `<span class="pill t-${color}">${dot(status)}${label}</span>`;
 }
 
+// 节点名称下方的小字：入站地址 · 备注（单行，过长显示省略号）
+function nodeSub(n) {
+  const note = n.note ? `<span class="sep">·</span><span class="note" title="${esc(n.note)}">${esc(n.note.replace(/\n+/g, " "))}</span>` : "";
+  return `<div class="sub node-sub"><span class="mono">${esc(n.addr)}</span>${note}</div>`;
+}
+
 function emptyState(icon, text) {
   return `<div class="empty"><div class="empty-icon">${icon}</div>${text}</div>`;
 }
@@ -264,7 +270,7 @@ async function nodeList() {
   const cards = d.nodes.map((n) => `
     <a class="card" href="#/nodes/${n.id}">
       <div class="card-head">
-        <div><div class="title">${esc(n.remark)}</div><div class="sub mono">${esc(n.addr)}</div></div>
+        <div class="node-head"><div class="title">${esc(n.name)}</div>${nodeSub(n)}</div>
         <div class="meta">${pill(n.status)}<span class="muted">${ago(n.last_seen, d.now)}</span></div>
       </div>
       ${bar(n.bar)}
@@ -324,9 +330,10 @@ async function nodeDetail(id) {
   render(`
     <a class="back" href="#/nodes">← 节点列表</a>
     <div class="detail-head">
-      <div><h1>${esc(n.remark)}</h1><div class="sub mono">${esc(n.addr)}</div></div>
+      <div class="node-head"><h1>${esc(n.name)}</h1><div class="sub mono">${esc(n.addr)}</div></div>
       <div class="meta">${pill(n.status)}<span class="muted">最后上报 ${ago(n.last_seen, d.now)}</span></div>
     </div>
+    ${n.note ? `<div class="panel note-full"><h2>备注</h2><div>${esc(n.note)}</div></div>` : ""}
     <div class="panel">${bar(n.bar)}</div>
     <div class="panel">
       <h2>接入信息</h2>
@@ -358,7 +365,7 @@ function pendingLine(c) {
   if (!c.pending.length) return "";
   const who = c.pending.map((p) => {
     const note = ["synced", "syncing"].includes(p.status) ? "" : `<span class="muted">（${STATUS[p.status]?.[0] || p.status}）</span>`;
-    return `<span class="who">${dot(p.status)}${esc(p.remark)}${note}</span>`;
+    return `<span class="who">${dot(p.status)}${esc(p.name)}${note}</span>`;
   });
   return `<div class="pending">等待确认：${who.join("")}</div>`;
 }
@@ -367,7 +374,7 @@ async function chainList() {
   const d = await api("GET", "chains");
   chainsById = Object.fromEntries(d.chains.map((c) => [c.id, c]));
   const cards = d.chains.map((c) => {
-    const path = c.hops.map((h) => `<span class="hop">${dot(h.status)}${esc(h.remark)}:${h.port}</span>`);
+    const path = c.hops.map((h) => `<span class="hop">${dot(h.status)}${esc(h.name)}:${h.port}</span>`);
     path.push(`<span class="hop mono">${esc(c.target_host)}:${c.target_port}</span>`);
     let badge, actions;
     if (c.deleting) {
@@ -475,7 +482,8 @@ function nodeForm(node) {
   openModal(`
     <h2>${node ? "编辑节点" : "新增节点"}</h2>
     <form data-form="node" data-id="${node ? node.id : ""}">
-      <label><span>备注</span><input name="remark" value="${esc(node?.remark)}" maxlength="64" required></label>
+      <label><span>名称</span><input name="name" value="${esc(node?.name)}" maxlength="64" required></label>
+      <label><span>备注（选填，节点的说明）</span><textarea name="note" rows="3" maxlength="500">${esc(node?.note)}</textarea></label>
       <label><span>入站地址（IPv4 或域名，其他节点通过它连接到该节点）</span>
         <input name="addr" value="${esc(node?.addr)}" class="mono" required></label>
       ${node ? `<p class="hint">修改入站地址会重新生成密钥。</p>` : ""}
@@ -489,7 +497,7 @@ function nodeForm(node) {
 
 function hopRow(nodes, hop = {}) {
   const options = nodes.map((n) =>
-    `<option value="${n.id}" ${hop.node_id === n.id ? "selected" : ""}>${esc(n.remark)}（${esc(n.addr)}）</option>`);
+    `<option value="${n.id}" ${hop.node_id === n.id ? "selected" : ""}>${esc(n.name)}（${esc(n.addr)}）</option>`);
   return `
     <div class="hop-row">
       <span class="hop-no"></span>
@@ -590,12 +598,12 @@ const FORMS = {
   async node(form, data) {
     const id = form.dataset.id;
     if (!id) {
-      const r = await api("POST", "nodes", { remark: data.remark, addr: data.addr });
+      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr });
       closeModal();
       location.hash = `#/nodes/${r.id}`;
       return;
     }
-    const r = await api("PATCH", `nodes/${id}`, { remark: data.remark, addr: data.addr });
+    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr });
     closeModal();
     if (r.key) {
       const ups = r.upstream.length ? `<p>以下节点的规则会自动更新：${r.upstream.map(esc).join("、")}</p>` : "";
@@ -661,7 +669,7 @@ const ACTIONS = {
   },
 
   async "node-rekey"() {
-    const ok = await confirmBox("重置密钥", `重置后旧密钥立即失效，节点 <b>${esc(currentNode.remark)}</b> 需要填入新密钥才能继续同步。`, "重置");
+    const ok = await confirmBox("重置密钥", `重置后旧密钥立即失效，节点 <b>${esc(currentNode.name)}</b> 需要填入新密钥才能继续同步。`, "重置");
     if (!ok) return;
     const r = await api("POST", `nodes/${currentNode.id}/rekey`);
     keyModal("密钥已重置", r.key);
@@ -672,10 +680,10 @@ const ACTIONS = {
     const force = el.dataset.force === "1";
     const n = currentNode;
     const text = force
-      ? `节点 <b>${esc(n.remark)}</b> 尚未确认清空规则。强制删除会直接删除记录，节点上的规则不会被清理。`
+      ? `节点 <b>${esc(n.name)}</b> 尚未确认清空规则。强制删除会直接删除记录，节点上的规则不会被清理。`
       : n.status === "new"
-        ? `确定删除节点 <b>${esc(n.remark)}</b>？`
-        : `将向节点 <b>${esc(n.remark)}</b> 下发空配置，节点确认清空规则后自动删除。`;
+        ? `确定删除节点 <b>${esc(n.name)}</b>？`
+        : `将向节点 <b>${esc(n.name)}</b> 下发空配置，节点确认清空规则后自动删除。`;
     if (!(await confirmBox(force ? "强制删除节点" : "删除节点", text, "删除", true))) return;
     const r = await api("DELETE", `nodes/${n.id}${force ? "?force=1" : ""}`);
     if (r.deleted) {

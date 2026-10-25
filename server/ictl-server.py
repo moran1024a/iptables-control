@@ -23,7 +23,7 @@ import threading
 import time
 from urllib.parse import parse_qs
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 REPO = "moran1024a/iptables-control"
 AGENT_URL = f"https://github.com/{REPO}/releases/download/v{VERSION}/ictl.sh"
 DB_PATH = os.environ.get("ICTL_DB", "/var/lib/ictl-server/ictl.db")
@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE TABLE IF NOT EXISTS nodes (
   id INTEGER PRIMARY KEY,
-  remark TEXT NOT NULL,
+  name TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
   addr TEXT NOT NULL,
   key TEXT NOT NULL UNIQUE,
   deleting INTEGER NOT NULL DEFAULT 0,
@@ -139,9 +140,14 @@ def init_db():
     conn = db()
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
-    # 0.1.0 升级：chains 增加 deleting 字段
-    if "deleting" not in [r["name"] for r in conn.execute("PRAGMA table_info(chains)")]:
+    # 旧版本升级
+    cols = lambda t: [r["name"] for r in conn.execute(f"PRAGMA table_info({t})")]
+    if "deleting" not in cols("chains"):                   # 0.1.0：转发删除确认
         conn.execute("ALTER TABLE chains ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0")
+    if "remark" in cols("nodes"):                          # 0.1.1：节点「备注」改为「名称」，新增「备注」
+        conn.execute("ALTER TABLE nodes RENAME COLUMN remark TO name")
+    if "note" not in cols("nodes"):
+        conn.execute("ALTER TABLE nodes ADD COLUMN note TEXT NOT NULL DEFAULT ''")
     with conn:
         if not setting(conn, "sync_path"):
             set_setting(conn, "sync_path", "/" + secrets.token_hex(12))
@@ -297,12 +303,19 @@ def check_port(s, field):
     raise UserError("端口必须是 1-65535 的整数", field)
 
 
-def check_remark(s, field="remark"):
+def check_remark(s, field="remark", label="别名"):
     s = str(s or "").strip()
     if not s:
-        raise UserError("备注不能为空", field)
+        raise UserError(f"{label}不能为空", field)
     if len(s) > 64 or "\n" in s:
-        raise UserError("备注最长 64 个字符，且不能换行", field)
+        raise UserError(f"{label}最长 64 个字符，且不能换行", field)
+    return s
+
+
+def check_note(s):
+    s = str(s or "").strip().replace("\r\n", "\n")
+    if len(s) > 500:
+        raise UserError("备注最长 500 个字符", "note")
     return s
 
 
@@ -317,7 +330,7 @@ def parse_hops(conn, hops, chain_id=None):
         if not node:
             raise UserError(f"第 {i} 跳：请选择节点", "hops")
         if node["deleting"]:
-            raise UserError(f"第 {i} 跳：节点 {node['remark']} 正在删除，不能使用", "hops")
+            raise UserError(f"第 {i} 跳：节点 {node['name']} 正在删除，不能使用", "hops")
         try:
             port = check_port(h.get("port"), "hops")
         except UserError:
@@ -327,7 +340,7 @@ def parse_hops(conn, hops, chain_id=None):
     seen = set()
     for i, (node, port) in enumerate(result, 1):
         if (node["id"], port) in seen:
-            raise UserError(f"第 {i} 跳：重复使用了节点 {node['remark']} 的端口 {port}", "hops")
+            raise UserError(f"第 {i} 跳：重复使用了节点 {node['name']} 的端口 {port}", "hops")
         seen.add((node["id"], port))
         row = conn.execute(
             """SELECT c.remark || CASE c.deleting WHEN 1 THEN '（删除中）' ELSE '' END AS remark
@@ -336,7 +349,7 @@ def parse_hops(conn, hops, chain_id=None):
             (node["id"], port, chain_id),
         ).fetchone()
         if row:
-            raise UserError(f"第 {i} 跳：节点 {node['remark']} 的端口 {port} 已被转发「{row['remark']}」使用", "hops")
+            raise UserError(f"第 {i} 跳：节点 {node['name']} 的端口 {port} 已被转发「{row['remark']}」使用", "hops")
     return [(node["id"], port) for node, port in result]
 
 
@@ -455,9 +468,9 @@ def record_report(conn, node, now, health, err, skew):
 
 
 def upstream_nodes(conn, node_id):
-    """以该节点为下一跳的节点备注。"""
+    """以该节点为下一跳的节点名称。"""
     return [r[0] for r in conn.execute(
-        """SELECT DISTINCT n.remark FROM hops h
+        """SELECT DISTINCT n.name FROM hops h
            JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1
            JOIN nodes n ON n.id = h.node_id
            WHERE h2.node_id = ? ORDER BY n.id""",
@@ -778,7 +791,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # 节点
 
     def node_brief(self, conn, n, now):
-        return {"id": n["id"], "remark": n["remark"], "addr": n["addr"], "status": node_status(conn, n, now),
+        return {"id": n["id"], "name": n["name"], "note": n["note"], "addr": n["addr"],
+                "status": node_status(conn, n, now),
                 "last_seen": n["last_seen"]}
 
     def api_nodes(self, conn, body):
@@ -789,10 +803,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return {"now": now, "nodes": nodes}
 
     def api_node_add(self, conn, body):
-        remark = check_remark(body.get("remark"))
+        name = check_remark(body.get("name"), "name", "名称")
+        note = check_note(body.get("note"))
         addr = check_host(body.get("addr"), "addr")
         with conn:
-            cur = conn.execute("INSERT INTO nodes (remark, addr, key) VALUES (?, ?, ?)", (remark, addr, new_key()))
+            cur = conn.execute("INSERT INTO nodes (name, note, addr, key) VALUES (?, ?, ?, ?)",
+                               (name, note, addr, new_key()))
             add_event(conn, cur.lastrowid, f"创建节点，入站地址 {addr}")
         return {"id": cur.lastrowid}
 
@@ -825,11 +841,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def api_node_edit(self, conn, body, node_id):
         n = get_node(conn, node_id)
-        remark = check_remark(body["remark"]) if "remark" in body else n["remark"]
+        name = check_remark(body["name"], "name", "名称") if "name" in body else n["name"]
+        note = check_note(body["note"]) if "note" in body else n["note"]
         addr = check_host(body["addr"], "addr") if "addr" in body else n["addr"]
         key = None
         with conn:
-            conn.execute("UPDATE nodes SET remark = ?, addr = ? WHERE id = ?", (remark, addr, node_id))
+            conn.execute("UPDATE nodes SET name = ?, note = ?, addr = ? WHERE id = ?", (name, note, addr, node_id))
             if addr != n["addr"]:
                 key = new_key()
                 conn.execute("UPDATE nodes SET key = ? WHERE id = ?", (key, node_id))
@@ -872,7 +889,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         now = int(time.time())
         nodes = {n["id"]: n for n in conn.execute("SELECT * FROM nodes").fetchall()}
         status = {nid: node_status(conn, n, now) for nid, n in nodes.items()}
-        node_info = lambda nid: {"node_id": nid, "remark": nodes[nid]["remark"], "status": status[nid]}
+        node_info = lambda nid: {"node_id": nid, "name": nodes[nid]["name"], "status": status[nid]}
         chains = []
         for c in conn.execute("SELECT * FROM chains ORDER BY id").fetchall():
             hops = [{**node_info(h["node_id"]), "addr": nodes[h["node_id"]]["addr"], "port": h["port"]}

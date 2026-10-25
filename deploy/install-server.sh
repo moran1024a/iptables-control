@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 IMAGE="ghcr.io/moran1024a/ictl-server:$VERSION"
 NAME="ictl-server"
 VOLUME="ictl-data"

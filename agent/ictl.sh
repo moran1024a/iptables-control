@@ -3,7 +3,7 @@
 
 set -u
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 BIN="/usr/local/bin/ictl"
 CONF_DIR="/etc/ictl"
