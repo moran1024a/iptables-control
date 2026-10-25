@@ -23,7 +23,7 @@ import threading
 import time
 from urllib.parse import parse_qs
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 REPO = "moran1024a/iptables-control"
 AGENT_URL = f"https://github.com/{REPO}/releases/download/v{VERSION}/ictl.sh"
 DB_PATH = os.environ.get("ICTL_DB", "/var/lib/ictl-server/ictl.db")
@@ -50,8 +50,17 @@ STATIC = {
     "style.css": "text/css; charset=utf-8",
 }
 HEALTH = {"ok": "正常", "error": "故障", "skew": "时间不一致"}
+KINDS = ("nodes", "chains")      # 分组的类型，与表名相同；节点和转发的分组相互独立
+DEFAULT_GROUP = "默认分组"
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS item_groups (
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  builtin INTEGER NOT NULL DEFAULT 0,
+  sort INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS settings (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL
@@ -77,7 +86,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   skew INTEGER,
   health TEXT,
   sort INTEGER NOT NULL DEFAULT 0,
-  ports TEXT NOT NULL DEFAULT '10000-65535'
+  ports TEXT NOT NULL DEFAULT '10000-65535',
+  group_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS chains (
   id INTEGER PRIMARY KEY,
@@ -85,7 +95,8 @@ CREATE TABLE IF NOT EXISTS chains (
   target_host TEXT NOT NULL,
   target_port INTEGER NOT NULL,
   deleting INTEGER NOT NULL DEFAULT 0,
-  sort INTEGER NOT NULL DEFAULT 0
+  sort INTEGER NOT NULL DEFAULT 0,
+  group_id INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS hops (
   id INTEGER PRIMARY KEY,
@@ -159,6 +170,13 @@ def init_db():
         conn.execute("ALTER TABLE nodes ADD COLUMN ports TEXT NOT NULL DEFAULT '10000-65535'")
         conn.execute("""UPDATE nodes SET ports = (SELECT MIN(port) FROM hops WHERE hops.node_id = nodes.id) || '-65535'
                         WHERE (SELECT MIN(port) FROM hops WHERE hops.node_id = nodes.id) < 10000""")
+    for t in KINDS:                                        # 0.1.6：分组，原有节点和转发放入默认分组
+        if "group_id" not in cols(t):
+            conn.execute(f"ALTER TABLE {t} ADD COLUMN group_id INTEGER NOT NULL DEFAULT 0")
+        if not conn.execute("SELECT 1 FROM item_groups WHERE kind = ? AND builtin = 1", (t,)).fetchone():
+            conn.execute("INSERT INTO item_groups (kind, name, builtin, sort) VALUES (?, ?, 1, 0)", (t, DEFAULT_GROUP))
+        conn.execute(f"UPDATE {t} SET group_id = ? WHERE group_id NOT IN (SELECT id FROM item_groups WHERE kind = ?)",
+                     (default_group(conn, t), t))
     conn.commit()
     with conn:
         if not setting(conn, "sync_path"):
@@ -184,6 +202,31 @@ def reset_admin(conn):
     set_setting(conn, "admin_hash", hash_password(DEFAULT_PASS))
     set_setting(conn, "must_change", "1")
     conn.execute("DELETE FROM sessions")
+
+
+def default_group(conn, kind):
+    return conn.execute("SELECT id FROM item_groups WHERE kind = ? AND builtin = 1", (kind,)).fetchone()[0]
+
+
+def get_groups(conn, kind):
+    return [dict(r) for r in conn.execute(
+        "SELECT id, name, builtin FROM item_groups WHERE kind = ? ORDER BY sort, id", (kind,))]
+
+
+def check_group(conn, kind, group_id):
+    """校验所选分组；未选择时为默认分组。"""
+    if group_id in (None, ""):
+        return default_group(conn, kind)
+    if isinstance(group_id, int) and conn.execute(
+            "SELECT 1 FROM item_groups WHERE id = ? AND kind = ?", (group_id, kind)).fetchone():
+        return group_id
+    raise UserError("分组不存在，请刷新后重试", "group_id")
+
+
+def ordered(kind, where=""):
+    """按分组顺序、再按组内顺序查询节点或转发。"""
+    return f"""SELECT t.* FROM {kind} t JOIN item_groups g ON g.id = t.group_id
+               {where} ORDER BY g.sort, g.id, t.sort, t.id"""
 
 
 def get_node(conn, node_id):
@@ -690,8 +733,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             err = fields.get("err", "")[:500]
             health = "skew" if abs(skew) > MAX_SKEW else ("error" if state == "error" else "ok")
 
+            agent = fields.get("agent", "")[:32]
             with conn:
                 record_report(conn, node, now, health, err, skew)
+                if agent and node["agent"] and agent != node["agent"]:
+                    add_event(conn, node["id"], f"节点端版本 {node['agent']} → {agent}", now)
 
                 # 时间相差过大：只记录时差，不处理请求（防重放）
                 if health == "skew":
@@ -705,8 +751,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.execute(
                     """UPDATE nodes SET first_seen = COALESCE(first_seen, ?), last_seen = ?, src_ip = ?,
                        reported_v = ?, state = ?, err = ?, agent = ?, skew = ?, health = ? WHERE id = ?""",
-                    (now, now, self.source_ip(), v, state, err, fields.get("agent", "")[:32], skew, health,
-                     node["id"]),
+                    (now, now, self.source_ip(), v, state, err, agent, skew, health, node["id"]),
                 )
                 lines = node_rules(conn, node)
                 want = rules_version(lines)
@@ -767,9 +812,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 handler = {"GET": self.api_chains, "POST": self.api_chain_save}.get(method)
             elif len(parts) == 2 and parts[0] == "chains" and parts[1].isdigit():
                 handler = {"PATCH": self.api_chain_save, "DELETE": self.api_chain_del}.get(method)
-            elif len(parts) == 2 and parts[0] in ("nodes", "chains") and parts[1] == "order":
+            elif len(parts) == 2 and parts[0] in KINDS and parts[1] == "order":
                 handler = {"POST": self.api_order}.get(method)
                 parts = [parts[0]]   # 表名作为参数传入
+            elif parts == ["groups"]:
+                handler = {"POST": self.api_group_add}.get(method)
+            elif len(parts) == 2 and parts[0] == "groups" and parts[1].isdigit():
+                handler = {"PATCH": self.api_group_edit, "DELETE": self.api_group_del}.get(method)
             elif parts == ["settings"]:
                 handler = {"GET": self.api_settings, "PATCH": self.api_settings_save}.get(method)
             if not handler:
@@ -878,26 +927,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def node_brief(self, conn, n, now):
         return {"id": n["id"], "name": n["name"], "note": n["note"], "addr": n["addr"],
-                "ports": n["ports"], "status": node_status(conn, n, now),
+                "ports": n["ports"], "group_id": n["group_id"], "status": node_status(conn, n, now),
                 "last_seen": n["last_seen"]}
 
     def api_nodes(self, conn, body):
         now = int(time.time())
         nodes = []
-        for n in conn.execute("SELECT * FROM nodes ORDER BY sort, id").fetchall():
+        for n in conn.execute(ordered("nodes")).fetchall():
             nodes.append({**self.node_brief(conn, n, now), "bar": node_bar(conn, n, now)})
-        return {"now": now, "nodes": nodes}
+        return {"now": now, "groups": get_groups(conn, "nodes"), "nodes": nodes}
 
     def api_node_add(self, conn, body):
         name = check_remark(body.get("name"), "name", "名称")
         note = check_note(body.get("note"))
         addr = check_host(body.get("addr"), "addr")
         ports = format_ports(parse_ports(body.get("ports", "10000-65535")))
+        group_id = check_group(conn, "nodes", body.get("group_id"))
         with conn:
             cur = conn.execute(
-                """INSERT INTO nodes (name, note, addr, key, ports, sort)
-                   VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM nodes))""",
-                (name, note, addr, new_key(), ports))
+                """INSERT INTO nodes (name, note, addr, key, ports, group_id, sort)
+                   VALUES (?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM nodes))""",
+                (name, note, addr, new_key(), ports, group_id))
             add_event(conn, cur.lastrowid, f"创建节点，入站地址 {addr}")
         return {"id": cur.lastrowid}
 
@@ -905,11 +955,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         now = int(time.time())
         n = get_node(conn, node_id)
         # 下发给节点的规则按规则 id 排序（影响版本号），这里只调整显示顺序
-        chain_sort = {r["id"]: (r["sort"], r["id"]) for r in conn.execute("SELECT id, sort FROM chains")}
+        chain_sort = {r["id"]: i for i, r in enumerate(conn.execute(ordered("chains")))}
         rules = sorted(node_rule_rows(conn, n), key=lambda r: (chain_sort[r["chain_id"]], r["id"]))
         chains = conn.execute(
-            """SELECT c.id, c.remark FROM hops h JOIN chains c ON c.id = h.chain_id
-               WHERE h.node_id = ? GROUP BY c.id ORDER BY c.sort, c.id""", (node_id,)).fetchall()
+            ordered("chains", "WHERE t.id IN (SELECT chain_id FROM hops WHERE node_id = ?)"), (node_id,)).fetchall()
+        group = conn.execute("SELECT name FROM item_groups WHERE id = ?", (n["group_id"],)).fetchone()
         events = conn.execute(
             "SELECT ts, text FROM events WHERE node_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
             (node_id, EVENTS_SHOWN)).fetchall()
@@ -923,10 +973,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 **self.node_brief(conn, n, now), "bar": node_bar(conn, n, now), "key": n["key"],
                 "first_seen": n["first_seen"], "src_ip": n["src_ip"], "skew": n["skew"], "agent": n["agent"],
                 "reported_v": n["reported_v"], "want_v": rules_version(node_rules(conn, n)),
-                "state": n["state"], "err": n["err"],
+                "state": n["state"], "err": n["err"], "group": group["name"],
             },
             "rules": rules,
-            "chains": [dict(c) for c in chains],
+            "chains": [{"id": c["id"], "remark": c["remark"]} for c in chains],
             "events": [dict(e) for e in events],
         }
 
@@ -936,6 +986,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         note = check_note(body["note"]) if "note" in body else n["note"]
         addr = check_host(body["addr"], "addr") if "addr" in body else n["addr"]
         ranges = parse_ports(body["ports"]) if "ports" in body else parse_ports(n["ports"])
+        group_id = check_group(conn, "nodes", body["group_id"]) if "group_id" in body else n["group_id"]
         outside = [r for r in conn.execute(
             """SELECT c.remark, h.port FROM hops h JOIN chains c ON c.id = h.chain_id
                WHERE h.node_id = ? ORDER BY h.port""", (node_id,)) if not in_ports(r["port"], ranges)]
@@ -946,6 +997,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with conn:
             conn.execute("UPDATE nodes SET name = ?, note = ?, addr = ?, ports = ? WHERE id = ?",
                          (name, note, addr, format_ports(ranges), node_id))
+            if group_id != n["group_id"]:   # 换到其他分组时排在该组末尾
+                conn.execute("""UPDATE nodes SET group_id = ?, sort = (SELECT MAX(sort) + 1 FROM nodes)
+                                WHERE id = ?""", (group_id, node_id))
             if addr != n["addr"]:
                 key = new_key()
                 conn.execute("UPDATE nodes SET key = ? WHERE id = ?", (key, node_id))
@@ -990,15 +1044,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         status = {nid: node_status(conn, n, now) for nid, n in nodes.items()}
         node_info = lambda nid: {"node_id": nid, "name": nodes[nid]["name"], "status": status[nid]}
         chains = []
-        for c in conn.execute("SELECT * FROM chains ORDER BY sort, id").fetchall():
+        for c in conn.execute(ordered("chains")).fetchall():
             hops = [{**node_info(h["node_id"]), "addr": nodes[h["node_id"]]["addr"], "port": h["port"]}
                     for h in conn.execute("SELECT * FROM hops WHERE chain_id = ? ORDER BY seq", (c["id"],))]
             pending = [node_info(r["node_id"]) for r in conn.execute(
                 "SELECT node_id FROM chain_pending WHERE chain_id = ? ORDER BY node_id", (c["id"],))]
             chains.append({"id": c["id"], "remark": c["remark"], "target_host": c["target_host"],
                            "target_port": c["target_port"], "deleting": bool(c["deleting"]),
-                           "hops": hops, "pending": pending})
-        return {"chains": chains}
+                           "group_id": c["group_id"], "hops": hops, "pending": pending})
+        # 节点及其分组用于筛选下拉框
+        node_list = [{"id": n["id"], "name": n["name"], "group_id": n["group_id"]}
+                     for n in conn.execute(ordered("nodes")).fetchall()]
+        return {"chains": chains, "groups": get_groups(conn, "chains"),
+                "nodes": node_list, "node_groups": get_groups(conn, "nodes")}
 
     def chain_spec(self, conn, chain_id):
         """转发的实际内容（跳和目标），用于判断改动是否影响规则。"""
@@ -1010,22 +1068,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_chain_save(self, conn, body, chain_id=None):
         old = None
         if chain_id is not None:
-            if get_chain(conn, chain_id)["deleting"]:
+            chain = get_chain(conn, chain_id)
+            if chain["deleting"]:
                 raise UserError("该转发正在删除，不能修改")
             old = self.chain_spec(conn, chain_id)
         remark = check_remark(body.get("remark"))
         hops, assigned = parse_hops(conn, body.get("hops"), chain_id)
         host = check_host(body.get("target_host"), "target_host")
         port = check_port(body.get("target_port"), "target_port")
+        if chain_id is not None and "group_id" not in body:
+            group_id = chain["group_id"]
+        else:
+            group_id = check_group(conn, "chains", body.get("group_id"))
         with conn:
             if chain_id is None:
                 chain_id = conn.execute(
-                    """INSERT INTO chains (remark, target_host, target_port, sort)
-                       VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM chains))""",
-                    (remark, host, port)).lastrowid
+                    """INSERT INTO chains (remark, target_host, target_port, group_id, sort)
+                       VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM chains))""",
+                    (remark, host, port, group_id)).lastrowid
             else:
                 conn.execute("UPDATE chains SET remark = ?, target_host = ?, target_port = ? WHERE id = ?",
                              (remark, host, port, chain_id))
+                if group_id != chain["group_id"]:   # 换到其他分组时排在该组末尾
+                    conn.execute("""UPDATE chains SET group_id = ?, sort = (SELECT MAX(sort) + 1 FROM chains)
+                                    WHERE id = ?""", (group_id, chain_id))
             save_hops(conn, chain_id, hops)
             # 规则有变化时，改动前后涉及的节点都需要确认（被移出的节点要清掉旧规则）
             if old != (hops, (host, port)):
@@ -1051,14 +1117,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # 排序
 
-    def api_order(self, conn, body, table):
-        ids = body.get("ids")
-        existing = {r[0] for r in conn.execute(f"SELECT id FROM {table}")}
-        if not isinstance(ids, list) or len(ids) != len(existing) or set(ids) != existing:
+    def api_order(self, conn, body, kind):
+        """保存顺序：groups 为分组顺序，ids 为全部对象按显示顺序排列（只能在组内调整，不改变所属分组）。"""
+        groups, ids = body.get("groups"), body.get("ids")
+        existing_groups = {r[0] for r in conn.execute("SELECT id FROM item_groups WHERE kind = ?", (kind,))}
+        existing = {r[0] for r in conn.execute(f"SELECT id FROM {kind}")}
+        if (not isinstance(groups, list) or len(groups) != len(existing_groups) or set(groups) != existing_groups
+                or not isinstance(ids, list) or len(ids) != len(existing) or set(ids) != existing):
             raise UserError("列表已变化，请刷新后重试")
         with conn:
+            for i, gid in enumerate(groups):
+                conn.execute("UPDATE item_groups SET sort = ? WHERE id = ?", (i + 1, gid))
             for i, item_id in enumerate(ids):
-                conn.execute(f"UPDATE {table} SET sort = ? WHERE id = ?", (i + 1, item_id))
+                conn.execute(f"UPDATE {kind} SET sort = ? WHERE id = ?", (i + 1, item_id))
+        return {}
+
+    def get_group(self, conn, group_id):
+        g = conn.execute("SELECT * FROM item_groups WHERE id = ?", (group_id,)).fetchone()
+        if not g:
+            raise UserError("分组不存在", status=404)
+        return g
+
+    def api_group_add(self, conn, body):
+        kind = body.get("kind")
+        if kind not in KINDS:
+            raise UserError("请求格式错误")
+        name = check_remark(body.get("name"), "name", "分组名称")
+        with conn:
+            cur = conn.execute(
+                """INSERT INTO item_groups (kind, name, sort)
+                   VALUES (?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM item_groups WHERE kind = ?))""",
+                (kind, name, kind))
+        return {"id": cur.lastrowid}
+
+    def api_group_edit(self, conn, body, group_id):
+        self.get_group(conn, group_id)
+        name = check_remark(body.get("name"), "name", "分组名称")
+        with conn:
+            conn.execute("UPDATE item_groups SET name = ? WHERE id = ?", (name, group_id))
+        return {}
+
+    def api_group_del(self, conn, body, group_id):
+        """删除分组，组内对象按原顺序移到默认分组末尾。"""
+        g = self.get_group(conn, group_id)
+        if g["builtin"]:
+            raise UserError("默认分组不能删除")
+        kind = g["kind"]
+        with conn:
+            base = conn.execute(f"SELECT COALESCE(MAX(sort), 0) FROM {kind}").fetchone()[0]
+            conn.execute(f"UPDATE {kind} SET group_id = ?, sort = sort + ? WHERE group_id = ?",
+                         (default_group(conn, kind), base, group_id))
+            conn.execute("DELETE FROM item_groups WHERE id = ?", (group_id,))
         return {}
 
     # 设置

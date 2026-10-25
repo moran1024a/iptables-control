@@ -23,10 +23,12 @@ let me = null;                    // {username, must_change}
 let currentView = null;           // 当前页面的渲染函数
 let refreshTimer = null;
 let currentNode = null;           // 详情页的节点
-let chainsById = {};              // 转发列表，编辑时使用
+let list = null;                  // 当前列表页：{kind, data, draw}，搜索、筛选和折叠时用已有数据重绘
 let sortMode = null;              // 正在排序的列表："nodes" / "chains"
 const openDetails = new Set();    // 已展开的折叠区，刷新后保持
 const revealedKeys = new Set();   // 已显示密钥的节点
+const filters = { nodes: {}, chains: {} };   // 搜索和筛选条件，刷新页面后清空
+const collapsed = new Set(JSON.parse(localStorage.getItem("ictl-collapsed") || "[]"));   // 已折叠的分组
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -215,6 +217,7 @@ async function safe(fn) {
 
 async function show(view, auto) {
   currentView = view;
+  list = null;
   view.auto = auto;
   fullRender = true;
   await safe(view);
@@ -313,43 +316,158 @@ function showChangeAccount() {
 
 // ------------------------------------------------------------ 节点列表
 
-// 列表页标题栏：排序模式下显示「取消 / 完成」
-function listHead(title, count, kind, newAction, newLabel) {
+const KIND_LABEL = { nodes: "节点", chains: "转发" };
+
+// 列表页标题栏：排序模式下显示「取消 / 完成」；搜索或筛选时不能排序
+function listHead(kind, total, shown, newAction, newLabel) {
+  const filtering = shown !== total;
   const buttons = sortMode === kind
     ? `<button data-action="sort-cancel">取消</button>
        <button class="primary" data-action="sort-save" data-kind="${kind}">完成</button>`
-    : `${count > 1 ? `<button data-action="sort-start" data-kind="${kind}">排序</button>` : ""}
+    : `${total > 1 || list.data.groups.length > 1 ? `<button data-action="sort-start" data-kind="${kind}" ${isFiltering(kind)
+        ? `disabled title="搜索或筛选时不能排序"` : ""}>排序</button>` : ""}
+       <button data-action="group-new" data-kind="${kind}">新建分组</button>
        <button class="primary" data-action="${newAction}">${newLabel}</button>`;
-  return `<div class="page-head"><h1>${title}<span class="count">${count || ""}</span></h1>
+  return `<div class="page-head"><h1>${KIND_LABEL[kind]}<span class="count">${filtering ? `${shown} / ${total}` : total || ""}</span></h1>
     <div class="head-actions">${buttons}</div></div>`;
 }
 
-// 排序模式：精简的卡片，左侧为拖动手柄
-function sortList(kind, items) {
-  return `<p class="hint sort-hint">按住左侧手柄拖动调整顺序，点「完成」保存。</p>
-    <div class="sort-list">${items.map(([id, inner]) => `
-      <div class="card sort-card" data-key="${kind}-${id}" data-id="${id}">
-        <span class="drag-handle" title="拖动排序">⠿</span><div class="sort-body">${inner}</div>
-      </div>`).join("")}</div>`;
+function isFiltering(kind) {
+  return Object.values(filters[kind]).some((v) => v && String(v).trim());
 }
 
-async function nodeList() {
-  const d = await api("GET", "nodes");
-  if (sortMode === "nodes") {
-    return render(listHead("节点", d.nodes.length, "nodes") +
-      sortList("node", d.nodes.map((n) => [n.id, `<div class="title">${esc(n.name)}</div>${nodeSub(n)}`])));
+function saveCollapsed() {
+  localStorage.setItem("ictl-collapsed", JSON.stringify([...collapsed]));
+}
+
+// 按分组显示：items 已按分组和组内顺序排列。只有默认分组时不显示组头。
+// 搜索或筛选时隐藏没有匹配项的分组，有匹配项的分组临时展开
+function groupedList(kind, items, card, summary) {
+  const groups = list.data.groups;
+  if (groups.length === 1) return items.map(card).join("");
+  const filtering = isFiltering(kind);
+  return groups.map((g) => {
+    const members = items.filter((x) => x.group_id === g.id);
+    if (filtering && !members.length) return "";
+    const key = `${kind}-${g.id}`;
+    return `<section class="group${!filtering && collapsed.has(key) ? " closed" : ""}" data-key="group-${key}">
+      ${groupHead(kind, g, `${members.length} 个${summary(members)}`)}
+      <div class="group-body">${members.map(card).join("") || `<div class="group-empty">空分组</div>`}</div>
+    </section>`;
+  }).join("");
+}
+
+function groupHead(kind, g, sum, handle = "") {
+  return `<div class="group-head" data-action="group-toggle" data-group="${kind}-${g.id}">
+    ${handle}<span class="chevron"></span><span class="group-name">${esc(g.name)}</span><span class="group-sum">${sum}</span>
+    ${handle ? "" : `<span class="group-actions">
+      <button class="small" data-action="group-rename" data-id="${g.id}">改名</button>
+      ${g.builtin ? "" : `<button class="small danger" data-action="group-delete" data-id="${g.id}">删除</button>`}
+    </span>`}
+  </div>`;
+}
+
+// 排序模式：精简的卡片，左侧为拖动手柄；有多个分组时，分组标题也可以拖动
+function sortList(kind, items, inner) {
+  const card = (x) => `
+    <div class="card sort-card sort-item" data-key="${kind}-${x.id}" data-id="${x.id}">
+      <span class="drag-handle" title="拖动排序">⠿</span><div class="sort-body">${inner(x)}</div>
+    </div>`;
+  const groups = list.data.groups;
+  if (groups.length === 1) {
+    return `<p class="hint sort-hint">按住左侧手柄拖动调整顺序，点「完成」保存。</p>
+      <div class="sort-list">${items.map(card).join("")}</div>`;
   }
-  const cards = d.nodes.map((n) => `
+  return `<p class="hint sort-hint">拖动分组标题左侧的手柄调整分组顺序，拖动卡片左侧的手柄调整组内顺序，点「完成」保存。更换分组请在编辑中选择。</p>
+    <div class="sort-list">${groups.map((g) => {
+      const members = items.filter((x) => x.group_id === g.id);
+      const key = `${kind}-${g.id}`;
+      return `<section class="group sort-group sort-item${collapsed.has(key) ? " closed" : ""}" data-key="sgroup-${key}" data-id="${g.id}">
+        ${groupHead(kind, g, `${members.length} 个`, `<span class="drag-handle" title="拖动排序">⠿</span>`)}
+        <div class="group-body">${members.map(card).join("") || `<div class="group-empty">空分组</div>`}</div>
+      </section>`;
+    }).join("")}</div>`;
+}
+
+// 搜索与筛选栏；控件的值在渲染后由 syncFilters 同步
+function filterBar(kind, controls) {
+  return `<div class="filters" data-filters="${kind}">${controls.join("")}
+    ${isFiltering(kind) ? `<button class="small link" data-action="filter-clear" data-kind="${kind}">清除</button>` : ""}</div>`;
+}
+
+function filterSelect(name, label, options) {
+  return `<select data-filter="${name}"><option value="">${label}</option>${options}</select>`;
+}
+
+function filterInput(name, placeholder, type = "text") {
+  return `<input type="${type}" data-filter="${name}" placeholder="${placeholder}" autocomplete="off">`;
+}
+
+function plainOptions(pairs) {
+  return pairs.map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`).join("");
+}
+
+function groupOptions(groups) {
+  return groups.length > 1 ? plainOptions(groups.map((g) => [g.id, g.name])) : "";
+}
+
+// 节点下拉选项：先按分组、再按组内顺序；有多个分组时用分组标题分隔
+function nodeOptions(nodes, groups, selected, text = (n) => esc(n.name)) {
+  const opt = (n) => `<option value="${n.id}" ${n.id === selected ? "selected" : ""}>${text(n)}</option>`;
+  if (groups.length < 2) return nodes.map(opt).join("");
+  return groups.map((g) => {
+    const members = nodes.filter((n) => n.group_id === g.id);
+    return members.length ? `<optgroup label="${esc(g.name)}">${members.map(opt).join("")}</optgroup>` : "";
+  }).join("");
+}
+
+function syncFilters() {
+  app.querySelectorAll("[data-filter]").forEach((el) => {
+    const v = filters[el.closest("[data-filters]").dataset.filters][el.dataset.filter] || "";
+    if (el.value !== v) el.value = v;
+  });
+}
+
+const has = (text, q) => String(text).toLowerCase().includes(q.trim().toLowerCase());
+
+const countText = (n, label, cls) => (n ? `<span class="${cls}"> · ${n} ${label}</span>` : "");
+
+async function nodeList() {
+  const data = await api("GET", "nodes");
+  list = { kind: "nodes", data, draw: drawNodes };
+  drawNodes();
+}
+
+function drawNodes() {
+  const d = list.data;
+  if (sortMode === "nodes") {
+    return render(listHead("nodes", d.nodes.length, d.nodes.length) +
+      sortList("nodes", d.nodes, (n) => `<div class="title">${esc(n.name)}</div>${nodeSub(n)}`));
+  }
+  const f = filters.nodes;
+  const items = d.nodes.filter((n) =>
+    (!f.q || has(n.name, f.q)) && (!f.status || n.status === f.status) && (!f.group || n.group_id === Number(f.group)));
+  const card = (n) => `
     <a class="card" href="#/nodes/${n.id}" data-key="node-${n.id}">
       <div class="card-head">
         <div class="node-head"><div class="title">${esc(n.name)}</div>${nodeSub(n)}</div>
         <div class="meta">${pill(n.status)}<span class="muted">${ago(n.last_seen, d.now)}</span></div>
       </div>
       ${bar(n.bar)}
-    </a>`);
-  render(`
-    ${listHead("节点", d.nodes.length, "nodes", "node-new", "新增节点")}
-    ${cards.join("") || emptyState("◎", "还没有节点，点击右上角新增。")}`);
+    </a>`;
+  const summary = (ns) =>
+    countText(ns.filter((n) => n.status === "offline").length, "离线", "t-red") +
+    countText(ns.filter((n) => ["error", "skew"].includes(n.status)).length, "异常", "t-yellow");
+  const tools = d.nodes.length ? filterBar("nodes", [
+    filterInput("q", "搜索名称", "search"),
+    filterSelect("status", "全部状态", plainOptions(Object.entries(STATUS).map(([k, [label]]) => [k, label]))),
+    d.groups.length > 1 ? filterSelect("group", "全部分组", groupOptions(d.groups)) : "",
+  ]) : "";
+  let body = groupedList("nodes", items, card, summary);
+  if (!items.length && isFiltering("nodes")) body = emptyState("⌕", "没有匹配的节点。");
+  else if (!d.nodes.length && d.groups.length === 1) body = emptyState("◎", "还没有节点，点击右上角新增。");
+  render(listHead("nodes", d.nodes.length, items.length, "node-new", "新增节点") + tools + body);
+  syncFilters();
 }
 
 // ------------------------------------------------------------ 节点详情
@@ -382,10 +500,11 @@ async function nodeDetail(id) {
 
   const skew = n.skew == null ? "-" : `${n.skew > 0 ? "+" : ""}${n.skew} 秒`;
   const more = `<div class="kv-grid">
+    <span>分组</span><span>${esc(n.group)}</span>
     <span>来源 IP</span><span class="mono">${esc(n.src_ip || "-")}</span>
     <span>时差</span><span>${skew}</span>
     <span>节点端版本</span><span>${esc(n.agent || "-")}${n.agent && n.agent !== d.version
-      ? `<span class="muted">（服务端为 ${esc(d.version)}，可在节点上运行 <code>sudo ictl --update</code> 更新）</span>` : ""}</span>
+      ? `<span class="muted">（服务端为 ${esc(d.version)}。节点端 0.1.6 起默认每 6 小时自动更新，也可在节点上运行 <code>sudo ictl --update</code> 立即更新）</span>` : ""}</span>
     <span>已应用版本</span><span class="mono">${esc(n.reported_v || "-")}</span>
     <span>应有版本</span><span class="mono">${esc(n.want_v)}</span>
     <span>上报状态</span><span>${esc(n.state || "-")}</span>
@@ -441,15 +560,32 @@ function pendingLine(c) {
   return `<div class="pending">等待确认：${who.join("")}</div>`;
 }
 
+function chainStatus(c) {
+  return c.deleting ? "deleting" : c.pending.length ? "applying" : "applied";
+}
+
 async function chainList() {
-  const d = await api("GET", "chains");
-  chainsById = Object.fromEntries(d.chains.map((c) => [c.id, c]));
+  const data = await api("GET", "chains");
+  list = { kind: "chains", data, draw: drawChains };
+  drawChains();
+}
+
+function drawChains() {
+  const d = list.data;
   if (sortMode === "chains") {
-    return render(listHead("转发", d.chains.length, "chains") + sortList("chain", d.chains.map((c) => [c.id,
+    return render(listHead("chains", d.chains.length, d.chains.length) + sortList("chains", d.chains, (c) =>
       `<div class="title">${esc(c.remark)}</div>
-       <div class="sub">${c.hops.map((h) => esc(h.name)).join(" → ")} → <span class="mono">${esc(c.target_host)}:${c.target_port}</span></div>`])));
+       <div class="sub">${c.hops.map((h) => esc(h.name)).join(" → ")} → <span class="mono">${esc(c.target_host)}:${c.target_port}</span></div>`));
   }
-  const cards = d.chains.map((c) => {
+  const f = filters.chains;
+  const items = d.chains.filter((c) =>
+    (!f.q || has(c.remark, f.q)) &&
+    (!f.entry || c.hops[0]?.node_id === Number(f.entry)) &&
+    (!f.via || c.hops.some((h) => h.node_id === Number(f.via))) &&
+    (!f.target || has(`${c.target_host}:${c.target_port}`, f.target)) &&
+    (!f.status || chainStatus(c) === f.status) &&
+    (!f.group || c.group_id === Number(f.group)));
+  const card = (c) => {
     const path = c.hops.map((h) => `<span class="hop">${dot(h.status)}${esc(h.name)}:${h.port}</span>`);
     path.push(`<span class="hop mono">${esc(c.target_host)}:${c.target_port}</span>`);
     const first = c.hops[0];
@@ -477,10 +613,23 @@ async function chainList() {
         <div class="path">${path.join(`<span class="arrow">→</span>`)}</div>
         ${pendingLine(c)}
       </div>`;
-  });
-  render(`
-    ${listHead("转发", d.chains.length, "chains", "chain-new", "新增转发")}
-    ${cards.join("") || emptyState("⇄", "还没有转发，点击右上角新增。")}`);
+  };
+  const summary = (cs) =>
+    countText(cs.filter((c) => chainStatus(c) === "applying").length, "下发中", "t-yellow") +
+    countText(cs.filter((c) => c.deleting).length, "删除中", "t-red");
+  const tools = d.chains.length ? filterBar("chains", [
+    filterInput("q", "搜索别名", "search"),
+    filterSelect("entry", "全部入口节点", nodeOptions(d.nodes, d.node_groups)),
+    filterSelect("via", "经过任意节点", nodeOptions(d.nodes, d.node_groups)),
+    filterInput("target", "目标地址"),
+    filterSelect("status", "全部状态", plainOptions([["applied", "已生效"], ["applying", "下发中"], ["deleting", "删除中"]])),
+    d.groups.length > 1 ? filterSelect("group", "全部分组", groupOptions(d.groups)) : "",
+  ]) : "";
+  let body = groupedList("chains", items, card, summary);
+  if (!items.length && isFiltering("chains")) body = emptyState("⌕", "没有匹配的转发。");
+  else if (!d.chains.length && d.groups.length === 1) body = emptyState("⇄", "还没有转发，点击右上角新增。");
+  render(listHead("chains", d.chains.length, items.length, "chain-new", "新增转发") + tools + body);
+  syncFilters();
 }
 
 // ------------------------------------------------------------ 设置
@@ -558,11 +707,21 @@ function keyModal(title, key, extra = "") {
     <div class="form-actions"><button type="button" class="primary" data-action="modal-close">完成</button></div>`);
 }
 
-function nodeForm(node) {
+// 分组下拉；新增时默认选中默认分组
+function groupSelect(groups, selected) {
+  if (groups.length < 2) return "";
+  selected ??= groups.find((g) => g.builtin).id;
+  const opts = groups.map((g) => `<option value="${g.id}" ${g.id === selected ? "selected" : ""}>${esc(g.name)}</option>`);
+  return `<label><span>分组</span><select name="group_id">${opts.join("")}</select></label>`;
+}
+
+async function nodeForm(node) {
+  const { groups } = await api("GET", "nodes");
   openModal(`
     <h2>${node ? "编辑节点" : "新增节点"}</h2>
     <form data-form="node" data-id="${node ? node.id : ""}">
       <label><span>名称</span><input name="name" value="${esc(node?.name)}" maxlength="64" required></label>
+      ${groupSelect(groups, node?.group_id)}
       <label><span>备注（选填，节点的说明）</span><textarea name="note" rows="3" maxlength="500">${esc(node?.note)}</textarea></label>
       <label><span>入站地址（IPv4 或域名，其他节点通过它连接到该节点）</span>
         <input name="addr" value="${esc(node?.addr)}" class="mono" required></label>
@@ -577,13 +736,25 @@ function nodeForm(node) {
     </form>`);
 }
 
-function hopRow(nodes, hop = {}) {
-  const options = nodes.map((n) =>
-    `<option value="${n.id}" ${hop.node_id === n.id ? "selected" : ""}>${esc(n.name)}（${esc(n.addr)} · 端口 ${esc(n.ports)}）</option>`);
+function groupForm(kind, group) {
+  openModal(`
+    <h2>${group ? "分组改名" : `新建${KIND_LABEL[kind]}分组`}</h2>
+    <form data-form="group" data-kind="${kind}" data-id="${group ? group.id : ""}">
+      <label><span>分组名称</span><input name="name" value="${esc(group?.name)}" maxlength="64" required></label>
+      <div class="form-error"></div>
+      <div class="form-actions">
+        <button type="button" data-action="modal-close">取消</button>
+        <button class="primary">保存</button>
+      </div>
+    </form>`);
+}
+
+function hopRow(nodes, groups, hop = {}) {
+  const options = nodeOptions(nodes, groups, hop.node_id, (n) => `${esc(n.name)}（${esc(n.addr)} · 端口 ${esc(n.ports)}）`);
   return `
     <div class="hop-row">
       <span class="hop-no"></span>
-      <select name="hop-node"><option value="">选择节点</option>${options.join("")}</select>
+      <select name="hop-node"><option value="">选择节点</option>${options}</select>
       <input name="hop-port" value="${hop.port ?? ""}" placeholder="留空自动分配" inputmode="numeric">
       <button type="button" data-action="hop-up" title="上移">↑</button>
       <button type="button" data-action="hop-down" title="下移">↓</button>
@@ -603,9 +774,10 @@ async function chainForm(chain) {
     <h2>${chain ? "编辑转发" : "新增转发"}</h2>
     <form data-form="chain" data-id="${chain ? chain.id : ""}">
       <label><span>别名</span><input name="remark" value="${esc(chain?.remark)}" maxlength="64" required></label>
+      ${groupSelect(list.data.groups, chain?.group_id)}
       <div class="hops">
         <label style="margin-bottom:6px"><span>经过的节点（按顺序，每一跳填写该节点的入站端口，留空则自动分配一个未使用的端口）</span></label>
-        <div id="hop-list">${hops.map((h) => hopRow(nodes, h)).join("")}</div>
+        <div id="hop-list">${hops.map((h) => hopRow(nodes, d.groups, h)).join("")}</div>
         <button type="button" class="small" data-action="hop-add">添加一跳</button>
         <div class="field-error" data-error="hops"></div>
       </div>
@@ -619,7 +791,7 @@ async function chainForm(chain) {
         <button class="primary">保存</button>
       </div>
     </form>`);
-  $("#modal form").hopTemplate = () => hopRow(nodes);
+  $("#modal form").hopTemplate = () => hopRow(nodes, d.groups);
   renumberHops();
 }
 
@@ -649,6 +821,9 @@ function showFormError(form, err) {
     else toast(msg, true);
   }
 }
+
+// 表单中的分组；只有默认分组时没有该字段，新增时由服务端放入默认分组，修改时保持不变
+const groupId = (data) => (data.group_id ? Number(data.group_id) : undefined);
 
 const FORMS = {
   async login(form, data) {
@@ -680,12 +855,12 @@ const FORMS = {
   async node(form, data) {
     const id = form.dataset.id;
     if (!id) {
-      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr, ports: data.ports });
+      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr, ports: data.ports, group_id: groupId(data) });
       closeModal();
       location.hash = `#/nodes/${r.id}`;
       return;
     }
-    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr, ports: data.ports });
+    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr, ports: data.ports, group_id: groupId(data) });
     closeModal();
     if (r.key) {
       const ups = r.upstream.length ? `<p>以下节点的规则会自动更新：${r.upstream.map(esc).join("、")}</p>` : "";
@@ -696,13 +871,25 @@ const FORMS = {
     refresh();
   },
 
+  async group(form, data) {
+    const id = form.dataset.id;
+    if (id) {
+      await api("PATCH", `groups/${id}`, { name: data.name });
+    } else {
+      await api("POST", "groups", { kind: form.dataset.kind, name: data.name });
+    }
+    closeModal();
+    toast("已保存");
+    refresh();
+  },
+
   async chain(form, data) {
     const id = form.dataset.id;
     const hops = [...form.querySelectorAll(".hop-row")].map((r) => ({
       node_id: Number($("[name=hop-node]", r).value) || null,
       port: $("[name=hop-port]", r).value.trim(),
     }));
-    const body = { remark: data.remark, target_host: data.target_host, target_port: data.target_port, hops };
+    const body = { remark: data.remark, target_host: data.target_host, target_port: data.target_port, hops, group_id: groupId(data) };
     const r = await api(id ? "PATCH" : "POST", id ? `chains/${id}` : "chains", body);
     closeModal();
     toast(r.assigned.length ? `已保存，自动分配端口：${r.assigned.join("、")}` : "已保存，正在下发到节点");
@@ -730,6 +917,8 @@ document.addEventListener("submit", async (e) => {
 });
 
 // ------------------------------------------------------------ 按钮操作
+
+const chainById = (id) => list.data.chains.find((c) => c.id === Number(id));
 
 const ACTIONS = {
   copy: (el) => copy(el.dataset.text),
@@ -777,6 +966,39 @@ const ACTIONS = {
     }
   },
 
+  "group-toggle"(el) {
+    if (isFiltering(list.kind) && !sortMode) return;   // 搜索或筛选时分组临时展开
+    const key = el.dataset.group;
+    collapsed.has(key) ? collapsed.delete(key) : collapsed.add(key);
+    saveCollapsed();
+    list.draw();
+  },
+
+  "group-new"(el) {
+    groupForm(el.dataset.kind);
+  },
+  "group-rename"(el) {
+    groupForm(list.kind, list.data.groups.find((g) => g.id === Number(el.dataset.id)));
+  },
+  async "group-delete"(el) {
+    const g = list.data.groups.find((x) => x.id === Number(el.dataset.id));
+    const count = list.data[list.kind].filter((x) => x.group_id === g.id).length;
+    const def = list.data.groups.find((x) => x.builtin);
+    const text = `确定删除分组 <b>${esc(g.name)}</b>？` +
+      (count ? `组内的 ${count} 个${KIND_LABEL[list.kind]}将移到 <b>${esc(def.name)}</b>。` : "");
+    if (!(await confirmBox("删除分组", text, "删除", true))) return;
+    await api("DELETE", `groups/${g.id}`);
+    collapsed.delete(`${list.kind}-${g.id}`);
+    saveCollapsed();
+    toast("分组已删除");
+    refresh();
+  },
+
+  "filter-clear"(el) {
+    filters[el.dataset.kind] = {};
+    list.draw();
+  },
+
   "sort-start"(el) {
     sortMode = el.dataset.kind;
     clearTimeout(refreshTimer);
@@ -789,7 +1011,10 @@ const ACTIONS = {
   },
   async "sort-save"(el) {
     const ids = [...app.querySelectorAll(".sort-card")].map((c) => Number(c.dataset.id));
-    await api("POST", `${el.dataset.kind}/order`, { ids });
+    const groups = list.data.groups.length > 1
+      ? [...app.querySelectorAll(".sort-group")].map((g) => Number(g.dataset.id))
+      : list.data.groups.map((g) => g.id);
+    await api("POST", `${el.dataset.kind}/order`, { groups, ids });
     sortMode = null;
     toast("顺序已保存");
     refresh();
@@ -797,10 +1022,10 @@ const ACTIONS = {
   },
 
   "chain-new": () => chainForm(),
-  "chain-edit": (el) => chainForm(chainsById[el.dataset.id]),
+  "chain-edit": (el) => chainForm(chainById(el.dataset.id)),
 
   async "chain-delete"(el) {
-    const c = chainsById[el.dataset.id];
+    const c = chainById(el.dataset.id);
     const force = el.dataset.force === "1";
     const text = force
       ? `直接删除转发 <b>${esc(c.remark)}</b> 的记录。尚未确认的节点恢复连接后，会在同步时自动清除对应规则。`
@@ -834,6 +1059,7 @@ const ACTIONS = {
 
 document.addEventListener("click", (e) => {
   if (e.target.id === "modal") return closeModal();
+  if (e.target.closest(".drag-handle")) return;   // 拖动分组标题时不触发折叠
   const el = e.target.closest("[data-action]");
   if (!el || !ACTIONS[el.dataset.action]) return;
   e.preventDefault();
@@ -845,7 +1071,8 @@ document.addEventListener("keydown", (e) => {
 });
 
 // ------------------------------------------------------------ 拖动排序
-// 只能从手柄开始拖动（触屏上其余区域仍可正常滚动）；拖动时其他卡片平滑让位
+// 只能从手柄开始拖动（触屏上其余区域仍可正常滚动）；拖动时其他卡片平滑让位。
+// 卡片只能在所在分组内移动，分组只能在分组之间移动
 
 let drag = null;
 
@@ -853,7 +1080,7 @@ document.addEventListener("pointerdown", (e) => {
   const handle = e.target.closest(".drag-handle");
   if (!handle || e.button > 0) return;
   e.preventDefault();
-  const card = handle.closest(".sort-card");
+  const card = handle.closest(".sort-item");
   handle.setPointerCapture(e.pointerId);
   drag = { card, offset: e.clientY - card.getBoundingClientRect().top };
   card.classList.add("dragging");
@@ -862,19 +1089,19 @@ document.addEventListener("pointerdown", (e) => {
 document.addEventListener("pointermove", (e) => {
   if (!drag) return;
   const { card } = drag;
-  const list = card.parentNode;
+  const parent = card.parentNode;
   const y = e.clientY;
   if (y < 60) scrollBy(0, -12);
   else if (y > innerHeight - 60) scrollBy(0, 12);
 
-  const others = [...list.children].filter((c) => c !== card);
+  const others = [...parent.children].filter((c) => c !== card && c.classList.contains("sort-item"));
   const before = others.find((c) => {
     const r = c.getBoundingClientRect();
     return y < r.top + r.height / 2;
   }) || null;
   if (card.nextElementSibling !== before) {
     const tops = new Map(others.map((c) => [c, c.getBoundingClientRect().top]));
-    list.insertBefore(card, before);
+    parent.insertBefore(card, before);
     for (const [c, top] of tops) {
       const dy = top - c.getBoundingClientRect().top;
       if (!dy) continue;
@@ -904,6 +1131,13 @@ document.addEventListener("toggle", (e) => {
   if (!key) return;
   e.target.open ? openDetails.add(key) : openDetails.delete(key);
 }, true);
+
+document.addEventListener("input", (e) => {
+  const name = e.target.dataset?.filter;
+  if (!name || !list) return;
+  filters[list.kind][name] = e.target.value;
+  list.draw();
+});
 
 document.addEventListener("change", (e) => {
   if (e.target.name !== "theme") return;

@@ -101,7 +101,9 @@ panel.example.com {
 - **转发**：每条转发显示别名、入口地址（第一跳节点的 `入站地址:入站端口`，可一键复制）和经过的节点（带状态）。新增和编辑时依次选择节点并填写入站端口（下拉框中显示各节点允许的端口），最后填写目标地址和端口。任何一跳（包括入口）的端口留空时，会在该节点允许的端口中随机分配一个未使用的端口，保存后提示分配结果。
   - 新增、修改后显示「下发中…」，并列出尚未确认的节点（含离线等状态）；相关节点全部拉取并应用新配置后变为「已生效」。修改时被移出的节点也需要确认，确保旧规则已清除。
   - 删除后显示「删除中…」，相关节点全部确认移除规则后才从列表中消失；期间端口保持占用，不能修改。节点长期离线时可「强制删除」，该节点恢复连接后会在同步时自动清除对应规则。
-- **排序**：节点和转发列表右上角的「排序」进入排序模式，按住卡片左侧手柄拖动调整顺序，点「完成」保存。转发表单中的节点下拉框也按节点顺序排列。
+- **分组**：节点和转发各自有独立的分组，「新建分组」后可在新增、编辑时选择分组，不选则放入默认分组。默认分组可以改名、不能删除；删除其他分组时，组内的节点或转发移到默认分组。分组标题可点击折叠，折叠状态保存在浏览器中；标题旁显示数量以及离线、异常（或下发中、删除中）的数量。只有默认分组时不显示分组标题。
+- **搜索与筛选**：节点可按名称搜索，按状态、分组筛选；转发可按别名搜索，按入口节点、经过的节点、目标地址、状态、分组筛选。搜索不区分大小写，名称中包含完整关键词才显示。搜索或筛选时隐藏没有匹配项的分组，有匹配项的分组临时展开。条件不保存，刷新页面后清空。
+- **排序**：节点和转发列表右上角的「排序」进入排序模式，拖动分组标题左侧的手柄调整分组顺序，拖动卡片左侧的手柄调整组内顺序，点「完成」保存。更换分组需在编辑中选择。搜索或筛选时不能排序。转发表单中的节点下拉框先按分组、再按组内顺序排列。
 - **设置**：修改账号密码、深色模式、对外地址。
 
 | 状态 | 含义 |
@@ -128,7 +130,7 @@ panel.example.com {
 curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v<版本>/ictl.sh -o ictl.sh && sudo bash ictl.sh --url '<同步地址>' --key '<密钥>'
 ```
 
-会安装 `/usr/local/bin/ictl` 和常驻服务 `ictl-agent`（开机自启）。
+会安装 `/usr/local/bin/ictl` 和常驻服务 `ictl-agent`（开机自启）。命令末尾加 `--mirror` 表示之后的更新经加速代理下载（见[国内加速](#国内加速)）。
 
 ### 交互菜单
 
@@ -145,16 +147,26 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/downlo
 2) 查看状态
 3) 立即同步
 4) 更新节点端
-5) 卸载
+5) 自动更新：已开启（切换）
+6) 下载加速：已关闭（切换）
+7) 卸载
 ```
 
 ### 更新
+
+从 0.1.6 起，节点端默认**自动更新**：每 6 小时（另加最多 30 分钟随机偏移）检查一次 GitHub Release 上的最新版本，有新版本时替换 `/usr/local/bin/ictl`，守护进程原地切换到新版本。更新只替换脚本，不重建 iptables 规则，转发不中断。下载失败、文件无效或下载到的版本不比当前新时不做改动，等下次检查。可在菜单中选 5 关闭，或把 `/etc/ictl/agent.conf` 中的 `AUTO_UPDATE` 改为 `0`。
+
+0.1.5 及更早的节点没有自动更新，需要手动更新一次。也可以随时手动更新：
 
 ```bash
 sudo ictl --update
 ```
 
-检查 GitHub Release 上的最新版本，有新版本时替换 `/usr/local/bin/ictl` 并重启服务（国内服务器可用 `sudo ictl --update --mirror`，见[国内加速](#国内加速)）；已是最新版本时不做改动。服务端地址、密钥和本地缓存的规则都保留。也可以在菜单中选 4。面板的节点详情会显示节点端版本，与服务端不一致时给出提示。
+有新版本时替换 `/usr/local/bin/ictl` 并重启服务，已是最新版本时不做改动。服务端地址、密钥和本地缓存的规则都保留。也可以在菜单中选 4。
+
+国内服务器可用 `sudo ictl --update --mirror` 经加速代理下载，同时开启「下载加速」，之后的自动更新和手动更新也都走加速代理（菜单 6 可关闭），见[国内加速](#国内加速)。
+
+面板的节点详情会显示节点端版本，节点端版本变化时记入事件记录。
 
 ### 卸载
 
@@ -162,7 +174,7 @@ sudo ictl --update
 sudo ictl --uninstall        # 需要确认；加 -y 跳过确认
 ```
 
-停止并删除 `ictl-agent` 服务，删除 ictl 的全部 iptables 规则（专用链和跳转），删除配置、缓存和 `/usr/local/bin/ictl`。也可以在菜单中选 5。
+停止并删除 `ictl-agent` 服务，删除 ictl 的全部 iptables 规则（专用链和跳转），删除配置、缓存和 `/usr/local/bin/ictl`。也可以在菜单中选 7。
 
 建议先在面板中删除该节点：服务端会下发空配置，节点确认清空规则后自动删除记录；再在节点上执行卸载。如果先卸载了节点，它在面板中会显示为离线，此时在面板中选择强制删除即可。
 
@@ -176,8 +188,8 @@ sudo ictl --uninstall        # 需要确认；加 -y 跳过确认
 
 | 路径 | 用途 |
 |---|---|
-| `/etc/ictl/agent.conf` | 同步地址和密钥（权限 600） |
-| `/var/lib/ictl/` | 配置缓存、已应用规则、域名缓存、状态 |
+| `/etc/ictl/agent.conf` | 同步地址、密钥、自动更新和下载加速设置（权限 600） |
+| `/var/lib/ictl/` | 配置缓存、已应用规则、域名缓存、状态、自动更新检查记录 |
 | `/etc/systemd/system/ictl-agent.service` | 常驻服务 |
 | `/etc/sysctl.d/99-ictl.conf` | `net.ipv4.ip_forward=1` |
 
@@ -196,10 +208,10 @@ curl -fsSL "https://gh-proxy.com/https://github.com/moran1024a/iptables-control/
 
 地址末尾的 `?t=...` 用于避免代理返回缓存的旧脚本。使用 `--mirror` 部署后，之后更新时不加参数也会自动沿用镜像站。其他参数（`--port`、`--force`、`--uninstall`、`--purge`）用法不变。
 
-**节点一键接入**：复制面板中的一键接入命令，把其中的 `https://github.com/` 改为 `https://gh-proxy.com/https://github.com/`：
+**节点一键接入**：复制面板中的一键接入命令，把其中的 `https://github.com/` 改为 `https://gh-proxy.com/https://github.com/`，并在末尾加上 `--mirror`（之后的自动更新也走加速代理）：
 
 ```bash
-curl -fsSL https://gh-proxy.com/https://github.com/moran1024a/iptables-control/releases/download/v<版本>/ictl.sh -o ictl.sh && sudo bash ictl.sh --url '<同步地址>' --key '<密钥>'
+curl -fsSL https://gh-proxy.com/https://github.com/moran1024a/iptables-control/releases/download/v<版本>/ictl.sh -o ictl.sh && sudo bash ictl.sh --url '<同步地址>' --key '<密钥>' --mirror
 ```
 
 **节点更新**
@@ -208,7 +220,9 @@ curl -fsSL https://gh-proxy.com/https://github.com/moran1024a/iptables-control/r
 sudo ictl --update --mirror
 ```
 
-加速源均为第三方公益服务，可用性不由本项目保证；gh-proxy.com 不可用时，也可以换成其他 GitHub 代理（如 `https://ghfast.top/`）。节点与服务端之间的同步通信不经过这些服务。
+执行一次后会记住加速设置，之后的自动更新和 `sudo ictl --update` 都经加速代理下载。
+
+加速源均为第三方公益服务，可用性不由本项目保证；开启下载加速后，节点自动更新等于信任该代理提供的脚本。gh-proxy.com 不可用时，也可以换成其他 GitHub 代理（如 `https://ghfast.top/`）。节点与服务端之间的同步通信不经过这些服务。
 
 ## 同步协议
 
