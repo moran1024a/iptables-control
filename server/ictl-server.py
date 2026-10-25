@@ -23,7 +23,7 @@ import threading
 import time
 from urllib.parse import parse_qs
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 REPO = "moran1024a/iptables-control"
 AGENT_URL = f"https://github.com/{REPO}/releases/download/v{VERSION}/ictl.sh"
 DB_PATH = os.environ.get("ICTL_DB", "/var/lib/ictl-server/ictl.db")

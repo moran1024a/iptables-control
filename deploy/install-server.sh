@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
-# ictl 服务端一键部署（Docker）。重复运行即更新到本脚本对应的版本，数据保留。
+# ictl 服务端一键部署 / 更新 / 卸载（Docker）
 #
-#   bash install-server.sh [--port 8730]
+#   bash install-server.sh [--port 8730] [--force]
+#   bash install-server.sh --uninstall [--purge]
+#
+#   首次运行：创建容器，默认对外端口 8730。
+#   再次运行：检查版本，有新版本时更新；沿用现有容器的端口，数据卷保留。
+#   --port       指定对外端口（更新时也可用来修改端口）
+#   --force      版本相同也重新创建容器
+#   --uninstall  删除容器和镜像，保留数据卷
+#   --purge      与 --uninstall 一起使用，同时删除数据卷（所有数据）
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 IMAGE="ghcr.io/moran1024a/ictl-server:$VERSION"
 NAME="ictl-server"
 VOLUME="ictl-data"
-PORT=8730
+PORT=""
+FORCE=0
+UNINSTALL=0
+PURGE=0
 
 die() {
   echo "错误：$*" >&2
@@ -19,10 +30,16 @@ die() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="${2:-}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    --uninstall) UNINSTALL=1; shift ;;
+    --purge) PURGE=1; shift ;;
     *) die "未知参数：$1" ;;
   esac
 done
-[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$PORT" -le 65535 ] || die "端口无效：$PORT"
+[ "$PURGE" -eq 0 ] || [ "$UNINSTALL" -eq 1 ] || die "--purge 需要与 --uninstall 一起使用"
+if [ -n "$PORT" ]; then
+  [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$PORT" -le 65535 ] || die "端口无效：$PORT"
+fi
 
 command -v docker >/dev/null 2>&1 ||
   die "未找到 docker 命令。请先安装 Docker：https://docs.docker.com/engine/install/"
@@ -30,6 +47,52 @@ if ! out="$(docker info 2>&1)"; then
   echo "$out" | tail -n 3 >&2
   die "无法连接 Docker 服务：请确认 Docker 已启动（systemctl start docker），并使用 root 或 docker 组用户运行。"
 fi
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  if image="$(docker container inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null)"; then
+    docker rm -f "$NAME" >/dev/null
+    echo "已删除容器 $NAME"
+    docker rmi "$image" >/dev/null 2>&1 && echo "已删除镜像 $image"
+  else
+    echo "未找到容器 $NAME"
+  fi
+  if [ "$PURGE" -eq 1 ]; then
+    if docker volume rm "$VOLUME" >/dev/null 2>&1; then
+      echo "已删除数据卷 $VOLUME，所有数据已清除"
+    else
+      echo "未找到数据卷 $VOLUME"
+    fi
+  elif docker volume inspect "$VOLUME" >/dev/null 2>&1; then
+    echo "数据卷 $VOLUME 已保留，重新部署后可继续使用；彻底删除请加 --purge"
+  fi
+  exit 0
+fi
+
+# 已有容器：读取版本和端口绑定
+BIND_IP=""
+if current_image="$(docker container inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null)"; then
+  current="${current_image##*:}"
+  binding="$(docker container inspect -f '{{with index .HostConfig.PortBindings "8730/tcp"}}{{(index . 0).HostIp}}|{{(index . 0).HostPort}}{{end}}' "$NAME")"
+  cur_ip="${binding%%|*}"
+  cur_port="${binding##*|}"
+  [ "$cur_ip" = "0.0.0.0" ] || [ "$cur_ip" = "::" ] && cur_ip=""
+  if [ -z "$PORT" ] || [ "$PORT" = "$cur_port" ]; then
+    PORT="$cur_port"
+    BIND_IP="$cur_ip"
+  else
+    FORCE=1   # 修改端口需要重新创建容器
+  fi
+  if [ "$current" = "$VERSION" ] && [ "$FORCE" -eq 0 ]; then
+    echo "ictl 服务端已是最新版本 $VERSION。如需重新创建容器，请加 --force。"
+    exit 0
+  fi
+  if [ "$current" = "$VERSION" ]; then
+    echo "ictl 服务端 $VERSION：重新创建容器"
+  else
+    echo "ictl 服务端：$current → $VERSION"
+  fi
+fi
+PORT="${PORT:-8730}"
 
 echo "拉取镜像 $IMAGE"
 docker pull "$IMAGE" || die "镜像拉取失败，请检查网络能否访问 ghcr.io。"
@@ -40,9 +103,9 @@ if docker container inspect "$NAME" >/dev/null 2>&1; then
 fi
 
 docker run -d --name "$NAME" --restart unless-stopped \
-  -p "$PORT:8730" -v "$VOLUME:/data" "$IMAGE" >/dev/null
+  -p "${BIND_IP:+$BIND_IP:}$PORT:8730" -v "$VOLUME:/data" "$IMAGE" >/dev/null
 
-# 等待首次初始化完成
+# 等待初始化完成
 for _ in $(seq 1 20); do
   docker exec "$NAME" python3 /app/ictl-server.py info >/dev/null 2>&1 && break
   sleep 0.5
@@ -52,6 +115,7 @@ echo
 echo "ictl 服务端 $VERSION 已启动"
 docker exec "$NAME" python3 /app/ictl-server.py info | sed "s#<服务器地址>:8730#<服务器IP>:$PORT#"
 echo
+echo "  检查更新：重新运行本脚本"
 echo "  查看日志：docker logs $NAME"
 echo "  重置账号：docker exec $NAME python3 /app/ictl-server.py reset-admin"
-echo "  停止删除：docker rm -f $NAME（数据保存在卷 $VOLUME 中）"
+echo "  卸载：    重新运行本脚本并加 --uninstall（加 --purge 同时删除数据）"

@@ -44,13 +44,32 @@ ictl 服务端 0.1.0 已启动
 
 面板和同步接口共用一个端口，其他任何路径都返回 404。用浏览器打开面板地址，用默认账号登录后必须同时修改用户名和密码。
 
-重复运行一键部署命令即可更新到最新版本，数据保留。
+### 更新
+
+在服务端重新执行一键部署命令即可：
+
+```bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/install-server.sh | bash
+```
+
+已是最新版本时直接退出；有新版本时拉取新镜像并重建容器。数据卷、端口和绑定地址沿用现有容器，账号、节点、转发链等配置都保留。加 `--port <端口>` 可在更新时修改端口，加 `--force` 可在版本相同时强制重建容器。
+
+### 卸载
+
+```bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/install-server.sh | bash -s -- --uninstall
+```
+
+删除容器和镜像，**保留数据卷** `ictl-data`，之后重新部署可继续使用原有数据。追加 `--purge`（即 `--uninstall --purge`）会同时删除数据卷，账号、节点、转发链等所有数据都会清除。
+
+服务端卸载不会影响节点：节点上的转发规则继续生效，只是不再同步。
+
+### 常用命令
 
 ```bash
 docker logs ictl-server                                              # 查看日志
 docker exec ictl-server python3 /app/ictl-server.py info             # 再次查看面板地址
 docker exec ictl-server python3 /app/ictl-server.py reset-admin      # 忘记密码时重置为默认账号
-docker rm -f ictl-server                                             # 停止并删除容器（数据卷保留）
 ```
 
 ### 不使用 Docker
@@ -132,7 +151,17 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/downlo
 sudo ictl --update
 ```
 
-从 GitHub Release 下载最新版本替换 `/usr/local/bin/ictl` 并重启服务，也可以在菜单中选 4。面板的节点详情会显示节点端版本，与服务端不一致时给出提示。
+检查 GitHub Release 上的最新版本，有新版本时替换 `/usr/local/bin/ictl` 并重启服务；已是最新版本时不做改动。服务端地址、密钥和本地缓存的规则都保留。也可以在菜单中选 4。面板的节点详情会显示节点端版本，与服务端不一致时给出提示。
+
+### 卸载
+
+```bash
+sudo ictl --uninstall        # 需要确认；加 -y 跳过确认
+```
+
+停止并删除 `ictl-agent` 服务，删除 ictl 的全部 iptables 规则（专用链和跳转），删除配置、缓存和 `/usr/local/bin/ictl`。也可以在菜单中选 5。
+
+建议先在面板中删除该节点：服务端会下发空配置，节点确认清空规则后自动删除记录；再在节点上执行卸载。如果先卸载了节点，它在面板中会显示为离线，此时在面板中选择强制删除即可。
 
 ### 工作方式
 

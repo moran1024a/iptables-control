@@ -3,7 +3,7 @@
 
 set -u
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 BIN="/usr/local/bin/ictl"
 CONF_DIR="/etc/ictl"
@@ -588,11 +588,18 @@ sync_now() {
   print_net_result
 }
 
+# 卸载；参数 -y 跳过确认
 uninstall() {
-  title "卸载"
+  title "卸载节点端"
   local yn
-  read -rp "  将停止服务、删除所有 ictl 规则和文件，确认？[y/N]: " yn || return
-  [[ "$yn" =~ ^[yY]$ ]] || { note "已取消。"; return; }
+  if [ "${1:-}" != "-y" ]; then
+    if ! read -rp "  将停止服务、删除所有 ictl 规则和文件，确认？[y/N]: " yn; then
+      echo
+      err "无法读取确认输入，非交互运行请使用：ictl --uninstall -y"
+      return 1
+    fi
+    [[ "$yn" =~ ^[yY]$ ]] || { note "已取消。"; return; }
+  fi
 
   systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1
   rm -f "$SERVICE"
@@ -601,6 +608,7 @@ uninstall() {
   rm -rf "$CONF_DIR" "$LIB" "$SYSCTL" "$LOCK"
   [ -f "$BIN" ] && rm -f "$BIN"
   ok "已卸载。IPv4 转发的运行时设置保持不变，重启后恢复系统默认。"
+  note "该节点在服务端面板中仍会显示为离线，可在面板中删除（节点已失联时选择强制删除）。"
   exit 0
 }
 
@@ -632,7 +640,8 @@ menu() {
 case "${1:-}" in
   --daemon) need_root; daemon ;;
   --update) need_root; update_agent; exit 0 ;;
+  --uninstall) need_root; uninstall "${2:-}" ;;
   --url|--key) need_root; quick_setup "$@" ;;
   "") need_root; menu ;;
-  *) echo "用法：ictl [--url <同步地址> --key <密钥> | --update | --daemon]" >&2; exit 1 ;;
+  *) echo "用法：ictl [--url <同步地址> --key <密钥> | --update | --uninstall [-y] | --daemon]" >&2; exit 1 ;;
 esac
