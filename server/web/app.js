@@ -272,6 +272,7 @@ async function nodeDetail(id) {
   const n = (currentNode = d.node);
   const url = syncAddress(d.public_url, d.sync_path);
   const shown = revealedKeys.has(id);
+  const install = (key) => `curl -fsSL ${d.agent_url} -o ictl.sh && sudo bash ictl.sh --url '${url}' --key '${key}'`;
 
   const rules = d.rules.length
     ? `<table><tr><th>入站端口</th><th>转发到</th><th>所属转发链</th></tr>${d.rules.map((r) => `
@@ -283,7 +284,8 @@ async function nodeDetail(id) {
   const more = `<div class="kv-grid">
     <span>来源 IP</span><span class="mono">${esc(n.src_ip || "-")}</span>
     <span>时差</span><span>${skew}</span>
-    <span>节点端版本</span><span>${esc(n.agent || "-")}</span>
+    <span>节点端版本</span><span>${esc(n.agent || "-")}${n.agent && n.agent !== d.version
+      ? `<span class="muted">（服务端为 ${esc(d.version)}，可在节点上运行 <code>sudo ictl --update</code> 更新）</span>` : ""}</span>
     <span>已应用版本</span><span class="mono">${esc(n.reported_v || "-")}</span>
     <span>应有版本</span><span class="mono">${esc(n.want_v)}</span>
     <span>上报状态</span><span>${esc(n.state || "-")}</span>
@@ -310,7 +312,9 @@ async function nodeDetail(id) {
       <div class="kv"><span>密钥</span><code>${shown ? esc(n.key) : "•".repeat(32)}</code>
         <button class="small" data-action="key-toggle">${shown ? "隐藏" : "显示"}</button>
         <button class="small" data-action="copy" data-text="${esc(n.key)}">复制</button></div>
-      <p class="hint">在节点上运行 <code>sudo ictl</code>，选择 1，填入以上同步地址和密钥。</p>
+      <div class="kv"><span>一键接入</span><code>${esc(install(shown ? n.key : "••••••"))}</code>
+        <button class="small" data-action="copy" data-text="${esc(install(n.key))}">复制</button></div>
+      <p class="hint">在节点上执行一键接入命令即可完成安装和接入；也可以运行 <code>sudo ictl</code>，选择 1 手动填写同步地址和密钥。</p>
     </div>
     <div class="panel"><h2>转发规则</h2>${rules}</div>
     <div class="actions">

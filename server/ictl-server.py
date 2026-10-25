@@ -23,8 +23,11 @@ import threading
 import time
 from urllib.parse import parse_qs
 
-VERSION = "0.2"
+VERSION = "0.1.0"
+REPO = "moran1024a/iptables-control"
+AGENT_URL = f"https://github.com/{REPO}/releases/download/v{VERSION}/ictl.sh"
 DB_PATH = os.environ.get("ICTL_DB", "/var/lib/ictl-server/ictl.db")
+TRUST_PROXY = os.environ.get("ICTL_TRUST_PROXY") == "1"   # 位于反向代理之后时，信任 X-Forwarded-For
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
 OFFLINE_AFTER = 30          # 超过该秒数没有上报视为离线
@@ -507,7 +510,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def source_ip(self):
         ip = self.client_address[0]
         xff = self.headers.get("X-Forwarded-For")
-        if ip in ("127.0.0.1", "::1") and xff:
+        if xff and (TRUST_PROXY or ip in ("127.0.0.1", "::1")):
             ip = xff.split(",")[-1].strip()
         return ip
 
@@ -768,6 +771,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "now": now,
             "sync_path": setting(conn, "sync_path"),
             "public_url": setting(conn, "public_url", ""),
+            "agent_url": AGENT_URL,
+            "version": VERSION,
             "node": {
                 **self.node_brief(conn, n, now), "bar": node_bar(conn, n, now), "key": n["key"],
                 "first_seen": n["first_seen"], "src_ip": n["src_ip"], "skew": n["skew"], "agent": n["agent"],

@@ -7,7 +7,7 @@
 
 只由节点发起请求，服务端从不主动连接节点。请求和响应的内容都用节点密钥加密，HTTP 和 HTTPS 均可使用。`ipt.sh` 是旧的单机版脚本，保留备用，不要和 ictl 在同一台机器上同时使用。
 
-> 当前为早期版本，尚未经过真机长期运行验证。Docker 一键部署待完成。
+> 当前为早期版本，尚未经过真机长期运行验证。
 
 ## 概念
 
@@ -23,48 +23,51 @@
 
 ## 服务端
 
-### 运行
+### 一键部署（Docker）
+
+需要已安装并启动 Docker。在服务端执行：
 
 ```bash
-mkdir -p /opt/ictl && cp -r server/ictl-server.py server/web /opt/ictl/
-python3 /opt/ictl/ictl-server.py serve          # 默认监听 0.0.0.0:8730
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/install-server.sh | bash
 ```
 
-首次运行会自动初始化数据库，随机生成**面板路径**和**同步路径**，并打印到输出：
+可选参数（追加在 `bash` 后面，如 `| bash -s -- --port 9000`）：
+
+| 参数 | 说明 |
+|---|---|
+| `--port <端口>` | 对外端口，默认 8730 |
+| `--trust-proxy` | 服务端位于反向代理之后时使用，从 `X-Forwarded-For` 获取真实来源 IP |
+
+脚本会拉取 `ghcr.io/moran1024a/ictl-server` 镜像，创建容器 `ictl-server`，数据保存在 Docker 卷 `ictl-data` 中。首次启动会随机生成**面板路径**和**同步路径**并打印出来：
 
 ```
-ictl-server 0.2 监听 0.0.0.0:8730
-  面板：    http://<服务器地址>:8730/<面板路径>/
+ictl 服务端 0.1.0 已启动
+  面板：    http://<服务器IP>:8730/<面板路径>/
   同步路径：/<同步路径>
   默认账号：admin / admin_pass（首次登录后须修改）
 ```
 
 面板和同步接口共用一个端口，其他任何路径都返回 404。用浏览器打开面板地址，用默认账号登录后必须同时修改用户名和密码。
 
-systemd 服务示例 `/etc/systemd/system/ictl-server.service`：
-
-```ini
-[Unit]
-Description=ictl server
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/python3 /opt/ictl/ictl-server.py serve
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 命令
+重复运行一键部署命令即可更新到最新版本，数据保留。
 
 ```bash
-python3 /opt/ictl/ictl-server.py serve [--listen 0.0.0.0:8730]   # 运行服务
-python3 /opt/ictl/ictl-server.py info                             # 显示面板地址和同步路径
-python3 /opt/ictl/ictl-server.py reset-admin                      # 忘记密码时重置为默认账号
+docker logs ictl-server                                              # 查看日志
+docker exec ictl-server python3 /app/ictl-server.py info             # 再次查看面板地址
+docker exec ictl-server python3 /app/ictl-server.py reset-admin      # 忘记密码时重置为默认账号
+docker rm -f ictl-server                                             # 停止并删除容器（数据卷保留）
 ```
 
-数据库默认 `/var/lib/ictl-server/ictl.db`，可用环境变量 `ICTL_DB` 覆盖。数据库保存节点密钥原文，权限为 600，请妥善保管。
+### 不使用 Docker
+
+需要 Python 3.8+（自带 SQLite 3.24+）和 openssl 命令行：
+
+```bash
+mkdir -p /opt/ictl && cp -r server/ictl-server.py server/web /opt/ictl/
+python3 /opt/ictl/ictl-server.py serve [--listen 0.0.0.0:8730]
+```
+
+命令同上（`info`、`reset-admin`）。数据库默认 `/var/lib/ictl-server/ictl.db`，可用环境变量 `ICTL_DB` 覆盖；位于反向代理之后时设置环境变量 `ICTL_TRUST_PROXY=1`。数据库保存节点密钥原文，权限为 600，请妥善保管。
 
 ### HTTPS
 
@@ -75,6 +78,8 @@ panel.example.com {
     reverse_proxy 127.0.0.1:8730
 }
 ```
+
+此时用 `--trust-proxy` 部署（或设置 `ICTL_TRUST_PROXY=1`），面板中显示的节点来源 IP 和登录失败锁定才会按真实 IP 计算。配置好后可以用防火墙关闭 8730 端口的公网访问。
 
 ### 面板
 
@@ -98,18 +103,41 @@ panel.example.com {
 
 依赖：bash、curl、openssl（1.1.1 及以上）、iptables（需 `addrtype`、`conntrack` 匹配）、getent、flock、systemd。节点时间需与服务端相差不超过 60 秒（启用 NTP 即可）。
 
+### 一键接入
+
+在面板的节点详情页复制「一键接入」命令，在节点上执行即可完成安装和接入：
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/moran1024a/iptables-control/main/agent/ictl.sh -o ictl.sh && sudo bash ictl.sh
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v<版本>/ictl.sh -o ictl.sh && sudo bash ictl.sh --url '<同步地址>' --key '<密钥>'
 ```
 
-选 `1) 设置服务端地址和密钥`，填入面板节点详情页中的同步地址和密钥。首次设置会安装 `/usr/local/bin/ictl` 和常驻服务 `ictl-agent`（开机自启）。之后用 `sudo ictl` 进入维护菜单：
+会安装 `/usr/local/bin/ictl` 和常驻服务 `ictl-agent`（开机自启）。
+
+### 交互菜单
+
+也可以下载后直接运行，手动填写同步地址和密钥：
+
+```bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh -o ictl.sh && sudo bash ictl.sh
+```
+
+安装后用 `sudo ictl` 进入维护菜单：
 
 ```
 1) 设置服务端地址和密钥
 2) 查看状态
 3) 立即同步
-4) 卸载
+4) 更新节点端
+5) 卸载
 ```
+
+### 更新
+
+```bash
+sudo ictl --update
+```
+
+从 GitHub Release 下载最新版本替换 `/usr/local/bin/ictl` 并重启服务，也可以在菜单中选 4。面板的节点详情会显示节点端版本，与服务端不一致时给出提示。
 
 ### 工作方式
 
@@ -167,6 +195,14 @@ v=<版本>
 ```
 
 请求中不含节点标识，服务端逐个用节点密钥校验 HMAC 来识别节点。响应绑定本次请求，无法被重放。HMAC 校验失败、路径错误或格式错误一律返回 404。
+
+## 发布
+
+推送 `v*` 标签（如 `v0.1.0`）后，GitHub Actions 会：
+
+1. 检查 `server/ictl-server.py`、`agent/ictl.sh`、`deploy/install-server.sh` 中的版本号与标签一致；
+2. 构建 `linux/amd64` 和 `linux/arm64` 镜像，推送到 `ghcr.io/moran1024a/ictl-server:<版本>` 和 `:latest`；
+3. 创建 GitHub Release，附带 `ictl.sh` 和 `install-server.sh`。
 
 ## 注意事项
 

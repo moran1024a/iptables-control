@@ -3,7 +3,8 @@
 
 set -u
 
-VERSION="0.1"
+VERSION="0.1.0"
+LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 BIN="/usr/local/bin/ictl"
 CONF_DIR="/etc/ictl"
 CONF="$CONF_DIR/agent.conf"
@@ -460,27 +461,22 @@ print_net_result() {
   fi
 }
 
-set_server() {
-  title "设置服务端地址和密钥"
-  local url key
-  load_conf
-  read -rp "  同步地址${URL:+ [$URL]}: " url || return
-  url="${url:-$URL}"
+# 保存服务端地址和密钥，立即同步一次并安装服务；连接成功返回 0
+save_server() {
+  local url="$1" key="$2"
   if [[ ! "$url" =~ ^https?://[^[:space:]]+$ ]]; then
     err "地址格式应为 https://域名/路径"
-    return
+    return 1
   fi
-  read -rsp "  密钥: " key || return
-  echo
   if [[ ! "$key" =~ ^[0-9a-f]{64}$ ]]; then
     err "密钥格式不正确（应为 64 位十六进制）"
-    return
+    return 1
   fi
 
   mkdir -p "$CONF_DIR"
   (umask 077 && printf 'URL=%s\nKEY=%s\n' "$url" "$key" > "$CONF")
 
-  with_lock cycle init || return
+  with_lock cycle init || return 1
   [ "$NEW" -eq 1 ] && with_lock cycle
   print_net_result
 
@@ -488,7 +484,60 @@ set_server() {
     ok "已安装并启动服务 $SERVICE_NAME（开机自启）"
   else
     err "服务安装失败，请检查 systemctl status $SERVICE_NAME"
+    return 1
   fi
+  [ "$NET" = "ok" ]
+}
+
+set_server() {
+  title "设置服务端地址和密钥"
+  local url key
+  load_conf
+  read -rp "  同步地址${URL:+ [$URL]}: " url || return
+  read -rsp "  密钥: " key || return
+  echo
+  save_server "${url:-$URL}" "$key"
+}
+
+# 命令行接入：ictl.sh --url <同步地址> --key <密钥>
+quick_setup() {
+  local url="" key=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --url) url="${2:-}"; shift 2 ;;
+      --key) key="${2:-}"; shift 2 ;;
+      *) err "未知参数：$1"; exit 1 ;;
+    esac
+  done
+  title "ictl 节点端 $VERSION"
+  save_server "$url" "$key"
+}
+
+# 从 GitHub Release 下载最新版本替换自身；更新成功返回 0
+update_agent() {
+  title "更新节点端"
+  local tmp="$BIN.download" new
+  mkdir -p "$(dirname "$BIN")"
+  if ! curl -fsSL --connect-timeout 10 --max-time 120 "$LATEST_URL" -o "$tmp"; then
+    rm -f "$tmp"
+    err "下载失败：$LATEST_URL"
+    return 1
+  fi
+  new="$(grep -m 1 '^VERSION=' "$tmp" | cut -d '"' -f 2)"
+  if [ -z "$new" ] || ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    err "下载的文件无效"
+    return 1
+  fi
+  if [ "$new" = "$VERSION" ] && [ -f "$BIN" ]; then
+    rm -f "$tmp"
+    ok "已是最新版本 $VERSION"
+    return 1
+  fi
+  chmod 755 "$tmp"
+  mv "$tmp" "$BIN"
+  [ -f "$SERVICE" ] && systemctl restart "$SERVICE_NAME"
+  ok "已更新：$VERSION → $new"
 }
 
 show_status() {
@@ -562,7 +611,8 @@ menu() {
     echo "  1) 设置服务端地址和密钥"
     echo "  2) 查看状态"
     echo "  3) 立即同步"
-    echo "  4) 卸载"
+    echo "  4) 更新节点端"
+    echo "  5) 卸载"
     echo "  0) 退出"
     local choice
     read -rp "  请选择: " choice || { echo; exit 0; }
@@ -570,7 +620,8 @@ menu() {
       1) set_server ;;
       2) show_status ;;
       3) sync_now ;;
-      4) uninstall ;;
+      4) update_agent && { note "请重新运行 sudo ictl"; exit 0; } ;;
+      5) uninstall ;;
       0|q) exit 0 ;;
       "") ;;
       *) err "无效选择：$choice" ;;
@@ -580,6 +631,8 @@ menu() {
 
 case "${1:-}" in
   --daemon) need_root; daemon ;;
+  --update) need_root; update_agent; exit 0 ;;
+  --url|--key) need_root; quick_setup "$@" ;;
   "") need_root; menu ;;
-  *) echo "用法：ictl [--daemon]" >&2; exit 1 ;;
+  *) echo "用法：ictl [--url <同步地址> --key <密钥> | --update | --daemon]" >&2; exit 1 ;;
 esac
