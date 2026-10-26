@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.6"
+VERSION="0.1.7"
 REGISTRY="ghcr.io"
 MIRROR_REGISTRY="ghcr.nju.edu.cn"
 REPO="moran1024a/ictl-server"
