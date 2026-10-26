@@ -8,6 +8,7 @@ RUN apk add --no-cache openssl
 WORKDIR /app
 COPY server/ictl-server.py ./
 COPY server/web ./web
+COPY agent/ictl.sh ./agent/ictl.sh
 
 ENV ICTL_DB=/data/ictl.db \
     PYTHONUNBUFFERED=1

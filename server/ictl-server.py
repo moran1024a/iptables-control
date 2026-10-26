@@ -23,17 +23,21 @@ import threading
 import time
 from urllib.parse import parse_qs
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 REPO = "moran1024a/iptables-control"
 AGENT_URL = f"https://github.com/{REPO}/releases/download/v{VERSION}/ictl.sh"
 DB_PATH = os.environ.get("ICTL_DB", "/var/lib/ictl-server/ictl.db")
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+# 同版本的节点端脚本，供节点自动更新时下载：Docker 镜像中为 /app/agent/ictl.sh，源码目录中为 ../agent/ictl.sh
+AGENT_FILES = [os.path.join(os.path.dirname(os.path.abspath(__file__)), p)
+               for p in ("agent/ictl.sh", "../agent/ictl.sh")]
+AGENT_AUTO_UPDATE = (0, 1, 7)    # 从该版本起，节点端按服务端的更新信号自动更新
 
-OFFLINE_AFTER = 60          # 超过该秒数没有上报视为离线（节点每 15-20 秒上报一次）
+OFFLINE_AFTER = 120         # 超过该秒数没有上报视为离线（节点每 20-40 秒上报一次）
 MAX_SKEW = 60               # 节点时间允许的最大偏差（秒）
 MAX_BODY = 8192             # 同步请求体上限
 MAX_API_BODY = 65536        # 面板请求体上限
-WINDOW = 30                 # 状态条时间窗口（秒）
+WINDOW = 60                 # 状态条时间窗口（秒），需大于节点的最长上报间隔
 BAR_WINDOWS = 60            # 状态条显示的窗口数
 RETENTION = 7 * 86400       # 状态窗口与事件保留时长
 EVENTS_SHOWN = 50
@@ -87,7 +91,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   health TEXT,
   sort INTEGER NOT NULL DEFAULT 0,
   ports TEXT NOT NULL DEFAULT '10000-65535',
-  group_id INTEGER NOT NULL DEFAULT 0
+  group_id INTEGER NOT NULL DEFAULT 0,
+  auto_update INTEGER
 );
 CREATE TABLE IF NOT EXISTS chains (
   id INTEGER PRIMARY KEY,
@@ -177,6 +182,17 @@ def init_db():
             conn.execute("INSERT INTO item_groups (kind, name, builtin, sort) VALUES (?, ?, 1, 0)", (t, DEFAULT_GROUP))
         conn.execute(f"UPDATE {t} SET group_id = ? WHERE group_id NOT IN (SELECT id FROM item_groups WHERE kind = ?)",
                      (default_group(conn, t), t))
+    if "auto_update" not in cols("nodes"):                 # 0.1.7：节点是否开启自动更新（旧版节点为空）
+        conn.execute("ALTER TABLE nodes ADD COLUMN auto_update INTEGER")
+    old_window = int(setting(conn, "window", 30))           # 0.1.7：状态窗口 30 秒 → 60 秒，合并旧数据并取较差的状态
+    if old_window != WINDOW:
+        rows = conn.execute("SELECT node_id, win, level FROM windows").fetchall()
+        conn.execute("DELETE FROM windows")
+        for r in rows:
+            conn.execute("""INSERT INTO windows VALUES (?, ?, ?)
+                            ON CONFLICT (node_id, win) DO UPDATE SET level = MIN(level, excluded.level)""",
+                         (r["node_id"], r["win"] * old_window // WINDOW, r["level"]))
+        set_setting(conn, "window", str(WINDOW))
     conn.commit()
     with conn:
         if not setting(conn, "sync_path"):
@@ -304,6 +320,44 @@ def new_key():
     return secrets.token_hex(32)
 
 
+# ---------------------------------------------------------------- 节点端更新
+
+def ver(s):
+    """版本号转为可比较的数字元组，如 "0.1.10" → (0, 1, 10)。"""
+    return tuple(int(x) for x in re.findall(r"\d+", str(s or "")))
+
+
+AGENT = None                # (版本, sha256, 内容)；找不到同版本的节点端脚本时为 None
+
+
+def load_agent():
+    global AGENT
+    for path in AGENT_FILES:
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                data = f.read()
+            m = re.search(rb'^VERSION="([^"]+)"', data, re.M)
+            if m and m[1].decode() == VERSION:
+                AGENT = (VERSION, hashlib.sha256(data).hexdigest(), data)
+                return
+            print(f"节点端脚本 {path} 的版本与服务端不一致，节点不会自动更新", file=sys.stderr)
+            return
+    print("未找到节点端脚本，节点不会自动更新", file=sys.stderr)
+
+
+def agent_update(agent, auto_update):
+    """节点端的更新情况：same / newer / pending / disabled / legacy / unavailable。"""
+    if not agent or ver(agent) == ver(VERSION):
+        return "same"
+    if ver(agent) > ver(VERSION):
+        return "newer"
+    if ver(agent) < AGENT_AUTO_UPDATE:
+        return "legacy"         # 旧版节点端自行定时检查更新
+    if not AGENT:
+        return "unavailable"
+    return "pending" if auto_update else "disabled"
+
+
 # ---------------------------------------------------------------- 载荷加密
 # AES-256-CTR + HMAC-SHA256，与节点端一样调用 openssl 命令行。
 # 每条消息由 openssl 随机生成 salt，经 PBKDF2 派生独立的密钥和 IV；去掉固定的 "Salted__" 前缀后传输。
@@ -331,10 +385,14 @@ def mac(mk, data):
     return hmac.new(mk, data, hashlib.sha256).digest()
 
 
-def seal(key, req_tag, text):
+def seal_bytes(key, req_tag, data):
     ek, mk = derive(key)
-    msg = aes(ek, text.encode())[8:]
+    msg = aes(ek, data)[8:]
     return base64.b64encode(msg + mac(mk, req_tag + msg)).decode()
+
+
+def seal(key, req_tag, text):
+    return seal_bytes(key, req_tag, text.encode())
 
 
 # ---------------------------------------------------------------- 校验
@@ -748,10 +806,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     )
                     return self.reply(200, seal(node["key"], req_tag, f"time={now}\n"))
 
+                auto_update = {"1": 1, "0": 0}.get(fields.get("au"))
                 conn.execute(
                     """UPDATE nodes SET first_seen = COALESCE(first_seen, ?), last_seen = ?, src_ip = ?,
-                       reported_v = ?, state = ?, err = ?, agent = ?, skew = ?, health = ? WHERE id = ?""",
-                    (now, now, self.source_ip(), v, state, err, agent, skew, health, node["id"]),
+                       reported_v = ?, state = ?, err = ?, agent = ?, skew = ?, health = ?, auto_update = ?
+                       WHERE id = ?""",
+                    (now, now, self.source_ip(), v, state, err, agent, skew, health, auto_update, node["id"]),
                 )
                 lines = node_rules(conn, node)
                 want = rules_version(lines)
@@ -767,6 +827,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     out = "same\n"
                 else:
                     out = "".join(f"{x}\n" for x in [f"v={want}"] + lines)
+                # 节点端版本低于服务端：附带更新信号（目标版本和脚本哈希），节点再以 get=agent 下载脚本
+                if agent_update(agent, auto_update) == "pending":
+                    if fields.get("get") == "agent":
+                        return self.reply(200, seal_bytes(node["key"], req_tag, AGENT[2]))
+                    out += f"update={AGENT[0]} {AGENT[1]}\n"
             self.reply(200, seal(node["key"], req_tag, out))
         finally:
             conn.close()
@@ -974,6 +1039,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "first_seen": n["first_seen"], "src_ip": n["src_ip"], "skew": n["skew"], "agent": n["agent"],
                 "reported_v": n["reported_v"], "want_v": rules_version(node_rules(conn, n)),
                 "state": n["state"], "err": n["err"], "group": group["name"],
+                "agent_update": agent_update(n["agent"], n["auto_update"]),
             },
             "rules": rules,
             "chains": [{"id": c["id"], "remark": c["remark"]} for c in chains],
@@ -1214,6 +1280,7 @@ def cmd_serve(args):
     if missing:
         raise UserError(f"缺少面板文件：{', '.join(missing)}（应位于 {WEB_DIR}）")
     conn = init_db()
+    load_agent()
     Handler.sync_path = setting(conn, "sync_path")
     Handler.panel_path = setting(conn, "panel_path")
     host, _, port = args.listen.rpartition(":")

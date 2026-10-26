@@ -3,9 +3,9 @@
 
 set -u
 
-VERSION="0.1.6"
+VERSION="0.1.7"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
-GH_PROXY="https://gh-proxy.com/"   # --mirror 时使用的 GitHub 下载加速
+GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/bin/ictl"
 CONF_DIR="/etc/ictl"
 CONF="$CONF_DIR/agent.conf"
@@ -14,8 +14,7 @@ CONFIG="$LIB/config"
 APPLIED="$LIB/applied"
 RESOLVED="$LIB/resolved"
 STATE="$LIB/state"
-UPDATE_STATE="$LIB/update"        # 自动更新：下次检查时间、最近一次检查结果
-UPDATE_EVERY=21600                # 自动更新检查间隔（6 小时），另加最多 30 分钟随机偏移
+UPDATE_RETRY=600                  # 自动更新失败后的重试间隔（秒）
 LOCK="/run/ictl.lock"
 SERVICE_NAME="ictl-agent"
 SERVICE="/etc/systemd/system/$SERVICE_NAME.service"
@@ -55,18 +54,17 @@ need_root() {
 
 # ---------------------------------------------------------------- 配置与状态
 
-# AUTO_UPDATE 是否自动更新（默认开启），MIRROR 下载更新时是否经加速代理
-URL="" KEY="" AUTO_UPDATE=1 MIRROR=0
+# AUTO_UPDATE 是否按服务端的更新信号自动更新（默认开启）
+URL="" KEY="" AUTO_UPDATE=1
 load_conf() {
   local k v
-  URL="" KEY="" AUTO_UPDATE=1 MIRROR=0
+  URL="" KEY="" AUTO_UPDATE=1
   [ -f "$CONF" ] || return 1
   while IFS='=' read -r k v; do
     case "$k" in
       URL) URL="$v" ;;
       KEY) KEY="$v" ;;
       AUTO_UPDATE) [ "$v" = "0" ] && AUTO_UPDATE=0 ;;
-      MIRROR) [ "$v" = "1" ] && MIRROR=1 ;;
     esac
   done < "$CONF"
   [ -n "$URL" ] && [ -n "$KEY" ]
@@ -74,7 +72,7 @@ load_conf() {
 
 save_conf() {
   mkdir -p "$CONF_DIR"
-  (umask 077 && printf 'URL=%s\nKEY=%s\nAUTO_UPDATE=%s\nMIRROR=%s\n' "$URL" "$KEY" "$AUTO_UPDATE" "$MIRROR" > "$CONF.tmp") &&
+  (umask 077 && printf 'URL=%s\nKEY=%s\nAUTO_UPDATE=%s\n' "$URL" "$KEY" "$AUTO_UPDATE" > "$CONF.tmp") &&
     mv "$CONF.tmp" "$CONF"
 }
 
@@ -331,38 +329,53 @@ local_apply() {
   fi
 }
 
-# 发送一次请求并处理响应；参数 init 表示首次连接。NEW=1 表示收到了新配置
-NEW=0
-sync_once() {
-  local state="$R_STATE" d out code body req_tag size now
-  NEW=0
-  [ "${1:-}" = "init" ] && state="init"
-  derive_keys
-
-  d="$(mktemp -d /run/ictl.XXXXXX)" || return 1
-  printf 't=%s\nv=%s\nstate=%s\nerr=%s\nagent=%s\n' "$(date +%s)" "$R_V" "$state" "$R_ERR" "$VERSION" |
-    aes | tail -c +9 > "$d/msg"
+# 发送一次加密请求：明文从标准输入读取，校验并解密后的响应写入文件 $1，$2 为超时秒数（默认 15）。
+# 输出 HTTP 状态码；响应校验失败时为 bad，连接失败时为 000
+send_request() {
+  local out="$1" d code req_tag size
+  d="$(mktemp -d /run/ictl.XXXXXX)" || { echo 000; return; }
+  aes | tail -c +9 > "$d/msg"
   req_tag="$(hmac_hex "$MK" < "$d/msg")"
   { cat "$d/msg"; hex2bin "$req_tag"; } | openssl base64 -A > "$d/req"
-  out="$(curl -sS --connect-timeout 5 --max-time 15 -w '\n%{http_code}' \
+  code="$(curl -sS --connect-timeout 5 --max-time "${2:-15}" -o "$d/body" -w '%{http_code}' \
     -H 'Content-Type: text/plain' --data-binary @"$d/req" "$URL" 2>/dev/null)"
-  code="${out##*$'\n'}"
-  body="${out%$'\n'*}"
-
   if [ "$code" = "200" ]; then
     # 校验响应的 HMAC（绑定本次请求）后解密
-    printf '%s' "$body" | openssl base64 -d -A > "$d/resp" 2>/dev/null
+    code="bad"
+    openssl base64 -d -A < "$d/body" > "$d/resp" 2>/dev/null
     size="$(wc -c < "$d/resp")"
-    body=""
     if [ "$size" -ge 40 ]; then
       head -c $((size - 32)) "$d/resp" > "$d/rmsg"
       if [ "$({ hex2bin "$req_tag"; cat "$d/rmsg"; } | hmac_hex "$MK")" = "$(tail -c 32 "$d/resp" | bin2hex)" ]; then
-        body="$({ printf 'Salted__'; cat "$d/rmsg"; } | aes -d)"
+        { printf 'Salted__'; cat "$d/rmsg"; } | aes -d > "$out" && [ -s "$out" ] && code="200"
       fi
     fi
-    [ -n "$body" ] || code="bad"
   fi
   rm -rf "$d"
+  echo "${code:-000}"
+}
+
+request_text() {
+  printf 't=%s\nv=%s\nstate=%s\nerr=%s\nagent=%s\nau=%s\n' "$(date +%s)" "$R_V" "$1" "$R_ERR" "$VERSION" "$AUTO_UPDATE"
+}
+
+# 发送一次同步请求并处理响应；参数 init 表示首次连接。NEW=1 表示收到了新配置；
+# 服务端发来更新信号时 UPD_TARGET、UPD_HASH 为目标版本和脚本哈希
+NEW=0 UPD_TARGET="" UPD_HASH=""
+sync_once() {
+  local state="$R_STATE" f code body now
+  NEW=0 UPD_TARGET="" UPD_HASH=""
+  [ "${1:-}" = "init" ] && state="init"
+  derive_keys
+
+  f="$(mktemp /run/ictl.XXXXXX)" || return 1
+  code="$(request_text "$state" | send_request "$f")"
+  body="$(cat "$f")"
+  rm -f "$f"
+  if [ "$code" = "200" ] && [[ "$body" =~ (^|$'\n')update=([0-9][0-9A-Za-z.-]*)\ ([0-9a-f]{64})($|$'\n') ]]; then
+    UPD_TARGET="${BASH_REMATCH[2]}" UPD_HASH="${BASH_REMATCH[3]}"
+    body="$(grep -v '^update=' <<< "$body")"
+  fi
 
   case "$code" in
     200)
@@ -410,53 +423,41 @@ cycle() {
 }
 
 daemon() {
+  rm -f "$LIB/update"   # 0.1.6 定时检查更新的记录，已不再使用
   with_lock local_apply_saved
   while true; do
     NEW=0
     with_lock cycle
-    [ "$NEW" -eq 1 ] && continue
-    auto_update
-    sleep $((15 + RANDOM % 6))   # 15-20 秒
+    [ -n "$UPD_TARGET" ] && auto_update
+    [ "$NEW" -eq 1 ] || sleep $((20 + RANDOM % 21))   # 20-40 秒
   done
 }
 
-# 到时间时检查更新；有新版本则替换脚本并原地重启守护进程（规则不变，转发不中断）
+# 服务端发来更新信号时，从服务端下载同版本的节点端脚本并校验哈希，替换后原地重启守护进程
+# （规则不变，转发不中断）。失败后 UPDATE_RETRY 秒内不再重试
+UPD_RETRY_AT=0
 auto_update() {
-  local k v next="" now
-  load_conf
-  [ "$AUTO_UPDATE" -eq 1 ] || return 0
-  now="$(date +%s)"
-  if [ -f "$UPDATE_STATE" ]; then
-    while IFS='=' read -r k v; do
-      [ "$k" = "next" ] && next="$v"
-    done < "$UPDATE_STATE"
-  fi
-  if [[ ! "$next" =~ ^[0-9]+$ ]]; then
-    save_update_state "$((now + UPDATE_EVERY + RANDOM % 1800))" ""
-    return 0
-  fi
-  [ "$now" -ge "$next" ] || return 0
-
-  local mirror=""
-  [ "$MIRROR" -eq 1 ] && mirror="--mirror"
-  save_update_state "$((now + UPDATE_EVERY + RANDOM % 1800))" "检查中"   # 先推迟下次检查，避免下载卡住被重启后反复检查
-  if fetch_update "$mirror"; then
-    save_update_state "$((now + UPDATE_EVERY + RANDOM % 1800))" "已更新 $VERSION → $NEW_VERSION"
-    echo "ictl: auto update $VERSION -> $NEW_VERSION"
+  local f code new
+  [ "$AUTO_UPDATE" -eq 1 ] && version_gt "$UPD_TARGET" "$VERSION" || return 0
+  [ "$(date +%s)" -ge "$UPD_RETRY_AT" ] || return 0
+  UPD_RETRY_AT=$(($(date +%s) + UPDATE_RETRY))
+  f="$BIN.download"
+  mkdir -p "$(dirname "$BIN")"
+  load_state
+  code="$(request_text "$R_STATE" | { printf 'get=agent\n'; cat; } | send_request "$f" 120)"
+  new="$(grep -m 1 '^VERSION=' "$f" 2>/dev/null | cut -d '"' -f 2)"
+  if [ "$code" != "200" ]; then
+    echo "ictl: 自动更新到 $UPD_TARGET 失败：下载失败（$code），$((UPDATE_RETRY / 60)) 分钟后重试"
+  elif [ "$(sha256_hex < "$f")" != "$UPD_HASH" ] || [ "$new" != "$UPD_TARGET" ] ||
+    ! grep -q '^# ictl 节点端' "$f" || ! bash -n "$f" 2>/dev/null; then
+    echo "ictl: 自动更新到 $UPD_TARGET 失败：文件校验失败，$((UPDATE_RETRY / 60)) 分钟后重试"
+  else
+    chmod 755 "$f"
+    mv "$f" "$BIN"
+    echo "ictl: 自动更新 $VERSION → $new"
     exec "$BIN" --daemon
   fi
-  case "$FETCH_RESULT" in
-    latest) v="已是最新版本" ;;
-    older) v="下载到的版本 $NEW_VERSION 较旧，未更新" ;;
-    download) v="下载失败" ;;
-    *) v="下载的文件无效" ;;
-  esac
-  save_update_state "$((now + UPDATE_EVERY + RANDOM % 1800))" "$v"
-}
-
-save_update_state() {
-  printf 'next=%s\nchecked=%s\nresult=%s\n' "$1" "$(date +%s)" "$2" > "$UPDATE_STATE.tmp" &&
-    mv "$UPDATE_STATE.tmp" "$UPDATE_STATE"
+  rm -f "$f"
 }
 
 # 开机时先按本地缓存恢复规则
@@ -528,7 +529,6 @@ save_server() {
 
   load_conf
   URL="$url" KEY="$key"
-  [ "${3:-}" = "--mirror" ] && MIRROR=1
   save_conf || { err "无法写入 $CONF"; return 1; }
 
   with_lock cycle init || return 1
@@ -554,19 +554,19 @@ set_server() {
   save_server "${url:-$URL}" "$key"
 }
 
-# 命令行接入：ictl.sh --url <同步地址> --key <密钥> [--mirror]
+# 命令行接入：ictl.sh --url <同步地址> --key <密钥>
 quick_setup() {
-  local url="" key="" mirror=""
+  local url="" key=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --url) url="${2:-}"; shift 2 ;;
       --key) key="${2:-}"; shift 2 ;;
-      --mirror) mirror="--mirror"; shift ;;
+      --mirror) shift ;;   # 0.1.6 用于记住下载加速，现已不需要，保留以兼容旧命令
       *) err "未知参数：$1"; exit 1 ;;
     esac
   done
   title "ictl 节点端 $VERSION"
-  save_server "$url" "$key" "$mirror"
+  save_server "$url" "$key"
 }
 
 # $1 是否比 $2 新
@@ -574,78 +574,52 @@ version_gt() {
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
 }
 
-# 从 GitHub Release 下载最新版本替换 $BIN；参数 --mirror 时经加速代理下载。
-# 替换成功返回 0，NEW_VERSION 为新版本；否则 FETCH_RESULT 为原因：latest / older / download / invalid
-NEW_VERSION="" FETCH_RESULT=""
-fetch_update() {
-  local tmp="$BIN.download" url="$LATEST_URL?t=$(date +%s)"   # 时间戳避免拿到代理缓存的旧文件
-  NEW_VERSION="" FETCH_RESULT=""
+# 手动更新：从 GitHub Release 下载最新版本替换自身；参数 --mirror 时经加速代理下载。更新成功返回 0
+update_agent() {
+  title "更新节点端"
+  local tmp="$BIN.download" new url="$LATEST_URL?t=$(date +%s)"   # 时间戳避免拿到代理缓存的旧文件
   [ "${1:-}" = "--mirror" ] && url="$GH_PROXY$url"
   mkdir -p "$(dirname "$BIN")"
   if ! curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$tmp"; then
     rm -f "$tmp"
-    FETCH_RESULT="download"
+    err "下载失败：$url"
+    [ "${1:-}" = "--mirror" ] || note "国内服务器可使用加速下载：sudo ictl --update --mirror"
     return 1
   fi
-  NEW_VERSION="$(grep -m 1 '^VERSION=' "$tmp" | cut -d '"' -f 2)"
-  if [[ ! "$NEW_VERSION" =~ ^[0-9][0-9A-Za-z.-]*$ ]] || ! grep -q '^# ictl 节点端' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
+  new="$(grep -m 1 '^VERSION=' "$tmp" | cut -d '"' -f 2)"
+  if [ -z "$new" ] || ! grep -q '^# ictl 节点端' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
     rm -f "$tmp"
-    FETCH_RESULT="invalid"
+    err "下载的文件无效"
     return 1
   fi
-  if [ -f "$BIN" ] && ! version_gt "$NEW_VERSION" "$VERSION"; then
+  if [ -f "$BIN" ] && ! version_gt "$new" "$VERSION"; then
     rm -f "$tmp"
-    FETCH_RESULT="older"
-    [ "$NEW_VERSION" = "$VERSION" ] && FETCH_RESULT="latest"
+    if [ "$new" = "$VERSION" ]; then
+      ok "已是最新版本 $VERSION"
+    else
+      warn "下载到的版本 $new 低于当前版本 $VERSION（可能是下载缓存），未做改动"
+    fi
     return 1
   fi
   chmod 755 "$tmp"
   mv "$tmp" "$BIN"
+  [ -f "$SERVICE" ] && systemctl restart "$SERVICE_NAME"
+  ok "已更新：$VERSION → $new"
 }
 
-# 手动更新；--mirror 经加速代理下载，并记住该选择供自动更新使用。更新成功返回 0
-update_agent() {
-  title "更新节点端"
-  load_conf
-  if [ "${1:-}" = "--mirror" ] && [ "$MIRROR" -eq 0 ] && [ -f "$CONF" ]; then
-    MIRROR=1
-    save_conf && note "已开启下载加速，之后的自动更新也经加速代理下载"
-  fi
-  local mirror=""
-  [ "$MIRROR" -eq 1 ] && mirror="--mirror"
-  if fetch_update "$mirror"; then
-    [ -f "$SERVICE" ] && systemctl restart "$SERVICE_NAME"
-    ok "已更新：$VERSION → $NEW_VERSION"
-    return 0
-  fi
-  case "$FETCH_RESULT" in
-    download)
-      err "下载失败"
-      [ -n "$mirror" ] || note "国内服务器可使用加速下载：sudo ictl --update --mirror"
-      ;;
-    invalid) err "下载的文件无效" ;;
-    latest) ok "已是最新版本 $VERSION" ;;
-    older) warn "下载到的版本 $NEW_VERSION 低于当前版本 $VERSION（可能是下载缓存），未做改动" ;;
-  esac
-  return 1
-}
-
-# 菜单中切换自动更新和下载加速
-toggle_setting() {
+# 菜单中切换自动更新
+toggle_auto_update() {
   if ! load_conf; then
     warn "请先设置服务端地址和密钥"
     return
   fi
-  case "$1" in
-    auto)
-      AUTO_UPDATE=$((1 - AUTO_UPDATE))
-      save_conf && { [ "$AUTO_UPDATE" -eq 1 ] && ok "已开启自动更新（每 6 小时检查一次）" || ok "已关闭自动更新"; }
-      ;;
-    mirror)
-      MIRROR=$((1 - MIRROR))
-      save_conf && { [ "$MIRROR" -eq 1 ] && ok "已开启下载加速（经 ${GH_PROXY%/} 下载更新）" || ok "已关闭下载加速"; }
-      ;;
-  esac
+  AUTO_UPDATE=$((1 - AUTO_UPDATE))
+  save_conf || return
+  if [ "$AUTO_UPDATE" -eq 1 ]; then
+    ok "已开启自动更新（节点端版本低于服务端时，自动从服务端更新到服务端的版本）"
+  else
+    ok "已关闭自动更新"
+  fi
 }
 
 on_off() { [ "$1" -eq 1 ] && echo "已开启" || echo "已关闭"; }
@@ -656,19 +630,7 @@ show_status() {
   if load_conf; then
     note "同步地址：$URL"
     note "密钥：    ${KEY:0:6}…"
-    note "自动更新：$(on_off "$AUTO_UPDATE")；下载加速：$(on_off "$MIRROR")"
-    local k v next="" checked="" result=""
-    if [ -f "$UPDATE_STATE" ]; then
-      while IFS='=' read -r k v; do
-        case "$k" in
-          next) next="$v" ;;
-          checked) checked="$v" ;;
-          result) result="$v" ;;
-        esac
-      done < "$UPDATE_STATE"
-    fi
-    [ -n "$result" ] && [ -n "$checked" ] && note "上次检查更新：$(date -d "@$checked" '+%F %T')（$result）"
-    [ "$AUTO_UPDATE" -eq 1 ] && [[ "$next" =~ ^[0-9]+$ ]] && note "下次检查更新：$(date -d "@$next" '+%F %T')"
+    note "自动更新：$(on_off "$AUTO_UPDATE")（跟随服务端版本）"
   else
     warn "尚未设置服务端地址和密钥"
   fi
@@ -745,8 +707,7 @@ menu() {
     echo "  3) 立即同步"
     echo "  4) 更新节点端"
     echo "  5) 自动更新：$(on_off "$AUTO_UPDATE")（切换）"
-    echo "  6) 下载加速：$(on_off "$MIRROR")（切换）"
-    echo "  7) 卸载"
+    echo "  6) 卸载"
     echo "  0) 退出"
     local choice
     read -rp "  请选择: " choice || { echo; exit 0; }
@@ -755,9 +716,8 @@ menu() {
       2) show_status ;;
       3) sync_now ;;
       4) update_agent && { note "请重新运行 sudo ictl"; exit 0; } ;;
-      5) toggle_setting auto ;;
-      6) toggle_setting mirror ;;
-      7) uninstall ;;
+      5) toggle_auto_update ;;
+      6) uninstall ;;
       0|q) exit 0 ;;
       "") ;;
       *) err "无效选择：$choice" ;;
@@ -771,5 +731,5 @@ case "${1:-}" in
   --uninstall) need_root; uninstall "${2:-}" ;;
   --url|--key) need_root; quick_setup "$@" ;;
   "") need_root; menu ;;
-  *) echo "用法：ictl [--url <同步地址> --key <密钥> [--mirror] | --update [--mirror] | --uninstall [-y] | --daemon]" >&2; exit 1 ;;
+  *) echo "用法：ictl [--url <同步地址> --key <密钥> | --update [--mirror] | --uninstall [-y] | --daemon]" >&2; exit 1 ;;
 esac

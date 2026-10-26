@@ -11,6 +11,14 @@ const STATUS = {
   error: ["失败", "yellow"],
   deleting: ["删除中", "grey"],
 };
+// 节点端版本与服务端不一致时的说明
+const AGENT_UPDATE = {
+  pending: "等待节点自动更新",
+  disabled: "节点已关闭自动更新，可在节点上运行 <code>sudo ictl --update</code> 更新",
+  legacy: "该版本节点端每 6 小时自行检查更新，也可在节点上运行 <code>sudo ictl --update</code> 立即更新",
+  unavailable: "服务端缺少同版本的节点端脚本，无法自动更新，可在节点上运行 <code>sudo ictl --update</code> 更新",
+  newer: "节点端版本高于服务端",
+};
 const LEVEL = { ok: "正常", fault: "故障", lost: "失联", none: "无数据" };
 const LIVE = new Set(["syncing", "deleting"]);   // 带呼吸动画的状态
 const REFRESH_MS = 5000;
@@ -503,8 +511,8 @@ async function nodeDetail(id) {
     <span>分组</span><span>${esc(n.group)}</span>
     <span>来源 IP</span><span class="mono">${esc(n.src_ip || "-")}</span>
     <span>时差</span><span>${skew}</span>
-    <span>节点端版本</span><span>${esc(n.agent || "-")}${n.agent && n.agent !== d.version
-      ? `<span class="muted">（服务端为 ${esc(d.version)}。节点端 0.1.6 起默认每 6 小时自动更新，也可在节点上运行 <code>sudo ictl --update</code> 立即更新）</span>` : ""}</span>
+    <span>节点端版本</span><span>${esc(n.agent || "-")}${AGENT_UPDATE[n.agent_update]
+      ? `<span class="muted">（服务端为 ${esc(d.version)}，${AGENT_UPDATE[n.agent_update]}）</span>` : ""}</span>
     <span>已应用版本</span><span class="mono">${esc(n.reported_v || "-")}</span>
     <span>应有版本</span><span class="mono">${esc(n.want_v)}</span>
     <span>上报状态</span><span>${esc(n.state || "-")}</span>

@@ -1,3 +1,4 @@
 *
 !server/ictl-server.py
 !server/web
+!agent/ictl.sh
