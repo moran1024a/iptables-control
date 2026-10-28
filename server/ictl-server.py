@@ -23,7 +23,7 @@ import threading
 import time
 from urllib.parse import parse_qs
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 REPO = "moran1024a/iptables-control"
 AGENT_URL = f"https://github.com/{REPO}/releases/download/v{VERSION}/ictl.sh"
 DB_PATH = os.environ.get("ICTL_DB", "/var/lib/ictl-server/ictl.db")
@@ -756,8 +756,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ------------------------------------------------------------ 同步接口
 
     def sync(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0 or length > MAX_BODY:
+        try:
+            length = self.body_length(MAX_BODY)
+        except UserError:
+            return self.not_found()
+        if length == 0:
             return self.not_found()
         try:
             raw = base64.b64decode(self.rfile.read(length).strip(), validate=True)
@@ -816,7 +819,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 lines = node_rules(conn, node)
                 want = rules_version(lines)
 
-                if v == want and state != "init":
+                if v == want and state == "ok":
                     conn.execute("DELETE FROM chain_pending WHERE node_id = ?", (node["id"],))
                     finish_deleted_chains(conn)
 
@@ -843,6 +846,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             # 修改类请求必须是 JSON，配合 SameSite=Strict 防跨站请求
             if method != "GET" and not self.headers.get("Content-Type", "").startswith("application/json"):
+                self.close_connection = True
                 return self.send_json(400, {"error": "请求格式错误"})
             body = self.read_json() if method != "GET" else {}
 
@@ -897,10 +901,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def read_json(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > MAX_API_BODY:
+    def body_length(self, limit):
+        lengths = self.headers.get_all("Content-Length", [])
+        value = lengths[0].strip() if lengths else "0"
+        try:
+            if (len(lengths) > 1 or self.headers.get("Transfer-Encoding") is not None
+                    or not re.fullmatch(r"[0-9]+", value)):
+                raise ValueError
+            length = int(value)
+        except ValueError:
+            self.close_connection = True
+            raise UserError("请求格式错误")
+        if length > limit:
+            self.close_connection = True
             raise UserError("请求过大")
+        return length
+
+    def read_json(self):
+        length = self.body_length(MAX_API_BODY)
         if length == 0:
             return {}
         try:
@@ -1158,25 +1176,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if group_id != chain["group_id"]:   # 换到其他分组时排在该组末尾
                     conn.execute("""UPDATE chains SET group_id = ?, sort = (SELECT MAX(sort) + 1 FROM chains)
                                     WHERE id = ?""", (group_id, chain_id))
-            save_hops(conn, chain_id, hops)
+            if old is None or old[0] != hops:
+                save_hops(conn, chain_id, hops)
             # 规则有变化时，改动前后涉及的节点都需要确认（被移出的节点要清掉旧规则）
             if old != (hops, (host, port)):
                 mark_pending(conn, chain_id, [nid for nid, _ in hops] + [nid for nid, _ in (old or ([], None))[0]])
         return {"id": chain_id, "assigned": assigned}
 
     def api_chain_del(self, conn, body, chain_id):
-        get_chain(conn, chain_id)
+        chain = get_chain(conn, chain_id)
         force = self.query.get("force") == ["1"]
         with conn:
             if force:
                 delete_chain(conn, chain_id)
                 return {"deleted": True}
-            conn.execute("UPDATE chains SET deleting = 1 WHERE id = ?", (chain_id,))
-            # 只需等待连接过的节点清理规则；之前未确认的改动一并以删除为准
-            conn.execute("DELETE FROM chain_pending WHERE chain_id = ?", (chain_id,))
-            mark_pending(conn, chain_id, [r[0] for r in conn.execute(
-                """SELECT h.node_id FROM hops h JOIN nodes n ON n.id = h.node_id
-                   WHERE h.chain_id = ? AND n.first_seen IS NOT NULL""", (chain_id,))])
+            # 保留之前被移出、尚未确认的节点；只等待仍存在且连接过的节点。
+            conn.execute("""DELETE FROM chain_pending WHERE chain_id = ? AND node_id NOT IN
+                            (SELECT id FROM nodes WHERE first_seen IS NOT NULL)""", (chain_id,))
+            if not chain["deleting"]:
+                conn.execute("UPDATE chains SET deleting = 1 WHERE id = ?", (chain_id,))
+                mark_pending(conn, chain_id, [r[0] for r in conn.execute(
+                    """SELECT h.node_id FROM hops h JOIN nodes n ON n.id = h.node_id
+                       WHERE h.chain_id = ? AND n.first_seen IS NOT NULL""", (chain_id,))])
             finish_deleted_chains(conn)
             deleted = not conn.execute("SELECT 1 FROM chains WHERE id = ?", (chain_id,)).fetchone()
         return {"deleted": deleted}

@@ -3,7 +3,7 @@
 
 set -u
 
-VERSION="0.1.7"
+VERSION="0.1.8"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/bin/ictl"
@@ -108,7 +108,7 @@ save_state() {
 
 with_lock() {
   local rc
-  exec 9>"$LOCK"
+  exec 9>"$LOCK" || { err "无法打开锁文件 $LOCK"; return 1; }
   if ! flock -w 60 9; then
     exec 9>&-
     err "另一个 ictl 进程正在运行，请稍后重试。"
@@ -245,7 +245,8 @@ render() {
       for p in $(protos "$proto"); do
         pre+="-A ICTL-PRE -p $p -m addrtype --dst-type LOCAL --dport $lport -j DNAT --to-destination $RIP:$tport"$'\n'
         post+="-A ICTL-POST -p $p -d $RIP --dport $tport -m conntrack --ctstate DNAT --ctorigdstport $lport -j MASQUERADE"$'\n'
-        fwd+="-A ICTL-FWD -p $p -d $RIP --dport $tport -m conntrack --ctstate DNAT --ctorigdstport $lport -j ACCEPT"$'\n'
+        # 原始/回复元组在两个方向保持不变；不用 -p，RELATED ICMP 也按原连接匹配。
+        fwd+="-A ICTL-FWD -m conntrack --ctstate DNAT --ctproto $p --ctorigdstport $lport --ctreplsrc $RIP --ctreplsrcport $tport -j ACCEPT"$'\n'
       done
     done < "$CONFIG"
   fi
@@ -257,7 +258,6 @@ render() {
 ${pre}${post}COMMIT
 *filter
 :ICTL-FWD - [0:0]
--A ICTL-FWD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 ${fwd}COMMIT
 "
 }
@@ -269,9 +269,9 @@ jumps_ok() {
 }
 
 ensure_jumps() {
-  iptables -t nat -C PREROUTING -j ICTL-PRE 2>/dev/null || iptables -w -t nat -A PREROUTING -j ICTL-PRE
-  iptables -t nat -C POSTROUTING -j ICTL-POST 2>/dev/null || iptables -w -t nat -A POSTROUTING -j ICTL-POST
-  iptables -C FORWARD -j ICTL-FWD 2>/dev/null || iptables -w -I FORWARD 1 -j ICTL-FWD
+  iptables -w -t nat -C PREROUTING -j ICTL-PRE 2>/dev/null || iptables -w -t nat -A PREROUTING -j ICTL-PRE || return 1
+  iptables -w -t nat -C POSTROUTING -j ICTL-POST 2>/dev/null || iptables -w -t nat -A POSTROUTING -j ICTL-POST || return 1
+  iptables -w -C FORWARD -j ICTL-FWD 2>/dev/null || iptables -w -I FORWARD 1 -j ICTL-FWD || return 1
 }
 
 ensure_ip_forward() {
@@ -298,13 +298,32 @@ apply_rules() {
   printf '%s' "$RENDERED" > "$APPLIED"
 }
 
+remove_chain() {
+  local table="$1" parent="$2" chain="$3" rules out
+  while true; do
+    # 成功列出整张表才能判断规则/链不存在，不能把 -D/-F 的所有失败当作不存在。
+    if ! rules="$(iptables -w -t "$table" -S 2>&1)"; then
+      err "无法读取 $table 规则：$rules"
+      return 1
+    fi
+    grep -Fxq -- "-A $parent -j $chain" <<< "$rules" || break
+    if ! out="$(iptables -w -t "$table" -D "$parent" -j "$chain" 2>&1)"; then
+      err "删除 $parent 到 $chain 的跳转失败：$out"
+      return 1
+    fi
+  done
+  grep -Fxq -- "-N $chain" <<< "$rules" || return 0
+  if ! out="$(iptables -w -t "$table" -F "$chain" 2>&1)" ||
+    ! out="$(iptables -w -t "$table" -X "$chain" 2>&1)"; then
+    err "删除链 $chain 失败：$out"
+    return 1
+  fi
+}
+
 remove_rules() {
-  while iptables -t nat -D PREROUTING -j ICTL-PRE 2>/dev/null; do :; done
-  while iptables -t nat -D POSTROUTING -j ICTL-POST 2>/dev/null; do :; done
-  while iptables -D FORWARD -j ICTL-FWD 2>/dev/null; do :; done
-  iptables -t nat -F ICTL-PRE 2>/dev/null; iptables -t nat -X ICTL-PRE 2>/dev/null
-  iptables -t nat -F ICTL-POST 2>/dev/null; iptables -t nat -X ICTL-POST 2>/dev/null
-  iptables -F ICTL-FWD 2>/dev/null; iptables -X ICTL-FWD 2>/dev/null
+  remove_chain nat PREROUTING ICTL-PRE || return 1
+  remove_chain nat POSTROUTING ICTL-POST || return 1
+  remove_chain filter FORWARD ICTL-FWD
 }
 
 # ---------------------------------------------------------------- 同步
@@ -389,8 +408,11 @@ sync_once() {
         return 0
       fi
       if valid_config "$body"; then
-        printf '%s\n' "$body" > "$CONFIG.tmp"
-        mv "$CONFIG.tmp" "$CONFIG"
+        if ! printf '%s\n' "$body" > "$CONFIG.tmp" || ! mv "$CONFIG.tmp" "$CONFIG"; then
+          rm -f "$CONFIG.tmp"
+          CFG_ERR="save config failed"
+          return 0
+        fi
         CFG_ERR=""
       else
         CFG_ERR="invalid config rejected"
@@ -437,12 +459,12 @@ daemon() {
 # （规则不变，转发不中断）。失败后 UPDATE_RETRY 秒内不再重试
 UPD_RETRY_AT=0
 auto_update() {
-  local f code new
+  local f code new rc
   [ "$AUTO_UPDATE" -eq 1 ] && version_gt "$UPD_TARGET" "$VERSION" || return 0
   [ "$(date +%s)" -ge "$UPD_RETRY_AT" ] || return 0
   UPD_RETRY_AT=$(($(date +%s) + UPDATE_RETRY))
-  f="$BIN.download"
-  mkdir -p "$(dirname "$BIN")"
+  mkdir -p "$(dirname "$BIN")" || return 1
+  f="$(mktemp "$BIN.download.XXXXXX")" || return 1
   load_state
   code="$(request_text "$R_STATE" | { printf 'get=agent\n'; cat; } | send_request "$f" 120)"
   new="$(grep -m 1 '^VERSION=' "$f" 2>/dev/null | cut -d '"' -f 2)"
@@ -452,10 +474,14 @@ auto_update() {
     ! grep -q '^# ictl 节点端' "$f" || ! bash -n "$f" 2>/dev/null; then
     echo "ictl: 自动更新到 $UPD_TARGET 失败：文件校验失败，$((UPDATE_RETRY / 60)) 分钟后重试"
   else
-    chmod 755 "$f"
-    mv "$f" "$BIN"
-    echo "ictl: 自动更新 $VERSION → $new"
+    with_lock install_update "$f" "$new"
+    rc=$?
+    rm -f "$f"
+    [ "$rc" -eq 0 ] || return "$rc"
+    echo "ictl: 自动更新 $UPDATE_FROM → $new"
+    # 安装锁已释放，避免新守护进程继承锁或和手动重启相互等待。
     exec "$BIN" --daemon
+    return 1
   fi
   rm -f "$f"
 }
@@ -559,8 +585,12 @@ quick_setup() {
   local url="" key=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --url) url="${2:-}"; shift 2 ;;
-      --key) key="${2:-}"; shift 2 ;;
+      --url)
+        [ $# -ge 2 ] && [[ "$2" != --* ]] || { err "--url 缺少参数"; return 1; }
+        url="$2"; shift 2 ;;
+      --key)
+        [ $# -ge 2 ] && [[ "$2" != --* ]] || { err "--key 缺少参数"; return 1; }
+        key="$2"; shift 2 ;;
       --mirror) shift ;;   # 0.1.6 用于记住下载加速，现已不需要，保留以兼容旧命令
       *) err "未知参数：$1"; exit 1 ;;
     esac
@@ -574,12 +604,41 @@ version_gt() {
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
 }
 
+# 必须在锁内重新比较已安装版本，防止下载期间其他进程更新后被旧版本覆盖。
+# 返回 2 表示无需安装；调用方在锁释放后再重启服务或 exec。
+UPDATE_FROM=""
+install_update() {
+  local tmp="$1" new="$2" current="$VERSION" installed
+  if [ -f "$BIN" ]; then
+    installed="$(grep -m 1 '^VERSION=' "$BIN" | cut -d '"' -f 2)"
+    if [[ ! "$installed" =~ ^[0-9][0-9A-Za-z.-]*$ ]]; then
+      err "无法读取已安装的节点端版本"
+      return 1
+    fi
+    version_gt "$installed" "$current" && current="$installed"
+  fi
+  UPDATE_FROM="$current"
+  if version_gt "$current" "$new"; then
+    warn "下载到的版本 $new 低于当前版本 $current（可能是下载缓存），未做改动"
+    return 2
+  fi
+  if [ -f "$BIN" ] && [ "$new" = "$current" ]; then
+    ok "已是最新版本 $current"
+    return 2
+  fi
+  if ! chmod 755 "$tmp" || ! mv "$tmp" "$BIN"; then
+    err "无法安装节点端到 $BIN"
+    return 1
+  fi
+}
+
 # 手动更新：从 GitHub Release 下载最新版本替换自身；参数 --mirror 时经加速代理下载。更新成功返回 0
 update_agent() {
   title "更新节点端"
-  local tmp="$BIN.download" new url="$LATEST_URL?t=$(date +%s)"   # 时间戳避免拿到代理缓存的旧文件
+  local tmp new rc url="$LATEST_URL?t=$(date +%s)"   # 时间戳避免拿到代理缓存的旧文件
   [ "${1:-}" = "--mirror" ] && url="$GH_PROXY$url"
-  mkdir -p "$(dirname "$BIN")"
+  mkdir -p "$(dirname "$BIN")" || { err "无法创建节点端安装目录"; return 1; }
+  tmp="$(mktemp "$BIN.download.XXXXXX")" || { err "无法创建更新临时文件"; return 1; }
   if ! curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$tmp"; then
     rm -f "$tmp"
     err "下载失败：$url"
@@ -587,24 +646,20 @@ update_agent() {
     return 1
   fi
   new="$(grep -m 1 '^VERSION=' "$tmp" | cut -d '"' -f 2)"
-  if [ -z "$new" ] || ! grep -q '^# ictl 节点端' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
+  if [[ ! "$new" =~ ^[0-9][0-9A-Za-z.-]*$ ]] || ! grep -q '^# ictl 节点端' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     err "下载的文件无效"
     return 1
   fi
-  if [ -f "$BIN" ] && ! version_gt "$new" "$VERSION"; then
-    rm -f "$tmp"
-    if [ "$new" = "$VERSION" ]; then
-      ok "已是最新版本 $VERSION"
-    else
-      warn "下载到的版本 $new 低于当前版本 $VERSION（可能是下载缓存），未做改动"
-    fi
+  with_lock install_update "$tmp" "$new"
+  rc=$?
+  rm -f "$tmp"
+  [ "$rc" -eq 0 ] || return 1
+  if [ -f "$SERVICE" ] && ! systemctl restart "$SERVICE_NAME"; then
+    err "已安装 $new，但重启服务失败，请检查 systemctl status $SERVICE_NAME"
     return 1
   fi
-  chmod 755 "$tmp"
-  mv "$tmp" "$BIN"
-  [ -f "$SERVICE" ] && systemctl restart "$SERVICE_NAME"
-  ok "已更新：$VERSION → $new"
+  ok "已更新：$UPDATE_FROM → $new"
 }
 
 # 菜单中切换自动更新
@@ -673,10 +728,23 @@ sync_now() {
   print_net_result
 }
 
+# 服务停止后在锁内清理；规则清理失败时不删除配置、服务文件或程序，便于重试。
+uninstall_files() {
+  remove_rules || return 1
+  if [ -f "$SERVICE" ]; then
+    systemctl disable "$SERVICE_NAME" || { err "禁用服务失败"; return 1; }
+    rm -f "$SERVICE" || { err "删除服务文件失败"; return 1; }
+  fi
+  systemctl daemon-reload || { err "重新加载服务配置失败"; return 1; }
+  rm -rf "$CONF_DIR" "$LIB" "$SYSCTL" || { err "删除节点端配置失败"; return 1; }
+  rm -f "$BIN" || { err "删除节点端程序失败"; return 1; }
+  # 不删除仍可能被其他进程等待的锁文件，避免并发进程锁住不同的 inode。
+}
+
 # 卸载；参数 -y 跳过确认
 uninstall() {
   title "卸载节点端"
-  local yn
+  local yn service_state
   if [ "${1:-}" != "-y" ]; then
     if ! read -rp "  将停止服务、删除所有 ictl 规则和文件，确认？[y/N]: " yn; then
       echo
@@ -686,12 +754,19 @@ uninstall() {
     [[ "$yn" =~ ^[yY]$ ]] || { note "已取消。"; return; }
   fi
 
-  systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1
-  rm -f "$SERVICE"
-  systemctl daemon-reload 2>/dev/null
-  remove_rules
-  rm -rf "$CONF_DIR" "$LIB" "$SYSCTL" "$LOCK"
-  [ -f "$BIN" ] && rm -f "$BIN"
+  if ! service_state="$(systemctl show -p LoadState --value "$SERVICE_NAME" 2>&1)"; then
+    err "无法确认服务状态：$service_state"
+    return 1
+  fi
+  if [ "$service_state" != "not-found" ] && ! systemctl stop "$SERVICE_NAME"; then
+    err "停止服务失败，未继续卸载"
+    return 1
+  fi
+  # stop 必须在获取锁之前完成，否则服务可能正在等待同一把锁而无法退出。
+  if ! with_lock uninstall_files; then
+    err "卸载未完成；服务保持停止，请排除错误后重新运行卸载。"
+    return 1
+  fi
   ok "已卸载。IPv4 转发的运行时设置保持不变，重启后恢复系统默认。"
   note "该节点在服务端面板中仍会显示为离线，可在面板中删除（节点已失联时选择强制删除）。"
   exit 0
@@ -727,7 +802,7 @@ menu() {
 
 case "${1:-}" in
   --daemon) need_root; daemon ;;
-  --update) need_root; update_agent "${2:-}"; exit 0 ;;
+  --update) need_root; update_agent "${2:-}"; exit $? ;;
   --uninstall) need_root; uninstall "${2:-}" ;;
   --url|--key) need_root; quick_setup "$@" ;;
   "") need_root; menu ;;

@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.7"
+VERSION="0.1.8"
 REGISTRY="ghcr.io"
 MIRROR_REGISTRY="ghcr.nju.edu.cn"
 REPO="moran1024a/ictl-server"
@@ -85,9 +85,9 @@ if current_image="$(docker container inspect -f '{{.Config.Image}}' "$NAME" 2>/d
   cur_ip="${binding%%|*}"
   cur_port="${binding##*|}"
   [ "$cur_ip" = "0.0.0.0" ] || [ "$cur_ip" = "::" ] && cur_ip=""
+  BIND_IP="$cur_ip"
   if [ -z "$PORT" ] || [ "$PORT" = "$cur_port" ]; then
     PORT="$cur_port"
-    BIND_IP="$cur_ip"
   else
     FORCE=1   # 修改端口需要重新创建容器
   fi

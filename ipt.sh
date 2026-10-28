@@ -420,16 +420,27 @@ managed_host() {
 # ---------------------------------------------------------------- 基础操作
 
 backup_rules() {
+  lock_acquire || return 1
   safe_mkdirs
   local base="$BACKUP_DIR/iptables-$(timestamp)" n=1
   local file="$base.rules"
-  while [ -e "$file" ]; do
+  while [ -e "$file" ] || [ -e "$file.managed" ]; do
     n=$((n + 1))
     file="$base-$n.rules"
   done
   if ! iptables-save > "$file"; then
     rm -f "$file"
     err "备份失败：iptables-save 执行出错。"
+    return 1
+  fi
+  # 规则和 DDNS 托管配置必须一起备份，回滚后定时刷新才不会重新应用旧配置。
+  if ! { if [ -f "$MANAGED_CONF" ]; then
+    cp "$MANAGED_CONF" "$file.managed"
+  else
+    : > "$file.managed"
+  fi; }; then
+    rm -f "$file" "$file.managed"
+    err "备份失败：无法保存托管配置。"
     return 1
   fi
   LAST_BACKUP="$file"
@@ -1232,19 +1243,34 @@ restore_backup() {
   print_backups || return
   echo
 
-  local idx file
+  local idx file managed_copy
   SEL_MAX="${#BACKUPS[@]}"
   ask idx "选择序号（q 取消）" valid_index || return
   file="${BACKUPS[$((idx - 1))]}"
 
   warn "这会用 $file 覆盖当前 iptables 规则。"
+  if [ ! -f "$file.managed" ]; then
+    warn "该旧备份没有托管配置快照，回滚后将清空 DDNS 托管记录，避免定时刷新覆盖恢复结果。"
+    note "当前规则和托管配置会先备份，可再次回滚恢复。"
+  fi
   confirm "确认回滚？" || { note "已取消。"; return; }
 
   prepare_change || return
-  if ! iptables-restore < "$file"; then
-    err "回滚失败：iptables-restore 执行出错，当前规则未改变。"
+  managed_copy="$(managed_tmp)" || return 1
+  if [ -f "$file.managed" ] && ! cp "$file.managed" "$managed_copy"; then
+    rm -f "$managed_copy"
+    err "无法读取备份的托管配置，未修改当前规则。"
+    return 1
+  fi
+  if ! iptables-restore < "$file" || ! mv "$managed_copy" "$MANAGED_CONF"; then
+    rm -f "$managed_copy"
+    if iptables-restore < "$LAST_BACKUP"; then
+      err "回滚失败，已恢复操作前的规则和托管配置。"
+    else
+      err "回滚失败，且自动恢复失败！请检查规则并从备份恢复：$LAST_BACKUP"
+    fi
     log "restore failed: $file"
-    return
+    return 1
   fi
   ok "已回滚到 $file"
   log "restore backup: $file"

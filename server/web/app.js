@@ -29,9 +29,11 @@ const app = $("#app");
 
 let me = null;                    // {username, must_change}
 let currentView = null;           // 当前页面的渲染函数
+let pageVersion = 0;              // 页面切换后使待完成的导航、弹窗请求失效
+let viewRequest = 0;              // 同一页面只接受最新一次刷新
 let refreshTimer = null;
 let currentNode = null;           // 详情页的节点
-let list = null;                  // 当前列表页：{kind, data, draw}，搜索、筛选和折叠时用已有数据重绘
+let list = null;                  // 当前列表页：{kind, data, draw}，搜索和筛选时用已有数据重绘
 let sortMode = null;              // 正在排序的列表："nodes" / "chains"
 const openDetails = new Set();    // 已展开的折叠区，刷新后保持
 const revealedKeys = new Set();   // 已显示密钥的节点
@@ -184,6 +186,7 @@ class ApiError extends Error {
 }
 
 async function api(method, path, body) {
+  const request = viewRequest;
   const opt = { method, headers: {}, credentials: "same-origin" };
   if (method !== "GET") {
     opt.headers["Content-Type"] = "application/json";
@@ -200,10 +203,10 @@ async function api(method, path, body) {
     data = await res.json();
   } catch {}
   if (res.ok) return data;
-  if (res.status === 401 && path !== "login") {
+  if (request === viewRequest && res.status === 401 && path !== "login") {
     me = null;
     showLogin();
-  } else if (res.status === 403 && data.must_change) {
+  } else if (request === viewRequest && res.status === 403 && data.must_change) {
     me = { ...me, must_change: true };
     showChangeAccount();
   }
@@ -212,10 +215,12 @@ async function api(method, path, body) {
 
 // 执行异步操作，统一处理错误
 async function safe(fn) {
+  const request = viewRequest;
   try {
     return await fn();
   } catch (e) {
     if (!(e instanceof ApiError)) throw e;
+    if (request !== viewRequest) return;
     if (e.status === 401 || (e.status === 403 && e.data.must_change)) return;
     toast(e.message, true);
   }
@@ -223,35 +228,51 @@ async function safe(fn) {
 
 // ------------------------------------------------------------ 页面切换与刷新
 
+function leaveView() {
+  pageVersion++;
+  viewRequest++;
+  currentView = null;
+  currentNode = null;
+  list = null;
+  sortMode = null;
+  clearTimeout(refreshTimer);
+}
+
 async function show(view, auto) {
+  const page = pageVersion;
   currentView = view;
   list = null;
   view.auto = auto;
   fullRender = true;
-  await safe(view);
-  schedule();
+  await refresh();
+  if (page === pageVersion) schedule();
 }
 
 function schedule() {
   clearTimeout(refreshTimer);
-  if (!currentView?.auto) return;
+  if (!currentView?.auto || sortMode) return;
+  const page = pageVersion;
   refreshTimer = setTimeout(async () => {
-    if ($("#modal").hidden && !document.hidden && !sortMode) await safe(currentView);
-    schedule();
+    if ($("#modal").hidden && !document.hidden && !sortMode) await refresh();
+    if (page === pageVersion) schedule();
   }, REFRESH_MS);
 }
 
 function refresh() {
-  return safe(currentView);
+  if (!currentView) return;
+  const request = ++viewRequest;
+  return safe(() => currentView(request));
 }
 
 async function route() {
-  clearTimeout(refreshTimer);
+  leaveView();
+  const version = pageVersion;
   closeModal();
-  sortMode = null;
   if (!me) {
     try {
-      me = await api("GET", "me");
+      const user = await api("GET", "me");
+      if (version !== pageVersion) return;
+      me = user;
     } catch {
       return;
     }
@@ -264,7 +285,7 @@ async function route() {
   const [page, id] = (location.hash || "#/nodes").replace(/^#\/?/, "").split("/");
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === page));
 
-  if (page === "nodes" && id) return show(() => nodeDetail(Number(id)), true);
+  if (page === "nodes" && id) return show((request) => nodeDetail(Number(id), request), true);
   if (page === "nodes") return show(nodeList, true);
   if (page === "chains") return show(chainList, true);
   if (page === "settings") return show(settingsPage, false);
@@ -274,7 +295,7 @@ async function route() {
 // ------------------------------------------------------------ 登录与账号
 
 function showLogin() {
-  clearTimeout(refreshTimer);
+  leaveView();
   closeModal();
   if (document.body.classList.contains("auth-page") && $('#app .auth[data-form="login"]')) return;   // 已显示时不重建，保留已输入内容
   $("#nav").hidden = true;
@@ -304,7 +325,7 @@ function accountFields(username, first) {
 }
 
 function showChangeAccount() {
-  clearTimeout(refreshTimer);
+  leaveView();
   closeModal();
   if (document.body.classList.contains("auth-page") && $('#app .auth[data-form="account"]')) return;   // 已显示时不重建，保留已输入内容
   $("#nav").hidden = true;
@@ -440,8 +461,9 @@ const has = (text, q) => String(text).toLowerCase().includes(q.trim().toLowerCas
 
 const countText = (n, label, cls) => (n ? `<span class="${cls}"> · ${n} ${label}</span>` : "");
 
-async function nodeList() {
+async function nodeList(request) {
   const data = await api("GET", "nodes");
+  if (request !== viewRequest) return;
   list = { kind: "nodes", data, draw: drawNodes };
   drawNodes();
 }
@@ -484,17 +506,19 @@ function detailsBlock(key, title, content) {
   return `<details data-key="${key}" ${openDetails.has(key) ? "open" : ""}><summary>${title}</summary>${content}</details>`;
 }
 
-async function nodeDetail(id) {
+async function nodeDetail(id, request) {
   let d;
   try {
     d = await api("GET", `nodes/${id}`);
   } catch (e) {
+    if (request !== viewRequest) return;
     if (e instanceof ApiError && e.status === 404) {
       location.hash = "#/nodes";
       return;
     }
     throw e;
   }
+  if (request !== viewRequest) return;
   const n = (currentNode = d.node);
   const url = syncAddress(d.public_url, d.sync_path);
   const shown = revealedKeys.has(id);
@@ -572,8 +596,9 @@ function chainStatus(c) {
   return c.deleting ? "deleting" : c.pending.length ? "applying" : "applied";
 }
 
-async function chainList() {
+async function chainList(request) {
   const data = await api("GET", "chains");
+  if (request !== viewRequest) return;
   list = { kind: "chains", data, draw: drawChains };
   drawChains();
 }
@@ -642,8 +667,9 @@ function drawChains() {
 
 // ------------------------------------------------------------ 设置
 
-async function settingsPage() {
+async function settingsPage(request) {
   const s = await api("GET", "settings");
+  if (request !== viewRequest) return;
   const theme = localStorage.getItem("ictl-theme") || "auto";
   const opt = (v, label) => `<option value="${v}" ${theme === v ? "selected" : ""}>${label}</option>`;
   render(`
@@ -724,7 +750,9 @@ function groupSelect(groups, selected) {
 }
 
 async function nodeForm(node) {
+  const page = pageVersion;
   const { groups } = await api("GET", "nodes");
+  if (page !== pageVersion) return;
   openModal(`
     <h2>${node ? "编辑节点" : "新增节点"}</h2>
     <form data-form="node" data-id="${node ? node.id : ""}">
@@ -775,7 +803,9 @@ function renumberHops() {
 }
 
 async function chainForm(chain) {
+  const page = pageVersion;
   const d = await api("GET", "nodes");
+  if (page !== pageVersion) return;
   const nodes = d.nodes.filter((n) => n.status !== "deleting");
   const hops = chain ? chain.hops : [{}];
   openModal(`
@@ -979,7 +1009,7 @@ const ACTIONS = {
     const key = el.dataset.group;
     collapsed.has(key) ? collapsed.delete(key) : collapsed.add(key);
     saveCollapsed();
-    list.draw();
+    el.closest(".group").classList.toggle("closed", collapsed.has(key));
   },
 
   "group-new"(el) {
