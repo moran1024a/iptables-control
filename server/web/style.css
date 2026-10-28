@@ -576,3 +576,12 @@ body.auth-page {
   .group-actions { opacity: 1; }
   .kv-grid { grid-template-columns: 96px 1fr; }
 }
+
+/* 0.2.0 node types and connection composition */
+.tabs { display:flex; gap:8px; margin:0 0 20px; }
+.tabs a { padding:8px 16px; border:1px solid var(--border); border-radius:8px; }
+.tabs a.selected { background:var(--primary-soft); color:var(--primary); border-color:var(--primary); font-weight:600; }
+.route-hop { grid-template-columns:24px minmax(100px,1fr) auto auto auto; }
+.kv-grid code { overflow-wrap:anywhere; min-width:0; }
+[hidden] { display:none !important; }
+@media(max-width:600px) { .nav-inner { flex-wrap:wrap; } header nav { order:3; width:100%; justify-content:space-between; } .card-head .actions { flex-wrap:wrap; } }

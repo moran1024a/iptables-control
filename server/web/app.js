@@ -3,6 +3,7 @@
 // ------------------------------------------------------------ 常量与工具
 
 const STATUS = {
+  online: ["在线", "green"],
   new: ["未连接", "grey"],
   offline: ["离线", "red"],
   skew: ["时间不一致", "yellow"],
@@ -17,7 +18,7 @@ const AGENT_UPDATE = {
   disabled: "节点已关闭自动更新，可在节点上运行 <code>sudo ictl --update</code> 更新",
   legacy: "该版本节点端每 6 小时自行检查更新，也可在节点上运行 <code>sudo ictl --update</code> 立即更新",
   unavailable: "服务端缺少同版本的节点端脚本，无法自动更新，可在节点上运行 <code>sudo ictl --update</code> 更新",
-  newer: "节点端版本高于服务端",
+  newer: "节点端版本高于目标版本",
 };
 const LEVEL = { ok: "正常", fault: "故障", lost: "失联", none: "无数据" };
 const LIVE = new Set(["syncing", "deleting"]);   // 带呼吸动画的状态
@@ -32,12 +33,13 @@ let currentView = null;           // 当前页面的渲染函数
 let pageVersion = 0;              // 页面切换后使待完成的导航、弹窗请求失效
 let viewRequest = 0;              // 同一页面只接受最新一次刷新
 let refreshTimer = null;
+let nodeKind = "forward";
 let currentNode = null;           // 详情页的节点
 let list = null;                  // 当前列表页：{kind, data, draw}，搜索和筛选时用已有数据重绘
 let sortMode = null;              // 正在排序的列表："nodes" / "chains"
 const openDetails = new Set();    // 已展开的折叠区，刷新后保持
 const revealedKeys = new Set();   // 已显示密钥的节点
-const filters = { nodes: {}, chains: {} };   // 搜索和筛选条件，刷新页面后清空
+const filters = { nodes: {}, tunnel_nodes: {}, routes: {}, tunnels: {}, chains: {} };   // 搜索和筛选条件，刷新页面后清空
 const collapsed = new Set(JSON.parse(localStorage.getItem("ictl-collapsed") || "[]"));   // 已折叠的分组
 
 function esc(s) {
@@ -283,11 +285,16 @@ async function route() {
   footer(true);
   $("#nav").hidden = false;
   const [page, id] = (location.hash || "#/nodes").replace(/^#\/?/, "").split("/");
-  document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === page));
+  document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === (page === "tunnel-nodes" ? "nodes" : page)));
 
   if (page === "nodes" && id) return show((request) => nodeDetail(Number(id), request), true);
-  if (page === "nodes") return show(nodeList, true);
-  if (page === "chains") return show(chainList, true);
+  if (page === "nodes" || page === "tunnel-nodes") {
+    nodeKind = page === "tunnel-nodes" ? "tunnel" : "forward";
+    return show(nodeList, true);
+  }
+  if (page === "configs" || page === "chains") return show(chainList, true);
+  if (page === "routes") return show(routeList, true);
+  if (page === "tunnels") return show(tunnelList, true);
   if (page === "settings") return show(settingsPage, false);
   location.hash = "#/nodes";
 }
@@ -345,7 +352,7 @@ function showChangeAccount() {
 
 // ------------------------------------------------------------ 节点列表
 
-const KIND_LABEL = { nodes: "节点", chains: "转发" };
+const KIND_LABEL = { nodes: "转发节点", tunnel_nodes: "隧道节点", routes: "链路", tunnels: "隧道", chains: "配置" };
 
 // 列表页标题栏：排序模式下显示「取消 / 完成」；搜索或筛选时不能排序
 function listHead(kind, total, shown, newAction, newLabel) {
@@ -462,19 +469,21 @@ const has = (text, q) => String(text).toLowerCase().includes(q.trim().toLowerCas
 const countText = (n, label, cls) => (n ? `<span class="${cls}"> · ${n} ${label}</span>` : "");
 
 async function nodeList(request) {
-  const data = await api("GET", "nodes");
+  const data = await api("GET", `nodes?kind=${nodeKind}`);
   if (request !== viewRequest) return;
-  list = { kind: "nodes", data, draw: drawNodes };
+  const kind = nodeKind === "tunnel" ? "tunnel_nodes" : "nodes";
+  data[kind] = data.nodes;
+  list = { kind, data, draw: drawNodes };
   drawNodes();
 }
 
 function drawNodes() {
-  const d = list.data;
-  if (sortMode === "nodes") {
-    return render(listHead("nodes", d.nodes.length, d.nodes.length) +
-      sortList("nodes", d.nodes, (n) => `<div class="title">${esc(n.name)}</div>${nodeSub(n)}`));
+  const d = list.data, kind = list.kind;
+  if (sortMode === kind) {
+    return render(nodeTabs() + listHead(kind, d.nodes.length, d.nodes.length) +
+      sortList(kind, d.nodes, (n) => `<div class="title">${esc(n.name)}</div>${nodeSub(n)}`));
   }
-  const f = filters.nodes;
+  const f = filters[kind];
   const items = d.nodes.filter((n) =>
     (!f.q || has(n.name, f.q)) && (!f.status || n.status === f.status) && (!f.group || n.group_id === Number(f.group)));
   const card = (n) => `
@@ -488,15 +497,15 @@ function drawNodes() {
   const summary = (ns) =>
     countText(ns.filter((n) => n.status === "offline").length, "离线", "t-red") +
     countText(ns.filter((n) => ["error", "skew"].includes(n.status)).length, "异常", "t-yellow");
-  const tools = d.nodes.length ? filterBar("nodes", [
+  const tools = d.nodes.length ? filterBar(kind, [
     filterInput("q", "搜索名称", "search"),
     filterSelect("status", "全部状态", plainOptions(Object.entries(STATUS).map(([k, [label]]) => [k, label]))),
     d.groups.length > 1 ? filterSelect("group", "全部分组", groupOptions(d.groups)) : "",
   ]) : "";
-  let body = groupedList("nodes", items, card, summary);
-  if (!items.length && isFiltering("nodes")) body = emptyState("⌕", "没有匹配的节点。");
+  let body = groupedList(kind, items, card, summary);
+  if (!items.length && isFiltering(kind)) body = emptyState("⌕", "没有匹配的节点。");
   else if (!d.nodes.length && d.groups.length === 1) body = emptyState("◎", "还没有节点，点击右上角新增。");
-  render(listHead("nodes", d.nodes.length, items.length, "node-new", "新增节点") + tools + body);
+  render(nodeTabs() + listHead(kind, d.nodes.length, items.length, "node-new", nodeKind === "tunnel" ? "新增隧道节点" : "新增转发节点") + tools + body);
   syncFilters();
 }
 
@@ -520,6 +529,7 @@ async function nodeDetail(id, request) {
   }
   if (request !== viewRequest) return;
   const n = (currentNode = d.node);
+  if (n.kind === "tunnel") return drawTunnelNode(d);
   const url = syncAddress(d.public_url, d.sync_path);
   const shown = revealedKeys.has(id);
   const install = (key) => `curl -fsSL ${d.agent_url} -o ictl.sh && sudo bash ictl.sh --url '${url}' --key '${key}'`;
@@ -527,7 +537,7 @@ async function nodeDetail(id, request) {
   const rules = d.rules.length
     ? `<table><thead><tr><th>入站端口</th><th>转发到</th><th>所属转发</th></tr></thead><tbody>${d.rules.map((r) => `
         <tr><td class="mono">${r.port}</td><td class="mono">${esc(r.host)}:${r.tport}</td>
-        <td><a href="#/chains">${esc(r.chain_remark)}</a></td></tr>`).join("")}</tbody></table>`
+        <td><a href="#/configs">${esc(r.chain_remark)}</a></td></tr>`).join("")}</tbody></table>`
     : `<div class="muted">${n.status === "deleting" ? "正在删除，已下发空配置" : "没有转发规则"}</div>`;
 
   const skew = n.skew == null ? "-" : `${n.skew > 0 ? "+" : ""}${n.skew} 秒`;
@@ -536,7 +546,7 @@ async function nodeDetail(id, request) {
     <span>来源 IP</span><span class="mono">${esc(n.src_ip || "-")}</span>
     <span>时差</span><span>${skew}</span>
     <span>节点端版本</span><span>${esc(n.agent || "-")}${AGENT_UPDATE[n.agent_update]
-      ? `<span class="muted">（服务端为 ${esc(d.version)}，${AGENT_UPDATE[n.agent_update]}）</span>` : ""}</span>
+      ? `<span class="muted">（目标转发 Agent 为 ${esc(d.forward_version)}，${AGENT_UPDATE[n.agent_update]}）</span>` : ""}</span>
     <span>已应用版本</span><span class="mono">${esc(n.reported_v || "-")}</span>
     <span>应有版本</span><span class="mono">${esc(n.want_v)}</span>
     <span>上报状态</span><span>${esc(n.state || "-")}</span>
@@ -593,11 +603,11 @@ function pendingLine(c) {
 }
 
 function chainStatus(c) {
-  return c.deleting ? "deleting" : c.pending.length ? "applying" : "applied";
+  return c.status || (c.deleting ? "deleting" : c.pending.length ? "applying" : "applied");
 }
 
 async function chainList(request) {
-  const data = await api("GET", "chains");
+  const data = await api("GET", "configs");
   if (request !== viewRequest) return;
   list = { kind: "chains", data, draw: drawChains };
   drawChains();
@@ -608,7 +618,7 @@ function drawChains() {
   if (sortMode === "chains") {
     return render(listHead("chains", d.chains.length, d.chains.length) + sortList("chains", d.chains, (c) =>
       `<div class="title">${esc(c.remark)}</div>
-       <div class="sub">${c.hops.map((h) => esc(h.name)).join(" → ")} → <span class="mono">${esc(c.target_host)}:${c.target_port}</span></div>`));
+       <div class="sub">${c.hops.length ? c.hops.map((h) => esc(h.name)).join(" → ") + " → " : "直连隧道 · "}<span class="mono">${esc(c.target_host)}:${c.target_port}</span></div>`));
   }
   const f = filters.chains;
   const items = d.chains.filter((c) =>
@@ -622,7 +632,7 @@ function drawChains() {
     const path = c.hops.map((h) => `<span class="hop">${dot(h.status)}${esc(h.name)}:${h.port}</span>`);
     path.push(`<span class="hop mono">${esc(c.target_host)}:${c.target_port}</span>`);
     const first = c.hops[0];
-    const entry = first ? `${first.addr}:${first.port}` : "";
+    const entry = c.connection ? `${c.connection.host}:${c.connection.port}` : first ? `${first.addr}:${first.port}` : "";
     const entryLine = entry ? `<div class="entry"><span class="muted">入口</span><code>${esc(entry)}</code>${c.deleting
       ? "" : `<button class="small" data-action="copy" data-text="${esc(entry)}">复制</button>`}</div>` : "";
     let badge, actions;
@@ -630,7 +640,8 @@ function drawChains() {
       badge = `<span class="badge removing"><i class="spinner"></i>删除中…</span>`;
       actions = `<button class="small danger" data-action="chain-delete" data-id="${c.id}" data-force="1">强制删除</button>`;
     } else {
-      badge = c.pending.length
+      badge = c.status === "waiting" ? `<span class="badge applying">等待隧道应用</span>`
+        : c.status === "error" ? `<span class="badge removing">应用失败</span>` : c.pending.length
         ? `<span class="badge applying"><i class="spinner"></i>下发中…</span>`
         : `<span class="badge applied">✓ 已生效</span>`;
       actions = `<button class="small" data-action="chain-edit" data-id="${c.id}">编辑</button>
@@ -643,6 +654,8 @@ function drawChains() {
           <div class="chain-side">${badge}<div class="chain-actions">${actions}</div></div>
         </div>
         ${entryLine}
+        <div class="sub">${c.route_id ? `链路：${esc(c.route_name)}` : "直连隧道"}${c.tunnel_id ? ` · 隧道：${esc(c.tunnel_name)}` : " · 直接转发"}</div>
+        ${c.connection && c.connection.protocol !== "direct" ? `<div class="entry"><span class="muted">连接信息</span><button class="small" data-action="connection" data-id="${c.id}">查看 / 复制</button>${c.connection.tcp_only ? `<span class="hint">SOCKS5 链路仅支持 TCP</span>` : ""}</div>` : ""}
         <div class="path">${path.join(`<span class="arrow">→</span>`)}</div>
         ${pendingLine(c)}
       </div>`;
@@ -655,13 +668,13 @@ function drawChains() {
     filterSelect("entry", "全部入口节点", nodeOptions(d.nodes, d.node_groups)),
     filterSelect("via", "经过任意节点", nodeOptions(d.nodes, d.node_groups)),
     filterInput("target", "目标地址"),
-    filterSelect("status", "全部状态", plainOptions([["applied", "已生效"], ["applying", "下发中"], ["deleting", "删除中"]])),
+    filterSelect("status", "全部状态", plainOptions([["applied", "已应用"], ["applying", "下发中"], ["waiting", "等待隧道"], ["error", "应用失败"], ["deleting", "删除中"]])),
     d.groups.length > 1 ? filterSelect("group", "全部分组", groupOptions(d.groups)) : "",
   ]) : "";
   let body = groupedList("chains", items, card, summary);
-  if (!items.length && isFiltering("chains")) body = emptyState("⌕", "没有匹配的转发。");
-  else if (!d.chains.length && d.groups.length === 1) body = emptyState("⇄", "还没有转发，点击右上角新增。");
-  render(listHead("chains", d.chains.length, items.length, "chain-new", "新增转发") + tools + body);
+  if (!items.length && isFiltering("chains")) body = emptyState("⌕", "没有匹配的配置。");
+  else if (!d.chains.length && d.groups.length === 1) body = emptyState("⇄", "还没有配置，选择链路组合或直连隧道。");
+  render(listHead("chains", d.chains.length, items.length, "chain-new", "新增配置") + tools + body);
   syncFilters();
 }
 
@@ -687,6 +700,8 @@ async function settingsPage(request) {
       <h2>对外地址</h2>
       <label><span>用于生成节点的同步地址。留空时使用当前访问面板的地址（${esc(location.origin)}）。</span>
         <input name="public_url" value="${esc(s.public_url)}" placeholder="https://example.com"></label>
+      <label><span>隧道 Agent 全局心跳间隔（秒，5-3600）</span><input name="tunnel_heartbeat" type="number" min="5" max="3600" value="${s.tunnel_heartbeat}" required></label>
+      <p class="hint">仅判断 Agent 在线；连续三个心跳周期未上报视为离线，不探测核心或端口。</p>
       <div class="form-error"></div>
       <div class="form-actions"><button class="primary">保存</button></div>
     </form>
@@ -695,7 +710,10 @@ async function settingsPage(request) {
       <div class="kv-grid">
         <span>同步路径</span><span class="mono">${esc(s.sync_path)}</span>
         <span>面板路径</span><span class="mono">${esc(s.panel_path)}/</span>
-        <span>版本</span><span>${esc(s.version)}</span>
+        <span>服务端</span><span>${esc(s.version)}</span>
+        <span>转发 Agent</span><span>${esc(s.components.forward_agent)}</span>
+        <span>隧道 Agent</span><span>${esc(s.components.tunnel_agent)}</span>
+        <span>sing-box</span><span>${esc(s.components.sing_box.version)}</span>
       </div>
     </div>`);
 }
@@ -751,11 +769,11 @@ function groupSelect(groups, selected) {
 
 async function nodeForm(node) {
   const page = pageVersion;
-  const { groups } = await api("GET", "nodes");
+  const { groups } = await api("GET", `nodes?kind=${node?.kind || nodeKind}`);
   if (page !== pageVersion) return;
   openModal(`
     <h2>${node ? "编辑节点" : "新增节点"}</h2>
-    <form data-form="node" data-id="${node ? node.id : ""}">
+    <form data-form="node" data-id="${node ? node.id : ""}" data-kind="${node?.kind || nodeKind}">
       <label><span>名称</span><input name="name" value="${esc(node?.name)}" maxlength="64" required></label>
       ${groupSelect(groups, node?.group_id)}
       <label><span>备注（选填，节点的说明）</span><textarea name="note" rows="3" maxlength="500">${esc(node?.note)}</textarea></label>
@@ -804,33 +822,52 @@ function renumberHops() {
 
 async function chainForm(chain) {
   const page = pageVersion;
-  const d = await api("GET", "nodes");
+  const [d, rd, td] = await Promise.all([api("GET", "nodes"), api("GET", "routes"), api("GET", "tunnels")]);
   if (page !== pageVersion) return;
-  const nodes = d.nodes.filter((n) => n.status !== "deleting");
-  const hops = chain ? chain.hops : [{}];
+  const routes = rd.routes;
+  const tunnels = td.tunnels.filter(t => !t.deleting);
+  const selectedRoute = chain ? chain.route_id : routes[0]?.id || null;
+  const selectedType = chain?.tunnel_id || !selectedRoute ? "tunnel" : "direct";
   openModal(`
-    <h2>${chain ? "编辑转发" : "新增转发"}</h2>
-    <form data-form="chain" data-id="${chain ? chain.id : ""}">
-      <label><span>别名</span><input name="remark" value="${esc(chain?.remark)}" maxlength="64" required></label>
+    <h2>${chain ? "编辑配置" : "新增配置"}</h2>
+    <form data-form="chain" data-id="${chain?.id || ""}">
+      <label><span>名称</span><input name="remark" value="${esc(chain?.remark)}" maxlength="64" required></label>
       ${groupSelect(list.data.groups, chain?.group_id)}
-      <div class="hops">
-        <label style="margin-bottom:6px"><span>经过的节点（按顺序，每一跳填写该节点的入站端口，留空则自动分配一个未使用的端口）</span></label>
-        <div id="hop-list">${hops.map((h) => hopRow(nodes, d.groups, h)).join("")}</div>
-        <button type="button" class="small" data-action="hop-add">添加一跳</button>
-        <div class="field-error" data-error="hops"></div>
+      <label><span>链路模板</span><select name="route_id"><option value="" ${selectedRoute === null ? "selected" : ""}>无链路（直连隧道）</option>${routes.map(r => `<option value="${r.id}" ${r.id === selectedRoute ? "selected" : ""}>${esc(r.name)}</option>`).join("")}</select></label>
+      <div id="config-ports"></div>
+      <label><span>目标类型</span><select name="target_type"><option value="direct">IP / 域名 + 端口</option><option value="tunnel" ${selectedType === "tunnel" ? "selected" : ""}>隧道</option></select></label>
+      <div data-target="direct" class="row">
+        <label><span>目标地址</span><input name="target_host" value="${esc(chain?.target_host)}"></label>
+        <label class="narrow"><span>目标端口</span><input name="target_port" value="${chain?.target_port || ""}" type="number" min="1" max="65535"></label>
       </div>
-      <div class="row">
-        <label><span>目标地址（IPv4 或域名）</span><input name="target_host" value="${esc(chain?.target_host)}" class="mono" required></label>
-        <label class="narrow"><span>目标端口</span><input name="target_port" value="${chain?.target_port ?? ""}" inputmode="numeric" required></label>
-      </div>
+      <div data-target="tunnel"><label><span>隧道</span><select name="tunnel_id"><option value="">请选择隧道</option>${tunnels.map(t => `<option value="${t.id}" ${t.id === chain?.tunnel_id ? "selected" : ""}>${esc(t.name)} · ${esc(t.protocol)} · ${esc(t.node_name)}</option>`).join("")}</select></label></div>
       <div class="form-error"></div>
-      <div class="form-actions">
-        <button type="button" data-action="modal-close">取消</button>
-        <button class="primary">保存</button>
-      </div>
+      <div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div>
     </form>`);
-  $("#modal form").hopTemplate = () => hopRow(nodes, d.groups);
-  renumberHops();
+  const form = $("#modal form");
+  const updatePorts = () => {
+    const r = routes.find(r => r.id === Number(form.elements.route_id.value));
+    if (!r) { $("#config-ports", form).innerHTML = ""; return; }
+    const old = r.id === chain?.route_id ? [...chain.hops] : [];
+    $("#config-ports", form).innerHTML = `<p class="hint">各跳端口属于此配置；留空自动分配。链路修改会自动更新引用它的配置。</p>` + r.node_ids.map((nid, i) => {
+      const n = d.nodes.find(n => n.id === nid);
+      const index = old.findIndex(h => h.node_id === nid);
+      const previous = index >= 0 ? old.splice(index, 1)[0].port : "";
+      return `<label><span>${i + 1}. ${esc(n.name)}（允许 ${esc(n.ports)}）</span><input name="config_port" value="${previous}" type="number" min="1" max="65535" placeholder="自动分配"></label>`;
+    }).join("");
+  };
+  const updateTarget = () => {
+    const directTunnel = !form.elements.route_id.value;
+    if (directTunnel) form.elements.target_type.value = "tunnel";
+    form.elements.target_type.querySelector('[value="direct"]').disabled = directTunnel;
+    form.querySelectorAll("[data-target]").forEach(el => {
+      el.hidden = el.dataset.target !== form.elements.target_type.value;
+      el.querySelectorAll("input,select").forEach(input => { input.disabled = el.hidden; input.required = !el.hidden; });
+    });
+  };
+  form.elements.route_id.addEventListener("change", () => { updatePorts(); updateTarget(); });
+  form.elements.target_type.addEventListener("change", updateTarget);
+  updatePorts(); updateTarget();
 }
 
 // ------------------------------------------------------------ 表单处理
@@ -885,7 +922,7 @@ const FORMS = {
   },
 
   async settings(form, data) {
-    await api("PATCH", "settings", { public_url: data.public_url });
+    await api("PATCH", "settings", { public_url: data.public_url, tunnel_heartbeat: Number(data.tunnel_heartbeat) });
     toast("已保存");
     refresh();
   },
@@ -893,12 +930,12 @@ const FORMS = {
   async node(form, data) {
     const id = form.dataset.id;
     if (!id) {
-      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr, ports: data.ports, group_id: groupId(data) });
+      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr, ports: data.ports, kind: form.dataset.kind, group_id: groupId(data) });
       closeModal();
       location.hash = `#/nodes/${r.id}`;
       return;
     }
-    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr, ports: data.ports, group_id: groupId(data) });
+    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr, ports: data.ports, kind: form.dataset.kind, group_id: groupId(data) });
     closeModal();
     if (r.key) {
       const ups = r.upstream.length ? `<p>以下节点的规则会自动更新：${r.upstream.map(esc).join("、")}</p>` : "";
@@ -923,12 +960,10 @@ const FORMS = {
 
   async chain(form, data) {
     const id = form.dataset.id;
-    const hops = [...form.querySelectorAll(".hop-row")].map((r) => ({
-      node_id: Number($("[name=hop-node]", r).value) || null,
-      port: $("[name=hop-port]", r).value.trim(),
-    }));
-    const body = { remark: data.remark, target_host: data.target_host, target_port: data.target_port, hops, group_id: groupId(data) };
-    const r = await api(id ? "PATCH" : "POST", id ? `chains/${id}` : "chains", body);
+    const ports = [...form.querySelectorAll("[name=config_port]")].map(input => input.value);
+    const body = { remark: data.remark, route_id: data.route_id ? Number(data.route_id) : null, target_type: data.target_type,
+      tunnel_id: Number(data.tunnel_id) || null, target_host: data.target_host, target_port: data.target_port, ports, group_id: groupId(data) };
+    const r = await api(id ? "PATCH" : "POST", id ? `configs/${id}` : "configs", body);
     closeModal();
     toast(r.assigned.length ? `已保存，自动分配端口：${r.assigned.join("、")}` : "已保存，正在下发到节点");
     refresh();
@@ -997,7 +1032,7 @@ const ACTIONS = {
     const r = await api("DELETE", `nodes/${n.id}${force ? "?force=1" : ""}`);
     if (r.deleted) {
       toast("已删除");
-      location.hash = "#/nodes";
+      location.hash = n.kind === "tunnel" ? "#/tunnel-nodes" : "#/nodes";
     } else {
       toast("已下发空配置，节点确认后自动删除");
       refresh();
@@ -1066,10 +1101,12 @@ const ACTIONS = {
     const c = chainById(el.dataset.id);
     const force = el.dataset.force === "1";
     const text = force
-      ? `直接删除转发 <b>${esc(c.remark)}</b> 的记录。尚未确认的节点恢复连接后，会在同步时自动清除对应规则。`
-      : `将通知相关节点移除转发 <b>${esc(c.remark)}</b> 的规则，所有节点确认后自动删除。`;
-    if (!(await confirmBox(force ? "强制删除转发" : "删除转发", text, "删除", true))) return;
-    const r = await api("DELETE", `chains/${c.id}${force ? "?force=1" : ""}`);
+      ? `直接删除配置 <b>${esc(c.remark)}</b> 的记录。尚未确认的节点恢复连接后，会在同步时自动清除对应规则。`
+      : c.route_id || c.pending.length
+        ? `将通知相关节点移除配置 <b>${esc(c.remark)}</b> 的转发规则，所有节点确认后自动删除。`
+        : `删除直连配置 <b>${esc(c.remark)}</b>？隧道监听及其他引用配置会保留。`;
+    if (!(await confirmBox(force ? "强制删除配置" : "删除配置", text, "删除", true))) return;
+    const r = await api("DELETE", `configs/${c.id}${force ? "?force=1" : ""}`);
     toast(r.deleted ? "已删除" : "已通知节点，确认后自动删除");
     refresh();
   },
@@ -1181,6 +1218,184 @@ document.addEventListener("change", (e) => {
   if (e.target.name !== "theme") return;
   localStorage.setItem("ictl-theme", e.target.value);
   document.documentElement.dataset.theme = e.target.value;
+});
+
+// ------------------------------------------------------------ 链路与隧道
+
+function nodeTabs() {
+  return `<div class="tabs"><a href="#/nodes" class="${nodeKind === "forward" ? "selected" : ""}">转发节点</a><a href="#/tunnel-nodes" class="${nodeKind === "tunnel" ? "selected" : ""}">隧道节点</a></div>`;
+}
+
+function drawTunnelNode(d) {
+  const n = d.node;
+  const url = syncAddress(d.public_url, d.tunnel_path);
+  const shown = revealedKeys.has(n.id);
+  const shellQuote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
+  const install = key => `curl -fsSL ${shellQuote(d.tunnel_installer_url)} -o install-tunnel.sh && sudo bash install-tunnel.sh --url ${shellQuote(url)} --token ${shellQuote(key)}`;
+  const apply = n.state === "error" ? "应用失败" : n.state === "ok" && n.reported_v === n.want_v ? "已应用" : "待应用";
+  render(`
+    <a class="back" href="#/tunnel-nodes">← 隧道节点列表</a>
+    <div class="detail-head"><div><h1>${esc(n.name)}</h1><div class="sub mono">${esc(n.addr)}</div></div><div class="meta">${pill(n.status)}<span class="muted">最后心跳 ${ago(n.last_seen, d.now)}</span></div></div>
+    <div class="panel">${bar(n.bar)}</div>
+    ${n.note ? `<div class="panel note-full"><h2>备注</h2>${esc(n.note)}</div>` : ""}
+    <div class="panel"><h2>接入信息</h2>
+      <div class="kv"><span>服务地址</span><code>${esc(url)}</code></div>
+      <div class="kv"><span>密钥</span><code>${shown ? esc(n.key) : "•".repeat(32)}</code><button class="small" data-action="key-toggle">${shown ? "隐藏" : "显示"}</button><button class="small" data-action="copy" data-text="${esc(n.key)}">复制</button></div>
+      <div class="kv"><span>安装命令</span><code>${esc(install(shown ? n.key : "••••••"))}</code><button class="small" data-action="copy" data-text="${esc(install(n.key))}">复制</button></div>
+      <p class="hint">Linux amd64 / arm64；需要 HTTPS、systemd、curl 和 Python 3。安装后前往“隧道”创建协议监听。</p>
+      ${url.startsWith("https://") ? "" : `<p class="t-red">请先配置 HTTPS，并在系统设置填写 HTTPS 对外地址。</p>`}
+    </div>
+    <div class="panel"><h2>版本与配置</h2><div class="kv-grid">
+      <span>隧道 Agent</span><span>${esc(n.agent || "未连接")}（目标 ${esc(d.tunnel_version)}）</span>
+      <span>sing-box</span><span>${esc(n.core_version || "未上报")}</span>
+      <span>允许端口</span><span>${esc(n.ports)}</span>
+      <span>配置状态</span><span>${apply}</span>
+      <span>错误信息</span><span>${esc(n.err || "无")}</span>
+      <span>已应用版本</span><code>${esc(n.reported_v || "-")}</code>
+      <span>应有版本</span><code>${esc(n.want_v)}</code>
+    </div><p class="hint">更新 Agent 和兼容核心：<code>sudo ictl-tunnel-agent update</code>。配置“已应用”不代表完成连通性检测。</p></div>
+    <div class="actions"><button data-action="node-edit">编辑</button><button data-action="node-rekey">重置密钥</button><button class="danger" data-action="node-delete" ${n.status === "deleting" ? 'data-force="1"' : ""}>${n.status === "deleting" ? "强制删除" : "删除"}</button></div>
+    ${detailsBlock(`events-${n.id}`, "事件记录", `<ul class="events">${d.events.map(e => `<li><time>${fmtTime(e.ts)}</time><span>${esc(e.text)}</span></li>`).join("") || "暂无事件"}</ul>`)}`);
+}
+
+async function routeList(request) {
+  const data = await api("GET", "routes");
+  if (request !== viewRequest) return;
+  list = {kind: "routes", data, draw: drawRoutes};
+  drawRoutes();
+}
+
+function drawRoutes() {
+  const d = list.data;
+  const card = r => `<div class="card" data-key="route-${r.id}"><div class="card-head"><div class="title">${esc(r.name)}</div><div class="actions"><button class="small" data-action="route-edit" data-id="${r.id}">编辑</button><button class="small danger" data-action="route-delete" data-id="${r.id}">删除</button></div></div>
+      <div class="path">${r.nodes.map(n => `<a href="#/nodes/${n.id}">${esc(n.name)}</a>`).join('<span class="arrow">→</span>')}</div>
+      <div class="sub">${r.configs.length ? `被 ${r.configs.length} 个配置引用：${r.configs.map(c => esc(c.remark)).join("、")}` : "尚未被配置使用"}</div></div>`;
+  drawManagedList("routes", d.routes, card, "route-new", "新增链路", "链路保存转发节点顺序，不分配端口。修改后会自动更新所有引用配置。");
+}
+
+// 各列表共用交互方式，数据、分组 ID、筛选与折叠状态按 kind 分开。
+function drawManagedList(kind, rows, card, newAction, newLabel, hint) {
+  if (sortMode === kind) return render(listHead(kind, rows.length, rows.length) +
+    sortList(kind, rows, item => `<div class="title">${esc(item.name)}</div>`));
+  const f = filters[kind], groups = list.data.groups;
+  const items = rows.filter(item => (!f.q || has(item.name, f.q)) && (!f.group || item.group_id === Number(f.group)));
+  const controls = filterBar(kind, [filterInput("q", "搜索名称", "search"),
+    groups.length > 1 ? filterSelect("group", "全部分组", groupOptions(groups)) : ""]);
+  const body = !items.length && isFiltering(kind) ? emptyState("⌕", "没有匹配的记录。")
+    : !rows.length && groups.length === 1 ? emptyState("◎", `还没有${KIND_LABEL[kind]}，点击右上角新增。`)
+    : groupedList(kind, items, card, () => "");
+  render(listHead(kind, rows.length, items.length, newAction, newLabel) + `<p class="hint">${hint}</p>` + controls + body);
+  syncFilters();
+}
+
+async function routeForm(r) {
+  const page = pageVersion;
+  const d = await api("GET", "nodes");
+  if (page !== pageVersion) return;
+  const nodes = d.nodes.filter(n => n.kind === "forward" && n.status !== "deleting");
+  if (!nodes.length) return toast("请先添加转发节点", true);
+  const row = id => `<div class="hop-row route-hop"><span class="hop-no"></span><select name="route-node" required><option value="">选择节点</option>${nodeOptions(nodes, d.groups, id)}</select><button type="button" data-action="hop-up">↑</button><button type="button" data-action="hop-down">↓</button><button type="button" data-action="hop-del">✕</button></div>`;
+  openModal(`<h2>${r ? "编辑链路" : "新增链路"}</h2><form data-form="route" data-id="${r?.id || ""}">
+    <label><span>名称</span><input name="name" value="${esc(r?.name)}" maxlength="64" required></label>
+    ${groupSelect(list.data.groups, r?.group_id)}
+    <div id="hop-list">${(r?.node_ids || [null]).map(row).join("")}</div><button type="button" class="small" data-action="hop-add">添加一跳</button>
+    ${r?.configs.length ? `<p class="t-yellow">保存会自动更新 ${r.configs.length} 个配置：${r.configs.map(c => esc(c.remark)).join("、")}。调整入口节点会改变连接地址。</p>` : ""}
+    <div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
+  $("#modal form").hopTemplate = () => row(null); renumberHops();
+}
+
+const PROTOCOLS = {shadowsocks: "Shadowsocks", "vless-reality": "VLESS Reality", socks5: "SOCKS5"};
+const APPLY_LABEL = {applied:"已应用", applying:"下发中", deleting:"删除中", error:"应用失败"};
+async function tunnelList(request) {
+  const data = await api("GET", "tunnels");
+  if (request !== viewRequest) return;
+  list = {kind: "tunnels", data, draw: drawTunnels};
+  drawTunnels();
+}
+
+function drawTunnels() {
+  const d = list.data;
+  const card = t => `<div class="card" data-key="tunnel-${t.id}"><div class="card-head"><div class="title">${esc(t.name)}</div><div class="actions"><span class="badge ${t.status === "applied" ? "applied" : "applying"}">${APPLY_LABEL[t.status]}</span>${t.deleting ? "" : `<button class="small" data-action="tunnel-edit" data-id="${t.id}">编辑</button><button class="small danger" data-action="tunnel-delete" data-id="${t.id}">删除</button>`}</div></div>
+      <div class="path">${esc(PROTOCOLS[t.protocol])}<span class="arrow">·</span><a href="#/nodes/${t.node_id}">${esc(t.node_name)}</a>${pill(t.agent_status)}<span class="mono">端口 ${t.port}</span></div>
+      <div class="sub">被 ${t.references} 个配置引用${t.protocol === "socks5" ? " · 链路组合仅支持 TCP" : ""}</div>
+      ${t.status === "error" ? `<p class="t-red">${esc(t.err)}</p>` : ""}</div>`;
+  drawManagedList("tunnels", d.tunnels, card, "tunnel-new", "新增隧道", "隧道使用独立节点上的 sing-box；在“配置”中选择链路组合或直连，并获取连接信息。");
+}
+
+async function tunnelForm(t) {
+  const page = pageVersion;
+  const d = await api("GET", "nodes?kind=tunnel");
+  if (page !== pageVersion) return;
+  const nodes = d.nodes.filter(n => n.kind === "tunnel" && n.status !== "deleting");
+  if (!nodes.length) return toast("请先添加隧道节点", true);
+  openModal(`<h2>${t ? "编辑隧道" : "新增隧道"}</h2><form data-form="tunnel" data-id="${t?.id || ""}">
+    <label><span>名称</span><input name="name" value="${esc(t?.name)}" maxlength="64" required></label>
+    ${groupSelect(list.data.groups, t?.group_id)}
+    <label><span>隧道节点</span><select name="node_id" ${t ? "disabled" : ""}>${nodeOptions(nodes, d.groups, t?.node_id)}</select></label>
+    <label><span>协议</span><select name="protocol" ${t ? "disabled" : ""}>${Object.entries(PROTOCOLS).map(([id, name]) => `<option value="${id}" ${t?.protocol === id ? "selected" : ""}>${name}</option>`).join("")}</select></label>
+    <label><span>监听端口（留空自动分配）</span><input name="port" type="number" min="1" max="65535" value="${t?.port || ""}"></label>
+    <div data-protocol="vless-reality">
+      <label><span>Reality SNI</span><input name="server_name" value="${esc(t?.params.server_name)}" placeholder="目标站点域名"></label>
+      <label><span>握手服务器（留空使用 SNI）</span><input name="handshake_host" value="${esc(t?.params.handshake_host)}"></label>
+      <label><span>握手端口</span><input name="handshake_port" type="number" min="1" max="65535" value="${t?.params.handshake_port || 443}"></label>
+      <p class="hint">使用支持 TLS 1.3 的握手站点。UUID、Reality 密钥及 short ID 自动生成。</p>
+    </div>
+    <div data-protocol="socks5"><label><span>用户名（留空自动生成或保留）</span><input name="username" value="${esc(t?.params.username)}" autocomplete="off"></label><label><span>密码（留空自动生成或保留）</span><input name="password" type="password" autocomplete="new-password"></label><p class="hint">链路组合首版支持 TCP。</p></div>
+    <div data-protocol="shadowsocks"><p class="hint">固定使用 2022-blake3-aes-128-gcm，密码自动生成；客户端需要支持 Shadowsocks 2022。</p></div>
+    ${t?.references ? `<p class="t-yellow">此隧道被 ${t.references} 个配置引用，修改会自动更新相关配置。</p>` : ""}
+    <p class="hint">应用时会重启此节点的专属 sing-box，该节点上的其他隧道可能短暂中断。</p>
+    <div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
+  const form = $("#modal form");
+  form.original = t;
+  const update = () => form.querySelectorAll("[data-protocol]").forEach(el => {
+    el.hidden = el.dataset.protocol !== form.elements.protocol.value;
+    el.querySelectorAll("input").forEach(i => {i.disabled = el.hidden; i.required = !el.hidden && ["server_name", "handshake_port"].includes(i.name);});
+  });
+  form.elements.protocol.addEventListener("change", update); update();
+}
+
+Object.assign(FORMS, {
+  async route(form, data) {
+    const id = form.dataset.id;
+    const body = {name: data.name, group_id: groupId(data), node_ids: [...form.querySelectorAll("[name=route-node]")].map(s => Number(s.value))};
+    const r = await api(id ? "PATCH" : "POST", id ? `routes/${id}` : "routes", body);
+    closeModal(); toast(r.affected ? `已保存，自动更新 ${r.affected} 个引用配置` : "链路已保存"); refresh();
+  },
+  async tunnel(form, data) {
+    const id = form.dataset.id;
+    const body = {name: data.name, group_id: groupId(data), node_id: form.original?.node_id || Number(data.node_id),
+      protocol: form.original?.protocol || data.protocol, port: data.port, params: {}};
+    if (body.protocol === "vless-reality") body.params = {server_name:data.server_name, handshake_host:data.handshake_host || data.server_name, handshake_port:Number(data.handshake_port)};
+    if (body.protocol === "socks5") body.params = {username:data.username, password:data.password};
+    const r = await api(id ? "PATCH" : "POST", id ? `tunnels/${id}` : "tunnels", body);
+    closeModal(); toast(`已保存，监听端口 ${r.port}，等待 Agent 应用`); refresh();
+  }
+});
+Object.assign(ACTIONS, {
+  "route-new": () => routeForm(),
+  "route-edit": el => routeForm(list.data.routes.find(r => r.id === Number(el.dataset.id))),
+  async "route-delete"(el) {
+    const r = list.data.routes.find(r => r.id === Number(el.dataset.id));
+    if (r.configs.length) return toast("此链路仍被配置引用，请先解除引用", true);
+    if (!(await confirmBox("删除链路", `删除 <b>${esc(r.name)}</b>？`, "删除", true))) return;
+    await api("DELETE", `routes/${r.id}`); toast("已删除"); refresh();
+  },
+  "tunnel-new": () => tunnelForm(),
+  "tunnel-edit": el => tunnelForm(list.data.tunnels.find(t => t.id === Number(el.dataset.id))),
+  async "tunnel-delete"(el) {
+    const t = list.data.tunnels.find(t => t.id === Number(el.dataset.id));
+    if (t.references) return toast("此隧道仍被配置引用，请先解除引用", true);
+    if (!(await confirmBox("删除隧道", `将移除 <b>${esc(t.name)}</b> 的监听，Agent 确认后释放端口。`, "删除", true))) return;
+    const r = await api("DELETE", `tunnels/${t.id}`); toast(r.deleted ? "已删除" : "等待 Agent 确认移除"); refresh();
+  },
+  connection(el) {
+    const c = chainById(el.dataset.id), x = c.connection;
+    openModal(`<h2>${esc(c.remark)} · 连接信息</h2><div class="kv-grid"><span>协议</span><span>${esc(PROTOCOLS[x.protocol] || x.protocol)}</span><span>地址</span><code>${esc(x.host)}:${x.port}</code>${x.username ? `<span>用户名</span><code>${esc(x.username)}</code>` : ""}${x.password ? `<span>密码</span><code>${esc(x.password)}</code>` : ""}</div>
+      <label><span>连接链接</span><textarea readonly rows="4">${esc(x.uri)}</textarea></label>
+      ${x.tcp_only ? `<p class="hint">此 SOCKS5 链路仅支持 TCP，链接导入支持取决于客户端。</p>` : ""}
+      <p class="hint">${chainStatus(c) === "applied" ? "配置已应用；尚未进行连通性检测。" : "配置尚未全部应用，请等待节点确认。"}</p>
+      <div class="form-actions"><button data-action="modal-close">关闭</button><button class="primary" data-action="copy" data-text="${esc(x.uri)}">复制链接</button></div>`);
+  }
 });
 
 // ------------------------------------------------------------ 启动
