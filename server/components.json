@@ -1,6 +1,6 @@
 {
   "api": 1,
-  "server": "0.2.0",
+  "server": "0.2.1",
   "forward_agent": "0.1.8",
   "tunnel_agent": "0.1.0",
   "sing_box": {

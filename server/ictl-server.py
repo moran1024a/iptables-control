@@ -24,7 +24,7 @@ import time
 from urllib.parse import parse_qs
 import tunnel_config
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -164,15 +164,16 @@ def init_db():
         os.makedirs(d, mode=0o700, exist_ok=True)
     conn = db()
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version > 201:
+    if version > 202:
         conn.close()
         raise UserError("数据库版本高于本服务端，请使用兼容版本")
-    if version == 201:
+    if version == 202:
         return conn
     # 备份旧库，包括尚未 checkpoint 的 WAL；迁移失败时旧数据仍然可恢复。
     exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'nodes'").fetchone()
     if exists:
-        backup_path = DB_PATH + (".pre-0.2.0.bak" if version < 200 else ".pre-layout-201.bak")
+        backup_path = DB_PATH + (".pre-0.2.0.bak" if version < 200 else
+                                 ".pre-layout-201.bak" if version == 200 else ".pre-0.2.1.bak")
         if not os.path.exists(backup_path):
             temporary = backup_path + ".tmp"
             backup = sqlite3.connect(temporary)
@@ -183,8 +184,12 @@ def init_db():
             os.chmod(temporary, 0o600)
             os.replace(temporary, backup_path)
     conn.execute("PRAGMA journal_mode = WAL")
+    if version == 201:
+        migrate_imports(conn)
+        return conn
     if version == 200:
         migrate_layout(conn)
+        migrate_imports(conn)
         return conn
     conn.executescript(SCHEMA)
     # 旧版本升级
@@ -231,6 +236,7 @@ def init_db():
             reset_admin(conn)
     migrate_v020(conn)
     migrate_layout(conn)
+    migrate_imports(conn)
     return conn
 
 
@@ -398,8 +404,9 @@ def migrate_layout(conn):
             schema = schema.replace("DEFAULT 'forward'", "DEFAULT 'tunnel'")
             conn.execute(schema)
             conn.execute("INSERT INTO tunnel_nodes SELECT * FROM nodes WHERE kind = 'tunnel'")
-            # 两种节点的分组各有独立记录，复制旧名称与排序以保留用户的归属。
-            for g in conn.execute("SELECT * FROM item_groups WHERE kind = 'nodes' ORDER BY id").fetchall():
+            # 仅迁移隧道节点实际使用的分组，避免复制仅属于转发节点的空分组。
+            for g in conn.execute("""SELECT * FROM item_groups WHERE kind = 'nodes'
+                    AND (builtin = 1 OR id IN (SELECT group_id FROM tunnel_nodes)) ORDER BY id""").fetchall():
                 gid = conn.execute("INSERT INTO item_groups(kind,name,builtin,sort) VALUES ('tunnel_nodes',?,?,?)",
                                    (g["name"], g["builtin"], g["sort"])).lastrowid
                 conn.execute("UPDATE tunnel_nodes SET group_id = ? WHERE group_id = ?", (gid, g["id"]))
@@ -434,6 +441,33 @@ def migrate_layout(conn):
             if before != after:
                 raise UserError("节点隔离迁移失败：转发规则发生变化")
             conn.execute("PRAGMA user_version = 201")
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def migrate_imports(conn):
+    """允许外部隧道不关联 Agent，保留已有隧道 ID、端口、凭据与引用。"""
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""CREATE TABLE tunnels_new (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                node_id INTEGER REFERENCES tunnel_nodes(id),
+                protocol TEXT NOT NULL, port INTEGER NOT NULL, params TEXT NOT NULL,
+                deleting INTEGER NOT NULL DEFAULT 0, group_id INTEGER NOT NULL DEFAULT 0,
+                sort INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'agent',
+                external_host TEXT,
+                CHECK ((source = 'agent' AND node_id IS NOT NULL AND external_host IS NULL)
+                    OR (source = 'external' AND node_id IS NULL AND external_host IS NOT NULL)),
+                UNIQUE(node_id, port))""")
+            conn.execute("""INSERT INTO tunnels_new(id,name,node_id,protocol,port,params,deleting,group_id,sort)
+                SELECT id,name,node_id,protocol,port,params,deleting,group_id,sort FROM tunnels""")
+            conn.execute("DROP TABLE tunnels")
+            conn.execute("ALTER TABLE tunnels_new RENAME TO tunnels")
+            if conn.execute("PRAGMA foreign_key_check").fetchall():
+                raise UserError("隧道导入升级失败：引用完整性校验未通过")
+            conn.execute("PRAGMA user_version = 202")
     finally:
         conn.execute("PRAGMA foreign_keys = ON")
 
@@ -1573,12 +1607,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                      ready=bool(row["ready"]), tunnel_name=None, connection=None)
             if row["tunnel_id"]:
                 t = get_tunnel(conn, row["tunnel_id"])
-                n = get_node(conn, t["node_id"])
+                external = t["source"] == "external"
+                n = None if external else get_node(conn, t["node_id"])
                 c["tunnel_name"] = t["name"]
+                c["tunnel_source"] = t["source"]
                 c["tunnel_status"] = self.tunnel_brief(conn, t)["status"]
-                c["tunnel_agent_status"] = node_status(conn, n, int(time.time()))
+                c["tunnel_agent_status"] = None if external else node_status(conn, n, int(time.time()))
                 if not c["deleting"]:
-                    first = c["hops"][0] if c["hops"] else {"addr": n["addr"], "port": t["port"]}
+                    first = c["hops"][0] if c["hops"] else {
+                        "addr": t["external_host"] if external else n["addr"], "port": t["port"]}
                     c["connection"] = tunnel_config.connection(t, first["addr"], first["port"], c["remark"])
                     if not row["route_id"]:
                         c["connection"].pop("tcp_only", None)
@@ -1589,7 +1626,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             c["status"] = ("deleting" if c["deleting"] else
                            "error" if ((row["tunnel_id"] and c["tunnel_status"] == "error") or
                                        any(p["status"] in ("error", "skew") for p in c["pending"])) else
-                           "waiting" if not c["ready"] else "applying" if c["pending"] else "applied")
+                           "waiting" if not c["ready"] else "applying" if c["pending"] else
+                           "saved" if c.get("tunnel_source") == "external" and not c["hops"] else "applied")
         return data
 
     def api_config_save(self, conn, body, chain_id=None):
@@ -1608,11 +1646,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         tunnel_id, ready = None, 1
         if target_type == "tunnel":
             t = get_tunnel(conn, body.get("tunnel_id"))
-            n = get_node(conn, t["node_id"])
-            if t["deleting"] or n["deleting"]:
+            n = None if t["source"] == "external" else get_node(conn, t["node_id"])
+            if t["deleting"] or (n is not None and n["deleting"]):
                 raise UserError("隧道正在删除", "tunnel_id")
-            tunnel_id, host, port = t["id"], n["addr"], t["port"]
-            ready = int(tunnel_ready(conn, n["id"]))
+            tunnel_id, host, port = t["id"], t["external_host"] if n is None else n["addr"], t["port"]
+            ready = 1 if n is None else int(tunnel_ready(conn, n["id"]))
         elif target_type == "direct":
             host = check_host(body.get("target_host"), "target_host")
             port = check_port(body.get("target_port"), "target_port")
@@ -1638,13 +1676,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return {"id": chain_id, "assigned": assigned}
 
     def tunnel_brief(self, conn, t):
+        if t["source"] == "external":
+            return {"id": t["id"], "name": t["name"], "group_id": t["group_id"], "node_id": None,
+                    "node_name": "手动导入", "source": "external", "host": t["external_host"],
+                    "protocol": t["protocol"], "port": t["port"], "deleting": False, "status": "imported",
+                    "agent_status": None, "params": json.loads(t["params"]),
+                    "uri": tunnel_config.connection(t, t["external_host"], t["port"], t["name"])["uri"],
+                    "references": conn.execute("SELECT COUNT(*) FROM chains WHERE tunnel_id = ?", (t["id"],)).fetchone()[0]}
         n = get_node(conn, t["node_id"])
         want = tunnel_snapshot(conn, n)["revision"]
         state = "deleting" if t["deleting"] else "applied" if tunnel_ready(conn, n["id"]) else "error" if n["state"] == "error" else "applying"
         # 凭据只在已认证的面板中显示，私钥只下发给对应 Agent。
         p = json.loads(t["params"])
         p.pop("private_key", None)
-        return {"id": t["id"], "name": t["name"], "group_id": t["group_id"], "node_id": t["node_id"], "node_name": n["name"],
+        return {"id": t["id"], "name": t["name"], "group_id": t["group_id"], "node_id": t["node_id"], "node_name": n["name"], "source": "agent",
                 "protocol": t["protocol"], "port": t["port"], "params": p, "deleting": bool(t["deleting"]),
                 "status": state, "agent_status": node_status(conn, n, int(time.time())),
                 "want_v": want, "err": n["err"] or "", "references": conn.execute(
@@ -1658,6 +1703,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         old = get_tunnel(conn, tunnel_id) if tunnel_id is not None else None
         if old and old["deleting"]:
             raise UserError("隧道正在删除")
+        source = body.get("source", old["source"] if old else "agent")
+        if source not in ("agent", "external") or (old and source != old["source"]):
+            raise UserError("隧道来源无效或与原记录不一致", "source")
+        if source == "external":
+            return self.api_imported_tunnel_save(conn, body, old)
         name = check_remark(body.get("name"), "name", "名称")
         nid = body.get("node_id", old["node_id"] if old else None)
         n = get_node(conn, nid)
@@ -1709,12 +1759,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     conn.execute("UPDATE chains SET target_port = ? WHERE tunnel_id = ?", (port, tunnel_id))
         return {"id": tunnel_id, "port": port}
 
+    def api_imported_tunnel_save(self, conn, body, old):
+        if any(key in body for key in ("node_id", "port", "protocol", "params")):
+            raise UserError("手动导入隧道的地址、协议和凭据请通过分享链接修改", "uri")
+        if "uri" in body or not old:
+            try:
+                parsed = tunnel_config.import_uri(body.get("uri"))
+                host = check_host(parsed["host"], "uri")
+                if parsed["protocol"] == "vless-reality":
+                    check_host(parsed["params"]["server_name"], "uri")
+            except ValueError as e:
+                raise UserError(str(e), "uri") from None
+            port, protocol, params = parsed["port"], parsed["protocol"], tunnel_config.canonical(parsed["params"])
+            fallback_name = old["name"] if old else parsed["name"]
+        else:
+            host, port, protocol, params = old["external_host"], old["port"], old["protocol"], old["params"]
+            fallback_name = old["name"]
+        name = check_remark(body.get("name") or fallback_name, "name", "名称")
+        group_id = check_group(conn, "tunnels", body.get("group_id", old["group_id"] if old else None))
+        with conn:
+            if old:
+                tunnel_id = old["id"]
+                conn.execute("""UPDATE tunnels SET name=?,external_host=?,port=?,protocol=?,params=? WHERE id=?""",
+                             (name, host, port, protocol, params, tunnel_id))
+                if group_id != old["group_id"]:
+                    move_group(conn, "tunnels", tunnel_id, group_id)
+                if (host, port) != (old["external_host"], old["port"]):
+                    conn.execute("UPDATE chains SET target_host=?,target_port=? WHERE tunnel_id=?", (host, port, tunnel_id))
+                    for c in conn.execute("SELECT id FROM chains WHERE tunnel_id=? AND deleting=0", (tunnel_id,)).fetchall():
+                        mark_config_nodes(conn, c["id"])
+            else:
+                tunnel_id = conn.execute("""INSERT INTO tunnels(name,protocol,port,params,group_id,sort,source,external_host)
+                    VALUES (?,?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM tunnels),'external',?)""",
+                    (name, protocol, port, params, group_id, host)).lastrowid
+        return {"id": tunnel_id, "port": port, "source": "external"}
+
     def api_tunnel_del(self, conn, body, tunnel_id):
         t = get_tunnel(conn, tunnel_id)
         if conn.execute("SELECT 1 FROM chains WHERE tunnel_id = ?", (tunnel_id,)).fetchone():
             raise UserError("隧道仍被配置引用，请先解除引用")
         with conn:
-            if not get_node(conn, t["node_id"])["first_seen"]:
+            if t["source"] == "external" or not get_node(conn, t["node_id"])["first_seen"]:
                 conn.execute("DELETE FROM tunnels WHERE id = ?", (tunnel_id,))
                 return {"deleted": True}
             conn.execute("UPDATE tunnels SET deleting = 1 WHERE id = ?", (tunnel_id,))

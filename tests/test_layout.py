@@ -128,7 +128,7 @@ class LayoutTests(Fixture, unittest.TestCase):
         before=s.node_rules(old,old.execute('SELECT * FROM nodes WHERE id=10').fetchone())
         snapshot=s.tunnel_snapshot(old,old.execute('SELECT * FROM nodes WHERE id=20').fetchone())
         old.close();self.db=s.init_db()
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],201)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],202)
         self.assertEqual(s.node_rules(self.db,s.get_node(self.db,10)),before)
         self.assertEqual(s.tunnel_snapshot(self.db,s.get_node(self.db,20)),snapshot)
         self.assertEqual(s.get_node(self.db,20)['key'],'cd'*32)

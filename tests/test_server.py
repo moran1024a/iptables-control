@@ -65,7 +65,7 @@ class ServerTests(Fixture, unittest.TestCase):
         self.assertEqual(s.AGENT[0], '0.1.8')
         self.assertEqual(s.agent_update('0.1.8', 1), 'same')
         self.assertEqual(s.agent_update('0.1.7', 1), 'pending')
-        self.assertEqual(s.VERSION, '0.2.0')
+        self.assertEqual(s.VERSION, '0.2.1')
 
     def test_route_allocates_no_ports(self):
         a, b = self.node(), self.node('B')
