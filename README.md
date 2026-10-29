@@ -1,6 +1,6 @@
 # iptables-control (ictl)
 
-轻量的中心化 iptables 转发管理面板。服务端 **0.3.0**，Bash Agent **0.2.0**。以下下载命令获取最新 Release。
+轻量的中心化 iptables 转发管理面板。服务端 **0.3.1**，Bash Agent **0.2.1**，单机脚本 **3.1**。以下下载命令获取最新 Release。
 
 ## 安装
 
@@ -14,13 +14,25 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/downlo
 
 **转发节点**：在面板新增节点，复制详情页的“一键接入”命令，到节点执行。安装后运行 `sudo ictl` 进入菜单。
 
-节点需要 Bash、curl、openssl 1.1.1+、iptables（含 save／restore、addrtype、conntrack）、getent、flock 和 systemd；与服务端时差不能超过 60 秒。
+节点需要 Bash、curl、openssl 1.1.1+、iptables（含 save／restore、addrtype、conntrack）、ss（iproute2）、getent、flock 和 systemd；与服务端时差不能超过 60 秒。
 
 面板登录应使用 HTTPS：通过反向代理转发到 `127.0.0.1:8730`，在“设置 → 对外地址”填写 HTTPS 地址，再复制节点接入命令。
+
+**单机脚本（不需要服务端或 Agent）：**
+
+```bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/ipt.sh -o ipt.sh.download &&
+sudo install -m 755 ipt.sh.download /root/ipt.sh.new && sudo mv -f /root/ipt.sh.new /root/ipt.sh
+sudo bash /root/ipt.sh
+```
+
+支持独立运行或与 Agent 共存，使用 systemd 开机恢复和域名定时刷新；首次运行会检查并安装缺少的 Python 3.8+、iptables 和 iproute2 软件包。
 
 ## 升级
 
 **服务端**：重新执行上面的安装命令。默认沿用端口、绑定地址和数据挂载；`--force` 可强制重建。安装器保留升级前数据库备份，新容器启动或就绪检查失败时恢复旧容器和数据库。
+
+**升级至 0.3.1**：先升级服务端，再升级 Agent 和单机脚本。单机脚本重新执行上面的下载命令；若原脚本不在 `/root/ipt.sh`，须替换原路径，确保已有定时任务运行新版。Agent 的端口检查需要 `ss`，缺失时会报告检查失败；共存时两端均须升级到本文版本。
 
 **升级至 0.3.0 会删除数据库中全部隧道节点、受管隧道及其关联配置。远端旧 Agent、sing-box 和配置文件不做处理，需自行卸载。** 外部导入的 SS／VLESS 转为“目标”，原配置中的地址和端口逐条生成独立目标；其余有效配置、密钥、路径、端口、分组和排序保留。
 
@@ -32,6 +44,8 @@ sudo ictl --sync             # 同步配置并上报执行结果
 ```
 
 旧节点升级后默认主动，成功上报新协议后才能切换模式；以后升级保留已选模式。被动节点只在手动同步时检查自动更新，菜单 5 可开关程序自动更新。
+
+Agent 0.2.1 起，已安装的新版启动时会检查 `/root/ictl.sh` 和 `/ictl.sh`，将特征匹配且版本更旧的 Agent 脚本替换为指向 `/usr/local/bin/ictl` 的软链接，原路径随后也会运行最新版。已有软链接及其他目录不作处理；配置、密钥和转发规则保留。整理失败会提示，下次运行 `sudo ictl` 时重试。
 
 迁移备份为数据库旁的 `ictl.db.pre-0.3.0.bak`，安装器另保留 `/data/ictl.db.pre-deploy-*.bak`。**回退须停止服务，同时恢复旧镜像和升级前数据库，移除新库的 `-wal`／`-shm` 后再启动**；回退会丢弃升级后新增的数据。自定义数据库路径请手动备份、升级和回退。
 
@@ -89,6 +103,14 @@ docker exec ictl-server python3 /app/ictl-server.py reset-admin    # 重置管�
 在面板修改模式后，**两个方向的切换都需要本机手动同步确认**。主动切被动时，下一次轮询会先停止后台同步；被动切主动时，本机同步成功后恢复轮询。混合链路不保证所有节点同时生效。
 
 手动同步按“上报 → 获取配置 → 应用 → 上报结果”执行。失败、旧确认或应用期间出现新变更不会清除等待；确认丢失时有限重试，仍失败请再次手动同步。绿色只代表收到同步请求，成功或失败见事件记录。两种状态条均保留 60 格，记录保留 7 天；主动模式的 20 秒记录从更新后开始积累。
+
+### 单独运行与共存
+
+无需切换模式：只有 Agent 或只有 `ipt.sh` 时各自正常工作，两者同时存在时会检查对方已保存的端口。双方还会检查实际转发规则和本机服务端口，并使用同一把锁串行完成检查、应用和保存。配置存在但损坏时报告错误；仅停止服务不释放已保存的端口。
+
+按“协议＋本机入站端口”判断冲突；Agent 同时使用 TCP、UDP。服务端照常分配和下发，不收集单机端口清单，也不自动换端口。Agent 冲突时拒绝整份新配置，保留原规则并上报“异常”；普通心跳和重启不会清除异常。同一失败配置不反复应用，修改配置或在本机执行 `sudo ictl --sync` 后才重新检查。被动节点仍需手动同步，开机检测失败只保存本地错误，不联网。
+
+单机脚本新增、修改、导入或恢复遇到冲突时取消操作并返回菜单，后台自检失败则记录日志。恢复备份只恢复其自身配置和规则，旧全量备份也不会整表覆盖防火墙。规则缓存改存 `/root/iptables-forward-conf/rules.v4`；旧 `/etc/iptables/rules.v4` 中可识别的单机条目和 Agent 条目分别由各自程序备份后清理，其他条目保留。
 
 ## 源码部署
 

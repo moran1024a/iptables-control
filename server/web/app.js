@@ -9,7 +9,7 @@ const STATUS = {
   skew: ["时间不一致", "yellow"],
   syncing: ["等待中", "blue"],
   synced: ["已同步", "green"],
-  error: ["失败", "yellow"],
+  error: ["异常", "yellow"],
   deleting: ["删除中", "grey"],
 };
 // 节点端版本与服务端不一致时的说明
@@ -529,7 +529,8 @@ async function nodeDetail(id, request) {
   const n = (currentNode = d.node);
   const url = syncAddress(d.public_url, d.sync_path);
   const shown = revealedKeys.has(id);
-  const install = (key) => `curl -fsSL ${d.agent_url} -o ictl.sh && sudo bash ictl.sh --url '${url}' --key '${key}'`;
+  const quote = (value) => "'" + String(value).replaceAll("'", "'\\''") + "'";
+  const install = (key) => `(f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL ${quote(d.agent_url)} -o "$f" && sudo bash "$f" --url ${quote(url)} --key ${quote(key)})`;
 
   const rules = d.rules.length
     ? `<table><thead><tr><th>入站端口</th><th>转发到</th><th>所属转发</th></tr></thead><tbody>${d.rules.map((r) => `
@@ -599,7 +600,7 @@ function pendingLine(c) {
   if (!c.pending.length) return "";
   const who = c.pending.map((p) => {
     const note = ["synced", "syncing"].includes(p.status) ? "" : `<span class="muted">（${STATUS[p.status]?.[0] || p.status}）</span>`;
-    return `<span class="who">${dot(p.status)}${esc(p.name)}${note}${p.desired_mode === "passive" ? `<span class="muted">（需本机同步）</span>` : ""}</span>`;
+    return `<span class="who" title="${esc(p.err || '')}">${dot(p.status)}${esc(p.name)}${note}${p.desired_mode === "passive" ? `<span class="muted">（需本机同步）</span>` : ""}</span>`;
   });
   return `<div class="pending">等待确认：${who.join("")}</div>`;
 }
@@ -643,7 +644,7 @@ function drawChains() {
       actions = `<button class="small danger" data-action="chain-delete" data-id="${c.id}" data-force="1">强制删除</button>`;
     } else {
       badge = c.status === "saved" ? `<span class="badge">已保存</span>`
-        : c.status === "error" ? `<span class="badge removing">应用失败</span>` : c.pending.length
+        : c.status === "error" ? `<span class="badge removing">异常</span>` : c.pending.length
         ? `<span class="badge applying"><i class="spinner"></i>等待中…</span>`
         : `<span class="badge applied">✓ 已应用</span>`;
       actions = `<button class="small" data-action="chain-edit" data-id="${c.id}">编辑</button>
@@ -670,7 +671,7 @@ function drawChains() {
     filterSelect("entry", "全部入口节点", nodeOptions(d.nodes, d.node_groups)),
     filterSelect("via", "经过任意节点", nodeOptions(d.nodes, d.node_groups)),
     filterInput("target", "目标地址"),
-    filterSelect("status", "全部状态", plainOptions([["applied", "已应用"], ["saved", "已保存"], ["applying", "下发中"], ["error", "应用失败"], ["deleting", "删除中"]])),
+    filterSelect("status", "全部状态", plainOptions([["applied", "已应用"], ["saved", "已保存"], ["applying", "下发中"], ["error", "异常"], ["deleting", "删除中"]])),
     d.groups.length > 1 ? filterSelect("group", "全部分组", groupOptions(d.groups)) : "",
   ]) : "";
   let body = groupedList("chains", items, card, summary);

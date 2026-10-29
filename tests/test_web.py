@@ -1,11 +1,44 @@
 """Exercise real DOM rendering, modes, white activity bars and target-only forms in Chrome."""
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
 from test_server import ROOT
+
+
+class InstallCommandTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('node'), 'Node is unavailable')
+    def test_download_does_not_follow_legacy_link_and_cleans_temporary_file(self):
+        source=(ROOT/'server/web/app.js').read_text()
+        code='\n'.join(line for line in source.splitlines() if line.startswith('  const quote =') or line.startswith('  const install ='))
+        url="https://example.com/sync'quoted"
+        command=subprocess.check_output(['node','-e','const d={agent_url:"https://example.com/ictl.sh"};const url='+json.dumps(url)+';\n'+code+'\nprocess.stdout.write(install("test-key"));'],text=True)
+        for fail in ('0','1'):
+            with self.subTest(download_failure=fail), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);bin_dir=root/'bin';bin_dir.mkdir();tmp=root/'tmp';tmp.mkdir()
+                installed=root/'installed';installed.write_text('installed Agent must remain unchanged')
+                (root/'ictl.sh').symlink_to(installed)
+                curl=bin_dir/'curl';curl.write_text('''#!/bin/bash
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -o ]; then output="$2"; shift; fi
+  shift
+done
+printf '%s\\n' "$output" > "$MOCK_ROOT/download-path"
+printf '%s\\n' '#!/bin/bash' 'printf "%s\\n" "$@" > "$MOCK_ROOT/arguments"' > "$output"
+[ "$FAIL_DOWNLOAD" = 0 ]
+''');curl.chmod(0o755)
+                sudo=bin_dir/'sudo';sudo.write_text('#!/bin/bash\nexec "$@"\n');sudo.chmod(0o755)
+                env={**os.environ,'PATH':str(bin_dir)+':'+os.environ['PATH'],'TMPDIR':str(tmp),'MOCK_ROOT':str(root),'FAIL_DOWNLOAD':fail}
+                result=subprocess.run(['bash','-c',command],cwd=root,env=env,capture_output=True,text=True)
+                self.assertEqual(result.returncode,0 if fail=='0' else 1,result.stderr)
+                self.assertEqual(installed.read_text(),'installed Agent must remain unchanged')
+                self.assertTrue((root/'ictl.sh').is_symlink())
+                self.assertFalse(Path((root/'download-path').read_text().strip()).exists())
+                if fail=='0':self.assertEqual((root/'arguments').read_text().splitlines(),['--url',url,'--key','test-key'])
+                else:self.assertFalse((root/'arguments').exists())
 
 
 class BrowserTests(unittest.TestCase):
@@ -20,7 +53,7 @@ const target={id:1,name:"target",type:"endpoint",host:"example.com",port:443,par
 const ss={...target,id:2,type:"shadowsocks",name:"SS target",uri:"ss://example"};
 const routeData={id:1,name:"route",node_ids:[1],nodes:[node],configs:[],group_id:1};
 const chain={id:1,remark:"config",route_id:1,route_name:"route",target_id:1,target_name:"target",target_host:"example.com",target_port:443,group_id:1,hops:[{...node,node_id:1,port:10001}],pending:[{...node,node_id:1}],status:"applying",connection:{protocol:"endpoint",host:"192.0.2.1",port:10001,uri:"192.0.2.1:10001"}};
-const responses={me:{username:"owner",version:"0.3.0"},nodes:{nodes:[node],groups:[group],now:100},"nodes/1":{node,rules:[],chains:[],events:[],sync_path:"/sync",public_url:"https://example.com",agent_url:"https://example.com/ictl.sh",forward_version:"0.2.0",now:100},routes:{routes:[routeData],groups:[group]},targets:{targets:[target,ss],groups:[group]},configs:{chains:[chain],nodes:[node],node_groups:[group],groups:[group]},settings:{components:{forward_agent:"0.2.0"},username:"owner",version:"0.3.0",sync_path:"/sync",panel_path:"/panel",public_url:""}};
+const responses={me:{username:"owner",version:"0.3.1"},nodes:{nodes:[node],groups:[group],now:100},"nodes/1":{node,rules:[],chains:[],events:[],sync_path:"/sync",public_url:"https://example.com",agent_url:"https://example.com/ictl.sh",forward_version:"0.2.1",now:100},routes:{routes:[routeData],groups:[group]},targets:{targets:[target,ss],groups:[group]},configs:{chains:[chain],nodes:[node],node_groups:[group],groups:[group]},settings:{components:{forward_agent:"0.2.1"},username:"owner",version:"0.3.1",sync_path:"/sync",panel_path:"/panel",public_url:""}};
 const requests=[];
 window.fetch=async (url,options={})=>{
  const path=String(url).split("api/")[1]?.split("?")[0];
@@ -51,6 +84,13 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(document.querySelector('[name=desired_mode]').value==='passive',"mode selection wrong");closeModal();
   await show(r=>nodeDetail(1,r),false);
   assert(app.textContent.includes('sudo ictl --sync'),"manual action hint missing");
+  node.status='error';node.err='端口冲突：TCP 10001 已被本机服务占用';
+  await show(r=>nodeDetail(1,r),false);
+  assert(app.textContent.includes('异常')&&app.textContent.includes(node.err),"conflict detail missing");
+  chain.status='error';chain.pending[0].status='error';chain.pending[0].err=node.err;
+  await show(chainList,false);
+  assert(app.textContent.includes('异常')&&app.textContent.includes('等待确认'),"conflict cleared pending state");
+  assert(app.querySelector('.who').title===node.err,"conflict source missing");
   await show(targetList,false);assert(app.textContent.includes('SS target'),"target list missing");
   targetForm(target);assert(document.querySelector('[name=host]'),"endpoint form missing");closeModal();
   targetForm(ss);assert(document.querySelector('[name=uri]'),"import form missing");closeModal();

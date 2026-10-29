@@ -5,6 +5,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import test_server
@@ -18,12 +19,14 @@ args=sys.argv[1:];name=pathlib.Path(sys.argv[0]).name
 with (root/'commands').open('a') as log:log.write(name+' '+' '.join(args)+'\n')
 def save():p.write_text(json.dumps(x))
 if name=='iptables-save':
- t=args[args.index('-t')+1]
- print('*'+t)
- for chain,rules in x[t].items():print(':'+chain+' - [0:0]')
- for chain,rules in x[t].items():
-  for rule in rules:print('-A '+chain+' '+rule)
- print('COMMIT');sys.exit(0)
+ tables=[args[args.index('-t')+1]] if '-t' in args else list(x)
+ for t in tables:
+  print('*'+t)
+  for chain,rules in x[t].items():print(':'+chain+' - [0:0]')
+  for chain,rules in x[t].items():
+   for rule in rules:print('-A '+chain+' '+rule)
+  print('COMMIT')
+ sys.exit(0)
 if name=='iptables-restore':
  current=None
  for line in sys.stdin.read().splitlines():
@@ -36,7 +39,10 @@ if name=='iptables-restore':
    if current=='filter' and marker.exists():marker.unlink();sys.exit(1)
    save()
  sys.exit(0)
-args=[a for a in args if a!='-w'];t='filter'
+if '-w' in args:
+ i=args.index('-w');del args[i]
+ if i<len(args) and args[i].isdigit():del args[i]
+t='filter'
 if '-t' in args:i=args.index('-t');t=args[i+1];del args[i:i+2]
 op,chain=args[:2] if len(args)>1 else (args[0],None)
 if op=='-S':
@@ -44,12 +50,12 @@ if op=='-S':
   print('-N '+c)
   for rule in rules:print('-A '+c+' '+rule)
  sys.exit(0)
-rest=args[2:]
-if op=='-I' and rest and rest[0].isdigit():rest=rest[1:]
+rest=args[2:];position=0
+if op=='-I' and rest and rest[0].isdigit():position=int(rest[0])-1;rest=rest[1:]
 rule=' '.join(rest)
 if op=='-C':sys.exit(0 if rule in x[t].get(chain,[]) else 1)
 if op=='-A':x[t].setdefault(chain,[]).append(rule)
-elif op=='-I':x[t].setdefault(chain,[]).insert(0,rule)
+elif op=='-I':x[t].setdefault(chain,[]).insert(position,rule)
 elif op=='-D':
  if rule not in x[t].get(chain,[]):sys.exit(1)
  x[t][chain].remove(rule)
@@ -69,8 +75,13 @@ class AgentHarness:
 printf 'systemctl %s\n' "$*" >> "$MOCK_ROOT/commands"
 [ ! -f "$MOCK_ROOT/fail-service" ]
 ''');systemctl.chmod(0o755)
+        ss=self.bin/'ss';ss.write_text('''#!/bin/bash
+[ ! -f "$MOCK_ROOT/fail-ss" ] || exit 1
+case "$*" in *t*) file="$MOCK_ROOT/tcp.sockets" ;; *) file="$MOCK_ROOT/udp.sockets" ;; esac
+if [ -f "$file" ]; then cat "$file"; fi
+''');ss.chmod(0o755)
         self.env={**os.environ,'PATH':str(self.bin)+':'+os.environ['PATH'],'MOCK_ROOT':str(self.root)}
-        source=(ROOT/'agent/ictl.sh').read_text().rsplit('case "${1:-}" in',1)[0]
+        source=(ROOT/'agent/ictl.sh').read_text().rsplit('\nmain "$@"',1)[0]
         source=source.replace('/run/ictl.',str(self.root)+'/request.')
         self.lib=self.root/'lib';self.lib.mkdir()
         self.conf=self.root/'conf';self.conf.mkdir()
@@ -82,6 +93,10 @@ KERNEL="$LIB/kernel"; MODE_FILE="$LIB/mode"; ACK_FILE="$LIB/ack"
 LOCK={shlex.quote(str(self.root/'lock'))}
 SERVICE={shlex.quote(str(self.root/'service'))}
 BIN={shlex.quote(str(self.root/'ictl'))}
+IPT_CONFIG={shlex.quote(str(self.root/'managed'))}
+LEGACY_PERSIST={shlex.quote(str(self.root/'system-rules.v4'))}
+SYSCTL={shlex.quote(str(self.root/'agent-sysctl'))}
+LEGACY_SCRIPTS=({shlex.quote(str(self.root/'root-ictl.sh'))} {shlex.quote(str(self.root/'ictl.sh'))})
 ensure_ip_forward() {{ :; }}
 '''
         self.script=self.root/'agent-lib.sh';self.script.write_text(source)
@@ -141,6 +156,113 @@ class AgentTests(AgentHarness,unittest.TestCase):
     def test_active_boot_can_fetch_replacement_when_cached_dns_fails(self):
         self.assertShell('local_apply_saved() { return 1; }; cycle() { MODE=passive; save_mode; }; daemon')
         self.assertEqual((self.lib/'mode').read_text(),'passive\n')
+
+
+class LegacyScriptTests(AgentHarness,unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.setup_agent()
+        self.installed=self.root/'ictl'
+        self.legacy=self.root/'root-ictl.sh'
+        self.other_legacy=self.root/'ictl.sh'
+        self.write_installed('0.2.1')
+        self.old_script='''#!/usr/bin/env bash
+# ictl 节点端：从服务端拉取转发规则，应用到 iptables 并上报结果
+VERSION="0.1.2"
+BIN="/usr/local/bin/ictl"
+CONF_DIR="/etc/ictl"
+touch "$MOCK_ROOT/old-script-executed"
+'''
+        self.legacy.write_text(self.old_script)
+
+    def tearDown(self):self.temp.cleanup()
+
+    def write_installed(self,version):
+        self.installed.write_text(f'#!/usr/bin/env bash\nVERSION="{version}"\nprintf "%s %s\\n" "$VERSION" "$*"\n')
+        self.installed.chmod(0o755)
+
+    def test_installed_startup_replaces_old_entries_and_preserves_node_data(self):
+        self.other_legacy.write_text(self.old_script.replace('0.1.2','0.2.0'))
+        unrelated=self.root/'backup.sh';unrelated.write_text(self.old_script)
+        files=[self.conf/'agent.conf',self.lib/'config',self.lib/'mode',self.lib/'state',self.root/'service',self.root/'kernel.json']
+        for path in files:path.write_text('preserved '+path.name)
+        before={p:p.read_bytes() for p in files}
+        self.assertShell('SELF="$BIN"; need_root() { :; }; daemon() { :; }; main --daemon')
+        for path in (self.legacy,self.other_legacy):
+            self.assertTrue(path.is_symlink());self.assertEqual(path.readlink(),self.installed)
+            result=subprocess.run([str(path),'--sync'],env=self.env,capture_output=True,text=True,check=True)
+            self.assertEqual(result.stdout,'0.2.1 --sync\n')
+        self.assertEqual(before,{p:p.read_bytes() for p in files})
+        self.assertEqual(unrelated.read_text(),self.old_script)
+        self.assertFalse((self.root/'old-script-executed').exists())
+        self.assertFalse((self.root/'commands').exists())
+        self.write_installed('0.2.2')
+        result=subprocess.run([str(self.legacy)],env=self.env,capture_output=True,text=True,check=True)
+        self.assertEqual(result.stdout,'0.2.2 \n')
+
+    def test_skips_unrecognized_current_newer_and_invalid_scripts(self):
+        candidates=[
+            '#!/bin/bash\necho unrelated\n',
+            self.old_script.replace('# ictl 节点端：','# unrelated：'),
+            self.old_script.replace('BIN="/usr/local/bin/ictl"','BIN="/opt/other"'),
+            self.old_script.replace('CONF_DIR="/etc/ictl"','CONF_DIR="/etc/other"'),
+            self.old_script.replace('0.1.2','0.2.1'),
+            self.old_script.replace('0.1.2','0.2.2'),
+            self.old_script.replace('0.1.2','invalid'),
+            self.old_script+'if then\n',
+        ]
+        for content in candidates:
+            with self.subTest(content=content):
+                self.legacy.write_text(content)
+                self.assertShell('SELF="$BIN"; with_lock cleanup_legacy_scripts')
+                self.assertFalse(self.legacy.is_symlink());self.assertEqual(self.legacy.read_text(),content)
+        self.assertFalse((self.root/'old-script-executed').exists())
+
+    def test_skips_existing_links_directories_and_missing_paths(self):
+        self.legacy.unlink();self.legacy.mkdir()
+        target=self.root/'custom.sh';target.write_text(self.old_script)
+        self.other_legacy.symlink_to(target)
+        self.assertShell('SELF="$BIN"; with_lock cleanup_legacy_scripts')
+        self.assertTrue(self.legacy.is_dir());self.assertEqual(self.other_legacy.readlink(),target)
+        self.assertEqual(target.read_text(),self.old_script)
+        target.unlink();self.legacy.rmdir()
+        self.assertShell('SELF="$BIN"; with_lock cleanup_legacy_scripts')
+        self.assertFalse(self.legacy.exists());self.assertEqual(self.other_legacy.readlink(),target)
+
+    def test_only_cleans_after_new_installed_program_is_running(self):
+        self.assertShell('SELF="${LEGACY_SCRIPTS[0]}"; cleanup_legacy_scripts')
+        self.assertEqual(self.legacy.read_text(),self.old_script)
+        for version in ('0.2.0','0.2.2'):
+            self.write_installed(version)
+            self.assertShell('SELF="$BIN"; cleanup_legacy_scripts')
+            self.assertFalse(self.legacy.is_symlink());self.assertEqual(self.legacy.read_text(),self.old_script)
+        self.installed.unlink()
+        self.assertShell('SELF="$BIN"; cleanup_legacy_scripts')
+        self.assertEqual(self.legacy.read_text(),self.old_script)
+        self.write_installed('0.2.1')
+        self.assertShell('SELF="$BIN"; with_lock cleanup_legacy_scripts')
+        self.assertTrue(self.legacy.is_symlink())
+
+    def test_failed_replacement_keeps_old_script_and_can_retry(self):
+        self.assertShell('SELF="$BIN"; mv() { return 1; }; ! with_lock cleanup_legacy_scripts')
+        self.assertFalse(self.legacy.is_symlink());self.assertEqual(self.legacy.read_text(),self.old_script)
+        self.assertFalse(list(self.root.glob('.ictl-link.*')))
+        self.assertShell('SELF="$BIN"; with_lock cleanup_legacy_scripts')
+        before=self.legacy.lstat().st_ino
+        self.assertShell('SELF="$BIN"; with_lock cleanup_legacy_scripts')
+        self.assertEqual(self.legacy.lstat().st_ino,before)
+
+    def test_cleanup_failure_does_not_block_menu_or_change_command_status(self):
+        result=self.shell('SELF="$BIN"; need_root() { :; }; mv() { return 1; }; menu() { echo menu-reached; return 17; }; main')
+        self.assertEqual(result.returncode,17,result.stderr)
+        self.assertIn('menu-reached',result.stdout);self.assertIn('下次运行 sudo ictl 时重试',result.stdout)
+        self.assertEqual(self.legacy.read_text(),self.old_script)
+
+    def test_uninstall_and_invalid_arguments_do_not_rewrite_old_entries(self):
+        self.assertShell('SELF="$BIN"; need_root() { :; }; uninstall() { [ "$1" = -y ]; }; main --uninstall -y')
+        self.assertEqual(self.legacy.read_text(),self.old_script)
+        result=self.shell('SELF="$BIN"; main --invalid')
+        self.assertEqual(result.returncode,1);self.assertIn('用法',result.stderr)
+        self.assertEqual(self.legacy.read_text(),self.old_script)
 
 
 class AgentHTTPTests(AgentHarness,test_server.HTTPTests):
@@ -232,3 +354,35 @@ send_request() {
         self.assertTrue(self.db.execute('SELECT 1 FROM chain_pending').fetchone())
         self.assertShell('with_lock cycle manual; [ "$CONFIRM" = confirmed ]')
         self.assertFalse(s.get_node(self.db,n)['manual_required'])
+
+    def test_real_conflict_is_reported_latched_and_cleared_after_port_edit(self):
+        n,r,c=self.enroll();before=json.loads((self.root/'kernel.json').read_text());config=(self.lib/'config').read_bytes()
+        (self.root/'managed').write_text('10002 example.com 443 tcp standalone\n')
+        self.call('api_config_save',{'ports':[10002]},c)
+        self.assertShell('! with_lock cycle auto; [[ "$R_ERR" == "端口冲突：TCP 10002"* ]]')
+        self.assertEqual(before,json.loads((self.root/'kernel.json').read_text()))
+        self.assertEqual((self.lib/'config').read_bytes(),config)
+        self.assertTrue(self.db.execute('SELECT 1 FROM chain_pending').fetchone())
+        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())),'error')
+        count=(self.root/'commands').read_text().count('iptables-restore')
+        self.assertShell('! with_lock cycle auto; [ "$R_STATE" = error ]')
+        self.assertEqual((self.root/'commands').read_text().count('iptables-restore'),count)
+        self.assertShell('with_lock local_apply_saved; load_state; [[ "$R_ERR" == "端口冲突：TCP 10002"* ]]')
+        self.call('api_config_save',{'ports':[10003]},c)
+        self.assertShell('with_lock cycle auto; [ "$CONFIRM" = confirmed ] && [ -z "$BLOCK_GEN" ]')
+        self.assertFalse(self.db.execute('SELECT 1 FROM chain_pending').fetchone())
+        self.assertIn('10003',(self.lib/'config').read_text())
+
+    def test_manual_retry_after_freeing_port_clears_same_generation_conflict(self):
+        n,r,c=self.enroll();(self.root/'tcp.sockets').write_text('LISTEN 0 128 0.0.0.0:10001 0.0.0.0:*\n')
+        self.assertShell('! with_lock cycle manual; [ "$R_STATE" = error ]')
+        (self.root/'tcp.sockets').unlink()
+        self.assertShell('! with_lock cycle auto; [ "$R_STATE" = error ]')
+        self.assertShell('with_lock cycle manual; [ "$CONFIRM" = confirmed ] && [ -z "$BLOCK_GEN" ]')
+
+    def test_runtime_listener_conflict_is_reported_in_the_same_poll(self):
+        n,r,c=self.enroll();before=json.loads((self.root/'kernel.json').read_text())
+        (self.root/'tcp.sockets').write_text('LISTEN 0 128 0.0.0.0:10001 0.0.0.0:*\n')
+        self.assertShell('! with_lock cycle auto; [[ "$R_ERR" == "端口冲突：TCP 10001"* ]]')
+        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())),'error')
+        self.assertEqual(before,json.loads((self.root/'kernel.json').read_text()))

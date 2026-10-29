@@ -27,8 +27,8 @@ jobs:
           node --check server/web/app.js
           for file in agent/ictl.sh deploy/install-server.sh ipt.sh; do bash -n "$file"; done
           mkdir -p dist
-          cp agent/ictl.sh deploy/install-server.sh server/components.json dist/
-          (cd dist && sha256sum ictl.sh install-server.sh components.json > SHA256SUMS)
+          cp agent/ictl.sh deploy/install-server.sh server/components.json ipt.sh dist/
+          (cd dist && sha256sum ictl.sh install-server.sh components.json ipt.sh > SHA256SUMS)
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3

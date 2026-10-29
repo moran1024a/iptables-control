@@ -11,6 +11,7 @@ checks = [
     ("server/ictl-server.py", r'^VERSION = "([^"]+)"', manifest["server"]),
     ("deploy/install-server.sh", r'^VERSION="([^"]+)"', manifest["server"]),
     ("agent/ictl.sh", r'^VERSION="([^"]+)"', manifest["forward_agent"]),
+    ("ipt.sh", r'^VERSION=([0-9.]+)$', manifest["standalone"]),
 ]
 for path, pattern, expected in checks:
     match = re.search(pattern, (root / path).read_text(), re.M)

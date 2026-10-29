@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/bin/ictl"
@@ -21,6 +21,7 @@ SERVICE_NAME="ictl-agent"
 SERVICE="/etc/systemd/system/$SERVICE_NAME.service"
 SYSCTL="/etc/sysctl.d/99-ictl.conf"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+LEGACY_SCRIPTS=(/root/ictl.sh /ictl.sh)
 
 if [ -t 1 ]; then
   GREEN=$'\033[32m' YELLOW=$'\033[33m' RED=$'\033[31m' CYAN=$'\033[36m' BOLD=$'\033[1m' DIM=$'\033[2m' RESET=$'\033[0m'
@@ -80,10 +81,10 @@ save_conf() {
 # 上报给服务端的内容：R_V 已处理的版本，R_STATE ok/error，R_ERR 错误说明
 # NET 最近一次请求结果：ok / auth / conn / bad / skew / noconf；ST_TIME 最近一次同步时间
 # SKEW 本机比服务端快多少秒（仅 NET=skew 时有值）
-R_V="" R_STATE="ok" R_ERR="" NET="" ST_TIME="" SKEW="" R_GEN=0 CONFIRM=""
+R_V="" R_STATE="ok" R_ERR="" NET="" ST_TIME="" SKEW="" R_GEN=0 CONFIRM="" BLOCK_GEN="" BLOCK_ERR=""
 load_state() {
   local k v
-  R_V="" R_STATE="ok" R_ERR="" NET="" ST_TIME="" SKEW="" R_GEN=0 CONFIRM=""
+  R_V="" R_STATE="ok" R_ERR="" NET="" ST_TIME="" SKEW="" R_GEN=0 CONFIRM="" BLOCK_GEN="" BLOCK_ERR=""
   if [ -f "$STATE" ]; then
     while IFS='=' read -r k v; do
       case "$k" in
@@ -95,6 +96,8 @@ load_state() {
         skew) SKEW="$v" ;;
         generation) R_GEN="$v" ;;
         confirm) CONFIRM="$v" ;;
+        blocked_generation) BLOCK_GEN="$v" ;;
+        blocked_error) BLOCK_ERR="$v" ;;
       esac
     done < "$STATE"
   elif [ -f "$CONFIG" ]; then
@@ -106,7 +109,7 @@ load_state() {
 save_state() {
   mkdir -p "$LIB"
   printf 'time=%s\nnet=%s\nskew=%s\nv=%s\nstate=%s\nerr=%s\n' "$(date +%s)" "$NET" "$SKEW" "$R_V" "$R_STATE" "$R_ERR" > "$STATE.tmp"
-  printf 'generation=%s\nconfirm=%s\n' "$R_GEN" "$CONFIRM" >> "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+  printf 'generation=%s\nconfirm=%s\nblocked_generation=%s\nblocked_error=%s\n' "$R_GEN" "$CONFIRM" "$BLOCK_GEN" "$BLOCK_ERR" >> "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
 }
 
 with_lock() {
@@ -231,6 +234,158 @@ aes() {
   ICTL_EK="$EK" openssl enc -aes-256-ctr -pbkdf2 -iter 1 -md sha256 -pass env:ICTL_EK "$@" 2>/dev/null
 }
 
+# Only inspect the peer and the kernel; never execute or source another manager's files.
+IPT_CONFIG="/root/iptables-forward-conf/managed-forwards.conf"
+LEGACY_PERSIST="/etc/iptables/rules.v4"
+is_port_error() { [[ "$1" == '端口冲突：'* || "$1" == '端口检查失败：'* ]]; }
+
+check_peer_ports() {
+  local line modern=0 first=1 incoming proto target ip key content
+  local -a fields
+  [ -e "$IPT_CONFIG" ] || [ -L "$IPT_CONFIG" ] || return 0
+  [ -f "$IPT_CONFIG" ] && [ -r "$IPT_CONFIG" ] || { echo '端口检查失败：无法读取单机脚本配置'; return 1; }
+  content="$(cat "$IPT_CONFIG")" || { echo '端口检查失败：无法读取单机脚本配置'; return 1; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$first" = 1 ] && [ "$line" = '# ipt-forward-manager v3' ]; then modern=1; first=0; continue; fi
+    first=0; line="${line%%#*}"; read -r -a fields <<< "$line"
+    [ "${#fields[@]}" -gt 0 ] || continue
+    if [ "$modern" = 1 ]; then
+      [ "${#fields[@]}" = 7 ] && [[ "${fields[0]}" =~ ^[0-9a-f]{32}$ ]] && valid_ipv4 "${fields[6]}" || {
+        echo '端口检查失败：单机脚本配置格式无效'; return 1;
+      }
+      incoming="${fields[1]}" target="${fields[3]}" proto="${fields[4]}"
+    else
+      [ "${#fields[@]}" = 5 ] || { echo '端口检查失败：单机脚本配置格式无效'; return 1; }
+      incoming="${fields[0]}" target="${fields[2]}" proto="${fields[3]}"
+    fi
+    [[ "$incoming" =~ ^[1-9][0-9]{0,4}$ && "$target" =~ ^[1-9][0-9]{0,4}$ ]] &&
+      [ "$incoming" -le 65535 ] && [ "$target" -le 65535 ] && [[ "$proto" =~ ^(tcp|udp|both)$ ]] || {
+      echo '端口检查失败：单机脚本配置端口或协议无效'; return 1;
+    }
+    for ip in $(protos "$proto"); do
+      key="$ip:$incoming"
+      if [ -n "${requested[$key]:-}" ]; then echo "端口冲突：${ip^^} $incoming 已被单机脚本保存的配置占用"; return 1; fi
+    done
+  done <<< "$content"
+}
+
+# Receives a validated wire configuration; caller holds /run/ictl.lock throughout the apply.
+check_port_conflicts() {
+  local config="$1" id proto port host target p key line address ip d error rc
+  local -a columns
+  local -A requested=()
+  while read -r id proto port host target; do
+    [[ "$id" != v=* ]] && [ -n "$id" ] || continue
+    for p in $(protos "$proto"); do requested["$p:$port"]=1; done
+  done <<< "$config"
+  [ "${#requested[@]}" -gt 0 ] || return 0
+  if ! error="$(check_peer_ports)"; then ERRS+=("$error"); return 1; fi
+  d="$(mktemp -d "$LIB/ports.XXXXXX")" || { ERRS+=('端口检查失败：无法创建临时文件'); return 1; }
+  for key in "${!requested[@]}"; do printf '%s\n' "${key/:/ }"; done > "$d/wanted"
+  if ! iptables-save > "$d/rules" 2> "$d/error"; then
+    rm -rf "$d"; ERRS+=('端口检查失败：无法读取防火墙规则'); return 1
+  fi
+  error="$(awk '
+    function hasport(list,port,    n,a,b,i,m,lo,hi) {
+      n=split(list,a,",")
+      for(i=1;i<=n;i++) {
+        m=split(a[i],b,":")
+        if(m>2 || a[i] ~ /[^0-9:]/) return -1
+        lo=(b[1]==""?0:b[1]+0); hi=(m==1?lo:(b[2]==""?65535:b[2]+0))
+        if(port>=lo && port<=hi) return 1
+      }
+      return 0
+    }
+    function matches(r,proto,port,    yes,m) {
+      if(protocol[r]!="") {
+        yes=(protocol[r]==proto || protocol[r]==(proto=="tcp"?"6":"17") || protocol[r]=="all" || protocol[r]=="0")
+        if(yes==negproto[r]) return 0
+      }
+      if(ports[r]!="") {
+        m=hasport(ports[r],port)
+        if(m>=0 && m==negport[r]) return 0
+      }
+      return 1
+    }
+    function visit(table,chain,proto,port,    k,i,r,j) {
+      k=table SUBSEP chain
+      if(visited[k] || chain=="ICTL-PRE" || chain=="ICTL-POST" || chain=="ICTL-FWD") return 0
+      visited[k]=1
+      for(i=1;i<=count[k];i++) {
+        r=rules[k,i]; if(!matches(r,proto,port)) continue
+        j=jump[r]
+        if(j=="DNAT" || j=="REDIRECT" || j=="TPROXY") {
+          print "端口冲突：" toupper(proto) " " port " 已被 " table "/" chain " 转发规则占用"; return 1
+        }
+        if(j!="" && visit(table,j,proto,port)) return 1
+      }
+      return 0
+    }
+    FILENAME==ARGV[1] { want[++w]=$1; number[w]=$2; next }
+    /^\*/ { table=substr($0,2); next }
+    /^-A / {
+      if(table!="nat" && table!="mangle") next
+      line=$0; gsub(/"([^"\\]|\\.)*"/,"COMMENT",line); n=split(line,a,/ +/)
+      r=++total; k=table SUBSEP a[2]; rules[k,++count[k]]=r
+      for(i=3;i<n;i++) {
+        value=a[i+1]; neg=(a[i-1]=="!")
+        if(value=="!") { value=a[i+2]; neg=1 }
+        if(a[i]=="-p" || a[i]=="--protocol") { protocol[r]=value; negproto[r]=neg }
+        if(a[i]=="--dport" || a[i]=="--destination-port" || a[i]=="--dports" || a[i]=="--destination-ports") { ports[r]=value; negport[r]=neg }
+        if(a[i]=="-j" || a[i]=="--jump" || a[i]=="-g" || a[i]=="--goto") jump[r]=value
+      }
+    }
+    END {
+      for(q=1;q<=w;q++) {
+        for(k in visited) delete visited[k]
+        if(visit("nat","PREROUTING",want[q],number[q]) || visit("mangle","PREROUTING",want[q],number[q])) exit 1
+      }
+    }
+  ' "$d/wanted" "$d/rules")"; rc=$?
+  if [ "$rc" -ne 0 ]; then rm -rf "$d"; ERRS+=("${error:-端口检查失败：无法解析防火墙规则}"); return 1; fi
+  for proto in tcp udp; do
+    if [ "$proto" = tcp ]; then p=-lnt; else p=-aun; fi
+    if ! ss -H "$p" > "$d/sockets" 2> "$d/error"; then
+      rm -rf "$d"; ERRS+=('端口检查失败：无法读取本机端口，请检查 ss（iproute2）'); return 1
+    fi
+    while read -r -a columns; do
+      [ "${#columns[@]}" -gt 0 ] || continue
+      p=3; [[ "${columns[0]}" != tcp && "${columns[0]}" != udp ]] || p=4
+      if [ "${#columns[@]}" -le "$p" ]; then error='端口检查失败：本机端口输出格式无效'; break; fi
+      address="${columns[$p]}"; port="${address##*:}"; ip="${address%:*}"
+      ip="${ip#\[}"; ip="${ip%\]}"; ip="${ip%%%*}"
+      [[ "$ip" != *:* || "$ip" = :: || "$ip" = ::ffff:* ]] || continue
+      if [[ ! "$port" =~ ^[0-9]+$ ]]; then error='端口检查失败：本机端口输出格式无效'; break; fi
+      if [ -n "${requested[$proto:$port]:-}" ]; then error="端口冲突：${proto^^} $port 已被本机服务占用"; break; fi
+    done < "$d/sockets"
+    [ -z "$error" ] || break
+  done
+  rm -rf "$d"
+  if [ -n "$error" ]; then ERRS+=("$error"); return 1; fi
+}
+
+# Earlier standalone releases saved the entire firewall. Remove only our own entries
+# from that legacy boot snapshot; the live firewall and unrelated entries stay intact.
+clean_legacy_persistence() {
+  local tmp rc=0
+  [ -e "$LEGACY_PERSIST" ] || return 0
+  [ -f "$LEGACY_PERSIST" ] || return 1
+  grep -Eq '(^:|^-A )(ICTL-PRE|ICTL-POST|ICTL-FWD) |-[jg] ICTL-(PRE|POST|FWD)( |$)' "$LEGACY_PERSIST" || rc=$?
+  [ "$rc" -ne 1 ] || return 0
+  [ "$rc" -eq 0 ] || return 1
+  tmp="$(mktemp "${LEGACY_PERSIST}.XXXXXX")" || return 1
+  if ! cp -p "$LEGACY_PERSIST" "$tmp" || ! awk '
+    { line=$0; gsub(/"([^"\\]|\\.)*"/,"COMMENT",line)
+      if(line !~ /(^:|^-A )(ICTL-PRE|ICTL-POST|ICTL-FWD) / && line !~ /-[jg] ICTL-(PRE|POST|FWD)( |$)/) print
+    }' "$LEGACY_PERSIST" > "$tmp"; then rm -f "$tmp"; return 1; fi
+  if cmp -s "$tmp" "$LEGACY_PERSIST"; then rm -f "$tmp"; return 0; fi
+  if [ -L "$LEGACY_PERSIST" ] || ! mkdir -p "$LIB"; then rm -f "$tmp"; return 1; fi
+  if [ ! -f "$LIB/pre-coexist-rules.v4.bak" ] && ! cp -p "$LEGACY_PERSIST" "$LIB/pre-coexist-rules.v4.bak"; then
+    rm -f "$tmp"; return 1
+  fi
+  mv "$tmp" "$LEGACY_PERSIST" || { rm -f "$tmp"; return 1; }
+}
+
 # ---------------------------------------------------------------- iptables
 
 # 根据本地缓存的配置生成 iptables-restore 输入，写入 RENDERED；问题追加到 ERRS
@@ -347,6 +502,9 @@ apply_rules() {
   local out previous flags actual
   render
   [ "${#ERRS[@]}" -eq 0 ] || return 1
+  check_port_conflicts "$(cat "$CONFIG" 2>/dev/null)" || return 1
+  ensure_ip_forward
+  [ "${#ERRS[@]}" -eq 0 ] || return 1
   previous="$(owned_snapshot)" || { ERRS+=("read iptables failed"); return 1; }
   flags="$(jump_flags)"
   if [ -f "$APPLIED" ] && printf '%s' "$RENDERED" | cmp -s - "$APPLIED" &&
@@ -408,7 +566,6 @@ local_apply() {
   ERRS=()
   [ -n "$CFG_ERR" ] && ERRS+=("$CFG_ERR")
   mkdir -p "$LIB"
-  ensure_ip_forward
   [ "${#ERRS[@]}" -ne 0 ] || apply_rules
   if [ "${#ERRS[@]}" -eq 0 ]; then
     R_STATE="ok" R_ERR=""
@@ -514,6 +671,7 @@ acknowledge() {
       case "$result" in
         confirmed|deleted|changed|failed|expired)
           CONFIRM="$result"; rm -f "$ACK_FILE" "$request"
+          if [ "$result" = confirmed ] || [ "$result" = deleted ]; then BLOCK_GEN="" BLOCK_ERR=""; fi
           if [ "$result" = deleted ]; then MODE=passive; save_mode || return 1; fi
           [ "$result" = confirmed ] || [ "$result" = deleted ]; return $? ;;
       esac
@@ -526,6 +684,11 @@ acknowledge() {
 # Apply a snapshot transactionally, preserving the last confirmed local configuration.
 apply_snapshot() {
   local config="$1" generation="$2" mode="$3" dir old_mode="$MODE" old_gen="$R_GEN" old_v="$R_V" name snapshot flags
+  ERRS=()
+  if ! check_port_conflicts "$config"; then
+    R_STATE=error R_ERR="${ERRS[0]}"
+    return 1
+  fi
   dir="$(mktemp -d "$LIB/apply.XXXXXX")" || return 1
   for name in config applied kernel resolved state mode; do
     [ ! -f "$LIB/$name" ] || cp "$LIB/$name" "$dir/$name" || { rm -rf "$dir"; return 1; }
@@ -594,8 +757,19 @@ cycle() {
     # Upgrade first; re-enter this operation with the new program before applying.
     if [ "$AUTO_UPDATE" = 1 ] && version_gt "$UPD_TARGET" "$VERSION"; then return 20; fi
   fi
+  if [ "$action" = blocked ]; then
+    R_STATE=error R_ERR="$(response_field err)"
+    BLOCK_GEN="$(response_field generation)" BLOCK_ERR="$R_ERR"
+    save_state; return 1
+  fi
   if [ "$action" = same ]; then
-    local_apply; save_state; [ "$R_STATE" = ok ]; return $?
+    local_apply
+    if is_port_error "$R_ERR"; then BLOCK_GEN="$R_GEN" BLOCK_ERR="$R_ERR"; fi
+    if [ -n "$BLOCK_GEN" ]; then R_STATE=error R_ERR="$BLOCK_ERR"; fi
+    save_state || return 1
+    # Report a newly detected runtime conflict in this sync, without waiting for the next poll.
+    if is_port_error "$R_ERR" && [ "${2:-}" != report ]; then cycle "$SOURCE" report; return $?; fi
+    [ "$R_STATE" = ok ]; return $?
   fi
   if [ "$action" != apply ] || [ "$(response_field op)" != "$OP" ]; then
     NET=bad; save_state; return 1
@@ -607,7 +781,12 @@ cycle() {
     NET=bad; save_state; return 1
   fi
   original_mode="$MODE" original_gen="$R_GEN" original_v="$R_V"
-  apply_snapshot "$config" "$generation" "$mode" || { R_STATE=error; R_ERR="${R_ERR:-local apply failed}"; }
+  if [ "$SOURCE" = auto ] && [ "$BLOCK_GEN" = "$generation" ]; then
+    R_STATE=error R_ERR="$BLOCK_ERR"
+  else
+    apply_snapshot "$config" "$generation" "$mode" || { R_STATE=error; R_ERR="${R_ERR:-local apply failed}"; }
+  fi
+  if is_port_error "$R_ERR"; then BLOCK_GEN="$generation" BLOCK_ERR="$R_ERR"; fi
   # An error ACK identifies the attempted snapshot, while persistent state remains the previous one.
   PHASE=ack MODE="$mode" R_GEN="$generation" R_V="$hash"
   request_text "$R_STATE" > "$ACK_FILE.tmp" && mv "$ACK_FILE.tmp" "$ACK_FILE" || {
@@ -625,7 +804,10 @@ daemon() {
   with_lock ensure_service_policy || return 1
   if ! with_lock local_apply_saved; then
     load_mode || return 1
-    [ "$MODE" = active ] || return 1
+    if [ "$MODE" = passive ]; then
+      if is_port_error "$R_ERR"; then err "$R_ERR；请修复后手动同步"; return 0; fi
+      return 1
+    fi
   fi
   while true; do
     load_mode || return 1
@@ -672,21 +854,45 @@ auto_update() {
 
 # 开机时先按本地缓存恢复规则
 local_apply_saved() {
+  local previous flags actual
   load_state
   load_mode || return 1
   if [ "$MODE" = passive ]; then
     # No DNS lookup or server traffic during passive boot.
-    ERRS=(); ensure_ip_forward
+    ERRS=()
+    if [ -f "$APPLIED" ]; then
+      if [ ! -f "$CONFIG" ] || ! valid_config "$(cat "$CONFIG")"; then
+        ERRS+=('端口检查失败：缺少有效的 Agent 缓存配置')
+      else
+        check_port_conflicts "$(cat "$CONFIG")"
+      fi
+    fi
+    if [ "${#ERRS[@]}" -ne 0 ]; then
+      R_STATE=error R_ERR="${ERRS[0]}" BLOCK_GEN="$R_GEN" BLOCK_ERR="${ERRS[0]}"
+      save_state; return 1
+    fi
+    ensure_ip_forward
     [ "${#ERRS[@]}" -eq 0 ] || return 1
     if [ -f "$APPLIED" ]; then
-      iptables-restore -w --noflush < "$APPLIED" && ensure_jumps || return 1
-      owned_snapshot > "$KERNEL.tmp" && mv "$KERNEL.tmp" "$KERNEL" || return 1
+      previous="$(owned_snapshot)" && flags="$(jump_flags)" || return 1
+      if ! iptables-restore -w --noflush < "$APPLIED" || ! ensure_jumps ||
+          ! actual="$(owned_snapshot)" || ! rules_match "$(cat "$APPLIED")" "$actual" ||
+          ! printf '%s\n' "$actual" > "$KERNEL.tmp" || ! mv "$KERNEL.tmp" "$KERNEL"; then
+        R_STATE=error R_ERR='restore cached rules failed'
+        restore_owned "$previous" "$flags" || R_ERR+='; rollback failed'
+        save_state; return 1
+      fi
     fi
-    return 0
+    if [ -n "$BLOCK_GEN" ]; then R_STATE=error R_ERR="$BLOCK_ERR"; fi
+    save_state; return 0
   fi
   local_apply
+  local rc=0
+  [ "$R_STATE" = ok ] || rc=1
+  if is_port_error "$R_ERR"; then BLOCK_GEN="$R_GEN" BLOCK_ERR="$R_ERR"; fi
+  if [ -n "$BLOCK_GEN" ]; then R_STATE=error R_ERR="$BLOCK_ERR"; fi
   save_state
-  [ "$R_STATE" = ok ]
+  return "$rc"
 }
 
 # ---------------------------------------------------------------- 安装与卸载
@@ -801,6 +1007,34 @@ quick_setup() {
 # $1 是否比 $2 新
 version_gt() {
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
+}
+
+# Run from the installed program, including its first start after an older updater replaced it.
+# Never source a candidate script or follow an existing link.
+cleanup_legacy_scripts() {
+  local path old temporary rc=0
+  [ "$SELF" = "$BIN" ] && [ -x "$BIN" ] || return 0
+  grep -Fxq "VERSION=\"$VERSION\"" "$BIN" || return 0
+  for path in "${LEGACY_SCRIPTS[@]}"; do
+    [ -f "$path" ] && [ ! -L "$path" ] && [ ! "$path" -ef "$BIN" ] || continue
+    grep -Fxq '# ictl 节点端：从服务端拉取转发规则，应用到 iptables 并上报结果' "$path" &&
+      grep -Fxq 'BIN="/usr/local/bin/ictl"' "$path" &&
+      grep -Fxq 'CONF_DIR="/etc/ictl"' "$path" || continue
+    old="$(grep -m 1 '^VERSION=' "$path" | cut -d '"' -f 2)"
+    [[ "$old" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && version_gt "$VERSION" "$old" || continue
+    bash -n "$path" 2>/dev/null || continue
+    temporary="$(mktemp -d "$(dirname "$path")/.ictl-link.XXXXXX")" || {
+      warn "无法整理旧脚本 $path，文件保持原样"; rc=1; continue
+    }
+    if ln -s "$BIN" "$temporary/ictl.sh" && mv -Tf "$temporary/ictl.sh" "$path"; then
+      note "旧脚本 $path（$old）已改为指向 $BIN"
+    else
+      warn "无法替换旧脚本 $path，请检查目录权限"; rc=1
+    fi
+    rm -f "$temporary/ictl.sh"
+    rmdir "$temporary" || rc=1
+  done
+  return "$rc"
 }
 
 # 必须在锁内重新比较已安装版本，防止下载期间其他进程更新后被旧版本覆盖。
@@ -944,6 +1178,7 @@ sync_now() {
 
 # 服务停止后在锁内清理；规则清理失败时不删除配置、服务文件或程序，便于重试。
 uninstall_files() {
+  clean_legacy_persistence || { err "旧持久化规则清理失败，请检查 $LEGACY_PERSIST"; return 1; }
   remove_rules || return 1
   if [ -f "$SERVICE" ]; then
     systemctl disable "$SERVICE_NAME" || { err "禁用服务失败"; return 1; }
@@ -1014,12 +1249,23 @@ menu() {
   done
 }
 
-case "${1:-}" in
-  --sync) need_root; sync_now; exit $? ;;
-  --daemon) need_root; daemon ;;
-  --update) need_root; update_agent "${2:-}"; exit $? ;;
-  --uninstall) need_root; uninstall "${2:-}" ;;
-  --url|--key) need_root; quick_setup "$@" ;;
-  "") need_root; menu ;;
-  *) echo "用法：ictl [--sync | --url <同步地址> --key <密钥> | --update [--mirror] | --uninstall [-y] | --daemon]" >&2; exit 1 ;;
-esac
+main() {
+  case "${1:-}" in
+    --sync|--daemon|--update|--uninstall|--url|--key|"") need_root ;;
+    *) echo "用法：ictl [--sync | --url <同步地址> --key <密钥> | --update [--mirror] | --uninstall [-y] | --daemon]" >&2; return 1 ;;
+  esac
+  if [ "$SELF" = "$BIN" ] && [ "${1:-}" != --uninstall ]; then
+    with_lock cleanup_legacy_scripts || warn "旧脚本整理未完成，下次运行 sudo ictl 时重试"
+    with_lock clean_legacy_persistence || warn "旧持久化规则整理失败，请检查 $LEGACY_PERSIST"
+  fi
+  case "${1:-}" in
+    --sync) sync_now ;;
+    --daemon) daemon ;;
+    --update) update_agent "${2:-}" ;;
+    --uninstall) uninstall "${2:-}" ;;
+    --url|--key) quick_setup "$@" ;;
+    "") menu ;;
+  esac
+}
+
+main "$@"

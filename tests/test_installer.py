@@ -85,30 +85,10 @@ class InstallerTests(unittest.TestCase):
     def test_success_removes_only_old_container_and_keeps_backup(self):
         r=self.run_install();self.assertEqual(r.returncode,0,r.stderr)
         containers=json.loads((self.root/'containers').read_text());self.assertEqual(list(containers),['ictl-server'])
-        self.assertTrue(containers['ictl-server']['image'].endswith('0.3.0'))
+        self.assertTrue(containers['ictl-server']['image'].endswith('0.3.1'))
         backup=next((self.root/'data').glob('*.bak'));c=sqlite3.connect(backup)
         self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],202);c.close()
 
     def test_missing_port_value_rejected(self):
         r=subprocess.run(['bash',str(ROOT/'deploy/install-server.sh'),'--port'],env=self.env,capture_output=True,text=True)
         self.assertNotEqual(r.returncode,0);self.assertIn('缺少参数',r.stderr)
-
-
-class LegacyDDNSTests(unittest.TestCase):
-    def test_failed_change_restores_old_address_and_managed_config(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);script=root/'ipt-lib.sh';script.write_text((ROOT/'ipt.sh').read_text().rsplit('main "$@"',1)[0])
-            conf=root/'managed';conf.write_text('10001 example.com 443 tcp test\n')
-            code=r'''
-source "$1"
-CONF_DIR="$2"; MANAGED_CONF="$CONF_DIR/managed"
-safe_mkdirs() { :; }; lock_acquire() { :; }; log() { :; }
-resolve_target() { echo 192.0.2.2; }; current_target_ip() { echo 192.0.2.1; }
-delete_forward_rules() { echo "delete $4" >> "$CONF_DIR/log"; }
-add_one_forward() { echo "add $6" >> "$CONF_DIR/log"; echo corrupted > "$MANAGED_CONF"; [ "$6" = 192.0.2.1 ]; }
-save_rules() { echo saved >> "$CONF_DIR/log"; }
-refresh_managed_domain_forwards
-'''
-            r=subprocess.run(['bash','-c',code,'test',str(script),str(root)],capture_output=True,text=True)
-            self.assertNotEqual(r.returncode,0);self.assertEqual(conf.read_text(),'10001 example.com 443 tcp test\n')
-            self.assertIn('add 192.0.2.1',(root/'log').read_text());self.assertNotIn('saved',(root/'log').read_text())

@@ -1,1559 +1,958 @@
 #!/usr/bin/env bash
-
+# IPv4 转发管理；运行时配置和备份保存在 /root 下。
 set -u
+set -o pipefail
 
-APP_NAME="ipt-forward-manager"
-VERSION="2.3"
-DEFAULT_COMMENT_PREFIX="xjj-forward"
-BACKUP_DIR="/root/iptables-backup"
-CONF_DIR="/root/iptables-forward-conf"
-MANAGED_CONF="$CONF_DIR/managed-forwards.conf"
-LOG_FILE="/var/log/ipt-forward-manager.log"
-LOCK_FILE="/run/ipt-forward-manager.lock"
-SYSCTL_FILE="/etc/sysctl.d/99-ipt-forward-manager.conf"
-ESTABLISHED_COMMENT="${APP_NAME}-established"
-SELF_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+VERSION=3.1
+SELF_PATH="$(readlink -f -- "$0")"
 
-if [ -t 1 ]; then
-  GREEN=$'\033[32m'
-  YELLOW=$'\033[33m'
-  RED=$'\033[31m'
-  BLUE=$'\033[34m'
-  CYAN=$'\033[36m'
-  BOLD=$'\033[1m'
-  DIM=$'\033[2m'
-  RESET=$'\033[0m'
-else
-  GREEN="" YELLOW="" RED="" BLUE="" CYAN="" BOLD="" DIM="" RESET=""
-fi
-
-HR="────────────────────────────────────────────────────────────"
-LOCK_HELD=0
-LAST_BACKUP=""
-VERR=""
-IPT_ERR=""
-DW=0
-
-# ---------------------------------------------------------------- 输出
-
-ok()   { printf '  %s✔%s %s\n' "$GREEN" "$RESET" "$*"; }
-warn() { printf '  %s!%s %s\n' "$YELLOW" "$RESET" "$*"; }
-err()  { printf '  %s✖%s %s\n' "$RED" "$RESET" "$*" >&2; }
-info() { printf '  %s›%s %s\n' "$BLUE" "$RESET" "$*"; }
-note() { printf '  %s%s%s\n' "$DIM" "$*" "$RESET"; }
-
-title() {
-  echo
-  printf '  %s%s%s\n' "$BOLD$CYAN" "$1" "$RESET"
-  printf '  %s%s%s\n' "$DIM" "$HR" "$RESET"
-}
-
-# 计算显示宽度（中文按 2 列计），结果写入 DW
-dw() {
-  local s="$1" b c
-  local LC_ALL=C
-  b=${#s}
-  LC_ALL=C.UTF-8
-  c=${#s}
-  DW=$(( c + (b - c) / 2 ))
-}
-
-# 按显示宽度输出一个表格单元：cell 文本 宽度 [颜色]
-cell() {
-  local s="$1" w="$2" color="${3:-}"
-  dw "$s"
-  printf '%s%s%s' "$color" "$s" "${color:+$RESET}"
-  [ "$w" -gt "$DW" ] && printf '%*s' $(( w - DW )) ''
-  printf ' '
-}
-
-indent() { sed 's/^/    /'; }
-
-log() {
-  mkdir -p "$(dirname "$LOG_FILE")"
-  echo "[$(date '+%F %T')] $*" >> "$LOG_FILE"
-}
-
-pause() {
-  echo
-  read -rp "  按 Enter 返回菜单..." _ || true
-}
-
-need_root() {
-  if [ "$(id -u)" -ne 0 ]; then
-    err "请使用 root 运行：sudo bash $0"
-    exit 1
-  fi
-}
-
-safe_mkdirs() {
-  mkdir -p "$BACKUP_DIR" "$CONF_DIR"
-}
-
-timestamp() {
-  date '+%Y%m%d-%H%M%S'
-}
-
-trim() {
-  local s="$1"
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
-  printf '%s' "$s"
-}
-
-# ---------------------------------------------------------------- 锁
-
-lock_acquire() {
-  command -v flock >/dev/null 2>&1 || return 0
-  [ "$LOCK_HELD" -eq 1 ] && return 0
-  exec 9>"$LOCK_FILE" || return 1
-  if ! flock -w "${1:-30}" 9; then
-    err "另一个实例（可能是 DDNS 定时任务）正在修改规则，请稍后重试。"
-    exec 9>&-
-    return 1
-  fi
-  LOCK_HELD=1
-}
-
-lock_release() {
-  [ "$LOCK_HELD" -eq 1 ] || return 0
-  flock -u 9 2>/dev/null
-  exec 9>&-
-  LOCK_HELD=0
-}
-
-# ---------------------------------------------------------------- 校验
-
-valid_port() {
-  if [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]; then
-    return 0
-  fi
-  VERR="端口必须是 1-65535 的整数：$1"
-  return 1
-}
-
-valid_ipv4() {
-  local o='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
-  [[ "$1" =~ ^$o\.$o\.$o\.$o$ ]]
-}
-
-valid_target() {
-  if valid_ipv4 "$1"; then
-    return 0
-  fi
-  if [ "${#1}" -le 253 ] && [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]{0,62}$ ]]; then
-    return 0
-  fi
-  VERR="不是有效的 IPv4 地址或域名：$1"
-  return 1
-}
-
-valid_comment() {
-  if [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$ ]]; then
-    return 0
-  fi
-  VERR="备注只能包含字母、数字和 . _ : -，以字母或数字开头，最长 200 个字符：$1"
-  return 1
-}
-
-default_comment() {
-  local c="${DEFAULT_COMMENT_PREFIX}-$1-to-$2-$3"
-  printf '%s' "${c:0:200}"
-}
-
-# ---------------------------------------------------------------- 交互输入
-
-# ask 变量名 提示 校验函数 [默认值]；输入 q 或 EOF 返回 1
-ask() {
-  local __var="$1" __prompt="$2" __check="$3" __def="${4:-}" __val
-  while true; do
-    if [ -n "$__def" ]; then
-      read -rp "  $__prompt [$__def]: " __val || return 1
-    else
-      read -rp "  $__prompt: " __val || return 1
-    fi
-    __val="$(trim "$__val")"
-    [ "$__val" = "q" ] && return 1
-    [ -z "$__val" ] && __val="$__def"
-    if [ -z "$__val" ]; then
-      err "不能为空，请重新输入（输入 q 取消）。"
-      continue
-    fi
-    if "$__check" "$__val"; then
-      printf -v "$__var" '%s' "$__val"
-      return 0
-    fi
-    err "$VERR"
-  done
-}
-
+error() { printf '错误：%s\n' "$*" >&2; }
 confirm() {
-  local yn
-  echo
-  read -rp "  $1 [y/N]: " yn || return 1
-  [[ "$yn" =~ ^[yY]$ ]]
+  local answer
+  read -rp "$1 [y/N]: " answer || return 1
+  [[ "$answer" == y || "$answer" == Y ]]
+}
+prompt() {
+  local var="$1" label="$2" default="${3:-}" value
+  read -rp "$label${default:+ [$default]}: " value || return 1
+  [[ "$value" == q ]] && return 1
+  value="${value:-$default}"
+  [[ -n "$value" ]] || { error '不能为空。'; return 1; }
+  printf -v "$var" '%s' "$value"
 }
 
-protocols_from_choice() {
-  case "$1" in
-    1|tcp|TCP) echo "tcp" ;;
-    2|udp|UDP) echo "udp" ;;
-    3|both|BOTH|all|ALL) echo "tcp udp" ;;
-    *) echo "" ;;
-  esac
-}
-
-choice_from_protocols() {
-  case "$1" in
-    tcp) echo 1 ;;
-    udp) echo 2 ;;
-    *) echo 3 ;;
-  esac
-}
-
-protocol_label() {
-  case "$1" in
-    "tcp udp") echo "TCP+UDP" ;;
-    *) echo "${1^^}" ;;
-  esac
-}
-
-# ask_protocols 变量名 [默认选项] [提示]
-ask_protocols() {
-  local __var="$1" __def="${2:-3}" __prompt="${3:-协议}" __c __p
-  while true; do
-    read -rp "  $__prompt  1) TCP  2) UDP  3) TCP+UDP [$__def]: " __c || return 1
-    __c="$(trim "$__c")"
-    [ "$__c" = "q" ] && return 1
-    __p="$(protocols_from_choice "${__c:-$__def}")"
-    if [ -n "$__p" ]; then
-      printf -v "$__var" '%s' "$__p"
-      return 0
-    fi
-    err "请输入 1、2 或 3（输入 q 取消）。"
+check_dependencies() {
+  local tool manager='' package missing=() packages=()
+  for tool in python3 iptables iptables-save iptables-restore ss; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
+  if ((${#missing[@]})); then
+    printf '缺少依赖：%s\n正在自动安装所需软件包。\n' "${missing[*]}"
+    for tool in apt-get dnf yum pacman zypper; do
+      if command -v "$tool" >/dev/null 2>&1; then manager="$tool"; break; fi
+    done
+    [[ -n "$manager" ]] || { error '未识别到支持的包管理器，无法自动安装依赖。'; return 1; }
+    for tool in "${missing[@]}"; do
+      case "$tool" in
+        python3) package=python3; [[ "$manager" == pacman ]] && package=python ;;
+        iptables*) package=iptables ;;
+        ss) package=iproute2; [[ "$manager" == dnf || "$manager" == yum ]] && package=iproute ;;
+      esac
+      [[ " ${packages[*]} " == *" $package "* ]] || packages+=("$package")
+    done
+    case "$manager" in
+      apt-get)
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || {
+          apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+        } || return 1 ;;
+      dnf|yum) "$manager" install -y "${packages[@]}" || return 1 ;;
+      pacman) pacman -S --needed --noconfirm "${packages[@]}" || return 1 ;;
+      zypper) zypper --non-interactive install "${packages[@]}" || return 1 ;;
+    esac
+  fi
+  for tool in python3 iptables iptables-save iptables-restore ss systemctl; do
+    command -v "$tool" >/dev/null 2>&1 || { error "依赖仍不可用：$tool"; return 1; }
+  done
+  python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || { error '需要 Python 3.8 或更新版本。'; return 1; }
 }
 
-# 解析一行 "入站端口 目标 目标端口 [协议] [备注]"
-# 成功返回 0 并设置 F_*；格式错误返回 1 并设置 VERR；空行/注释行返回 2
-parse_forward_line() {
-  local line extra
-  line="$(trim "${1%%#*}")"
-  [ -z "$line" ] && return 2
+backend() {
+  python3 - "$SELF_PATH" "$@" <<'IPT_PYTHON'
+import contextlib
+from collections import Counter
+import datetime
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
 
-  F_IN="" F_HOST="" F_TPORT="" F_PROTO_IN="" F_COMMENT="" extra=""
-  read -r F_IN F_HOST F_TPORT F_PROTO_IN F_COMMENT extra <<< "$line"
+CONF = Path('/root/iptables-forward-conf/managed-forwards.conf')
+BACKUPS = Path('/root/iptables-backup')
+PERSIST = CONF.parent / 'rules.v4'
+LEGACY_PERSIST = Path('/etc/iptables/rules.v4')
+AGENT_CONF = Path('/var/lib/ictl/config')
+AGENT_LOCK = Path('/run/ictl.lock')
+SYSCTL = Path('/etc/sysctl.d/99-ipt-forward-manager.conf')
+IP_FORWARD = Path('/proc/sys/net/ipv4/ip_forward')
+LOCK = Path('/run/ipt-forward-manager.lock')
+LOG = Path('/var/log/ipt-forward-manager.log')
+UNIT_DIR = Path('/etc/systemd/system')
+SERVICE = 'ipt-forward-selfcheck.service'
+TIMER = 'ipt-forward-selfcheck.timer'
+PREFIX = 'iptfm:'
 
-  if [ -z "$F_TPORT" ]; then
-    VERR="字段不足，至少需要：入站端口 目标 目标端口"
-    return 1
+class Failure(Exception):
+    pass
+
+def command(args, data=None, check=True, timeout=40):
+    try:
+        result = subprocess.run(args, input=data, text=True, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Failure(f'命令执行失败：{shlex.join(args)}：{exc}') from exc
+    if check and result.returncode:
+        raise Failure(f'{shlex.join(args)}：{result.stderr.strip() or result.stdout.strip() or "执行失败"}')
+    return result
+
+def atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+def log(message):
+    try:
+        with LOG.open('a') as stream:
+            stream.write(f'[{datetime.datetime.now():%F %T}] {message}\n')
+    except OSError as exc:
+        print(f'日志写入失败：{exc}', file=sys.stderr)
+
+@contextlib.contextmanager
+def locked():
+    # The Agent only takes AGENT_LOCK; this fixed order cannot form a lock cycle.
+    with contextlib.ExitStack() as stack:
+        deadline = time.monotonic() + 30
+        for path in (LOCK, AGENT_LOCK):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            stream = stack.enter_context(path.open('a'))
+            while True:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise Failure('其他实例或 Agent 正在操作转发，请稍后重试。')
+                    time.sleep(0.1)
+        yield
+
+def ipv4(value):
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ipaddress.AddressValueError:
+        return None
+
+def validate(values):
+    if len(values) != 5:
+        raise Failure('配置格式：入站端口 目标IP或域名 目标端口 tcp/udp/both 备注')
+    incoming, host, target, proto, comment = values
+    for label, port in [('入站', incoming), ('目标', target)]:
+        if not re.fullmatch(r'[1-9][0-9]{0,4}', port) or int(port) > 65535:
+            raise Failure(f'{label}端口必须为 1–65535：{port}')
+    if not ipv4(host):
+        labels = host.split('.')
+        if (len(host) > 253 or len(labels) < 2 or not re.match(r'^[A-Za-z]', labels[-1])
+                or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', x) for x in labels)):
+            raise Failure(f'无效的 IPv4 地址或域名：{host}')
+    proto = proto.lower()
+    if proto not in ('tcp', 'udp', 'both'):
+        raise Failure(f'协议必须是 tcp、udp 或 both：{proto}')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,199}', comment):
+        raise Failure('备注须以字母或数字开头，限字母、数字、._:-，最多 200 字符。')
+    return dict(incoming=incoming, host=host, target=target, proto=proto, comment=comment)
+
+def protocols(row):
+    return ('tcp', 'udp') if row['proto'] == 'both' else (row['proto'],)
+
+def option(spec, *names):
+    for index, value in enumerate(spec[:-1]):
+        if value in names:
+            return spec[index + 1], index > 0 and spec[index - 1] == '!'
+    return None, False
+
+def normalize(spec):
+    # iptables-save 会重新排列 -s/-d/-p 等参数，不能按原命令的词序比较。
+    arguments = {'-p', '-s', '-d', '-m', '-j', '--dport', '--sport', '--comment',
+                 '--ctstate', '--ctorigdstport', '--ctdir', '--to-destination', '--dst-type'}
+    result = []
+    index = 0
+    while index < len(spec):
+        negated = spec[index] == '!'
+        if negated:
+            index += 1
+        if index >= len(spec):
+            result.append(('raw', '!', ''))
+            break
+        flag = spec[index]
+        if flag not in arguments or index + 1 >= len(spec):
+            result.append(('raw', '!' if negated else '', flag))
+            index += 1
+            continue
+        value = spec[index + 1]
+        if flag == '-m' and value in ('tcp', 'udp') and not negated:
+            index += 2
+            continue
+        if flag in ('-s', '-d') and value.endswith('/32'):
+            value = value[:-3]
+        if flag == '-p':
+            value = {'6': 'tcp', '17': 'udp'}.get(value, value)
+        result.append(('!' if negated else '', flag, value))
+        index += 2
+    return tuple(sorted(result))
+
+def snapshot(text=None):
+    live = text is None
+    if text is None:
+        text = command(['iptables-save']).stdout
+    table = None
+    rules = []
+    counts = {}
+    chains = set()
+    for line in text.splitlines():
+        if line.startswith('*'):
+            table = line[1:]
+        elif line == 'COMMIT':
+            table = None
+        elif line.startswith(':') and table:
+            chains.add((table, line[1:].split()[0]))
+        elif line.startswith('-A ') and table:
+            words = shlex.split(line)
+            chain = words[1]
+            key = (table, chain)
+            counts[key] = counts.get(key, 0) + 1
+            rules.append(dict(table=table, chain=chain, spec=words[2:], pos=counts[key]))
+    if ('nat', 'PREROUTING') not in chains or ('filter', 'FORWARD') not in chains:
+        if live:
+            # 空白机器可能尚未加载 NAT/filter 表；显式查询后重新读取一次。
+            for name in ('nat', 'filter'):
+                command(['iptables', '-w', '30', '-t', name, '-S'])
+            return snapshot(command(['iptables-save']).stdout)
+        raise Failure('无法读取完整的 IPv4 NAT/FORWARD 表，已停止操作。')
+    return dict(text=text, rules=rules, chains=chains)
+
+def rule_key(rule):
+    return rule['table'], rule['chain'], normalize(rule['spec'])
+
+def make_rules(rows, legacy=False):
+    result = []
+    for row in rows:
+        if not row['ip']:
+            continue
+        for proto in protocols(row):
+            ip, target, incoming = row['ip'], row['target'], row['incoming']
+            comment = row['comment'] if legacy else PREFIX + row['id']
+            mark = ['-m', 'comment', '--comment', comment]
+            pre = ['-p', proto, '--dport', incoming]
+            post = ['-p', proto, '-d', ip, '--dport', target]
+            if legacy:
+                specs = [('nat', 'PREROUTING', pre + mark + ['-j', 'DNAT', '--to-destination', ip + ':' + target]),
+                         ('nat', 'POSTROUTING', post + mark + ['-j', 'MASQUERADE']),
+                         ('filter', 'FORWARD', post + mark + ['-j', 'ACCEPT'])]
+            else:
+                # 原目的端口使每条转发独立；LOCAL 限制为发往本机的流量。
+                original = ['-m', 'conntrack', '--ctstate', 'DNAT', '--ctorigdstport', incoming, '--ctdir', 'ORIGINAL']
+                reply = ['-p', proto, '-s', ip, '--sport', target, '-m', 'conntrack', '--ctstate', 'DNAT',
+                         '--ctorigdstport', incoming, '--ctdir', 'REPLY']
+                specs = [('nat', 'PREROUTING', pre + ['-m', 'addrtype', '--dst-type', 'LOCAL'] + mark + ['-j', 'DNAT', '--to-destination', ip + ':' + target]),
+                         ('nat', 'POSTROUTING', post + original + mark + ['-j', 'MASQUERADE']),
+                         ('filter', 'FORWARD', post + original + mark + ['-j', 'ACCEPT']),
+                         ('filter', 'FORWARD', reply + mark + ['-j', 'ACCEPT'])]
+            result.extend(dict(table=t, chain=c, spec=s) for t, c, s in specs)
+    return result
+
+def load_config(snap, text=None):
+    if text is None:
+        text = CONF.read_text() if CONF.exists() else ''
+    modern = text.startswith('# ipt-forward-manager v3\n')
+    rows = []
+    old_groups = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        fields = line.split('#', 1)[0].split()
+        if not fields:
+            continue
+        try:
+            if modern:
+                if len(fields) != 7 or not re.fullmatch(r'[0-9a-f]{32}', fields[0]) or not ipv4(fields[6]):
+                    raise Failure('托管配置格式错误')
+                row = validate(fields[1:6])
+                row.update(id=fields[0], ip=fields[6], legacy=False)
+                rows.append(row)
+            else:
+                row = validate(fields)
+                if row['proto'] == 'both':
+                    raise Failure('旧托管配置必须按 tcp/udp 分行保存')
+                # 只接管与旧脚本模板完全一致的规则，不丢弃外部规则的限制条件。
+                matches = []
+                for rule in snap['rules']:
+                    spec = rule['spec']
+                    dest, _ = option(spec, '--to-destination')
+                    if (rule['table'] == 'nat' and rule['chain'] == 'PREROUTING'
+                        and option(spec, '--comment')[0] == row['comment']
+                        and option(spec, '-p')[0] == row['proto']
+                        and option(spec, '--dport')[0] == row['incoming']
+                        and dest and dest.endswith(':' + row['target'])):
+                        ip = dest.rsplit(':', 1)[0]
+                        candidate = dict(row, id='', ip=ip)
+                        if not ipv4(ip) or normalize(spec) != normalize(make_rules([candidate], True)[0]['spec']):
+                            raise Failure('旧规则包含无法安全迁移的条件，请先人工核对：' + shlex.join(spec))
+                        matches.append(ip)
+                if len(set(matches)) > 1:
+                    raise Failure('同一旧配置对应多个目标 IP，无法安全迁移')
+                ip = matches[0] if matches else (ipv4(row['host']) or '')
+                key = (row['incoming'], row['host'], row['target'], row['comment'], ip)
+                if key in old_groups:
+                    existing = old_groups[key]
+                    if existing['proto'] == row['proto'] or existing['proto'] == 'both':
+                        raise Failure('旧托管配置重复')
+                    existing['proto'] = 'both'
+                else:
+                    row.update(id=uuid.uuid5(uuid.NAMESPACE_URL, repr(key)).hex, ip=ip, legacy=True)
+                    old_groups[key] = row
+                    rows.append(row)
+        except Failure as exc:
+            raise Failure(f'托管配置第 {n} 行：{exc}') from exc
+    if len({r['id'] for r in rows}) != len(rows):
+        raise Failure('托管配置存在重复标识，已停止操作。')
+    unique_ports(rows)
+    return rows
+
+def serialize(rows):
+    lines = ['# ipt-forward-manager v3']
+    for r in rows:
+        lines.append(' '.join(r[x] for x in ('id', 'incoming', 'host', 'target', 'proto', 'comment', 'ip')))
+    return '\n'.join(lines) + '\n'
+
+def fingerprint(row):
+    values = [row[k] for k in ('id', 'incoming', 'host', 'target', 'proto', 'comment')]
+    return hashlib.sha256(json.dumps(values).encode()).hexdigest()[:16]
+
+def owned_rules(snap, rows):
+    expected = {rule_key(r) for r in make_rules([r for r in rows if not r['legacy']])}
+    old_expected = {rule_key(r) for r in make_rules([r for r in rows if r['legacy']], True)}
+    result = []
+    for rule in snap['rules']:
+        comment, _ = option(rule['spec'], '--comment')
+        key = rule_key(rule)
+        if comment and comment.startswith(PREFIX):
+            if key not in expected:
+                raise Failure('发现未知或被外部修改的托管规则，已停止操作：' + shlex.join(rule['spec']))
+            result.append(rule)
+        elif key in old_expected:
+            result.append(rule)
+    return result
+
+def unique_ports(rows):
+    seen = {}
+    for row in rows:
+        for proto in protocols(row):
+            key = (proto, row['incoming'])
+            if key in seen:
+                raise Failure(f'配置冲突：{proto.upper()} {row["incoming"]} 同时用于 [{seen[key]}] 和 [{row["comment"]}]。')
+            seen[key] = row['comment']
+
+def port_matches(value, port, proto):
+    for part in value.split(','):
+        bounds = part.split(':')
+        if len(bounds) > 2:
+            raise Failure(f'无法判断现有端口条件：{value}')
+        def number(x, default):
+            if not x:
+                return default
+            if x.isdigit():
+                return int(x)
+            try:
+                return socket.getservbyname(x, proto)
+            except OSError as exc:
+                raise Failure(f'无法判断现有端口条件：{value}') from exc
+        if len(bounds) == 1:
+            low = high = number(bounds[0], 0)
+        else:
+            low, high = number(bounds[0], 0), number(bounds[1], 65535)
+        if low <= int(port) <= high:
+            return True
+    return False
+
+def may_match(spec, proto, port):
+    value, negate = option(spec, '-p', '--protocol')
+    if value is not None:
+        match = value in (proto, {'tcp': '6', 'udp': '17'}[proto], 'all', '0')
+        if match == negate:
+            return False
+    for names in [('--dport', '--destination-port'), ('--dports', '--destination-ports')]:
+        value, negate = option(spec, *names)
+        if value is not None and port_matches(value, port, proto) == negate:
+            return False
+    # --ports 可以匹配源端口，未知扩展也可能限制流量；无法证明不重叠时保守拒绝。
+    return True
+
+def rule_conflict(snap, proto, port, owned):
+    ignored = {rule_key(r) for r in owned}
+    by_chain = {}
+    for rule in snap['rules']:
+        by_chain.setdefault((rule['table'], rule['chain']), []).append(rule)
+    def visit(table, chain, seen):
+        if chain in seen:
+            return None
+        for rule in by_chain.get((table, chain), []):
+            if rule_key(rule) in ignored or not may_match(rule['spec'], proto, port):
+                continue
+            jump, _ = option(rule['spec'], '-j', '--jump', '-g', '--goto')
+            if jump in ('DNAT', 'REDIRECT', 'TPROXY'):
+                return rule
+            if (table, jump) in snap['chains']:
+                found = visit(table, jump, seen | {chain})
+                if found:
+                    return found
+        return None
+    return visit('nat', 'PREROUTING', set()) or visit('mangle', 'PREROUTING', set())
+
+def sockets(proto):
+    flags = '-lntp' if proto == 'tcp' else '-aunp'
+    output = command(['ss', '-H', flags]).stdout
+    result = {}
+    for line in output.splitlines():
+        fields = line.split()
+        offset = 1 if fields and fields[0] in ('tcp', 'udp') else 0
+        if len(fields) < 5 + offset:
+            raise Failure('无法解析本机端口状态，已停止操作：' + line)
+        address, port = fields[3 + offset].rsplit(':', 1)
+        address = address.strip('[]').split('%', 1)[0]
+        if ':' in address:
+            ip6 = ipaddress.IPv6Address(address)
+            # 明确绑定到 IPv6 专用地址的套接字不占用 IPv4；:: 可能双栈，保守拒绝。
+            if not ip6.is_unspecified and ip6.ipv4_mapped is None:
+                continue
+        if not port.isdigit():
+            raise Failure('无法判断本机端口占用，已停止操作：' + line)
+        result.setdefault(port, []).append(line)
+    return result
+
+def check_conflicts(check_rows, all_rows, snap, owned):
+    unique_ports(all_rows)
+    if not check_rows:
+        return  # Removing our own entries must remain possible when the peer is damaged.
+    reserved = agent_ports()
+    used = {p: sockets(p) for p in {p for r in check_rows for p in protocols(r)}}
+    for row in check_rows:
+        for proto in protocols(row):
+            port = row['incoming']
+            if (proto, port) in reserved:
+                raise Failure(f'端口冲突：{proto.upper()} {port} 已被 Agent 保存的配置占用。')
+            if port in used[proto]:
+                raise Failure(f'端口冲突：{proto.upper()} {port} 已被本机进程占用：\n' + '\n'.join(used[proto][port]))
+            rule = rule_conflict(snap, proto, port, owned)
+            if rule:
+                raise Failure(f'端口冲突：现有规则可能覆盖 {proto.upper()} {port}：\n'
+                              f'{rule["table"]}/{rule["chain"]} ' + shlex.join(rule['spec']))
+
+def agent_ports():
+    if not AGENT_CONF.exists() and not AGENT_CONF.is_symlink():
+        return set()
+    try:
+        lines = AGENT_CONF.read_text().splitlines()
+        if not lines or not re.fullmatch(r'v=[0-9a-f]{1,64}', lines[0]):
+            raise ValueError('版本头无效')
+        result = set()
+        for line in lines[1:]:
+            if not line.strip():
+                continue
+            fields = line.split()
+            if (len(fields) != 5 or not fields[0].isdigit() or fields[1] not in ('tcp', 'udp', 'both')
+                    or not re.fullmatch(r'[A-Za-z0-9.-]{1,253}', fields[3])
+                    or any(not p.isdigit() or not 1 <= int(p) <= 65535 for p in (fields[2], fields[4]))):
+                raise ValueError('规则格式无效')
+            for proto in ('tcp', 'udp') if fields[1] == 'both' else (fields[1],):
+                result.add((proto, str(int(fields[2]))))
+        return result
+    except (OSError, ValueError) as exc:
+        raise Failure(f'无法校验 Agent 端口占用：{exc}') from exc
+
+def owned_snapshot(snap, rows):
+    rules = owned_rules(snap, rows)
+    lines = []
+    for table, chains in [('nat', ('PREROUTING', 'POSTROUTING')), ('filter', ('FORWARD',))]:
+        lines += ['*' + table] + [':' + c + ' - [0:0]' for c in chains]
+        lines += [shlex.join(['-A', r['chain']] + r['spec']) for r in rules if r['table'] == table]
+        lines.append('COMMIT')
+    return '\n'.join(lines) + '\n'
+
+def clean_legacy_persist(rows, saved):
+    if not LEGACY_PERSIST.exists():
+        return
+    text = LEGACY_PERSIST.read_text()
+    legacy = {rule_key(r) for r in make_rules(rows, True)}
+    table = None
+    kept = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith('*'):
+            table = line[1:].strip()
+        elif line == 'COMMIT\n':
+            table = None
+        if table and line.startswith('-A '):
+            words = shlex.split(line)
+            comment, _ = option(words[2:], '--comment')
+            rule = dict(table=table, chain=words[1], spec=words[2:])
+            if (comment and re.fullmatch(r'iptfm:[0-9a-f]{32}', comment)) or rule_key(rule) in legacy:
+                continue
+        kept.append(line)
+    if ''.join(kept) != text:
+        if LEGACY_PERSIST.is_symlink():
+            raise Failure('旧全局规则文件是软链接，请人工迁移其中的单机脚本规则。')
+        atomic_write(saved / 'previous-system-rules.v4', text)
+        atomic_write(LEGACY_PERSIST, ''.join(kept))
+        return text
+
+def resolve(rows):
+    cache = {}
+    for row in rows:
+        host = row['host']
+        if ipv4(host):
+            row['ip'] = host
+            continue
+        if host not in cache:
+            code = 'import socket,sys,json; print(json.dumps(list(dict.fromkeys(x[4][0] for x in socket.getaddrinfo(sys.argv[1],None,socket.AF_INET,socket.SOCK_STREAM)))))'
+            try:
+                addresses = json.loads(command([sys.executable, '-c', code, host], timeout=10).stdout)
+            except (Failure, ValueError) as exc:
+                raise Failure(f'域名解析失败：{host}：{exc}') from exc
+            if not addresses or any(not ipv4(ip) for ip in addresses):
+                raise Failure(f'没有可用的 IPv4 地址：{host}')
+            cache[host] = addresses
+        row['ip'] = row['ip'] if row['ip'] in cache[host] else cache[host][0]
+
+def backup(snap):
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    name = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-')
+    path = Path(tempfile.mkdtemp(prefix=name, dir=BACKUPS))
+    try:
+        atomic_write(path / 'rules.v4', owned_snapshot(snap, load_config(snap)))
+        atomic_write(path / 'managed.conf', CONF.read_text() if CONF.exists() else '')
+        atomic_write(path / 'complete', '1\n')
+    except Exception:
+        # 未完成的目录不会出现在恢复列表中。
+        raise
+    return path
+
+def ipt(rule, op, pos=None):
+    args = ['iptables', '-w', '30', '-t', rule['table'], op, rule['chain']]
+    if pos is not None:
+        args.append(str(pos))
+    return command(args + rule['spec'])
+
+def rollback_rules(owned, desired):
+    # 根据实际规则撤销，兼顾命令已经提交、但在返回前超时或收到信号的情况。
+    current = snapshot()
+    expected = Counter(rule_key(r) for r in owned)
+    relevant = set(expected) | {rule_key(r) for r in desired}
+    actual = Counter(rule_key(r) for r in current['rules'] if rule_key(r) in relevant)
+    for rule in reversed(current['rules']):
+        key = rule_key(rule)
+        if key in relevant and actual[key] > expected[key]:
+            ipt(rule, '-D')
+            actual[key] -= 1
+    for rule in sorted(owned, key=lambda r: (r['table'], r['chain'], r['pos'])):
+        key = rule_key(rule)
+        if actual[key] < expected[key]:
+            latest = snapshot()
+            length = sum(r['table'] == rule['table'] and r['chain'] == rule['chain'] for r in latest['rules'])
+            ipt(rule, '-I', min(rule['pos'], length + 1))
+            actual[key] += 1
+
+def restore_file(path, old):
+    if old is None:
+        path.unlink(missing_ok=True)
+    else:
+        atomic_write(path, old)
+
+def service_text(script):
+    if any(c in script for c in '\n\r\0') or not Path(script).is_file():
+        raise Failure('无法定位脚本文件，不能配置开机恢复。')
+    escaped = script.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%').replace('$', '$$')
+    return ('[Unit]\nDescription=IPv4 forwarding restore and DDNS refresh\nAfter=network-online.target\nWants=network-online.target\n'
+            '[Service]\nType=oneshot\nExecStart=/bin/bash "' + escaped + '" --self-check\nTimeoutStartSec=300\n'
+            '[Install]\nWantedBy=multi-user.target\n')
+
+def scheduler(rows, script):
+    if not Path('/run/systemd/system').is_dir():
+        raise Failure('当前版本需要运行中的 systemd 来提供开机恢复和域名定时刷新。')
+    atomic_write(UNIT_DIR / SERVICE, service_text(script))
+    atomic_write(UNIT_DIR / TIMER, '[Unit]\nDescription=IPv4 forwarding periodic check\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=5min\nUnit=' + SERVICE + '\n[Install]\nWantedBy=timers.target\n')
+    command(['systemctl', 'daemon-reload'])
+    command(['systemctl', 'enable', SERVICE])
+    if any(not ipv4(r['host']) for r in rows):
+        command(['systemctl', 'enable', '--now', TIMER])
+    else:
+        command(['systemctl', 'disable', '--now', TIMER])
+
+def scheduler_state():
+    return {SERVICE: command(['systemctl', 'is-enabled', '--quiet', SERVICE], check=False).returncode == 0,
+            TIMER: command(['systemctl', 'is-enabled', '--quiet', TIMER], check=False).returncode == 0,
+            'active': command(['systemctl', 'is-active', '--quiet', TIMER], check=False).returncode == 0}
+
+def restore_scheduler(state):
+    command(['systemctl', 'daemon-reload'])
+    for unit in (SERVICE, TIMER):
+        command(['systemctl', 'enable' if state[unit] else 'disable', unit], check=state[unit])
+    command(['systemctl', 'start' if state['active'] else 'stop', TIMER], check=state['active'])
+
+def transact(old_rows, rows, snap, script, refresh=False):
+    owned = owned_rules(snap, old_rows)
+    desired = make_rules(rows)
+    desired_keys = {rule_key(r) for r in desired}
+    live_keys = {rule_key(r) for r in snap['rules']}
+    additions = [r for r in desired if rule_key(r) not in live_keys]
+    kept = set()
+    deletions = []
+    for rule in owned:
+        key = rule_key(rule)
+        if key in desired_keys and key not in kept:
+            kept.add(key)
+        else:
+            deletions.append(rule)
+    # 回程/出站先准备好，DNAT 最后添加；新规则完整存在后才删除旧规则。
+    additions.sort(key=lambda r: r['chain'] == 'PREROUTING')
+    deletions.sort(key=lambda r: r['chain'] != 'PREROUTING')
+    config_text = serialize(rows)
+    old_conf = CONF.read_text() if CONF.exists() else None
+    if refresh and not additions and not deletions and old_conf == config_text and IP_FORWARD.read_text().strip() == '1':
+        return
+    saved = backup(snap)
+    files = {p: p.read_text() if p.exists() else None for p in (CONF, PERSIST, SYSCTL, UNIT_DIR / SERVICE, UNIT_DIR / TIMER)}
+    legacy_before = None
+    ip_forward = IP_FORWARD.read_text()
+    old_scheduler = scheduler_state() if not refresh else None
+    signals = {}
+    import signal
+    def interrupted(signum, frame):
+        raise Failure(f'操作被信号 {signum} 中断')
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signals[sig] = signal.signal(sig, interrupted)
+    try:
+        legacy_before = clean_legacy_persist(old_rows, saved)
+        if rows:
+            atomic_write(SYSCTL, 'net.ipv4.ip_forward=1\n')
+            if IP_FORWARD.read_text().strip() != '1':
+                IP_FORWARD.write_text('1\n')
+            if IP_FORWARD.read_text().strip() != '1':
+                raise Failure('无法开启 IPv4 转发。')
+        for rule in additions:
+            ipt(rule, '-I', 1) if rule['chain'] == 'FORWARD' else ipt(rule, '-A')
+        for rule in deletions:
+            ipt(rule, '-D')
+        atomic_write(CONF, config_text)
+        atomic_write(PERSIST, owned_snapshot(snapshot(), rows))
+        if not refresh:
+            scheduler(rows, script)
+        log(f'change committed: forwards={len(rows)} backup={saved}')
+    except Exception as exc:
+        for sig in signals:
+            signal.signal(sig, signal.SIG_IGN)
+        errors = []
+        if legacy_before is not None:
+            try:
+                restore_file(LEGACY_PERSIST, legacy_before)
+            except Exception as rollback_error:
+                errors.append(str(rollback_error))
+        try:
+            rollback_rules(owned, desired)
+        except Exception as rollback_error:
+            errors.append(str(rollback_error))
+        for path, value in files.items():
+            try:
+                restore_file(path, value)
+            except Exception as rollback_error:
+                errors.append(str(rollback_error))
+        try:
+            if IP_FORWARD.read_text() != ip_forward:
+                IP_FORWARD.write_text(ip_forward)
+        except OSError as rollback_error:
+            errors.append(str(rollback_error))
+        if not refresh:
+            try:
+                restore_scheduler(old_scheduler)
+            except Exception as rollback_error:
+                errors.append(str(rollback_error))
+        log(f'change failed: {exc}; rollback_errors={errors}; backup={saved}')
+        if errors:
+            raise Failure(f'{exc}\n恢复未全部成功：{"; ".join(errors)}\n完整备份：{saved}') from exc
+        raise Failure(f'{exc}\n已撤销本次规则与配置修改。备份：{saved}') from exc
+    finally:
+        for sig, handler in signals.items():
+            signal.signal(sig, handler)
+    if not refresh:
+        print(f'操作成功，规则已保存。备份：{saved}')
+
+def import_rows(path):
+    rows = []
+    for n, line in enumerate(Path(path).read_text().splitlines(), 1):
+        fields = line.split('#', 1)[0].split()
+        if not fields:
+            continue
+        if len(fields) == 3:
+            fields.append('both')
+        if len(fields) == 4:
+            fields.append(f'xjj-forward-{fields[0]}-to-{fields[1]}-{fields[2]}'[:200])
+        try:
+            row = validate(fields)
+        except Failure as exc:
+            raise Failure(f'导入文件第 {n} 行：{exc}；整个文件未导入。') from exc
+        row.update(id=uuid.uuid4().hex, ip='', legacy=False)
+        rows.append(row)
+    if not rows:
+        raise Failure('文件中没有可导入的配置。')
+    unique_ports(rows)
+    return rows
+
+def complete_backups():
+    if not BACKUPS.exists():
+        return []
+    return sorted((p for p in BACKUPS.iterdir() if p.is_dir() and (p / 'complete').is_file()
+                   and (p / 'rules.v4').is_file() and (p / 'managed.conf').is_file()), reverse=True)
+
+def restore_backup(name, script):
+    matches = [p for p in complete_backups() if p.name == name]
+    if len(matches) != 1:
+        raise Failure('备份不存在或缺少配套配置，不能恢复。')
+    chosen = matches[0]
+    rules_text = (chosen / 'rules.v4').read_text()
+    conf_text = (chosen / 'managed.conf').read_text()
+    rows = load_config(snapshot(rules_text), conf_text)
+    before = snapshot()
+    old_rows = load_config(before)
+    check_conflicts(rows, rows, before, owned_rules(before, old_rows))
+    resolve([r for r in rows if not r['ip']])
+    for row in rows:
+        row['legacy'] = False
+    transact(old_rows, rows, before, script)
+    log(f'backup restored: {chosen}')
+    print('已恢复单机脚本的规则及配置，其他防火墙规则保持不变。')
+
+def dispatch(args, script):
+    action = args[0]
+    if action == 'backups':
+        for path in complete_backups():
+            print(path.name)
+        return
+    if action == 'restore':
+        restore_backup(args[1], script)
+        return
+    if action == 'preview-import':
+        for row in import_rows(args[1]):
+            print(f'{row["comment"]}: {row["proto"].upper()} {row["incoming"]} → {row["host"]}:{row["target"]}')
+        return
+    snap = snapshot()
+    old_rows = load_config(snap)
+    if action == 'list':
+        for row in old_rows:
+            print('\t'.join([row['id'], fingerprint(row)] + [row[k] for k in ('incoming', 'host', 'target', 'proto', 'comment', 'ip')]))
+        return
+    if action == 'export':
+        if not old_rows:
+            raise Failure('没有可导出的托管转发。')
+        output = '# 入站端口 目标IP或域名 目标端口 协议 备注\n'
+        output += ''.join(' '.join(row[k] for k in ('incoming', 'host', 'target', 'proto', 'comment')) + '\n' for row in old_rows)
+        destination = Path(args[1]).resolve()
+        if (destination in {CONF.resolve(), PERSIST.resolve(), LEGACY_PERSIST.resolve(), AGENT_CONF.resolve(),
+                            SYSCTL.resolve(), Path(script).resolve(), Path('/usr/local/bin/ictl'),
+                            UNIT_DIR / 'ictl-agent.service'}
+                or Path('/var/lib/ictl') in destination.parents or Path('/etc/ictl') in destination.parents):
+            raise Failure('不能覆盖脚本或运行配置文件。')
+        atomic_write(destination, output)
+        print(f'已导出 {len(old_rows)} 条转发：{destination}')
+        return
+    owned = owned_rules(snap, old_rows)
+    rows = [dict(r) for r in old_rows]
+    check_rows = []
+    if action in ('delete', 'update'):
+        selected = next((r for r in rows if r['id'] == args[1]), None)
+        if selected is None or fingerprint(selected) != args[2]:
+            raise Failure('所选转发已被修改或删除，请重新选择。')
+        rows.remove(selected)
+        if action == 'update':
+            row = validate(args[3:])
+            row.update(id=selected['id'], ip=selected['ip'] if row['host'] == selected['host'] else '', legacy=False)
+            rows.append(row)
+            check_rows.append(row)
+    elif action == 'add':
+        row = validate(args[1:])
+        row.update(id=uuid.uuid4().hex, ip='', legacy=False)
+        rows.append(row)
+        check_rows.append(row)
+    elif action == 'import':
+        check_rows = import_rows(args[1])
+        rows.extend(check_rows)
+    elif action == 'refresh':
+        if not rows:
+            return
+        check_rows = rows
+    else:
+        raise Failure('未知操作：' + action)
+    check_conflicts(check_rows, rows, snap, owned)
+    # 删除不依赖其他域名当前能否解析；仅新建、修改、刷新和缺失 IP 的迁移需要解析。
+    resolution_error = None
+    try:
+        resolve([r for r in rows if r in check_rows or not r['ip']])
+    except Failure as exc:
+        if action != 'refresh' or any(not ipv4(r['ip']) for r in old_rows):
+            raise
+        # 开机时 DNS 暂不可用，也能用上次成功的地址恢复已有转发。
+        rows = [dict(r) for r in old_rows]
+        resolution_error = exc
+    for row in rows:
+        row['legacy'] = False
+    # 在开始写入前再读一次，检测预检查期间其他管理器对规则的修改。
+    latest = snapshot()
+    if [rule_key(r) for r in latest['rules']] != [rule_key(r) for r in snap['rules']]:
+        raise Failure('检查期间防火墙规则发生变化，未执行操作，请重试。')
+    check_conflicts(check_rows, rows, latest, owned)
+    transact(old_rows, rows, latest, script, action == 'refresh')
+    if resolution_error:
+        raise Failure(f'{resolution_error}；已保留或恢复上次成功的 IPv4 地址，等待下次刷新。')
+
+def main():
+    script, args = sys.argv[1], sys.argv[2:]
+    import signal
+    def interrupted(signum, frame):
+        raise Failure(f'操作被信号 {signum} 中断')
+    previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        if not args:
+            raise Failure('缺少操作参数。')
+        with locked():
+            dispatch(args, script)
+        return 0
+    except Exception as exc:
+        print(f'错误：{exc}', file=sys.stderr)
+        log(f'operation failed: {exc}')
+        return 1
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+if __name__ == '__main__':
+    sys.exit(main())
+IPT_PYTHON
+}
+
+ROWS=()
+SELECTED_ID='' SELECTED_TOKEN='' SELECTED_IN='' SELECTED_HOST=''
+SELECTED_TARGET='' SELECTED_PROTO='' SELECTED_COMMENT=''
+
+list_forwards() {
+  local output line id token incoming host target proto comment ip n=0
+  output="$(backend list)" || return 1
+  ROWS=()
+  if [[ -z "$output" ]]; then
+    printf '没有托管的转发配置。\n'
+    return 0
   fi
-  if [ -n "$extra" ]; then
-    VERR="字段过多（备注不能包含空格）"
-    return 1
-  fi
-  valid_port "$F_IN" || { VERR="入站$VERR"; return 1; }
-  valid_target "$F_HOST" || return 1
-  valid_port "$F_TPORT" || { VERR="目标$VERR"; return 1; }
-
-  F_PROTO_IN="${F_PROTO_IN:-both}"
-  F_PROTOS="$(protocols_from_choice "$F_PROTO_IN")"
-  if [ -z "$F_PROTOS" ]; then
-    VERR="协议无效：$F_PROTO_IN（可用 tcp / udp / both）"
-    return 1
-  fi
-
-  F_COMMENT="${F_COMMENT:-$(default_comment "$F_IN" "$F_HOST" "$F_TPORT")}"
-  valid_comment "$F_COMMENT" || return 1
+  mapfile -t ROWS <<< "$output"
+  for line in "${ROWS[@]}"; do
+    IFS=$'\t' read -r id token incoming host target proto comment ip <<< "$line"
+    n=$((n+1))
+    printf '%d. %s — %s %s → %s:%s\n' "$n" "$comment" "${proto^^}" "$incoming" "$host" "$target"
+    [[ "$host" != "$ip" ]] && printf '   当前 IPv4：%s\n' "${ip:-尚未解析}"
+  done
   return 0
 }
 
-# ---------------------------------------------------------------- 规则解析
-
-# awk 函数：解析一条 iptables -S / iptables-save 规则
-# 设置 C(备注) P(协议) DP(目的端口) D(目的地址) TD(DNAT 目标) J(动作)
-PARSE_AWK='
-function parse(line,   p, s, out, ch, n, t, i) {
-  C = ""; P = ""; DP = ""; D = ""; TD = ""; J = ""
-  p = index(line, "--comment ")
-  if (p > 0) {
-    s = substr(line, p + 10)
-    if (substr(s, 1, 1) == "\"") {
-      s = substr(s, 2); out = ""
-      while (length(s) > 0) {
-        ch = substr(s, 1, 1)
-        if (ch == "\\") { out = out substr(s, 2, 1); s = substr(s, 3); continue }
-        if (ch == "\"") { s = substr(s, 2); break }
-        out = out ch; s = substr(s, 2)
-      }
-      C = out
-    } else {
-      n = index(s, " ")
-      if (n > 0) { C = substr(s, 1, n - 1); s = substr(s, n) } else { C = s; s = "" }
-    }
-    line = substr(line, 1, p - 1) s
-  }
-  n = split(line, t, " ")
-  for (i = 1; i < n; i++) {
-    if (t[i] == "-p") P = t[i + 1]
-    else if (t[i] == "--dport") DP = t[i + 1]
-    else if (t[i] == "-d") { D = t[i + 1]; sub(/\/32$/, "", D) }
-    else if (t[i] == "--to-destination") TD = t[i + 1]
-    else if (t[i] == "-j") J = t[i + 1]
-  }
-}
-'
-
-# 输出匹配规则的序号：rule_nums 表 链 备注 [协议] [端口] [目的IP] [DNAT目标] [动作]，空参数表示不限
-rule_nums() {
-  iptables -t "$1" -S "$2" 2>/dev/null | awk -v c="$3" -v p="${4:-}" -v dp="${5:-}" -v d="${6:-}" -v td="${7:-}" -v j="${8:-}" "$PARSE_AWK"'
-    NR > 1 {
-      parse($0)
-      if (C == c && (p == "" || P == p) && (dp == "" || DP == dp) && (d == "" || D == d) && (td == "" || TD == td) && (j == "" || J == j))
-        print NR - 1
-    }'
-}
-
-# 按序号从大到小删除，序号不会因删除而错位；返回删除条数到 DEL_COUNT
-delete_rule_nums() {
-  local table="$1" chain="$2" n
-  shift 2
-  for n in $(rule_nums "$table" "$chain" "$@" | sort -rn); do
-    if iptables -t "$table" -D "$chain" "$n" 2>/dev/null; then
-      DEL_COUNT=$((DEL_COUNT + 1))
-    else
-      log "delete failed: $table $chain #$n"
-    fi
-  done
-}
-
-# PREROUTING 中的 DNAT 规则，每行：备注(无则为 -)<TAB>协议<TAB>入站端口<TAB>目标IP<TAB>目标端口
-dnat_records() {
-  iptables -t nat -S PREROUTING 2>/dev/null | awk "$PARSE_AWK"'
-    NR > 1 {
-      parse($0)
-      if (J != "DNAT" || (P != "tcp" && P != "udp") || DP !~ /^[0-9]+$/ || TD !~ /:[0-9]+$/) next
-      ip = TD; sub(/:[0-9]+$/, "", ip)
-      tp = TD; sub(/^.*:/, "", tp)
-      cc = (C == "" ? "-" : C)
-      print cc "\t" P "\t" DP "\t" ip "\t" tp
-    }'
-}
-
-# 带备注的转发配置（tcp/udp 合并），每行：备注<TAB>入站端口<TAB>目标IP<TAB>目标端口<TAB>协议列表
-forward_configs() {
-  dnat_records | awk -F'\t' '$1 != "-"' | sort -t$'\t' -k3,3n -k1,1 -k4,4 -k5,5n | awk -F'\t' '
-    {
-      key = $1 "\t" $3 "\t" $4 "\t" $5
-      if (!(key in seen)) { seen[key] = 1; keys[++n] = key }
-      if ($2 == "tcp") tcp[key] = 1; else udp[key] = 1
-    }
-    END {
-      for (i = 1; i <= n; i++) {
-        k = keys[i]
-        pr = (k in tcp) ? "tcp" : ""
-        if (k in udp) pr = (pr == "" ? "udp" : pr " udp")
-        print k "\t" pr
-      }
-    }'
-}
-
-current_target_ip() {
-  dnat_records | awk -F'\t' -v c="$1" -v p="$2" -v i="$3" -v t="$4" '$1 == c && $2 == p && $3 == i && $5 == t { print $4; exit }'
-}
-
-# 占用某协议入站端口的 DNAT：输出 "备注<TAB>IP:端口"
-dnat_owner() {
-  dnat_records | awk -F'\t' -v p="$1" -v i="$2" '$2 == p && $3 == i { print $1 "\t" $4 ":" $5; exit }'
-}
-
-# ---------------------------------------------------------------- 托管配置（DDNS 用）
-
-managed_tmp() {
-  safe_mkdirs
-  mktemp "$CONF_DIR/.managed.XXXXXX"
-}
-
-register_forward_config() {
-  local in_port="$1" host="$2" tport="$3" proto="$4" comment="$5" tmp
-  tmp="$(managed_tmp)"
-  touch "$MANAGED_CONF"
-  awk -v i="$in_port" -v t="$tport" -v p="$proto" -v c="$comment" '
-    NF < 5 { next }
-    !($1 == i && $3 == t && $4 == p && $5 == c) { print }
-  ' "$MANAGED_CONF" > "$tmp"
-  echo "$in_port $host $tport $proto $comment" >> "$tmp"
-  mv "$tmp" "$MANAGED_CONF"
-  log "managed config updated: $in_port $host $tport $proto $comment"
-}
-
-remove_managed_forward_config() {
-  local in_port="$1" tport="$2" proto="$3" comment="$4" tmp
-  [ -f "$MANAGED_CONF" ] || return 0
-  tmp="$(managed_tmp)"
-  awk -v i="$in_port" -v t="$tport" -v p="$proto" -v c="$comment" '
-    NF < 5 { next }
-    !($1 == i && $3 == t && $4 == p && $5 == c) { print }
-  ' "$MANAGED_CONF" > "$tmp"
-  mv "$tmp" "$MANAGED_CONF"
-  log "managed config removed: in=$in_port target_port=$tport proto=$proto comment=$comment"
-}
-
-remove_managed_by_comment() {
-  local comment="$1" tmp
-  [ -f "$MANAGED_CONF" ] || return 0
-  tmp="$(managed_tmp)"
-  awk -v c="$comment" 'NF < 5 { next } $5 != c { print }' "$MANAGED_CONF" > "$tmp"
-  mv "$tmp" "$MANAGED_CONF"
-  log "managed config removed by comment: $comment"
-}
-
-# 托管配置中记录的目标（可能是域名）：managed_host 备注 入站端口 目标端口 协议列表
-managed_host() {
-  local proto
-  [ -f "$MANAGED_CONF" ] || return 0
-  for proto in $4; do
-    awk -v c="$1" -v i="$2" -v t="$3" -v p="$proto" '$1 == i && $3 == t && $4 == p && $5 == c { print $2; found = 1; exit } END { exit !found }' "$MANAGED_CONF" && return 0
-  done
-}
-
-# ---------------------------------------------------------------- 基础操作
-
-backup_rules() {
-  lock_acquire || return 1
-  safe_mkdirs
-  local base="$BACKUP_DIR/iptables-$(timestamp)" n=1
-  local file="$base.rules"
-  while [ -e "$file" ] || [ -e "$file.managed" ]; do
-    n=$((n + 1))
-    file="$base-$n.rules"
-  done
-  if ! iptables-save > "$file"; then
-    rm -f "$file"
-    err "备份失败：iptables-save 执行出错。"
+select_forward() {
+  local index
+  list_forwards || return 1
+  ((${#ROWS[@]})) || return 1
+  prompt index '选择编号（q 取消）' || return 1
+  if [[ ! "$index" =~ ^[1-9][0-9]{0,8}$ ]] || ((index > ${#ROWS[@]})); then
+    error '编号无效，请使用列表中的数字，不要添加前导零。'
     return 1
   fi
-  # 规则和 DDNS 托管配置必须一起备份，回滚后定时刷新才不会重新应用旧配置。
-  if ! { if [ -f "$MANAGED_CONF" ]; then
-    cp "$MANAGED_CONF" "$file.managed"
+  IFS=$'\t' read -r SELECTED_ID SELECTED_TOKEN SELECTED_IN SELECTED_HOST SELECTED_TARGET SELECTED_PROTO SELECTED_COMMENT _ <<< "${ROWS[index-1]}"
+}
+
+edit_forward() {
+  local operation="$1" incoming='' host='' target='' proto=tcp comment=''
+  if [[ "$operation" == update ]]; then
+    select_forward || return 1
+    incoming="$SELECTED_IN" host="$SELECTED_HOST" target="$SELECTED_TARGET"
+    proto="$SELECTED_PROTO" comment="$SELECTED_COMMENT"
+  fi
+  printf '输入 q 取消。协议可选 tcp、udp、both。\n'
+  prompt incoming '入站端口' "$incoming" || return 1
+  prompt host '目标 IPv4/域名' "$host" || return 1
+  prompt target '目标端口' "${target:-$incoming}" || return 1
+  prompt proto '协议' "$proto" || return 1
+  prompt comment '备注（字母、数字、._:-）' "${comment:-xjj-forward-$incoming}" || return 1
+  printf '%s：%s %s → %s:%s\n' "$comment" "$proto" "$incoming" "$host" "$target"
+  confirm '确认提交？提交前将检查规则和端口冲突' || return 0
+  if [[ "$operation" == update ]]; then
+    backend update "$SELECTED_ID" "$SELECTED_TOKEN" "$incoming" "$host" "$target" "$proto" "$comment"
   else
-    : > "$file.managed"
-  fi; }; then
-    rm -f "$file" "$file.managed"
-    err "备份失败：无法保存托管配置。"
-    return 1
-  fi
-  LAST_BACKUP="$file"
-  note "已备份当前规则 → $file"
-  log "backup created: $file"
-}
-
-# 修改规则前的准备：加锁并备份
-prepare_change() {
-  lock_acquire || return 1
-  backup_rules || return 1
-}
-
-save_rules() {
-  if command -v netfilter-persistent >/dev/null 2>&1; then
-    if netfilter-persistent save >/dev/null 2>&1; then
-      ok "规则已持久化（netfilter-persistent）"
-      log "rules saved by netfilter-persistent"
-    else
-      err "netfilter-persistent save 执行失败，请手动检查。"
-      log "netfilter-persistent save failed"
-      return 1
-    fi
-  else
-    mkdir -p /etc/iptables
-    if iptables-save > /etc/iptables/rules.v4; then
-      ok "规则已保存到 /etc/iptables/rules.v4"
-      warn "未安装 iptables-persistent，重启后不一定自动加载。"
-      log "rules saved to /etc/iptables/rules.v4"
-    else
-      err "保存到 /etc/iptables/rules.v4 失败。"
-      return 1
-    fi
+    backend add "$incoming" "$host" "$target" "$proto" "$comment"
   fi
 }
 
-check_iptables() {
-  title "检查 iptables 环境"
-
-  if command -v iptables >/dev/null 2>&1; then
-    ok "iptables：$(iptables --version)"
-  else
-    err "iptables 未安装。"
-    if command -v apt >/dev/null 2>&1 && confirm "是否现在安装 iptables 和 iptables-persistent？"; then
-      apt update && apt install -y iptables iptables-persistent netfilter-persistent
-    else
-      note "已跳过安装。"
-    fi
-  fi
-
-  if command -v iptables-save >/dev/null 2>&1; then
-    ok "iptables-save 可用"
-  else
-    err "iptables-save 不可用，请检查 iptables 安装。"
-  fi
-
-  if command -v netfilter-persistent >/dev/null 2>&1; then
-    ok "netfilter-persistent 已安装"
-  else
-    warn "netfilter-persistent 未安装，保存规则时会写入 /etc/iptables/rules.v4"
-  fi
+delete_forward() {
+  select_forward || return 1
+  confirm "确认删除 [$SELECTED_COMMENT] $SELECTED_PROTO $SELECTED_IN → $SELECTED_HOST:$SELECTED_TARGET？" || return 0
+  backend delete "$SELECTED_ID" "$SELECTED_TOKEN"
 }
 
-ip_forward_state() {
-  cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0
-}
-
-# 确保 IPv4 转发开启并持久化；参数 quiet 时只在有改动时输出
-ensure_ip_forward() {
-  local quiet="${1:-}"
-
-  if ! grep -qsE '^\s*net\.ipv4\.ip_forward\s*=\s*1\s*$' "$SYSCTL_FILE"; then
-    mkdir -p "$(dirname "$SYSCTL_FILE")"
-    echo "net.ipv4.ip_forward=1" > "$SYSCTL_FILE"
-    ok "已写入持久配置 $SYSCTL_FILE"
-    log "sysctl file written: $SYSCTL_FILE"
-  elif [ -z "$quiet" ]; then
-    ok "持久配置已存在：$SYSCTL_FILE"
-  fi
-
-  # /etc/sysctl.conf 最后加载，其中的 =0 会覆盖上面的配置
-  if grep -qsE '^\s*net\.ipv4\.ip_forward\s*=\s*0' /etc/sysctl.conf; then
-    sed -i -E 's/^(\s*net\.ipv4\.ip_forward\s*=\s*0.*)$/# \1  # disabled by ipt-forward-manager/' /etc/sysctl.conf
-    ok "已注释 /etc/sysctl.conf 中的 net.ipv4.ip_forward=0"
-    log "commented ip_forward=0 in /etc/sysctl.conf"
-  fi
-
-  if [ "$(ip_forward_state)" != "1" ]; then
-    if command -v sysctl >/dev/null 2>&1; then
-      sysctl -qw net.ipv4.ip_forward=1 2>/dev/null
-    fi
-    [ "$(ip_forward_state)" = "1" ] || echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
-    if [ "$(ip_forward_state)" = "1" ]; then
-      ok "已开启 IPv4 转发"
-      log "ip_forward enabled"
-    else
-      err "IPv4 转发开启失败，请手动检查。"
-      log "ip_forward enable failed"
-      return 1
-    fi
-  elif [ -z "$quiet" ]; then
-    ok "IPv4 转发当前已开启"
-  fi
-}
-
-check_sysctl() {
-  title "检查/修复 IPv4 转发"
-  ensure_ip_forward
-}
-
-# 放行转发连接的回程流量，FORWARD 默认策略为 DROP 时必需
-ensure_forward_established() {
-  local spec=(-m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$ESTABLISHED_COMMENT" -j ACCEPT)
-  iptables -C FORWARD "${spec[@]}" >/dev/null 2>&1 && return 0
-  if iptables -I FORWARD 1 "${spec[@]}" >/dev/null 2>&1; then
-    log "forward established rule added"
-  else
-    warn "无法添加 FORWARD 回程放行规则（conntrack），若 FORWARD 默认策略为 DROP，转发可能不通。"
-  fi
-}
-
-resolve_target() {
-  local target="$1" resolved=""
-
-  if valid_ipv4 "$target"; then
-    echo "$target"
-    return 0
-  fi
-
-  if command -v getent >/dev/null 2>&1; then
-    resolved="$(getent ahostsv4 "$target" 2>/dev/null | awk '{print $1; exit}')"
-  fi
-  if [ -z "$resolved" ] && command -v dig >/dev/null 2>&1; then
-    resolved="$(dig +short A "$target" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)"
-  fi
-  if [ -z "$resolved" ] && command -v host >/dev/null 2>&1; then
-    resolved="$(host -t A "$target" 2>/dev/null | awk '/has address/ {print $4; exit}')"
-  fi
-
-  valid_ipv4 "$resolved" || return 1
-  echo "$resolved"
-}
-
-# 规则不存在则添加：0 已添加，2 已存在，1 失败（错误信息在 IPT_ERR）
-ipt_ensure() {
-  local table="$1" op="$2" chain="$3"
-  shift 3
-  iptables -t "$table" -C "$chain" "$@" >/dev/null 2>&1 && return 2
-  local pos=(-A "$chain")
-  [ "$op" = "-I" ] && pos=(-I "$chain" 1)
-  IPT_ERR="$(iptables -t "$table" "${pos[@]}" "$@" 2>&1)" || return 1
-  return 0
-}
-
-# add_one_forward 入站端口 目标(IP/域名) 目标端口 协议 备注 [已解析IP]
-add_one_forward() {
-  local in_port="$1" host="$2" tport="$3" proto="$4" comment="$5" ip="${6:-}"
-  local label owner todest rc pre_added=0 post_added=0 fwd_added=0
-
-  label="$(printf '%-4s %5s → %s:%s' "${proto^^}" "$in_port" "$host" "$tport")"
-
-  if [ -z "$ip" ] && ! ip="$(resolve_target "$host")"; then
-    err "$label  域名解析失败"
-    log "resolve failed target=$host proto=$proto in=$in_port target_port=$tport comment=$comment"
-    return 1
-  fi
-  [ "$host" != "$ip" ] && label="$label ($ip)"
-  todest="$ip:$tport"
-
-  owner="$(dnat_owner "$proto" "$in_port")"
-  if [ -n "$owner" ] && [ "$owner" != "$comment"$'\t'"$todest" ]; then
-    err "$label  入站端口已被占用：${owner#*$'\t'} [${owner%%$'\t'*}]"
-    return 1
-  fi
-
-  ensure_forward_established
-
-  local pre=(-p "$proto" --dport "$in_port" -m comment --comment "$comment" -j DNAT --to-destination "$todest")
-  local post=(-p "$proto" -d "$ip" --dport "$tport" -m comment --comment "$comment" -j MASQUERADE)
-  local fwd=(-p "$proto" -d "$ip" --dport "$tport" -m comment --comment "$comment" -j ACCEPT)
-
-  ipt_ensure nat -A PREROUTING "${pre[@]}"; rc=$?
-  if [ "$rc" -eq 1 ]; then
-    err "$label  添加 DNAT 失败：$IPT_ERR"
-    return 1
-  fi
-  [ "$rc" -eq 0 ] && pre_added=1
-
-  ipt_ensure nat -A POSTROUTING "${post[@]}"; rc=$?
-  if [ "$rc" -eq 1 ]; then
-    err "$label  添加 MASQUERADE 失败：$IPT_ERR"
-    [ "$pre_added" -eq 1 ] && iptables -t nat -D PREROUTING "${pre[@]}" 2>/dev/null
-    return 1
-  fi
-  [ "$rc" -eq 0 ] && post_added=1
-
-  ipt_ensure filter -I FORWARD "${fwd[@]}"; rc=$?
-  if [ "$rc" -eq 1 ]; then
-    err "$label  添加 FORWARD 放行失败：$IPT_ERR"
-    [ "$pre_added" -eq 1 ] && iptables -t nat -D PREROUTING "${pre[@]}" 2>/dev/null
-    [ "$post_added" -eq 1 ] && iptables -t nat -D POSTROUTING "${post[@]}" 2>/dev/null
-    return 1
-  fi
-  [ "$rc" -eq 0 ] && fwd_added=1
-
-  register_forward_config "$in_port" "$host" "$tport" "$proto" "$comment" || return 1
-  log "add forward proto=$proto in=$in_port target=$host($ip):$tport comment=$comment"
-
-  if [ $((pre_added + post_added + fwd_added)) -eq 0 ]; then
-    ok "$label  ${DIM}[$comment] 已存在${RESET}"
-  else
-    ok "$label  ${DIM}[$comment]${RESET}"
-  fi
-}
-
-# 删除一条转发的三类规则：delete_forward_rules 备注 协议 入站端口 目标IP 目标端口
-delete_forward_rules() {
-  local comment="$1" proto="$2" in_port="$3" ip="$4" tport="$5"
-  DEL_COUNT=0
-  delete_rule_nums nat PREROUTING "$comment" "$proto" "$in_port" "" "$ip:$tport" DNAT
-  delete_rule_nums nat POSTROUTING "$comment" "$proto" "$tport" "$ip" "" MASQUERADE
-  delete_rule_nums filter FORWARD "$comment" "$proto" "$tport" "$ip" "" ACCEPT
-  log "delete forward proto=$proto in=$in_port target=$ip:$tport comment=$comment rules=$DEL_COUNT"
-}
-
-# 删除 nat 表所有链和 FORWARD 链中带该备注的规则
-delete_by_comment_core() {
-  local comment="$1" chain
-  DEL_COUNT=0
-  for chain in $(iptables -t nat -S 2>/dev/null | awk '$1 == "-P" || $1 == "-N" { print $2 }'); do
-    delete_rule_nums nat "$chain" "$comment"
-  done
-  delete_rule_nums filter FORWARD "$comment"
-  remove_managed_by_comment "$comment"
-  log "delete by comment: $comment rules=$DEL_COUNT"
-}
-
-# nat 表与 FORWARD 链中带该备注的规则原文
-rules_with_comment() {
-  { iptables -t nat -S 2>/dev/null; iptables -S FORWARD 2>/dev/null; } | awk -v c="$1" "$PARSE_AWK"'
-    /^-A / { parse($0); if (C == c) print }'
-}
-
-# ---------------------------------------------------------------- 选择列表
-
-# 列出转发配置并让用户选择，结果写入 S_COMMENT S_IN S_IP S_TPORT S_PROTOS S_HOST
-SEL_MAX=0
-valid_index() {
-  if [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le "$SEL_MAX" ]; then
-    return 0
-  fi
-  VERR="请输入 1-$SEL_MAX 之间的序号。"
-  return 1
-}
-
-print_config_header() {
-  printf '  %s' "$BOLD"
-  cell "序号" 4; cell "入站端口" 8; cell "协议" 7; cell "目标" 34; printf '备注%s\n' "$RESET"
-}
-
-print_config_row() {
-  local idx="$1" comment="$2" in_port="$3" ip="$4" tport="$5" protos="$6" host
-  host="$(managed_host "$comment" "$in_port" "$tport" "$protos")"
-  local target="$ip:$tport"
-  [ -n "$host" ] && [ "$host" != "$ip" ] && target="$host:$tport ($ip)"
-  printf '  '
-  cell "$idx" 4 "$CYAN"; cell "$in_port" 8; cell "$(protocol_label "$protos")" 7; cell "$target" 34; printf '%s\n' "$comment"
-}
-
-select_forward_config() {
-  local configs=() i idx
-  mapfile -t configs < <(forward_configs)
-
-  if [ "${#configs[@]}" -eq 0 ]; then
-    warn "没有找到带备注的 DNAT 转发规则。"
-    return 1
-  fi
-
-  print_config_header
-  for i in "${!configs[@]}"; do
-    IFS=$'\t' read -r S_COMMENT S_IN S_IP S_TPORT S_PROTOS <<< "${configs[$i]}"
-    print_config_row $((i + 1)) "$S_COMMENT" "$S_IN" "$S_IP" "$S_TPORT" "$S_PROTOS"
-  done
-  echo
-
-  SEL_MAX="${#configs[@]}"
-  ask idx "选择序号（q 取消）" valid_index || return 1
-  IFS=$'\t' read -r S_COMMENT S_IN S_IP S_TPORT S_PROTOS <<< "${configs[$((idx - 1))]}"
-  S_HOST="$(managed_host "$S_COMMENT" "$S_IN" "$S_TPORT" "$S_PROTOS")"
-  S_HOST="${S_HOST:-$S_IP}"
-}
-
-# ---------------------------------------------------------------- 添加
-
-add_forward_interactive() {
-  title "添加单条转发"
-  note "随时输入 q 取消"
-
-  local in_port host tport protos comment proto
-  ask in_port "入站端口" valid_port || return
-  ask host "目标 IP/域名" valid_target || return
-  ask tport "目标端口" valid_port "$in_port" || return
-  ask_protocols protos 3 || return
-  ask comment "备注" valid_comment "$(default_comment "$in_port" "$host" "$tport")" || return
-
-  echo
-  info "$(protocol_label "$protos")  $in_port → $host:$tport  [$comment]"
-  confirm "确认添加？" || { note "已取消。"; return; }
-
-  prepare_change || return
-  ensure_ip_forward quiet
-  local ip
-  if ! ip="$(resolve_target "$host")"; then
-    err "域名解析失败：$host"
-    return
-  fi
-  local added=0
-  for proto in $protos; do
-    add_one_forward "$in_port" "$host" "$tport" "$proto" "$comment" "$ip" && added=1
-  done
-  [ "$added" -eq 1 ] && save_rules
-}
-
-print_line_table_header() {
-  printf '  %s' "$BOLD"
-  cell "入站端口" 8; cell "目标" 30; cell "目标端口" 8; cell "协议" 7; printf '备注%s\n' "$RESET"
-}
-
-print_line_table_row() {
-  printf '  '
-  cell "$F_IN" 8; cell "$F_HOST" 30; cell "$F_TPORT" 8; cell "$(protocol_label "$F_PROTOS")" 7; printf '%s\n' "$F_COMMENT"
-}
-
-# 应用一组已校验的转发行
-apply_forward_lines() {
-  local line proto ip ok_n=0 fail_n=0
-  for line in "$@"; do
-    parse_forward_line "$line" || continue
-    if ! ip="$(resolve_target "$F_HOST")"; then
-      err "$F_IN → $F_HOST:$F_TPORT  域名解析失败"
-      fail_n=$((fail_n + 1))
-      continue
-    fi
-    for proto in $F_PROTOS; do
-      if add_one_forward "$F_IN" "$F_HOST" "$F_TPORT" "$proto" "$F_COMMENT" "$ip"; then
-        ok_n=$((ok_n + 1))
-      else
-        fail_n=$((fail_n + 1))
-      fi
-    done
-  done
-  echo
-  info "成功 $ok_n 条，失败 $fail_n 条"
-  [ "$ok_n" -gt 0 ] && save_rules
-}
-
-batch_add_forward() {
-  title "批量添加转发"
-  note "格式：入站端口 目标IP或域名 目标端口 [协议 tcp/udp/both，默认 both] [备注]"
-  note "例如：443 1.1.1.1 443 both xjj-forward-443"
-  note "      8443 home.example.com 443 tcp"
-  note "每行一条，输入 END 结束"
-  echo
-
-  local lines=() line rc
-  while read -rp "  > " line; do
-    line="$(trim "$line")"
-    case "$line" in
-      END|end) break ;;
-    esac
-    parse_forward_line "$line"
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-      lines+=("$line")
-    elif [ "$rc" -eq 1 ]; then
-      err "已忽略：$VERR"
-    fi
-  done
-
-  if [ "${#lines[@]}" -eq 0 ]; then
-    warn "没有输入有效规则。"
-    return
-  fi
-
-  echo
-  print_line_table_header
-  for line in "${lines[@]}"; do
-    parse_forward_line "$line"
-    print_line_table_row
-  done
-
-  confirm "确认添加以上 ${#lines[@]} 条？" || { note "已取消。"; return; }
-  prepare_change || return
-  ensure_ip_forward quiet
-  apply_forward_lines "${lines[@]}"
-}
-
-# ---------------------------------------------------------------- 删除
-
-delete_by_comment() {
-  title "选择删除转发"
-  select_forward_config || return
-
-  local protos="$S_PROTOS"
-  if [ "$S_PROTOS" = "tcp udp" ]; then
-    ask_protocols protos 3 "删除哪些协议（未选的保留）" || return
-  fi
-
-  echo
-  info "删除 $(protocol_label "$protos")  $S_IN → $S_HOST:$S_TPORT  [$S_COMMENT]"
-  confirm "确认删除？" || { note "已取消。"; return; }
-
-  prepare_change || return
-  local proto
-  for proto in $protos; do
-    delete_forward_rules "$S_COMMENT" "$proto" "$S_IN" "$S_IP" "$S_TPORT"
-    remove_managed_forward_config "$S_IN" "$S_TPORT" "$proto" "$S_COMMENT"
-    ok "已删除 ${proto^^} $S_IN → $S_IP:$S_TPORT（$DEL_COUNT 条规则）"
-  done
-  save_rules
-}
-
-batch_delete_by_comment() {
-  title "按备注批量删除"
-
-  local existing
-  existing="$(forward_configs | cut -f1 | sort -u)"
-  if [ -n "$existing" ]; then
-    note "现有备注："
-    printf '%s\n' "$existing" | indent
-    echo
-  fi
-  note "每行输入一个备注，输入 END 结束"
-
-  local comments=() c
-  while read -rp "  > " c; do
-    c="$(trim "$c")"
-    case "$c" in
-      END|end) break ;;
-      "") continue ;;
-    esac
-    comments+=("$c")
-  done
-
-  if [ "${#comments[@]}" -eq 0 ]; then
-    warn "没有输入任何备注。"
-    return
-  fi
-
-  local found=0 rules
-  for c in "${comments[@]}"; do
-    echo
-    printf '  %s%s%s\n' "$BOLD" "$c" "$RESET"
-    rules="$(rules_with_comment "$c")"
-    if [ -n "$rules" ]; then
-      printf '%s\n' "$rules" | indent
-      found=1
-    else
-      note "    未找到对应规则"
-    fi
-  done
-
-  [ "$found" -eq 1 ] || { warn "没有可删除的规则。"; return; }
-  confirm "确认删除以上规则？" || { note "已取消。"; return; }
-
-  prepare_change || return
-  for c in "${comments[@]}"; do
-    delete_by_comment_core "$c"
-    [ "$DEL_COUNT" -gt 0 ] && ok "已删除 [$c]（$DEL_COUNT 条规则）"
-  done
-  save_rules
-}
-
-# ---------------------------------------------------------------- 修改
-
-modify_rule() {
-  title "修改已有转发"
-  select_forward_config || return
-
-  local old_comment="$S_COMMENT" old_in="$S_IN" old_ip="$S_IP" old_tport="$S_TPORT" old_protos="$S_PROTOS"
-  local in_port host tport protos comment proto
-
-  echo
-  note "直接回车保留原值，输入 q 取消"
-  ask in_port "入站端口" valid_port "$old_in" || return
-  ask host "目标 IP/域名" valid_target "$S_HOST" || return
-  ask tport "目标端口" valid_port "$old_tport" || return
-  ask_protocols protos "$(choice_from_protocols "$old_protos")" || return
-  ask comment "备注" valid_comment "$old_comment" || return
-
-  echo
-  info "原：$(protocol_label "$old_protos")  $old_in → $S_HOST:$old_tport  [$old_comment]"
-  info "新：$(protocol_label "$protos")  $in_port → $host:$tport  [$comment]"
-
-  # 先检查新配置可用，再动旧规则
-  local ip owner
-  if ! ip="$(resolve_target "$host")"; then
-    err "域名解析失败：$host，未做任何修改。"
-    return
-  fi
-  for proto in $protos; do
-    owner="$(dnat_owner "$proto" "$in_port")"
-    if [ -n "$owner" ] && [ "${owner%%$'\t'*}" != "$old_comment" ]; then
-      err "${proto^^} 入站端口 $in_port 已被占用：${owner#*$'\t'} [${owner%%$'\t'*}]，未做任何修改。"
-      return
-    fi
-  done
-
-  confirm "确认修改？" || { note "已取消。"; return; }
-
-  prepare_change || return
-  local managed_copy
-  managed_copy="$(managed_tmp)"
-  cp "$MANAGED_CONF" "$managed_copy" 2>/dev/null || : > "$managed_copy"
-
-  for proto in $old_protos; do
-    delete_forward_rules "$old_comment" "$proto" "$old_in" "$old_ip" "$old_tport"
-    remove_managed_forward_config "$old_in" "$old_tport" "$proto" "$old_comment"
-  done
-
-  ensure_ip_forward quiet
-  local failed=0
-  for proto in $protos; do
-    add_one_forward "$in_port" "$host" "$tport" "$proto" "$comment" "$ip" || failed=1
-  done
-
-  if [ "$failed" -eq 1 ]; then
-    if iptables-restore < "$LAST_BACKUP"; then
-      mv "$managed_copy" "$MANAGED_CONF"
-      err "修改失败，已恢复为修改前的规则。"
-      log "modify failed, restored from $LAST_BACKUP"
-    else
-      rm -f "$managed_copy"
-      err "修改失败，且自动恢复失败！请用菜单 17 从备份回滚：$LAST_BACKUP"
-      log "modify failed, restore failed: $LAST_BACKUP"
-    fi
-    return
-  fi
-
-  rm -f "$managed_copy"
-  save_rules
-}
-
-# ---------------------------------------------------------------- 查看
-
-show_summary() {
-  title "转发规则摘要"
-
-  local records=() r c p i ip tp host target
-  mapfile -t records < <(dnat_records | sort -t$'\t' -k3,3n -k2,2)
-  if [ "${#records[@]}" -eq 0 ]; then
-    note "没有找到 DNAT 转发规则。"
-    return
-  fi
-
-  printf '  %s' "$BOLD"
-  cell "入站端口" 8; cell "协议" 5; cell "目标" 36; printf '备注%s\n' "$RESET"
-  for r in "${records[@]}"; do
-    IFS=$'\t' read -r c p i ip tp <<< "$r"
-    target="$ip:$tp"
-    host=""
-    [ "$c" != "-" ] && host="$(managed_host "$c" "$i" "$tp" "$p")"
-    [ -n "$host" ] && [ "$host" != "$ip" ] && target="$host:$tp ($ip)"
-    printf '  '
-    cell "$i" 8 "$CYAN"; cell "${p^^}" 5; cell "$target" 36; printf '%s\n' "$c"
-  done
-  echo
-  note "共 ${#records[@]} 条 DNAT 规则"
-}
-
-show_all_rules() {
-  title "NAT 表"
-  iptables -t nat -L -n -v --line-numbers | indent
-  title "FORWARD 链"
-  iptables -L FORWARD -n -v --line-numbers | indent
-}
-
-show_comment_rules() {
-  title "带备注的规则"
-  local rules
-  rules="$(iptables-save | grep -F -- '--comment')"
-  if [ -n "$rules" ]; then
-    printf '%s\n' "$rules" | indent
-  else
-    note "没有带备注的规则。"
-  fi
-}
-
-search_rules() {
-  title "搜索规则"
-  local keyword result
-  read -rp "  关键词（端口/IP/备注）: " keyword || return
-  keyword="$(trim "$keyword")"
-  if [ -z "$keyword" ]; then
-    err "关键词不能为空。"
-    return
-  fi
-
-  result="$(iptables-save | grep -F -e "$keyword")"
-  echo
-  if [ -z "$result" ]; then
-    note "没有找到相关规则。"
-    return
-  fi
-  if [ -t 1 ]; then
-    printf '%s\n' "$result" | grep -F --color=always -e "$keyword" | indent
-  else
-    printf '%s\n' "$result" | indent
-  fi
-}
-
-test_forward_hit() {
-  title "端口命中统计"
-  local port
-  ask port "入站端口" valid_port || return
-
-  echo
-  printf '  %sNAT PREROUTING%s\n' "$BOLD" "$RESET"
-  iptables -t nat -L PREROUTING -n -v --line-numbers | awk -v p="dpt:$port" '
-    NR <= 2 { print; next }
-    { for (i = 1; i <= NF; i++) if ($i == p) { print; found = 1; next } }
-    END { if (!found) print "（没有匹配该端口的规则）" }' | indent
-
-  local comments
-  comments="$(dnat_records | awk -F'\t' -v p="$port" '$3 == p && $1 != "-" { print $1 }' | sort -u)"
-  echo
-  printf '  %sFORWARD%s\n' "$BOLD" "$RESET"
-  iptables -L FORWARD -n -v --line-numbers | awk -v list="$comments" '
-    BEGIN { n = split(list, cs, "\n") }
-    NR <= 2 { print; next }
-    { for (i = 1; i <= n; i++) if (cs[i] != "" && index($0, "/* " cs[i] " */")) { print; found = 1; next } }
-    END { if (!found) print "（没有对应的 FORWARD 规则）" }' | indent
-
-  echo
-  note "packets/bytes 增加说明流量命中了规则。"
-}
-
-test_target() {
-  title "测试目标 TCP 连通性"
-  local host port
-  ask host "目标 IP/域名" valid_target || return
-  ask port "目标端口" valid_port || return
-
-  echo
-  if command -v nc >/dev/null 2>&1; then
-    if nc -z -w 3 "$host" "$port" >/dev/null 2>&1; then
-      ok "TCP $host:$port 可连接"
-    else
-      err "TCP $host:$port 不可连接或超时"
-    fi
-  elif command -v timeout >/dev/null 2>&1; then
-    if timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" >/dev/null 2>&1; then
-      ok "TCP $host:$port 可连接"
-    else
-      err "TCP $host:$port 不可连接或超时"
-    fi
-  else
-    warn "没有 nc/timeout，无法测试。可安装：apt install -y netcat-openbsd"
-  fi
-  note "UDP 无法可靠探测，这里只测试 TCP。"
-}
-
-# ---------------------------------------------------------------- 导入导出
-
-export_conf() {
-  title "导出转发为 .conf"
-  safe_mkdirs
-
-  local out_file
-  read -rp "  导出路径 [$CONF_DIR/forwards-$(timestamp).conf]: " out_file || return
-  out_file="$(trim "$out_file")"
-  out_file="${out_file:-$CONF_DIR/forwards-$(timestamp).conf}"
-
-  if [ ! -d "$(dirname "$out_file")" ]; then
-    err "目录不存在：$(dirname "$out_file")"
-    return
-  fi
-
-  local configs=() r c i ip tp pr host count=0 skipped tmp
-  mapfile -t configs < <(forward_configs)
-  skipped="$(dnat_records | grep -c '^-'$'\t')"
-
-  if [ "${#configs[@]}" -eq 0 ]; then
-    warn "没有可导出的带备注 DNAT 转发规则。"
-    return
-  fi
-
-  tmp="$(mktemp)"
-  {
-    echo "# iptables forward config exported by $APP_NAME $VERSION"
-    echo "# format: in_port target_ip_or_domain target_port protocol comment"
-    echo "# protocol: tcp / udp / both"
-    echo
-    for r in "${configs[@]}"; do
-      IFS=$'\t' read -r c i ip tp pr <<< "$r"
-      host="$(managed_host "$c" "$i" "$tp" "$pr")"
-      [ "$pr" = "tcp udp" ] && pr="both"
-      printf '%-6s %-30s %-6s %-5s %s\n' "$i" "${host:-$ip}" "$tp" "$pr" "$c"
-      count=$((count + 1))
-    done
-  } > "$tmp"
-
-  if ! mv "$tmp" "$out_file"; then
-    rm -f "$tmp"
-    err "写入失败：$out_file"
-    return
-  fi
-
-  ok "已导出 $count 条配置 → $out_file"
-  [ "$skipped" -gt 0 ] && warn "跳过了 $skipped 条没有备注的 DNAT 规则（非本脚本创建）。"
-  log "config exported: $out_file"
-}
-
-import_conf() {
-  title "从 .conf 导入转发"
-
+export_config() {
   local file
-  ask file ".conf 文件路径" valid_file || return
-
-  local raw=() lines=() line n=0 rc bad=0
-  mapfile -t raw < "$file"
-
-  echo
-  for line in "${raw[@]}"; do
-    n=$((n + 1))
-    parse_forward_line "$line"
-    rc=$?
-    if [ "$rc" -eq 0 ]; then
-      lines+=("$(trim "$line")")
-    elif [ "$rc" -eq 1 ]; then
-      err "第 $n 行：$VERR"
-      bad=$((bad + 1))
-    fi
-  done
-
-  if [ "${#lines[@]}" -eq 0 ]; then
-    warn "没有可导入的有效规则。"
-    return
-  fi
-
-  [ "$bad" -gt 0 ] && echo
-  print_line_table_header
-  for line in "${lines[@]}"; do
-    parse_forward_line "$line"
-    print_line_table_row
-  done
-  echo
-  info "有效 ${#lines[@]} 条，错误 $bad 条（错误行会被跳过）"
-
-  confirm "确认导入？" || { note "已取消。"; return; }
-  prepare_change || return
-  ensure_ip_forward quiet
-  apply_forward_lines "${lines[@]}"
+  prompt file '导出路径' "/root/forwards-$(date +%Y%m%d-%H%M%S).conf" || return 1
+  if [[ -e "$file" ]]; then confirm '文件已存在，确认覆盖？' || return 0; fi
+  backend export "$file"
 }
 
-valid_file() {
-  if [ -f "$1" ] && [ -r "$1" ]; then
-    return 0
-  fi
-  VERR="文件不存在或不可读：$1"
-  return 1
+import_config() {
+  local file
+  prompt file '导入文件路径（q 取消）' || return 1
+  backend preview-import "$file" || return 1
+  confirm '确认导入？任一配置有错误或冲突时，整次导入失败' || return 0
+  backend import "$file"
 }
 
-# ---------------------------------------------------------------- 备份/回滚
-
-BACKUPS=()
-load_backups() {
-  BACKUPS=()
-  [ -d "$BACKUP_DIR" ] || return 0
-  mapfile -t BACKUPS < <(ls -1t "$BACKUP_DIR"/*.rules 2>/dev/null)
-}
-
-print_backups() {
-  local i f
-  if [ "${#BACKUPS[@]}" -eq 0 ]; then
-    note "没有找到备份文件。"
-    return 1
-  fi
-  printf '  %s' "$BOLD"
-  cell "序号" 4; cell "时间" 20; cell "大小" 8; printf '文件%s\n' "$RESET"
-  for i in "${!BACKUPS[@]}"; do
-    f="${BACKUPS[$i]}"
-    printf '  '
-    cell $((i + 1)) 4 "$CYAN"
-    cell "$(date -r "$f" '+%F %T')" 20
-    cell "$(du -h "$f" | cut -f1)" 8
-    printf '%s\n' "$f"
-  done
-}
-
-list_backups() {
-  title "备份列表"
-  load_backups
-  print_backups
-}
-
-restore_backup() {
-  title "从备份回滚"
-  load_backups
-  print_backups || return
-  echo
-
-  local idx file managed_copy
-  SEL_MAX="${#BACKUPS[@]}"
-  ask idx "选择序号（q 取消）" valid_index || return
-  file="${BACKUPS[$((idx - 1))]}"
-
-  warn "这会用 $file 覆盖当前 iptables 规则。"
-  if [ ! -f "$file.managed" ]; then
-    warn "该旧备份没有托管配置快照，回滚后将清空 DDNS 托管记录，避免定时刷新覆盖恢复结果。"
-    note "当前规则和托管配置会先备份，可再次回滚恢复。"
-  fi
-  confirm "确认回滚？" || { note "已取消。"; return; }
-
-  prepare_change || return
-  managed_copy="$(managed_tmp)" || return 1
-  if [ -f "$file.managed" ] && ! cp "$file.managed" "$managed_copy"; then
-    rm -f "$managed_copy"
-    err "无法读取备份的托管配置，未修改当前规则。"
-    return 1
-  fi
-  if ! iptables-restore < "$file" || ! mv "$managed_copy" "$MANAGED_CONF"; then
-    rm -f "$managed_copy"
-    if iptables-restore < "$LAST_BACKUP"; then
-      err "回滚失败，已恢复操作前的规则和托管配置。"
-    else
-      err "回滚失败，且自动恢复失败！请检查规则并从备份恢复：$LAST_BACKUP"
-    fi
-    log "restore failed: $file"
-    return 1
-  fi
-  ok "已回滚到 $file"
-  log "restore backup: $file"
-  save_rules
-}
-
-# ---------------------------------------------------------------- 自检/DDNS
-
-refresh_managed_domain_forwards() {
-  [ -t 1 ] && title "刷新域名/DDNS 转发"
-  safe_mkdirs
-
-  if [ ! -s "$MANAGED_CONF" ]; then
-    note "没有托管的转发配置。"
-    log "ddns refresh skipped: no managed config"
-    return 0
-  fi
-
-  lock_acquire 120 || { log "ddns refresh skipped: lock busy"; return 1; }
-
-  local entries=() e in_port host tport proto comment rest ip cur saved domains=0 changed=0 failed=0 rollback_failed=0
-  mapfile -t entries < "$MANAGED_CONF"
-
-  for e in "${entries[@]}"; do
-    in_port="" host="" tport="" proto="" comment="" rest=""
-    read -r in_port host tport proto comment rest <<< "$e"
-    [ -z "$in_port" ] && continue
-    [ "${in_port:0:1}" = "#" ] && continue
-    if [ -z "$comment" ]; then
-      log "ddns refresh skipped malformed line: $e"
-      continue
-    fi
-    valid_ipv4 "$host" && continue
-    domains=$((domains + 1))
-
-    if ! ip="$(resolve_target "$host")"; then
-      warn "域名解析失败，跳过：$host"
-      log "ddns refresh resolve failed target=$host proto=$proto in=$in_port comment=$comment"
-      failed=$((failed + 1))
-      continue
-    fi
-
-    cur="$(current_target_ip "$comment" "$proto" "$in_port" "$tport")"
-    if [ "$cur" = "$ip" ]; then
-      log "ddns refresh unchanged target=$host ip=$ip proto=$proto in=$in_port comment=$comment"
-      continue
-    fi
-
-    info "$host：${cur:-无} → $ip（${proto^^} $in_port → $tport）"
-    saved="$(mktemp "$CONF_DIR/ddns.XXXXXX")" || return 1
-    cp "$MANAGED_CONF" "$saved" || { rm -f "$saved"; return 1; }
-    [ -z "$cur" ] || delete_forward_rules "$comment" "$proto" "$in_port" "$cur" "$tport"
-    if add_one_forward "$in_port" "$host" "$tport" "$proto" "$comment" "$ip"; then
-      changed=$((changed + 1))
-    else
-      failed=$((failed + 1))
-      delete_forward_rules "$comment" "$proto" "$in_port" "$ip" "$tport"
-      if [ -n "$cur" ] && ! add_one_forward "$in_port" "$host" "$tport" "$proto" "$comment" "$cur"; then
-        rollback_failed=1
-        err "DDNS 更新失败且旧规则恢复失败：$host；请检查规则后重试。"
-      fi
-      cp "$saved" "$MANAGED_CONF" || { err "恢复托管配置失败：$saved"; return 1; }
-    fi
-    rm -f "$saved"
-  done
-
-  if [ "$changed" -gt 0 ] && [ "$rollback_failed" -eq 0 ]; then
-    save_rules || failed=$((failed + 1))
-    log "ddns refresh changed=$changed failed=$failed"
-  else
-    log "ddns refresh no changes (domains=$domains failed=$failed)"
-  fi
-
-  if [ "$domains" -eq 0 ]; then
-    note "没有使用域名的转发。"
-  elif [ "$changed" -eq 0 ] && [ "$failed" -eq 0 ]; then
-    ok "$domains 条域名转发均无需更新。"
-  else
-    info "已更新 $changed 条，失败 $failed 条"
-  fi
-  [ "$failed" -eq 0 ]
-}
-
-install_self_check_service() {
-  title "安装自检/DDNS 定时服务"
-
-  if ! command -v systemctl >/dev/null 2>&1; then
-    err "系统没有 systemctl，无法安装。"
-    return
-  fi
-  if [ ! -f "$SELF_PATH" ]; then
-    err "无法定位当前脚本路径：$SELF_PATH"
-    return
-  fi
-
-  cat > /etc/systemd/system/ipt-forward-selfcheck.service <<EOF
-[Unit]
-Description=iptables forward manager self check
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash "$SELF_PATH" --self-check
-RemainAfterExit=no
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  cat > /etc/systemd/system/ipt-forward-selfcheck.timer <<EOF
-[Unit]
-Description=run iptables forward manager self check periodically
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=5min
-Unit=ipt-forward-selfcheck.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable ipt-forward-selfcheck.service >/dev/null 2>&1
-  if systemctl enable --now ipt-forward-selfcheck.timer >/dev/null 2>&1; then
-    ok "已安装并启用 ipt-forward-selfcheck.service / .timer"
-    note "每 5 分钟刷新一次域名/DDNS 转发，脚本路径：$SELF_PATH"
-    note "移动或删除脚本后需要重新安装。日志：$LOG_FILE"
-    log "self-check service and timer installed"
-  else
-    err "启用定时器失败，请执行 systemctl status ipt-forward-selfcheck.timer 查看。"
-  fi
-}
-
-uninstall_self_check_service() {
-  title "卸载自检/DDNS 定时服务"
-  systemctl disable --now ipt-forward-selfcheck.timer >/dev/null 2>&1 || true
-  systemctl disable ipt-forward-selfcheck.service >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/ipt-forward-selfcheck.timer /etc/systemd/system/ipt-forward-selfcheck.service
-  systemctl daemon-reload 2>/dev/null || true
-  ok "已卸载。"
-  log "self-check service and timer uninstalled"
-}
-
-self_check() {
-  log "self-check start"
-
-  if command -v iptables >/dev/null 2>&1; then
-    log "iptables ok: $(iptables --version)"
-  else
-    log "iptables missing"
-  fi
-
-  local ipf count
-  ipf="$(ip_forward_state)"
-  log "runtime ip_forward=$ipf"
-  if [ "$ipf" != "1" ]; then
-    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
-    log "attempted to enable runtime ip_forward"
-  fi
-
-  count="$(iptables-save -t nat 2>/dev/null | grep -c -- '-j DNAT')"
-  log "dnat rule count=${count:-0}"
-
-  refresh_managed_domain_forwards
-  local rc=$?
-  lock_release
-  log "self-check end"
-  return "$rc"
-}
-
-view_log() {
-  title "脚本日志（最近 100 行）"
-  if [ -f "$LOG_FILE" ]; then
-    tail -n 100 "$LOG_FILE" | indent
-  else
-    note "暂无日志。"
-  fi
-}
-
-# ---------------------------------------------------------------- 菜单
-
-menu_item() {
-  printf '  %s%3s)%s ' "$CYAN" "$1" "$RESET"
-  cell "$2" 26
-}
-
-menu_group() {
-  echo
-  printf '  %s%s%s\n' "$BOLD" "$1" "$RESET"
-}
-
-menu() {
-  [ -t 1 ] && clear
-
-  local fwd rules timer
-  if [ "$(ip_forward_state)" = "1" ]; then fwd="${GREEN}已开启${RESET}"; else fwd="${RED}未开启${RESET}"; fi
-  rules="$(forward_configs | wc -l)"
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet ipt-forward-selfcheck.timer 2>/dev/null; then
-    timer="${GREEN}运行中${RESET}"
-  else
-    timer="${DIM}未启用${RESET}"
-  fi
-
-  printf '  %s%s%s\n' "$DIM" "$HR" "$RESET"
-  printf '  %s%s%s %sv%s%s\n' "$BOLD$CYAN" "$APP_NAME" "$RESET" "$DIM" "$VERSION" "$RESET"
-  printf '  IPv4 转发 %s   转发配置 %s%s%s 条   DDNS 定时 %s\n' "$fwd" "$BOLD" "$rules" "$RESET" "$timer"
-  printf '  %s%s%s\n' "$DIM" "$HR" "$RESET"
-
-  menu_group "基础检查"
-  menu_item 1 "检查 iptables 环境";   menu_item 2 "检查/修复 IPv4 转发"; echo
-  menu_group "规则查看"
-  menu_item 3 "转发规则摘要";         menu_item 4 "全部 NAT/FORWARD 规则"; echo
-  menu_item 5 "搜索规则";             menu_item 6 "带备注的规则"; echo
-  menu_item 7 "端口命中统计"; echo
-  menu_group "添加 / 删除 / 修改"
-  menu_item 8 "添加单条转发";         menu_item 9 "批量添加转发"; echo
-  menu_item 10 "选择删除转发";        menu_item 11 "按备注批量删除"; echo
-  menu_item 12 "修改已有转发"; echo
-  menu_group "导入导出"
-  menu_item 13 "导出为 .conf";        menu_item 14 "从 .conf 导入"; echo
-  menu_group "备份 / 回滚 / 测试"
-  menu_item 15 "备份当前规则";        menu_item 16 "查看备份列表"; echo
-  menu_item 17 "从备份回滚";          menu_item 18 "测试目标 TCP 连通"; echo
-  menu_item 19 "保存当前规则"; echo
-  menu_group "自检 / DDNS / 日志"
-  menu_item 20 "安装 DDNS 定时服务";  menu_item 21 "卸载 DDNS 定时服务"; echo
-  menu_item 22 "查看日志";            menu_item 23 "立即刷新 DDNS 转发"; echo
-  echo
-  menu_item 0 "退出"; echo
-  printf '  %s%s%s\n' "$DIM" "$HR" "$RESET"
+restore_config() {
+  local output index n=0 item backups=()
+  output="$(backend backups)" || return 1
+  [[ -n "$output" ]] || { printf '没有包含规则及托管配置的完整备份。\n'; return 0; }
+  mapfile -t backups <<< "$output"
+  for item in "${backups[@]}"; do n=$((n+1)); printf '%d. %s\n' "$n" "$item"; done
+  prompt index '选择备份编号（q 取消）' || return 1
+  if [[ ! "$index" =~ ^[1-9][0-9]{0,8}$ ]] || ((index > ${#backups[@]})); then error '编号无效。'; return 1; fi
+  confirm '这会检查端口冲突并恢复单机脚本自身的规则和配置，确认继续？' || return 0
+  backend restore "${backups[index-1]}"
 }
 
 main() {
-  if [ "${1:-}" = "--self-check" ]; then
-    self_check
-    exit $?
-  fi
-
-  need_root
-  safe_mkdirs
-
+  [[ "$(id -u)" == 0 ]] || { error "请使用 sudo bash $SELF_PATH 运行。"; return 1; }
+  [[ $# == 0 || ( $# == 1 && "$1" == --self-check ) ]] || { error '仅支持交互运行或 --self-check。'; return 1; }
+  umask 077
+  check_dependencies || { error '依赖准备失败，未进入转发操作。'; return 1; }
+  if [[ "${1:-}" == --self-check ]]; then backend refresh; return $?; fi
   local choice
   while true; do
-    menu
-    if ! command -v iptables >/dev/null 2>&1; then
-      warn "未检测到 iptables，请先执行 1 安装。"
-    fi
-    read -rp "  请选择: " choice || { echo; exit 0; }
-    choice="$(trim "$choice")"
-
+    printf '\nIPv4 转发管理 v%s\n' "$VERSION"
+    printf '1. 查看转发\n2. 添加转发\n3. 修改转发\n4. 删除转发\n5. 导出配置\n6. 导入配置\n7. 恢复备份\n0. 退出\n'
+    read -rp '请选择：' choice || return 0
     case "$choice" in
-      1) check_iptables ;;
-      2) check_sysctl ;;
-      3) show_summary ;;
-      4) show_all_rules ;;
-      5) search_rules ;;
-      6) show_comment_rules ;;
-      7) test_forward_hit ;;
-      8) add_forward_interactive ;;
-      9) batch_add_forward ;;
-      10) delete_by_comment ;;
-      11) batch_delete_by_comment ;;
-      12) modify_rule ;;
-      13) export_conf ;;
-      14) import_conf ;;
-      15) title "备份当前规则"; backup_rules && ok "备份完成" ;;
-      16) list_backups ;;
-      17) restore_backup ;;
-      18) test_target ;;
-      19) title "保存当前规则"; save_rules ;;
-      20) install_self_check_service ;;
-      21) uninstall_self_check_service ;;
-      22) view_log ;;
-      23) refresh_managed_domain_forwards ;;
-      0|q) exit 0 ;;
-      "") continue ;;
-      *) err "无效选择：$choice" ;;
+      1) list_forwards ;;
+      2) edit_forward add ;;
+      3) edit_forward update ;;
+      4) delete_forward ;;
+      5) export_config ;;
+      6) import_config ;;
+      7) restore_config ;;
+      0|q) return 0 ;;
+      *) error '无效选项。' ;;
     esac
-    lock_release
-    pause
   done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

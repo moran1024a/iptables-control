@@ -25,7 +25,7 @@ import time
 from urllib.parse import parse_qs
 import target_config
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -558,7 +558,7 @@ def cleanup(conn):
         conn.execute("DELETE FROM active_windows WHERE win < ?", ((now - RETENTION) // ACTIVE_WINDOW,))
         conn.execute("DELETE FROM events WHERE ts < ?", (now - RETENTION,))
         conn.execute("DELETE FROM sessions WHERE expires < ?", (now,))
-        conn.execute("DELETE FROM sync_ops WHERE expires < ?", (now - RETENTION,))
+        conn.execute("DELETE FROM sync_ops WHERE expires < ? AND (result IS NULL OR result != 'failed')", (now - RETENTION,))
         conn.execute("DELETE FROM deleted_receipts WHERE expires < ?", (now,))
 
 
@@ -1075,10 +1075,16 @@ def rules_version(lines):
     return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:12]
 
 
+def port_error(err):
+    return (err or '').startswith(('端口冲突：', '端口检查失败：'))
+
+
 def node_status(conn, node, now):
     """new / offline / skew / syncing / synced / error / deleting"""
     if node["deleting"]:
         return "deleting"
+    if node['state'] == 'error' and port_error(node['err']):
+        return 'error'
     if node["manual_required"] or node["desired_mode"] == "passive":
         return "syncing" if (node["manual_required"] or node["applied_generation"] != node["desired_generation"]
                               or node["state"] != "ok") else "synced"
@@ -1193,6 +1199,8 @@ def sync_report(conn, node, fields, source_ip, now=None):
         return f'time={now}\n'
     proto = fields.get('proto') == '2'
     source, phase = fields.get('source'), fields.get('phase')
+    if proto and phase in ('poll', 'begin') and node['state'] == 'error' and port_error(node['err']):
+        health, err = 'error', node['err']
     if proto and (source not in ('manual','auto') or phase not in ('begin','poll','ack','asset')):
         raise UserError('无效同步阶段')
     au = {'0': 0, '1': 1}.get(fields.get('au'))
@@ -1237,7 +1245,9 @@ def sync_report(conn, node, fields, source_ip, now=None):
         current = (op['generation'] == node['desired_generation'] and op['mode'] == node['desired_mode'] and op['hash'] == want)
         result = 'failed' if state != 'ok' else 'confirmed' if current else 'changed'
         conn.execute('UPDATE sync_ops SET result=? WHERE node_id=?', (result, node['id']))
-        conn.execute('UPDATE nodes SET state=?,err=? WHERE id=?', (state, err, node['id']))
+        # A successful obsolete snapshot must not clear a newer pending error.
+        if result != 'changed' or not port_error(node['err']):
+            conn.execute('UPDATE nodes SET state=?,err=? WHERE id=?', (state, err, node['id']))
         if state == 'ok':
             conn.execute('UPDATE nodes SET reported_v=?,reported_mode=?,applied_generation=?,last_success=? WHERE id=?',
                          (op['hash'], op['mode'], op['generation'], now, node['id']))
@@ -1257,12 +1267,16 @@ def sync_report(conn, node, fields, source_ip, now=None):
         raise UserError('无效同步阶段')
     if source == 'auto' and op and op['source']=='manual' and not op['result'] and op['expires'] >= now:
         return 'proto=2\naction=busy\n'
+    if (source == 'auto' and op and op['result'] == 'failed' and port_error(node['err'])
+            and op['generation'] == node['desired_generation'] and op['mode'] == node['desired_mode'] and op['hash'] == want):
+        return f"proto=2\naction=blocked\ngeneration={op['generation']}\nerr={node['err']}\n" + update
     if op and op['op']==opid:
         if op['expires'] < now or op['source'] != source:
             return 'proto=2\nresult=expired\n'
     else:
         if source == 'auto' and (node['applied_generation']==node['desired_generation'] and
-                fields.get('generation')==str(node['desired_generation']) and fields.get('v')==want and state=='ok'):
+                fields.get('generation')==str(node['desired_generation']) and fields.get('v')==want and state=='ok'
+                and not port_error(node['err'])):
             conn.execute("UPDATE nodes SET state='ok',err='' WHERE id=?", (node['id'],))
             return 'proto=2\naction=same\n' + update
         op = {'op':opid, 'source':source, 'generation':node['desired_generation'], 'mode':node['desired_mode'],
@@ -1273,7 +1287,7 @@ def sync_report(conn, node, fields, source_ip, now=None):
             conn.execute('''INSERT INTO windows(node_id,win,level,manual_count,last_activity) VALUES (?,?,2,1,?)
                 ON CONFLICT(node_id,win) DO UPDATE SET manual_count=manual_count+1,last_activity=excluded.last_activity''',
                          (node['id'], now//WINDOW, now))
-            conn.execute("UPDATE nodes SET last_manual=?,state='init' WHERE id=?", (now,node['id']))
+            conn.execute("UPDATE nodes SET last_manual=?,state=CASE WHEN state='error' THEN state ELSE 'init' END WHERE id=?", (now,node['id']))
             add_event(conn, node['id'], '手动同步开始', now)
     return (f"proto=2\naction=apply\nop={opid}\ngeneration={op['generation']}\nmode={op['mode']}\n"
             f"v={op['hash']}\n{op['rules']}\n" + update)
@@ -1928,7 +1942,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not c["deleting"]:
                 first = c["hops"][0] if c["hops"] else {"addr": t["host"], "port": t["port"]}
                 c["connection"] = target_config.connection(t, first["addr"], first["port"], c["remark"])
-            c["status"] = ("deleting" if c["deleting"] else "applying" if c["pending"] else
+            c["status"] = ("deleting" if c["deleting"] else "error" if any(n['status']=='error' for n in c['hops']+c['pending']) else "applying" if c["pending"] else
                            "saved" if not c["hops"] else "applied")
         return data
 

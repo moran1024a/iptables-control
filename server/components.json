@@ -1,5 +1,6 @@
 {
   "api": 2,
-  "server": "0.3.0",
-  "forward_agent": "0.2.0"
+  "server": "0.3.1",
+  "forward_agent": "0.2.1",
+  "standalone": "3.1"
 }

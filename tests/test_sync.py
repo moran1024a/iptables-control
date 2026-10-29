@@ -151,6 +151,39 @@ class SyncTests(Fixture, unittest.TestCase):
         with patch.object(s,'AGENT',None):
             s.load_agent()
             data=self.report(n,proto='1',agent='0.1.8',au='1',get='agent',v=s.rules_version(s.node_rules(self.db,s.get_node(self.db,n))))
-            self.assertEqual(data,s.AGENT[2]);self.assertIn(b'VERSION="0.2.0"',data)
+            self.assertEqual(data,s.AGENT[2]);self.assertIn(b'VERSION="0.2.1"',data)
             self.assertTrue(self.db.execute('SELECT 1 FROM chain_pending').fetchone())
             self.assertEqual(s.get_node(self.db,n)['protocol_version'],1)
+
+    def test_port_conflict_blocks_same_generation_without_clearing_on_heartbeat(self):
+        n,r,c=self.ready();self.call('api_config_save',{'ports':[10002]},c)
+        op=self.begin(n,source='auto',phase='poll')
+        error='端口冲突：TCP 10002 已被单机脚本保存的配置占用'
+        self.assertEqual(self.ack(n,op,source='auto',state='error',err=error),'failed')
+        count=self.db.execute('SELECT COUNT(*) FROM events').fetchone()[0]
+        for _ in range(3):
+            response=self.begin(n,source='auto',phase='poll',state='ok',v=op['v'],generation=op['generation'])
+            self.assertEqual(response['action'],'blocked');self.assertEqual(response['err'],error)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM events').fetchone()[0],count)
+        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())),'error')
+        self.assertEqual(self.call('api_configs')['chains'][0]['status'],'error')
+        self.assertTrue(self.db.execute('SELECT 1 FROM chain_pending').fetchone())
+        self.db.execute('UPDATE sync_ops SET expires=0');self.db.commit();s.cleanup(self.db)
+        self.assertEqual(self.begin(n,source='auto',phase='poll')['action'],'blocked')
+        self.call('api_config_save',{'ports':[10003]},c)
+        new=self.begin(n,source='auto',phase='poll');self.assertEqual(new['action'],'apply')
+        self.assertEqual(self.ack(n,new,source='auto'),'confirmed')
+        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())),'synced')
+
+    def test_passive_port_conflict_survives_begin_old_success_and_restart(self):
+        n,r,c=self.passive();self.call('api_config_save',{'ports':[10002]},c)
+        op=self.begin(n);self.assertEqual(self.ack(n,op,state='error',err='端口冲突：UDP 10002 已被本机服务占用'),'failed')
+        self.db.close();self.db=s.init_db()
+        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())+864000),'error')
+        old=self.begin(n)
+        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())),'error')
+        self.call('api_config_save',{'ports':[10003]},c)
+        self.assertEqual(self.ack(n,old),'changed')
+        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())),'error')
+        new=self.begin(n);self.assertEqual(self.ack(n,new),'confirmed')
+        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())+864000),'synced')
