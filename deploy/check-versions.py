@@ -11,8 +11,6 @@ checks = [
     ("server/ictl-server.py", r'^VERSION = "([^"]+)"', manifest["server"]),
     ("deploy/install-server.sh", r'^VERSION="([^"]+)"', manifest["server"]),
     ("agent/ictl.sh", r'^VERSION="([^"]+)"', manifest["forward_agent"]),
-    ("tunnel-agent/main.go", r'^const Version = "([^"]+)"', manifest["tunnel_agent"]),
-    ("tunnel-agent/install-tunnel.sh", r'^VERSION="([^"]+)"', manifest["tunnel_agent"]),
 ]
 for path, pattern, expected in checks:
     match = re.search(pattern, (root / path).read_text(), re.M)

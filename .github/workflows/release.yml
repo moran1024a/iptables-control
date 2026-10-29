@@ -21,21 +21,14 @@ jobs:
           python3 deploy/check-versions.py "$v"
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.27.3'
-          cache: false
-
-      - name: 验证与构建独立 Agent
+      - name: 验证与打包
         run: |
           python3 -m unittest discover -s tests
-          (cd tunnel-agent && go test ./...)
+          node --check server/web/app.js
+          for file in agent/ictl.sh deploy/install-server.sh ipt.sh; do bash -n "$file"; done
           mkdir -p dist
-          for arch in amd64 arm64; do
-            (cd tunnel-agent && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o ../dist/tunnel-agent-linux-$arch .)
-          done
-          cp agent/ictl.sh deploy/install-server.sh tunnel-agent/install-tunnel.sh server/components.json dist/
-          (cd dist && sha256sum ictl.sh install-server.sh install-tunnel.sh components.json tunnel-agent-linux-* > SHA256SUMS)
+          cp agent/ictl.sh deploy/install-server.sh server/components.json dist/
+          (cd dist && sha256sum ictl.sh install-server.sh components.json > SHA256SUMS)
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -58,5 +51,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          awk -v version="${GITHUB_REF_NAME#v}" '
+            /^## / { if (found) exit; if ($2 == version) found = 1; next }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          test -s "$RUNNER_TEMP/release-notes.md"
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" --generate-notes
+            --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"

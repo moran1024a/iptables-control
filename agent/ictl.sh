@@ -2,8 +2,9 @@
 # ictl 节点端：从服务端拉取转发规则，应用到 iptables 并上报结果
 
 set -u
+umask 077
 
-VERSION="0.1.8"
+VERSION="0.2.0"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/bin/ictl"
@@ -43,7 +44,7 @@ need_root() {
     exit 1
   fi
   local c missing=()
-  for c in curl openssl iptables iptables-restore getent flock od systemctl; do
+  for c in curl openssl iptables iptables-save iptables-restore getent flock od systemctl; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -79,10 +80,10 @@ save_conf() {
 # 上报给服务端的内容：R_V 已处理的版本，R_STATE ok/error，R_ERR 错误说明
 # NET 最近一次请求结果：ok / auth / conn / bad / skew / noconf；ST_TIME 最近一次同步时间
 # SKEW 本机比服务端快多少秒（仅 NET=skew 时有值）
-R_V="" R_STATE="ok" R_ERR="" NET="" ST_TIME="" SKEW=""
+R_V="" R_STATE="ok" R_ERR="" NET="" ST_TIME="" SKEW="" R_GEN=0 CONFIRM=""
 load_state() {
   local k v
-  R_V="" R_STATE="ok" R_ERR="" NET="" ST_TIME="" SKEW=""
+  R_V="" R_STATE="ok" R_ERR="" NET="" ST_TIME="" SKEW="" R_GEN=0 CONFIRM=""
   if [ -f "$STATE" ]; then
     while IFS='=' read -r k v; do
       case "$k" in
@@ -92,6 +93,8 @@ load_state() {
         net) NET="$v" ;;
         time) ST_TIME="$v" ;;
         skew) SKEW="$v" ;;
+        generation) R_GEN="$v" ;;
+        confirm) CONFIRM="$v" ;;
       esac
     done < "$STATE"
   elif [ -f "$CONFIG" ]; then
@@ -103,7 +106,7 @@ load_state() {
 save_state() {
   mkdir -p "$LIB"
   printf 'time=%s\nnet=%s\nskew=%s\nv=%s\nstate=%s\nerr=%s\n' "$(date +%s)" "$NET" "$SKEW" "$R_V" "$R_STATE" "$R_ERR" > "$STATE.tmp"
-  mv "$STATE.tmp" "$STATE"
+  printf 'generation=%s\nconfirm=%s\n' "$R_GEN" "$CONFIRM" >> "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
 }
 
 with_lock() {
@@ -280,22 +283,92 @@ ensure_ip_forward() {
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || ERRS+=("enable ip_forward failed")
 }
 
-# 生成规则；与上次提交的内容不同，或跳转规则丢失时才重新提交
+# Capture only our chains; counters and generated comments do not affect comparison.
+owned_snapshot() {
+  local table rules
+  for table in nat filter; do
+    rules="$(iptables-save -t "$table")" || return 1
+    printf '*%s\n' "$table"
+    printf '%s\n' "$rules" | awk '/^:ICTL-(PRE|POST|FWD) / {sub(/\[[0-9]+:[0-9]+\]/,"[0:0]"); print}
+      /^-A ICTL-(PRE|POST|FWD) / {print}'
+    echo COMMIT
+  done
+}
+
+jump_flags() {
+  local table parent chain item
+  for item in 'nat PREROUTING ICTL-PRE' 'nat POSTROUTING ICTL-POST' 'filter FORWARD ICTL-FWD'; do
+    read -r table parent chain <<< "$item"
+    if iptables -t "$table" -C "$parent" -j "$chain" 2>/dev/null; then echo 1; else echo 0; fi
+  done
+}
+
+restore_owned() {
+  local snapshot="$1" flags="$2" table parent chain flag i=0 item
+  # Empty owned chains absent from the original snapshot before removing them.
+  local input="$snapshot"
+  [[ "$input" == *':ICTL-PRE '* ]] || input="${input/\*nat/*nat$'\n':ICTL-PRE - [0:0]}"
+  [[ "$input" == *':ICTL-POST '* ]] || input="${input/\*nat/*nat$'\n':ICTL-POST - [0:0]}"
+  [[ "$input" == *':ICTL-FWD '* ]] || input="${input/\*filter/*filter$'\n':ICTL-FWD - [0:0]}"
+  printf '%s\n' "$input" | iptables-restore -w --noflush || return 1
+  for item in 'nat PREROUTING ICTL-PRE' 'nat POSTROUTING ICTL-POST' 'filter FORWARD ICTL-FWD'; do
+    read -r table parent chain <<< "$item"
+    i=$((i+1)); flag="$(sed -n "${i}p" <<< "$flags")"
+    if [ "$flag" = 0 ]; then
+      while iptables -t "$table" -C "$parent" -j "$chain" 2>/dev/null; do
+        iptables -w -t "$table" -D "$parent" -j "$chain" || return 1
+      done
+    fi
+    if [[ "$snapshot" != *":$chain "* ]]; then
+      iptables -w -t "$table" -F "$chain" && iptables -w -t "$table" -X "$chain" || return 1
+    fi
+  done
+}
+
+rules_match() {
+  local input="$1" actual="$2" line table="" expected=0 count=0
+  local -a args
+  while IFS= read -r line; do
+    case "$line" in
+      '*nat') table=nat ;;
+      '*filter') table=filter ;;
+      '-A ICTL-'*)
+        read -r -a args <<< "$line"
+        args[0]=-C
+        iptables -w -t "$table" "${args[@]}" 2>/dev/null || return 1
+        expected=$((expected+1)) ;;
+    esac
+  done <<< "$input"
+  count="$(grep -c '^-A ICTL-' <<< "$actual")"
+  [ "$expected" -eq "$count" ]
+}
+
 apply_rules() {
-  local out
+  local out previous flags actual
   render
-  if [ -f "$APPLIED" ] && printf '%s' "$RENDERED" | cmp -s - "$APPLIED" && jumps_ok; then
+  [ "${#ERRS[@]}" -eq 0 ] || return 1
+  previous="$(owned_snapshot)" || { ERRS+=("read iptables failed"); return 1; }
+  flags="$(jump_flags)"
+  if [ -f "$APPLIED" ] && printf '%s' "$RENDERED" | cmp -s - "$APPLIED" &&
+      [ -f "$KERNEL" ] && [ "$(cat "$KERNEL")" = "$previous" ] && jumps_ok; then
     return 0
   fi
-  if ! out="$(printf '%s' "$RENDERED" | iptables-restore -w --noflush 2>&1)"; then
-    ERRS+=("iptables-restore failed: ${out%%$'\n'*}")
+  if ! out="$(printf '%s' "$RENDERED" | iptables-restore -w --noflush 2>&1)" || ! out="$(ensure_jumps 2>&1)"; then
+    ERRS+=("apply failed: ${out%%$'\n'*}")
+    restore_owned "$previous" "$flags" || ERRS+=("rollback failed")
     return 1
   fi
-  if ! out="$(ensure_jumps 2>&1)"; then
-    ERRS+=("add jump failed: ${out%%$'\n'*}")
+  if ! actual="$(owned_snapshot)" || ! rules_match "$RENDERED" "$actual"; then
+    ERRS+=("verify rules failed")
+    restore_owned "$previous" "$flags" || ERRS+=("rollback failed")
     return 1
   fi
-  printf '%s' "$RENDERED" > "$APPLIED"
+  if ! printf '%s' "$RENDERED" > "$APPLIED.tmp" || ! printf '%s\n' "$actual" > "$KERNEL.tmp" ||
+      ! mv "$APPLIED.tmp" "$APPLIED" || ! mv "$KERNEL.tmp" "$KERNEL"; then
+    ERRS+=("save applied rules failed")
+    restore_owned "$previous" "$flags" || ERRS+=("rollback failed")
+    return 1
+  fi
 }
 
 remove_chain() {
@@ -336,7 +409,7 @@ local_apply() {
   [ -n "$CFG_ERR" ] && ERRS+=("$CFG_ERR")
   mkdir -p "$LIB"
   ensure_ip_forward
-  apply_rules
+  [ "${#ERRS[@]}" -ne 0 ] || apply_rules
   if [ "${#ERRS[@]}" -eq 0 ]; then
     R_STATE="ok" R_ERR=""
   else
@@ -374,84 +447,194 @@ send_request() {
   echo "${code:-000}"
 }
 
+# The selected mode survives Agent replacements. A pause never acknowledges a change.
+MODE="active" R_GEN=0 CONFIRM="" SOURCE="auto" OP="" PHASE="poll"
+MODE_FILE="$LIB/mode"
+ACK_FILE="$LIB/ack"
+KERNEL="$LIB/kernel"
+load_mode() {
+  MODE="active"
+  [ ! -f "$MODE_FILE" ] || read -r MODE < "$MODE_FILE"
+  [[ "$MODE" = active || "$MODE" = passive ]] || { err "本地模式文件无效"; return 1; }
+}
+save_mode() {
+  printf '%s\n' "$MODE" > "$MODE_FILE.tmp" && mv "$MODE_FILE.tmp" "$MODE_FILE"
+}
+
+ensure_service_policy() {
+  [ -f "$SERVICE" ] || return 0
+  if ! grep -qx 'Restart=on-failure' "$SERVICE"; then
+    sed 's/^Restart=.*/Restart=on-failure/' "$SERVICE" > "$SERVICE.tmp" &&
+      grep -qx 'Restart=on-failure' "$SERVICE.tmp" && mv "$SERVICE.tmp" "$SERVICE" || return 1
+  fi
+  # Retry a previous failed reload even when the file already has the new policy.
+  systemctl daemon-reload
+}
+
 request_text() {
-  printf 't=%s\nv=%s\nstate=%s\nerr=%s\nagent=%s\nau=%s\n' "$(date +%s)" "$R_V" "$1" "$R_ERR" "$VERSION" "$AUTO_UPDATE"
+  printf 't=%s\nv=%s\nstate=%s\nerr=%s\nagent=%s\nau=%s\nproto=2\nsource=%s\nphase=%s\nop=%s\ngeneration=%s\nmode=%s\n' \
+    "$(date +%s)" "$R_V" "$1" "$R_ERR" "$VERSION" "$AUTO_UPDATE" "$SOURCE" "$PHASE" "$OP" "$R_GEN" "$MODE"
 }
 
-# 发送一次同步请求并处理响应；参数 init 表示首次连接。NEW=1 表示收到了新配置；
-# 服务端发来更新信号时 UPD_TARGET、UPD_HASH 为目标版本和脚本哈希
-NEW=0 UPD_TARGET="" UPD_HASH=""
-sync_once() {
-  local state="$R_STATE" f code body now
-  NEW=0 UPD_TARGET="" UPD_HASH=""
-  [ "${1:-}" = "init" ] && state="init"
-  derive_keys
-
-  f="$(mktemp /run/ictl.XXXXXX)" || return 1
-  code="$(request_text "$state" | send_request "$f")"
-  body="$(cat "$f")"
-  rm -f "$f"
-  if [ "$code" = "200" ] && [[ "$body" =~ (^|$'\n')update=([0-9][0-9A-Za-z.-]*)\ ([0-9a-f]{64})($|$'\n') ]]; then
-    UPD_TARGET="${BASH_REMATCH[2]}" UPD_HASH="${BASH_REMATCH[3]}"
-    body="$(grep -v '^update=' <<< "$body")"
-  fi
-
+response_field() { sed -n "s/^$1=//p" <<< "$RESPONSE"; }
+RESPONSE="" NEW=0 UPD_TARGET="" UPD_HASH=""
+exchange() {
+  local file code
+  file="$(mktemp /run/ictl.XXXXXX)" || return 1
+  code="$(send_request "$file")"
+  RESPONSE="$(cat "$file")"; rm -f "$file"
   case "$code" in
-    200)
-      NET="ok"
-      SKEW=""
-      [ "$body" = "same" ] && return 0
-      if [[ "$body" =~ ^time=([0-9]+)$ ]]; then
-        now="$(date +%s)"
-        NET="skew"
-        SKEW=$((now - BASH_REMATCH[1]))
-        return 0
-      fi
-      if valid_config "$body"; then
-        if ! printf '%s\n' "$body" > "$CONFIG.tmp" || ! mv "$CONFIG.tmp" "$CONFIG"; then
-          rm -f "$CONFIG.tmp"
-          CFG_ERR="save config failed"
-          return 0
-        fi
-        CFG_ERR=""
-      else
-        CFG_ERR="invalid config rejected"
-        [[ "${body%%$'\n'*}" =~ ^v=([0-9a-f]{1,64})$ ]] || return 0
-      fi
-      R_V="$(head -n 1 <<< "$body")"
-      R_V="${R_V#v=}"
-      NEW=1
-      ;;
-    404) NET="auth" ;;
-    bad) NET="bad" ;;
-    *) NET="conn" ;;
+    200) NET="ok"; SKEW="" ;;
+    404) NET="auth"; return 1 ;;
+    bad) NET="bad"; return 1 ;;
+    *) NET="conn"; return 1 ;;
   esac
+  if [[ "$RESPONSE" =~ ^time=([0-9]+)$ ]]; then
+    NET="skew" SKEW=$(($(date +%s)-BASH_REMATCH[1])); return 1
+  fi
+  [ "$(response_field proto)" = 2 ] || { NET="bad"; return 1; }
 }
 
-# 一轮完整同步：请求 → 应用 → 保存状态
-cycle() {
-  mkdir -p "$LIB"
-  load_state
-  CFG_ERR=""
-  [[ "$R_ERR" == "invalid config rejected"* ]] && CFG_ERR="invalid config rejected"
-  if load_conf; then
-    sync_once "${1:-}"
+# Store the full immutable acknowledgment for bounded, idempotent retries.
+acknowledge() {
+  local attempt result request
+  [ -f "$ACK_FILE" ] || return 0
+  CONFIRM="unknown"
+  request="$(mktemp /run/ictl.XXXXXX)" || return 1
+  for attempt in 1 2; do
+    { printf 't=%s\n' "$(date +%s)"; grep -v '^t=' "$ACK_FILE"; } > "$request"
+    if exchange < "$request"; then
+      if [ "$(response_field action)" = pause ]; then
+        MODE=passive CONFIRM=waiting
+        save_mode || { rm -f "$request"; return 1; }
+        rm -f "$ACK_FILE" "$request"
+        return 1
+      fi
+      result="$(response_field result)"
+      case "$result" in
+        confirmed|deleted|changed|failed|expired)
+          CONFIRM="$result"; rm -f "$ACK_FILE" "$request"
+          if [ "$result" = deleted ]; then MODE=passive; save_mode || return 1; fi
+          [ "$result" = confirmed ] || [ "$result" = deleted ]; return $? ;;
+      esac
+    fi
+  done
+  rm -f "$request"
+  return 1
+}
+
+# Apply a snapshot transactionally, preserving the last confirmed local configuration.
+apply_snapshot() {
+  local config="$1" generation="$2" mode="$3" dir old_mode="$MODE" old_gen="$R_GEN" old_v="$R_V" name snapshot flags
+  dir="$(mktemp -d "$LIB/apply.XXXXXX")" || return 1
+  for name in config applied kernel resolved state mode; do
+    [ ! -f "$LIB/$name" ] || cp "$LIB/$name" "$dir/$name" || { rm -rf "$dir"; return 1; }
+  done
+  snapshot="$(owned_snapshot)" && flags="$(jump_flags)" || { rm -rf "$dir"; return 1; }
+  if printf '%s\n' "$config" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"; then
+    CFG_ERR=""; local_apply
   else
-    NET="noconf"
-    NEW=0
+    R_STATE=error R_ERR="save config failed"
   fi
-  local_apply
-  save_state
+  if [ "$R_STATE" = ok ]; then
+    MODE="$mode" R_GEN="$generation" R_V="${config%%$'\n'*}"; R_V="${R_V#v=}"
+    if ! save_mode || ! ensure_service_policy; then
+      R_STATE=error R_ERR="save mode/service policy failed"
+    elif [ "$SOURCE" = manual ] && [ "$MODE" = active ] && [ -f "$SERVICE" ]; then
+      # Type=simple starts before the daemon waits for our lock. Never stop while holding it.
+      systemctl start "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME" || {
+        R_STATE=error R_ERR="start active service failed"
+      }
+    fi
+  fi
+  if [ "$R_STATE" != ok ]; then
+    restore_owned "$snapshot" "$flags" || R_ERR+="; rollback failed"
+    for name in config applied kernel resolved state mode; do
+      if [ -f "$dir/$name" ]; then
+        cp "$dir/$name" "$LIB/$name.tmp" && mv "$LIB/$name.tmp" "$LIB/$name" || R_ERR+="; restore $name failed"
+      else
+        rm -f "$LIB/$name" || R_ERR+="; restore $name failed"
+      fi
+    done
+    MODE="$old_mode" R_GEN="$old_gen" R_V="$old_v"
+  fi
+  rm -rf "$dir"
+  [ "$R_STATE" = ok ]
+}
+
+cycle() {
+  local request action config generation mode hash original_mode original_gen original_v
+  mkdir -p "$LIB" || return 1
+  load_state; load_mode || return 1
+  NEW=0 UPD_TARGET="" UPD_HASH="" CFG_ERR=""
+  load_conf || { NET=noconf; return 1; }
+  derive_keys
+  # Retry a lost final receipt before requesting another snapshot.
+  if [ -f "$ACK_FILE" ]; then
+    acknowledge
+    if [ -f "$ACK_FILE" ]; then save_state; return 1; fi
+    if [ "$CONFIRM" = deleted ]; then save_state; return 0; fi
+    if [ "${1:-auto}" = auto ] && [ "$MODE" = passive ]; then save_state; return 0; fi
+  fi
+  SOURCE="${1:-auto}" PHASE=poll; [ "$SOURCE" != manual ] || PHASE=begin
+  OP="$(openssl rand -hex 16)" || return 1
+  request="$(mktemp /run/ictl.XXXXXX)" || return 1
+  request_text "$R_STATE" > "$request"
+  if ! exchange < "$request"; then rm -f "$request"; save_state; return 1; fi
+  rm -f "$request"
+  action="$(response_field action)"
+  if [ "$action" = pause ]; then
+    MODE=passive CONFIRM=waiting
+    save_mode && save_state || return 1
+    return 0
+  fi
+  [ "$action" != busy ] || return 0
+  if [[ "$RESPONSE" =~ (^|$'\n')update=([0-9][0-9A-Za-z.-]*)\ ([0-9a-f]{64})($|$'\n') ]]; then
+    UPD_TARGET="${BASH_REMATCH[2]}" UPD_HASH="${BASH_REMATCH[3]}"
+    # Upgrade first; re-enter this operation with the new program before applying.
+    if [ "$AUTO_UPDATE" = 1 ] && version_gt "$UPD_TARGET" "$VERSION"; then return 20; fi
+  fi
+  if [ "$action" = same ]; then
+    local_apply; save_state; [ "$R_STATE" = ok ]; return $?
+  fi
+  if [ "$action" != apply ] || [ "$(response_field op)" != "$OP" ]; then
+    NET=bad; save_state; return 1
+  fi
+  generation="$(response_field generation)" mode="$(response_field mode)" hash="$(response_field v)"
+  config="$(sed -n '/^v=/,$p' <<< "$RESPONSE" | sed '/^update=/d;/^$/d')"
+  if [[ ! "$generation" =~ ^[1-9][0-9]{0,14}$ ]] || [[ "$mode" != active && "$mode" != passive ]] || ! valid_config "$config" ||
+      [ "$(printf '%s' "$(tail -n +2 <<< "$config")" | sha256_hex | cut -c1-12)" != "$hash" ]; then
+    NET=bad; save_state; return 1
+  fi
+  original_mode="$MODE" original_gen="$R_GEN" original_v="$R_V"
+  apply_snapshot "$config" "$generation" "$mode" || { R_STATE=error; R_ERR="${R_ERR:-local apply failed}"; }
+  # An error ACK identifies the attempted snapshot, while persistent state remains the previous one.
+  PHASE=ack MODE="$mode" R_GEN="$generation" R_V="$hash"
+  request_text "$R_STATE" > "$ACK_FILE.tmp" && mv "$ACK_FILE.tmp" "$ACK_FILE" || {
+    MODE="$original_mode" R_GEN="$original_gen" R_V="$original_v" CONFIRM=unknown; save_state; return 1
+  }
+  if [ "$R_STATE" != ok ]; then MODE="$original_mode" R_GEN="$original_gen" R_V="$original_v"; fi
+  CONFIRM=unknown
+  save_state || return 1
+  acknowledge; local rc=$?
+  save_state || return 1
+  return "$rc"
 }
 
 daemon() {
-  rm -f "$LIB/update"   # 0.1.6 定时检查更新的记录，已不再使用
-  with_lock local_apply_saved
+  with_lock ensure_service_policy || return 1
+  if ! with_lock local_apply_saved; then
+    load_mode || return 1
+    [ "$MODE" = active ] || return 1
+  fi
   while true; do
-    NEW=0
-    with_lock cycle
-    [ -n "$UPD_TARGET" ] && auto_update
-    [ "$NEW" -eq 1 ] || sleep $((20 + RANDOM % 21))   # 20-40 秒
+    load_mode || return 1
+    [ "$MODE" = active ] || return 0
+    with_lock cycle auto
+    load_mode || return 1
+    [ "$MODE" = active ] || return 0
+    [ -z "$UPD_TARGET" ] || auto_update --daemon
+    sleep $((5 + RANDOM % 6))   # 主动模式随机等待 5–10 秒
   done
 }
 
@@ -480,17 +663,30 @@ auto_update() {
     [ "$rc" -eq 0 ] || return "$rc"
     echo "ictl: 自动更新 $UPDATE_FROM → $new"
     # 安装锁已释放，避免新守护进程继承锁或和手动重启相互等待。
-    exec "$BIN" --daemon
+    exec "$BIN" "${1:---daemon}"
     return 1
   fi
   rm -f "$f"
+  return 1
 }
 
 # 开机时先按本地缓存恢复规则
 local_apply_saved() {
   load_state
+  load_mode || return 1
+  if [ "$MODE" = passive ]; then
+    # No DNS lookup or server traffic during passive boot.
+    ERRS=(); ensure_ip_forward
+    [ "${#ERRS[@]}" -eq 0 ] || return 1
+    if [ -f "$APPLIED" ]; then
+      iptables-restore -w --noflush < "$APPLIED" && ensure_jumps || return 1
+      owned_snapshot > "$KERNEL.tmp" && mv "$KERNEL.tmp" "$KERNEL" || return 1
+    fi
+    return 0
+  fi
   local_apply
   save_state
+  [ "$R_STATE" = ok ]
 }
 
 # ---------------------------------------------------------------- 安装与卸载
@@ -510,7 +706,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=$BIN --daemon
-Restart=always
+Restart=on-failure
 RestartSec=5
 
 [Install]
@@ -534,7 +730,14 @@ print_net_result() {
   esac
   if [ "$NET" = "ok" ]; then
     if [ "$R_STATE" = "ok" ]; then
-      ok "规则已应用（版本 ${R_V:-无}）"
+      case "$CONFIRM" in
+        confirmed) ok "同步更新已确认（版本 ${R_V:-无}）" ;;
+        deleted) ok "清理已确认；节点已删除，后台同步已停止" ;;
+        changed) warn "本轮已应用，服务端仍有新变更，请再次同步" ;;
+        waiting) warn "已停止轮询，请手动同步更新以确认模式" ;;
+        unknown) warn "应用完成，服务端确认未完成／未知，请再次同步" ;;
+        *) note "本地规则版本 ${R_V:-无}；确认状态：${CONFIRM:-尚未确认}" ;;
+      esac
     else
       err "规则应用有问题：$R_ERR"
     fi
@@ -557,17 +760,13 @@ save_server() {
   URL="$url" KEY="$key"
   save_conf || { err "无法写入 $CONF"; return 1; }
 
-  with_lock cycle init || return 1
-  [ "$NEW" -eq 1 ] && with_lock cycle
-  print_net_result
-
   if install_service; then
     ok "已安装并启动服务 $SERVICE_NAME（开机自启）"
   else
     err "服务安装失败，请检查 systemctl status $SERVICE_NAME"
     return 1
   fi
-  [ "$NET" = "ok" ]
+  sync_now
 }
 
 set_server() {
@@ -685,7 +884,9 @@ show_status() {
   if load_conf; then
     note "同步地址：$URL"
     note "密钥：    ${KEY:0:6}…"
-    note "自动更新：$(on_off "$AUTO_UPDATE")（跟随服务端版本）"
+    load_mode
+    note "同步模式：$MODE（模式在面板修改后需本机同步确认）"
+    note "自动更新：$(on_off "$AUTO_UPDATE")（被动模式仅在手动同步时检查）"
   else
     warn "尚未设置服务端地址和密钥"
   fi
@@ -722,10 +923,23 @@ show_status() {
 }
 
 sync_now() {
-  title "立即同步"
-  with_lock cycle || return
-  [ "$NEW" -eq 1 ] && with_lock cycle
+  title "同步更新"
+  # Stop before acquiring the lock; a daemon may itself be waiting for it.
+  if [ -f "$SERVICE" ]; then systemctl stop "$SERVICE_NAME" || return 1; fi
+  with_lock ensure_service_policy || { err "更新服务重启策略失败"; return 1; }
+  with_lock cycle manual
+  local rc=$?
+  if [ "$rc" -eq 20 ]; then
+    auto_update --sync
+    rc=$?
+    [ "$rc" -ne 0 ] || rc=1
+  fi
+  load_mode || return 1
+  if [ "$MODE" = active ] && [ -f "$SERVICE" ]; then
+    systemctl start "$SERVICE_NAME" || { err "恢复主动服务失败"; return 1; }
+  fi
   print_net_result
+  return "$rc"
 }
 
 # 服务停止后在锁内清理；规则清理失败时不删除配置、服务文件或程序，便于重试。
@@ -779,8 +993,8 @@ menu() {
     printf '  %sictl 节点端%s %sv%s%s\n' "$BOLD$CYAN" "$RESET" "$DIM" "$VERSION" "$RESET"
     echo "  1) 设置服务端地址和密钥"
     echo "  2) 查看状态"
-    echo "  3) 立即同步"
-    echo "  4) 更新节点端"
+    echo "  3) 同步更新"
+    echo "  4) 更新节点端程序"
     echo "  5) 自动更新：$(on_off "$AUTO_UPDATE")（切换）"
     echo "  6) 卸载"
     echo "  0) 退出"
@@ -801,10 +1015,11 @@ menu() {
 }
 
 case "${1:-}" in
+  --sync) need_root; sync_now; exit $? ;;
   --daemon) need_root; daemon ;;
   --update) need_root; update_agent "${2:-}"; exit $? ;;
   --uninstall) need_root; uninstall "${2:-}" ;;
   --url|--key) need_root; quick_setup "$@" ;;
   "") need_root; menu ;;
-  *) echo "用法：ictl [--url <同步地址> --key <密钥> | --update [--mirror] | --uninstall [-y] | --daemon]" >&2; exit 1 ;;
+  *) echo "用法：ictl [--sync | --url <同步地址> --key <密钥> | --update [--mirror] | --uninstall [-y] | --daemon]" >&2; exit 1 ;;
 esac

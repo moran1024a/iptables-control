@@ -1,8 +1,6 @@
 *
 !server/ictl-server.py
-!server/tunnel_config.py
+!server/target_config.py
 !server/components.json
 !server/web
 !agent/ictl.sh
-!tunnel-agent/go.mod
-!tunnel-agent/main.go

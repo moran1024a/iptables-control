@@ -13,8 +13,9 @@
 #   --purge      与 --uninstall 一起使用，同时删除数据卷（所有数据）
 
 set -euo pipefail
+umask 077
 
-VERSION="0.2.1"
+VERSION="0.3.0"
 REGISTRY="ghcr.io"
 MIRROR_REGISTRY="ghcr.nju.edu.cn"
 REPO="moran1024a/ictl-server"
@@ -32,7 +33,7 @@ die() {
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port) PORT="${2:-}"; shift 2 ;;
+    --port) [ $# -ge 2 ] || die "--port 缺少参数"; PORT="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
@@ -110,25 +111,95 @@ if ! docker pull "$IMAGE"; then
   die "镜像拉取失败，请检查网络能否访问 ghcr.io；国内服务器可加 --mirror 使用镜像站。"
 fi
 
+# Preflight the image and the actual existing /data mount before stopping the writer.
+docker run --rm --network none --entrypoint python3 "$IMAGE" /app/ictl-server.py --help >/dev/null
+DATA_MOUNT="$VOLUME:/data"
+OLD_NAME="" BACKUP="" RESTORE_NEEDED=0
 if docker container inspect "$NAME" >/dev/null 2>&1; then
-  echo "替换已有容器 $NAME（数据卷 $VOLUME 保留）"
-  docker rm -f "$NAME" >/dev/null
+  mount="$(docker container inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}}|{{.Name}}|{{.Source}}|{{.RW}}{{end}}{{end}}' "$NAME")"
+  IFS='|' read -r mount_type mount_name mount_source mount_rw <<< "$mount"
+  [ "$mount_rw" = true ] || die "原容器 /data 不是可写挂载，未停止服务"
+  case "$mount_type" in
+    volume) [ -n "$mount_name" ] || die "无法确定原数据卷"; DATA_MOUNT="$mount_name:/data" ;;
+    bind) [ -n "$mount_source" ] || die "无法确定原数据目录"; DATA_MOUNT="$mount_source:/data" ;;
+    *) die "不支持的 /data 挂载类型：$mount_type，未停止服务" ;;
+  esac
+  db_env="$(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME")"
+  if printf '%s\n' "$db_env" | grep '^ICTL_DB=' | grep -qv '^ICTL_DB=/data/ictl.db$'; then
+    die "原容器使用自定义数据库路径，请使用源码部署流程备份升级，未停止服务"
+  fi
+  OLD_NAME="$NAME-pre-update-$(date +%s)-$$"
+  BACKUP="/data/ictl.db.pre-deploy-$(date +%s)-$$.bak"
+fi
+
+rollback() {
+  trap - ERR INT TERM
+  echo "升级失败，正在恢复旧容器及升级前数据库。" >&2
+  # Never restore a database while the new process could still be writing it.
+  if docker container inspect "$NAME" >/dev/null 2>&1; then
+    docker rm -f "$NAME" >/dev/null || die "停止新容器失败；未恢复数据库，备份：$BACKUP"
+  fi
+  if [ -n "$OLD_NAME" ]; then
+    if [ "$RESTORE_NEEDED" -eq 1 ]; then
+      docker run --rm --network none -v "$DATA_MOUNT" --entrypoint python3 "$IMAGE" -c '
+import os, shutil, sys
+backup=sys.argv[1]; db="/data/ictl.db"
+if not os.path.isfile(backup): raise RuntimeError("missing rollback backup")
+shutil.copyfile(backup, db+".restore")
+os.chmod(db+".restore", 0o600)
+os.replace(db+".restore", db)
+for suffix in ("-wal", "-shm"):
+    try: os.unlink(db+suffix)
+    except FileNotFoundError: pass
+' "$BACKUP" || die "数据库恢复失败，旧容器保持停止；请检查备份 $BACKUP"
+    fi
+    docker rename "$OLD_NAME" "$NAME" && docker start "$NAME" >/dev/null || die "恢复旧容器失败，数据库备份：$BACKUP"
+    echo "已恢复旧容器；备份保留在 $BACKUP" >&2
+  fi
+  exit 1
+}
+
+if [ -n "$OLD_NAME" ]; then
+  echo "升级会删除数据库中的隧道节点、受管隧道及其关联配置；远端旧隧道服务请自行卸载。"
+  docker stop "$NAME" >/dev/null
+  if ! docker rename "$NAME" "$OLD_NAME"; then
+    docker start "$NAME" >/dev/null
+    die "无法保留原容器，升级取消"
+  fi
+  trap rollback ERR INT TERM
+  docker run --rm --network none -v "$DATA_MOUNT" --entrypoint python3 "$IMAGE" -c '
+import os, sqlite3, sys
+os.umask(0o077)
+path=sys.argv[1]
+if os.path.exists(path): raise RuntimeError("backup already exists")
+source=sqlite3.connect("file:/data/ictl.db?mode=ro",uri=True)
+target=sqlite3.connect(path)
+try: source.backup(target)
+finally: target.close(); source.close()
+os.chmod(path,0o600)
+' "$BACKUP"
+  RESTORE_NEEDED=1
+else
+  trap rollback ERR INT TERM
 fi
 
 docker run -d --name "$NAME" --restart unless-stopped \
-  -p "${BIND_IP:+$BIND_IP:}$PORT:8730" -v "$VOLUME:/data" "$IMAGE" >/dev/null
+  -p "${BIND_IP:+$BIND_IP:}$PORT:8730" -v "$DATA_MOUNT" "$IMAGE" >/dev/null
 
-# 等待初始化完成
-for _ in $(seq 1 20); do
-  docker exec "$NAME" python3 /app/ictl-server.py info >/dev/null 2>&1 && break
+healthy=0
+for _ in $(seq 1 40); do
+  if docker exec "$NAME" python3 /app/ictl-server.py health >/dev/null 2>&1; then healthy=1; break; fi
   sleep 0.5
 done
+[ "$healthy" -eq 1 ] || rollback
+trap - ERR INT TERM
+[ -z "$OLD_NAME" ] || docker rm "$OLD_NAME" >/dev/null
 
 echo
 echo "ictl 服务端 $VERSION 已启动"
 docker exec "$NAME" python3 /app/ictl-server.py info | sed "s#<服务器地址>:8730#<服务器IP>:$PORT#"
-echo
+[ -z "$BACKUP" ] || echo "  升级前数据库备份：$BACKUP（人工回退须同时恢复旧版本镜像和此备份）"
 echo "  检查更新：重新运行本脚本"
 echo "  查看日志：docker logs $NAME"
 echo "  重置账号：docker exec $NAME python3 /app/ictl-server.py reset-admin"
-echo "  卸载：    重新运行本脚本并加 --uninstall（加 --purge 同时删除数据）"
+echo "  卸载：重新运行本脚本并加 --uninstall（加 --purge 同时删除数据）"

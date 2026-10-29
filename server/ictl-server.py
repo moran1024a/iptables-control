@@ -8,6 +8,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import http.client
 import http.cookies
 import http.server
 import ipaddress
@@ -22,14 +23,13 @@ import sys
 import threading
 import time
 from urllib.parse import parse_qs
-import tunnel_config
+import target_config
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
 FORWARD_VERSION = COMPONENTS["forward_agent"]
-TUNNEL_VERSION = COMPONENTS["tunnel_agent"]
 REPO = "moran1024a/iptables-control"
 AGENT_URL = f"https://github.com/{REPO}/releases/download/v{VERSION}/ictl.sh"
 DB_PATH = os.environ.get("ICTL_DB", "/var/lib/ictl-server/ictl.db")
@@ -39,11 +39,12 @@ AGENT_FILES = [os.path.join(os.path.dirname(os.path.abspath(__file__)), p)
                for p in ("agent/ictl.sh", "../agent/ictl.sh")]
 AGENT_AUTO_UPDATE = (0, 1, 7)    # 从该版本起，节点端按服务端的更新信号自动更新
 
-OFFLINE_AFTER = 120         # 超过该秒数没有上报视为离线（节点每 20-40 秒上报一次）
+OFFLINE_AFTER = 120         # 超过该秒数没有上报视为离线（主动节点每轮等待 5-10 秒）
 MAX_SKEW = 60               # 节点时间允许的最大偏差（秒）
 MAX_BODY = 8192             # 同步请求体上限
 MAX_API_BODY = 65536        # 面板请求体上限
-WINDOW = 60                 # 状态条时间窗口（秒），需大于节点的最长上报间隔
+WINDOW = 60                 # 被动活动与旧版状态记录：每格 60 秒
+ACTIVE_WINDOW = 20          # 主动状态条：每格 20 秒，覆盖多次 5–10 秒轮询
 BAR_WINDOWS = 60            # 状态条显示的窗口数
 RETENTION = 7 * 86400       # 状态窗口与事件保留时长
 EVENTS_SHOWN = 50
@@ -60,7 +61,7 @@ STATIC = {
     "style.css": "text/css; charset=utf-8",
 }
 HEALTH = {"ok": "正常", "error": "故障", "skew": "时间不一致"}
-KINDS = ("nodes", "tunnel_nodes", "routes", "tunnels", "chains")  # 五套独立的分组与排序
+KINDS = ("nodes", "routes", "targets", "chains")
 DEFAULT_GROUP = "默认分组"
 
 SCHEMA = """
@@ -158,7 +159,7 @@ def db():
     return conn
 
 
-def init_db():
+def init_legacy_db():
     d = os.path.dirname(DB_PATH)
     if d:
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -240,6 +241,214 @@ def init_db():
     return conn
 
 
+# Version 202 is retained only as a migration baseline; runtime uses targets.
+TARGET_SCHEMA = """
+CREATE TABLE targets (
+ id INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL,
+ host TEXT NOT NULL, port INTEGER NOT NULL, params TEXT NOT NULL DEFAULT '{}',
+ group_id INTEGER NOT NULL, sort INTEGER NOT NULL DEFAULT 0,
+ CHECK(type IN ('endpoint','shadowsocks','vless-reality')),
+ CHECK(port BETWEEN 1 AND 65535)
+);
+"""
+CHAIN_SCHEMA = """CREATE TABLE chains (
+ id INTEGER PRIMARY KEY, remark TEXT NOT NULL, target_id INTEGER NOT NULL REFERENCES targets(id),
+ route_id INTEGER REFERENCES routes(id), deleting INTEGER NOT NULL DEFAULT 0,
+ sort INTEGER NOT NULL DEFAULT 0, group_id INTEGER NOT NULL DEFAULT 0
+)"""
+SYNC_COLUMNS = {
+    "desired_mode": "TEXT NOT NULL DEFAULT 'active' CHECK(desired_mode IN ('active','passive'))",
+    "reported_mode": "TEXT", "desired_generation": "INTEGER NOT NULL DEFAULT 1",
+    "applied_generation": "INTEGER NOT NULL DEFAULT 0", "manual_required": "INTEGER NOT NULL DEFAULT 0",
+    "protocol_version": "INTEGER NOT NULL DEFAULT 1", "last_manual": "INTEGER", "last_success": "INTEGER",
+}
+SYNC_SCHEMA = """
+CREATE TABLE sync_ops (
+ node_id INTEGER PRIMARY KEY, op TEXT NOT NULL, source TEXT NOT NULL,
+ generation INTEGER NOT NULL, mode TEXT NOT NULL, hash TEXT NOT NULL,
+ rules TEXT NOT NULL, expires INTEGER NOT NULL, result TEXT
+);
+CREATE TABLE deleted_receipts (
+ key TEXT PRIMARY KEY, op TEXT NOT NULL, generation INTEGER NOT NULL, mode TEXT NOT NULL,
+ hash TEXT NOT NULL, expires INTEGER NOT NULL
+);
+"""
+
+
+def add_sync_schema(conn):
+    for col, ddl in SYNC_COLUMNS.items():
+        conn.execute(f"ALTER TABLE nodes ADD COLUMN {col} {ddl}")
+    conn.execute("ALTER TABLE windows ADD COLUMN manual_count INTEGER NOT NULL DEFAULT 0")
+    conn.execute("ALTER TABLE windows ADD COLUMN last_activity INTEGER")
+    ensure_active_windows(conn)
+    for statement in SYNC_SCHEMA.split(';'):
+        if statement.strip():
+            conn.execute(statement)
+
+
+def ensure_active_windows(conn):
+    # Keep minute-level history intact; it cannot reconstruct individual 20-second samples.
+    conn.execute("""CREATE TABLE IF NOT EXISTS active_windows (
+        node_id INTEGER NOT NULL, win INTEGER NOT NULL, level INTEGER NOT NULL,
+        PRIMARY KEY(node_id, win))""")
+    if setting(conn, "active_window_start") is None:
+        set_setting(conn, "active_window_start", str(int(time.time())))
+
+
+def backup_database(conn, path):
+    # Do not replace an earlier successful backup, including a WAL-consistent one.
+    if os.path.exists(path):
+        return
+    temporary = path + '.tmp'
+    backup = sqlite3.connect(temporary)
+    try:
+        conn.backup(backup)
+    finally:
+        backup.close()
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def init_db():
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), mode=0o700, exist_ok=True)
+    conn = db()
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > 300:
+        conn.close()
+        raise UserError("数据库版本高于本服务端，请使用兼容版本")
+    if version == 300:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            ensure_active_windows(conn)
+        return conn
+    exists = conn.execute("SELECT 1 FROM sqlite_master WHERE name='nodes'").fetchone()
+    if not exists:
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Build the current schema directly. SCHEMA is the archived 0.1 baseline.
+        schema = SCHEMA.replace(SCHEMA[SCHEMA.index('CREATE TABLE IF NOT EXISTS chains'):SCHEMA.index('CREATE TABLE IF NOT EXISTS hops')],
+                                TARGET_SCHEMA + CHAIN_SCHEMA + ';\n')
+        conn.executescript("BEGIN IMMEDIATE;\n" + schema)
+        with conn:
+            conn.execute("CREATE TABLE routes(id INTEGER PRIMARY KEY,name TEXT NOT NULL,node_ids TEXT NOT NULL,group_id INTEGER NOT NULL,sort INTEGER NOT NULL DEFAULT 0)")
+            conn.execute("CREATE TABLE retired_ports(node_id INTEGER NOT NULL,port INTEGER NOT NULL,PRIMARY KEY(node_id,port))")
+            conn.execute("ALTER TABLE nodes ADD COLUMN kind TEXT NOT NULL DEFAULT 'forward' CHECK(kind='forward')")
+            add_sync_schema(conn)
+            for kind in KINDS:
+                conn.execute("INSERT INTO item_groups(kind,name,builtin) VALUES (?,?,1)", (kind, DEFAULT_GROUP))
+            for k, v in (("sync_path", '/' + secrets.token_hex(12)), ("panel_path", '/' + secrets.token_hex(8)),
+                         ("window", str(WINDOW)), ("next_node_id", '1'), ("next_hop_id", '1')):
+                set_setting(conn, k, v)
+            reset_admin(conn)
+            conn.execute("PRAGMA user_version=300")
+        return conn
+    backup_database(conn, DB_PATH + '.pre-0.3.0.bak')
+    if version < 202:
+        conn.close()
+        conn = init_legacy_db()
+    try:
+        migrate_v030(conn)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def migrate_v030(conn):
+    """Delete only managed tunnel data; preserve external credentials and forwarding IDs."""
+    managed = {r[0] for r in conn.execute("SELECT id FROM tunnels WHERE source='agent'")}
+    removed = {r[0] for r in conn.execute("SELECT id FROM chains WHERE tunnel_id IN (SELECT id FROM tunnels WHERE source='agent')")}
+    old_nodes = conn.execute("SELECT * FROM nodes").fetchall()
+    before = {n['id']: legacy_node_rules(conn, n) for n in old_nodes}
+    expected = {n['id']: [f"{r['id']} both {r['port']} {r['host']} {r['tport']}"
+                         for r in legacy_node_rule_rows(conn, n) if r['chain_id'] not in removed] for n in old_nodes}
+    tunnel_count = conn.execute("SELECT COUNT(*) FROM tunnel_nodes").fetchone()[0]
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(TARGET_SCHEMA)
+            conn.execute("UPDATE item_groups SET kind='targets' WHERE kind='tunnels'")
+            conn.execute("""INSERT INTO targets(id,name,type,host,port,params,group_id,sort)
+                SELECT id,name,protocol,external_host,port,params,group_id,sort FROM tunnels WHERE source='external'""")
+            external_count = conn.execute("SELECT COUNT(*) FROM targets").fetchone()[0]
+            for cid in removed:
+                for h in conn.execute("SELECT * FROM hops WHERE chain_id=?", (cid,)).fetchall():
+                    reserve_removed(conn, h['node_id'], h['port'])
+                delete_chain(conn, cid)
+            conn.execute(CHAIN_SCHEMA.replace('CREATE TABLE chains', 'CREATE TABLE chains_new'))
+            for c in conn.execute("SELECT * FROM chains ORDER BY id").fetchall():
+                tid = c['tunnel_id']
+                if tid is None:
+                    tid = conn.execute("INSERT INTO targets(name,type,host,port,group_id,sort) VALUES (?,'endpoint',?,?,?,?)",
+                        (c['remark'], c['target_host'], c['target_port'], default_group(conn, 'targets'), c['sort'])).lastrowid
+                conn.execute("INSERT INTO chains_new(id,remark,target_id,route_id,deleting,sort,group_id) VALUES (?,?,?,?,?,?,?)",
+                             (c['id'], c['remark'], tid, c['route_id'], c['deleting'], c['sort'], c['group_id']))
+            conn.execute("DROP TABLE chains")
+            conn.execute("ALTER TABLE chains_new RENAME TO chains")
+            conn.execute("DROP VIEW all_nodes")
+            for table in ('windows', 'events', 'chain_pending', 'retired_ports'):
+                conn.execute(f"DELETE FROM {table} WHERE node_id IN (SELECT id FROM tunnel_nodes)")
+            for table in ('tunnels', 'tunnel_presence', 'tunnel_nodes'):
+                conn.execute(f"DROP TABLE {table}")
+            conn.execute("DELETE FROM item_groups WHERE kind='tunnel_nodes'")
+            conn.execute("DELETE FROM settings WHERE k IN ('tunnel_path','tunnel_heartbeat')")
+            for column in ('core_version', 'online_until'):
+                conn.execute(f"ALTER TABLE nodes DROP COLUMN {column}")
+            add_sync_schema(conn)
+            for n in old_nodes:
+                lines = node_rules(conn, n)
+                if lines != expected[n['id']]:
+                    raise UserError("升级校验失败：保留配置的规则发生变化")
+                applied = int(before[n['id']] == lines and n['state'] == 'ok' and n['reported_v'] == rules_version(lines))
+                conn.execute("UPDATE nodes SET applied_generation=? WHERE id=?", (applied, n['id']))
+            if conn.execute("PRAGMA foreign_key_check").fetchall():
+                raise UserError("升级校验失败：引用不完整")
+            conn.execute("PRAGMA user_version=300")
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+    print(f"0.3.0 迁移完成：删除隧道节点 {tunnel_count}、受管隧道 {len(managed)}、关联配置 {len(removed)}；"
+          f"保留外部目标 {external_count}。备份：{DB_PATH}.pre-0.3.0.bak；远端隧道服务请自行卸载。", flush=True)
+
+
+def read_db():
+    conn = sqlite3.connect('file:' + os.path.abspath(DB_PATH) + '?mode=ro', uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def mutation_snapshot(conn):
+    out = {}
+    for n in conn.execute('SELECT * FROM nodes').fetchall():
+        out[n['id']] = (dict(n), node_rule_rows(conn, n),
+                       {r[0] for r in conn.execute('SELECT port FROM retired_ports WHERE node_id=?', (n['id'],))})
+    return out
+
+
+def track_mutation(method):
+    """Keep generation changes and all affected configuration waits in the same transaction."""
+    def wrapped(self, conn, *args, **kwargs):
+        with conn:
+            if not conn.in_transaction:
+                conn.execute('BEGIN IMMEDIATE')
+            before = mutation_snapshot(conn)
+            result = method(self, conn, *args, **kwargs)
+            after = mutation_snapshot(conn)
+            for nid, (n, rows, retired) in after.items():
+                old, old_rows, old_retired = before.get(nid, ({}, [], set()))
+                # Remarks are display-only; compare the actual wire rules per configuration.
+                key = lambda r: (r['id'], r['port'], r['host'], r['tport'])
+                changed = ([key(r) for r in rows] != [key(r) for r in old_rows] or retired != old_retired or
+                           any(n[k] != old.get(k, n[k]) for k in ('key','desired_mode','deleting')))
+                if changed:
+                    conn.execute('UPDATE nodes SET desired_generation=desired_generation+1 WHERE id=?', (nid,))
+                for cid in {r['chain_id'] for r in old_rows + rows}:
+                    if [key(r) for r in old_rows if r['chain_id']==cid] != [key(r) for r in rows if r['chain_id']==cid]:
+                        if conn.execute('SELECT 1 FROM chains WHERE id=?', (cid,)).fetchone():
+                            mark_pending(conn, cid, [nid])
+            return result
+    return wrapped
+
+
 def setting(conn, k, default=None):
     row = conn.execute("SELECT v FROM settings WHERE k = ?", (k,)).fetchone()
     return row["v"] if row else default
@@ -284,7 +493,7 @@ def ordered(kind, where=""):
 def get_node(conn, node_id):
     if type(node_id) is not int or node_id <= 0:
         raise UserError("无效的对象 ID", "node_id")
-    node = conn.execute("SELECT * FROM all_nodes WHERE id = ?", (node_id,)).fetchone()
+    node = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
     if not node:
         raise UserError("节点不存在", status=404)
     return node
@@ -302,9 +511,10 @@ def get_chain(conn, chain_id):
 def delete_node(conn, node_id):
     table = node_table(get_node(conn, node_id)["kind"])
     conn.execute("DELETE FROM retired_ports WHERE node_id = ?", (node_id,))
-    conn.execute("DELETE FROM tunnel_presence WHERE node_id = ?", (node_id,))
+    conn.execute("DELETE FROM sync_ops WHERE node_id = ?", (node_id,))
     conn.execute(f"DELETE FROM {table} WHERE id = ?", (node_id,))
     conn.execute("DELETE FROM windows WHERE node_id = ?", (node_id,))
+    conn.execute("DELETE FROM active_windows WHERE node_id = ?", (node_id,))
     conn.execute("DELETE FROM events WHERE node_id = ?", (node_id,))
     conn.execute("DELETE FROM chain_pending WHERE node_id = ?", (node_id,))
     finish_deleted_chains(conn)
@@ -345,9 +555,11 @@ def cleanup(conn):
     now = int(time.time())
     with conn:
         conn.execute("DELETE FROM windows WHERE win < ?", ((now - RETENTION) // WINDOW,))
+        conn.execute("DELETE FROM active_windows WHERE win < ?", ((now - RETENTION) // ACTIVE_WINDOW,))
         conn.execute("DELETE FROM events WHERE ts < ?", (now - RETENTION,))
         conn.execute("DELETE FROM sessions WHERE expires < ?", (now,))
-        conn.execute("DELETE FROM tunnel_presence WHERE end < ?", (now - RETENTION,))
+        conn.execute("DELETE FROM sync_ops WHERE expires < ?", (now - RETENTION,))
+        conn.execute("DELETE FROM deleted_receipts WHERE expires < ?", (now,))
 
 
 def migrate_v020(conn):
@@ -357,7 +569,7 @@ def migrate_v020(conn):
     if version == 200:
         return
     # 物理表 chains/hops 继续保存实际配置，避免重编号或改变规则顺序。
-    before = {n["id"]: node_rules(conn, n) for n in conn.execute("SELECT * FROM nodes")}
+    before = {n["id"]: legacy_node_rules(conn, n) for n in conn.execute("SELECT * FROM nodes")}
     with conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("ALTER TABLE nodes ADD COLUMN kind TEXT NOT NULL DEFAULT 'forward'")
@@ -385,7 +597,7 @@ def migrate_v020(conn):
         set_setting(conn, "next_hop_id", str(conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM hops").fetchone()[0]))
         set_setting(conn, "tunnel_path", "/" + secrets.token_hex(12))
         set_setting(conn, "tunnel_heartbeat", "10")
-        after = {n["id"]: node_rules(conn, n) for n in conn.execute("SELECT * FROM nodes")}
+        after = {n["id"]: legacy_node_rules(conn, n) for n in conn.execute("SELECT * FROM nodes")}
         if before != after:
             raise UserError("升级校验失败：转发规则发生变化，迁移已回滚")
         conn.execute("PRAGMA user_version = 200")
@@ -394,7 +606,7 @@ def migrate_v020(conn):
 def migrate_layout(conn):
     """拆分节点存储与五类分组；不重编号节点、凭据、转发规则。"""
     original = [dict(n) for n in conn.execute("SELECT * FROM nodes ORDER BY id")]
-    before = {n["id"]: node_rules(conn, n) for n in original if n["kind"] == "forward"}
+    before = {n["id"]: legacy_node_rules(conn, n) for n in original if n["kind"] == "forward"}
     conn.execute("PRAGMA foreign_keys = OFF")
     try:
         with conn:
@@ -437,7 +649,7 @@ def migrate_layout(conn):
                     n.pop("group_id")  # 仅分组 ID 在拆分时变化，其余节点数据必须完全一致。
             if original != migrated:
                 raise UserError("节点隔离迁移失败：节点记录不一致")
-            after = {n["id"]: node_rules(conn, n) for n in conn.execute("SELECT * FROM nodes")}
+            after = {n["id"]: legacy_node_rules(conn, n) for n in conn.execute("SELECT * FROM nodes")}
             if before != after:
                 raise UserError("节点隔离迁移失败：转发规则发生变化")
             conn.execute("PRAGMA user_version = 201")
@@ -473,9 +685,9 @@ def migrate_imports(conn):
 
 
 def node_table(kind):
-    if kind not in ("forward", "tunnel"):
-        raise UserError("节点类型无效", "kind")
-    return "tunnel_nodes" if kind == "tunnel" else "nodes"
+    if kind != "forward":
+        raise UserError("只支持 iptables 转发节点", "kind")
+    return "nodes"
 
 
 def move_group(conn, table, item_id, group_id):
@@ -483,10 +695,6 @@ def move_group(conn, table, item_id, group_id):
     conn.execute(f"""UPDATE {table} SET group_id = ?, sort =
                  (SELECT COALESCE(MAX(sort), 0) + 1 FROM {table} WHERE group_id = ?)
                  WHERE id = ?""", (group_id, group_id, item_id))
-
-
-def heartbeat_interval(conn):
-    return int(setting(conn, "tunnel_heartbeat", "10"))
 
 
 def get_route(conn, route_id):
@@ -498,40 +706,13 @@ def get_route(conn, route_id):
     return r
 
 
-def get_tunnel(conn, tunnel_id):
-    if type(tunnel_id) is not int or tunnel_id <= 0:
-        raise UserError("无效的对象 ID", "tunnel_id")
-    t = conn.execute("SELECT * FROM tunnels WHERE id = ?", (tunnel_id,)).fetchone()
-    if not t:
-        raise UserError("隧道不存在", "tunnel_id", 404)
-    return t
-
-
-def tunnel_snapshot(conn, node):
-    ts = [] if node["deleting"] else conn.execute(
-        "SELECT * FROM tunnels WHERE node_id = ? AND deleting = 0 ORDER BY id", (node["id"],)).fetchall()
-    config = tunnel_config.core_config(ts)
-    return {"api": 1, "revision": tunnel_config.revision({"config": config, "core_version": COMPONENTS["sing_box"]["version"]}), "config": config,
-            "core_version": COMPONENTS["sing_box"]["version"]}
-
-
-def tunnel_ready(conn, node_id):
-    n = get_node(conn, node_id)
-    return n["state"] == "ok" and n["reported_v"] == tunnel_snapshot(conn, n)["revision"]
-
-
-def tunnel_bar(conn, node, now):
-    start = (now // 10 - 59) * 10
-    spans = conn.execute("SELECT start, end FROM tunnel_presence WHERE node_id = ? AND end >= ?",
-                         (node["id"], start)).fetchall()
-    levels = []
-    for ts in range(start, start + 600, 10):
-        point = min(ts + 9, now)
-        if not node["first_seen"] or point < node["first_seen"]:
-            levels.append("none")
-        else:
-            levels.append("ok" if any(s[0] <= point <= s[1] for s in spans) else "lost")
-    return {"start": start, "window": 10, "levels": levels}
+def get_target(conn, target_id):
+    if type(target_id) is not int or target_id <= 0:
+        raise UserError("请选择目标", "target_id")
+    target = conn.execute("SELECT * FROM targets WHERE id = ?", (target_id,)).fetchone()
+    if not target:
+        raise UserError("目标不存在", "target_id", 404)
+    return target
 
 
 def reserve_removed(conn, node_id, port):
@@ -576,12 +757,6 @@ def route_hops(conn, route, chain_id=None, ports=None):
 
 def mark_config_nodes(conn, chain_id):
     mark_pending(conn, chain_id, [r[0] for r in conn.execute("SELECT node_id FROM hops WHERE chain_id = ?", (chain_id,))])
-
-
-def block_tunnel_configs(conn, tunnel_id):
-    for c in conn.execute("SELECT id FROM chains WHERE tunnel_id = ? AND deleting = 0", (tunnel_id,)).fetchall():
-        conn.execute("UPDATE chains SET ready = 0 WHERE id = ?", (c["id"],))
-        mark_config_nodes(conn, c["id"])
 
 
 # ---------------------------------------------------------------- 密码
@@ -829,7 +1004,7 @@ def parse_hops(conn, hops, chain_id=None):
 
 # ---------------------------------------------------------------- 规则展开与状态
 
-def node_rule_rows(conn, node):
+def legacy_node_rule_rows(conn, node):
     """节点应有的规则：非最后一跳指向下一跳节点，最后一跳指向链的目标。"""
     if node["deleting"]:
         return []
@@ -858,6 +1033,39 @@ def node_rule_rows(conn, node):
     return out
 
 
+def legacy_node_rules(conn, node):
+    return [f"{r['id']} both {r['port']} {r['host']} {r['tport']}" for r in legacy_node_rule_rows(conn, node)]
+
+
+def node_rule_rows(conn, node):
+    """节点应有的规则：非最后一跳指向下一跳节点，最后一跳指向链的目标。"""
+    if node["deleting"]:
+        return []
+    rows = conn.execute(
+        f"""
+        SELECT h.id, h.port, c.id AS chain_id, c.remark AS chain_remark, t.host AS target_host, t.port AS target_port,
+               n2.addr AS next_addr, h2.port AS next_port
+        FROM hops h
+        JOIN chains c ON c.id = h.chain_id
+        JOIN targets t ON t.id = c.target_id
+        LEFT JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1
+        LEFT JOIN nodes n2 ON n2.id = h2.node_id
+        WHERE h.node_id = ? AND c.deleting = 0
+        ORDER BY h.id
+        """,
+        (node["id"],),
+    )
+    out = []
+    for r in rows:
+        if r["next_port"] is None:
+            host, port = r["target_host"], r["target_port"]
+        else:
+            host, port = r["next_addr"], r["next_port"]
+        out.append({"id": r["id"], "port": r["port"], "host": host, "tport": port,
+                    "chain_id": r["chain_id"], "chain_remark": r["chain_remark"]})
+    return out
+
+
 def node_rules(conn, node):
     """下发给节点的规则行：规则id 协议 入站端口 目标地址 目标端口。"""
     return [f"{r['id']} both {r['port']} {r['host']} {r['tport']}" for r in node_rule_rows(conn, node)]
@@ -871,37 +1079,48 @@ def node_status(conn, node, now):
     """new / offline / skew / syncing / synced / error / deleting"""
     if node["deleting"]:
         return "deleting"
-    if node["kind"] == "tunnel":
-        return "new" if not node["first_seen"] else "online" if now <= node["online_until"] else "offline"
+    if node["manual_required"] or node["desired_mode"] == "passive":
+        return "syncing" if (node["manual_required"] or node["applied_generation"] != node["desired_generation"]
+                              or node["state"] != "ok") else "synced"
     if not node["first_seen"]:
         return "new"
     if now - node["last_seen"] > OFFLINE_AFTER:
         return "offline"
     if node["skew"] is not None and abs(node["skew"]) > MAX_SKEW:
         return "skew"
-    if node["reported_v"] != rules_version(node_rules(conn, node)) or node["state"] == "init":
+    if node["state"] == "error":
+        return "error"
+    if node["applied_generation"] != node["desired_generation"] or node["reported_v"] != rules_version(node_rules(conn, node)) or node["state"] == "init":
         return "syncing"
     return "synced" if node["state"] == "ok" else "error"
 
 
 def node_bar(conn, node, now):
     """最近 BAR_WINDOWS 个时间窗口的状态：ok / fault / lost / none。"""
-    if node["kind"] == "tunnel":
-        return tunnel_bar(conn, node, now)
-    cur = now // WINDOW
+    if node["desired_mode"] == "passive":
+        start = now // WINDOW - BAR_WINDOWS + 1
+        activity = {r["win"]: dict(r) for r in conn.execute(
+            "SELECT win,manual_count,last_activity FROM windows WHERE node_id=? AND win>=?", (node["id"], start))}
+        return {"start": start * WINDOW, "window": WINDOW,
+                "levels": ["ok" if activity.get(w, {}).get("manual_count", 0) else "white" for w in range(start, now // WINDOW + 1)],
+                "counts": [activity.get(w, {}).get("manual_count", 0) for w in range(start, now // WINDOW + 1)],
+                "times": [activity.get(w, {}).get("last_activity") for w in range(start, now // WINDOW + 1)]}
+    cur = now // ACTIVE_WINDOW
     start = cur - BAR_WINDOWS + 1
     levels = {r[0]: r[1] for r in conn.execute(
-        "SELECT win, level FROM windows WHERE node_id = ? AND win >= ?", (node["id"], start))}
+        "SELECT win, level FROM active_windows WHERE node_id = ? AND win >= ?", (node["id"], start))}
+    recording_since = int(setting(conn, "active_window_start", "0"))
     first = node["first_seen"]
     bar = []
     for w in range(start, cur + 1):
         if w in levels:
             bar.append("ok" if levels[w] == 2 else "fault")
-        elif not first or (w + 1) * WINDOW <= first or w == cur:
+        elif (not first or (w + 1) * ACTIVE_WINDOW <= first or w == cur
+              or w * ACTIVE_WINDOW < recording_since):
             bar.append("none")
         else:
             bar.append("lost")
-    return {"start": start * WINDOW, "window": WINDOW, "levels": bar}
+    return {"start": start * ACTIVE_WINDOW, "window": ACTIVE_WINDOW, "levels": bar}
 
 
 def duration(sec):
@@ -918,7 +1137,7 @@ def record_report(conn, node, now, health, err, skew):
     """记录一次上报：状态窗口 + 状态变化事件。"""
     if not node["first_seen"]:
         add_event(conn, node["id"], "首次连接", now)
-    elif now - node["last_seen"] > OFFLINE_AFTER:
+    elif node["desired_mode"] == "active" and now - node["last_seen"] > OFFLINE_AFTER:
         add_event(conn, node["id"], f"失联 {duration(now - node['last_seen'])} 后恢复", now)
 
     prev = node["health"] or "ok"
@@ -931,9 +1150,9 @@ def record_report(conn, node, now, health, err, skew):
         add_event(conn, node["id"], text, now)
 
     conn.execute(
-        """INSERT INTO windows VALUES (?, ?, ?)
+        """INSERT INTO active_windows(node_id,win,level) VALUES (?, ?, ?)
            ON CONFLICT (node_id, win) DO UPDATE SET level = MIN(level, excluded.level)""",
-        (node["id"], now // WINDOW, 2 if health == "ok" else 1),
+        (node["id"], now // ACTIVE_WINDOW, 2 if health == "ok" else 1),
     )
 
 
@@ -954,11 +1173,142 @@ LOGIN_FAILS = {}            # ip → [失败次数, 锁定到期时间]
 LOGIN_FAILS_LOCK = threading.Lock()
 
 
+def clear_pending(conn, node):
+    conn.execute('DELETE FROM retired_ports WHERE node_id=?', (node['id'],))
+    conn.execute('DELETE FROM chain_pending WHERE node_id=?', (node['id'],))
+    finish_deleted_chains(conn)
+
+
+def sync_report(conn, node, fields, source_ip, now=None):
+    """Return authenticated plaintext. Network IO is handled outside the DB transaction."""
+    now = int(time.time()) if now is None else now
+    state = fields.get('state')
+    if state not in ('init', 'ok', 'error') or not re.fullmatch(r'[0-9]{1,12}', fields.get('t', '')):
+        raise UserError('无效上报')
+    skew = int(fields['t']) - now
+    err, agent = fields.get('err', '')[:500], fields.get('agent', '')[:32]
+    health = 'skew' if abs(skew) > MAX_SKEW else 'error' if state == 'error' else 'ok'
+    if health == 'skew':
+        conn.execute('UPDATE nodes SET skew=?,health=? WHERE id=?', (skew, health, node['id']))
+        return f'time={now}\n'
+    proto = fields.get('proto') == '2'
+    source, phase = fields.get('source'), fields.get('phase')
+    if proto and (source not in ('manual','auto') or phase not in ('begin','poll','ack','asset')):
+        raise UserError('无效同步阶段')
+    au = {'0': 0, '1': 1}.get(fields.get('au'))
+    # Asset downloads never acknowledge state, register activity, or mutate operation context.
+    if fields.get('get') == 'agent':
+        if AGENT and au and (not node['manual_required'] and node['desired_mode']=='active' or proto and source=='manual'):
+            return AGENT[2]
+        raise UserError('没有可用更新')
+    record_report(conn, node, now, health, err, skew)
+    conn.execute('''UPDATE nodes SET first_seen=COALESCE(first_seen,?),last_seen=?,src_ip=?,
+        agent=?,skew=?,health=?,auto_update=?,protocol_version=MAX(protocol_version,?) WHERE id=?''',
+        (now, now, source_ip, agent, skew, health, au, 2 if proto else 1, node['id']))
+    if proto and fields.get('mode') in ('active','passive'):
+        conn.execute('UPDATE nodes SET reported_mode=? WHERE id=?', (fields['mode'], node['id']))
+    lines = node_rules(conn, node)
+    want = rules_version(lines)
+    update = f'update={AGENT[0]} {AGENT[1]}\n' if agent_update(agent, au)=='pending' else ''
+    if not proto:
+        if node['protocol_version'] >= 2 or node['manual_required'] or node['desired_mode'] != 'active':
+            return 'same\n' + update  # Legacy requests cannot clear v2 waits.
+        v = fields.get('v', '')
+        conn.execute('UPDATE nodes SET reported_v=?,state=?,err=? WHERE id=?', (v, state, err, node['id']))
+        if v == want and state == 'ok':
+            conn.execute('UPDATE nodes SET applied_generation=desired_generation WHERE id=?', (node['id'],))
+            clear_pending(conn, node)
+            if node['deleting']:
+                delete_node(conn, node['id'])
+                return 'same\n'
+        return ('same\n' if v == want and state != 'init' else '\n'.join([f'v={want}']+lines)+'\n') + update
+    if source == 'auto' and (node['desired_mode'] == 'passive' or node['manual_required']):
+        return 'proto=2\naction=pause\nmode=passive\n'
+    opid = fields.get('op', '')
+    if not re.fullmatch(r'[a-f0-9]{32}', opid):
+        raise UserError('无效操作编号')
+    op = conn.execute('SELECT * FROM sync_ops WHERE node_id=?', (node['id'],)).fetchone()
+    if phase == 'ack':
+        if (not op or op['op'] != opid or op['source'] != source or op['expires'] < now or
+                fields.get('generation') != str(op['generation']) or fields.get('mode') != op['mode'] or fields.get('v') != op['hash']):
+            return 'proto=2\nresult=expired\n'
+        if op['result']:
+            return 'proto=2\nresult='+op['result']+'\n'
+        current = (op['generation'] == node['desired_generation'] and op['mode'] == node['desired_mode'] and op['hash'] == want)
+        result = 'failed' if state != 'ok' else 'confirmed' if current else 'changed'
+        conn.execute('UPDATE sync_ops SET result=? WHERE node_id=?', (result, node['id']))
+        conn.execute('UPDATE nodes SET state=?,err=? WHERE id=?', (state, err, node['id']))
+        if state == 'ok':
+            conn.execute('UPDATE nodes SET reported_v=?,reported_mode=?,applied_generation=?,last_success=? WHERE id=?',
+                         (op['hash'], op['mode'], op['generation'], now, node['id']))
+        add_event(conn, node['id'], ('手动' if source=='manual' else '自动') + '同步：' +
+                  {'confirmed':'确认成功','changed':'已应用旧快照，仍有新变更','failed':'失败：'+err}[result], now)
+        if result == 'confirmed':
+            if source == 'manual':
+                conn.execute('UPDATE nodes SET manual_required=0 WHERE id=?', (node['id'],))
+            clear_pending(conn, node)
+            if node['deleting']:
+                conn.execute('INSERT OR REPLACE INTO deleted_receipts VALUES (?,?,?,?,?,?)',
+                             (node['key'], opid, op['generation'], op['mode'], op['hash'], now+600))
+                delete_node(conn, node['id'])
+                return 'proto=2\nresult=deleted\n'
+        return f'proto=2\nresult={result}\n'
+    if phase not in ('begin','poll') or (source=='manual' and phase!='begin') or (source=='auto' and phase!='poll'):
+        raise UserError('无效同步阶段')
+    if source == 'auto' and op and op['source']=='manual' and not op['result'] and op['expires'] >= now:
+        return 'proto=2\naction=busy\n'
+    if op and op['op']==opid:
+        if op['expires'] < now or op['source'] != source:
+            return 'proto=2\nresult=expired\n'
+    else:
+        if source == 'auto' and (node['applied_generation']==node['desired_generation'] and
+                fields.get('generation')==str(node['desired_generation']) and fields.get('v')==want and state=='ok'):
+            conn.execute("UPDATE nodes SET state='ok',err='' WHERE id=?", (node['id'],))
+            return 'proto=2\naction=same\n' + update
+        op = {'op':opid, 'source':source, 'generation':node['desired_generation'], 'mode':node['desired_mode'],
+              'hash':want, 'rules':'\n'.join(lines), 'expires':now+600}
+        conn.execute('''INSERT OR REPLACE INTO sync_ops(node_id,op,source,generation,mode,hash,rules,expires)
+            VALUES (?,?,?,?,?,?,?,?)''', (node['id'], opid, source, op['generation'], op['mode'], want, op['rules'], op['expires']))
+        if source == 'manual':
+            conn.execute('''INSERT INTO windows(node_id,win,level,manual_count,last_activity) VALUES (?,?,2,1,?)
+                ON CONFLICT(node_id,win) DO UPDATE SET manual_count=manual_count+1,last_activity=excluded.last_activity''',
+                         (node['id'], now//WINDOW, now))
+            conn.execute("UPDATE nodes SET last_manual=?,state='init' WHERE id=?", (now,node['id']))
+            add_event(conn, node['id'], '手动同步开始', now)
+    return (f"proto=2\naction=apply\nop={opid}\ngeneration={op['generation']}\nmode={op['mode']}\n"
+            f"v={op['hash']}\n{op['rules']}\n" + update)
+
+
+class LimitedHTTPServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    max_connections = 64
+
+    def __init__(self, *args, **kwargs):
+        self.slots = threading.BoundedSemaphore(self.max_connections)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     sync_path = "/"
     panel_path = "/"
-    tunnel_path = "/tunnel-uninitialized"
+    timeout = 15
 
     # 不发送 Server 头，不暴露实现
     def send_response(self, code, message=None):
@@ -1003,8 +1353,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.cookies = []
         try:
             path, _, query = self.path.partition("?")
-            if path.startswith(self.tunnel_path + "/"):
-                return self.tunnel_api(method, path[len(self.tunnel_path) + 1:])
             if path == self.sync_path:
                 return self.sync() if method == "POST" else self.not_found()
             if path == self.panel_path and method == "GET":
@@ -1047,88 +1395,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def sync(self):
         try:
             length = self.body_length(MAX_BODY)
-        except UserError:
-            return self.not_found()
-        if length == 0:
-            return self.not_found()
-        try:
             raw = base64.b64decode(self.rfile.read(length).strip(), validate=True)
-        except ValueError:
-            return self.not_found()
-        if len(raw) < 8 + 32:
+            if len(raw) < 40:
+                raise ValueError()
+        except (UserError, ValueError):
             return self.not_found()
         msg, req_tag = raw[:-32], raw[-32:]
-
         conn = db()
+        out = None
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            for node in conn.execute("SELECT * FROM nodes WHERE kind = 'forward'").fetchall():
-                ek, mk = derive(node["key"])
+            # Authentication/decryption happens before obtaining the SQLite writer lock.
+            identities = [dict(n) for n in conn.execute('SELECT * FROM nodes')]
+            identities += [dict(r) for r in conn.execute('SELECT * FROM deleted_receipts WHERE expires>=?', (int(time.time()),))]
+            for candidate in identities:
+                ek, mk = derive(candidate['key'])
                 if hmac.compare_digest(req_tag, mac(mk, msg)):
                     break
             else:
                 return self.not_found()
-            text = aes(ek, b"Salted__" + msg, decrypt=True).decode("utf-8", "replace")
-
+            plaintext = aes(ek, b'Salted__'+msg, decrypt=True).decode('utf-8')
             fields = {}
-            for line in text.splitlines():
-                k, sep, v = line.partition("=")
+            for line in plaintext.splitlines():
+                k, sep, v = line.partition('=')
                 if sep:
-                    fields[k.strip()] = v.strip()
-            state = fields.get("state", "")
-            if state not in ("init", "ok", "error") or not fields.get("t", "").isdigit():
-                return self.not_found()
-            now = int(time.time())
-            skew = int(fields["t"]) - now
-            v = fields.get("v", "")
-            err = fields.get("err", "")[:500]
-            health = "skew" if abs(skew) > MAX_SKEW else ("error" if state == "error" else "ok")
-
-            agent = fields.get("agent", "")[:32]
+                    if k in fields:
+                        raise UserError('重复字段')
+                    fields[k] = v.strip()
             with conn:
-                record_report(conn, node, now, health, err, skew)
-                if agent and node["agent"] and agent != node["agent"]:
-                    add_event(conn, node["id"], f"节点端版本 {node['agent']} → {agent}", now)
-
-                # 时间相差过大：只记录时差，不处理请求（防重放）
-                if health == "skew":
-                    conn.execute(
-                        """UPDATE nodes SET first_seen = COALESCE(first_seen, ?), last_seen = ?, src_ip = ?,
-                           skew = ?, health = ? WHERE id = ?""",
-                        (now, now, self.source_ip(), skew, health, node["id"]),
-                    )
-                    return self.reply(200, seal(node["key"], req_tag, f"time={now}\n"))
-
-                auto_update = {"1": 1, "0": 0}.get(fields.get("au"))
-                conn.execute(
-                    """UPDATE nodes SET first_seen = COALESCE(first_seen, ?), last_seen = ?, src_ip = ?,
-                       reported_v = ?, state = ?, err = ?, agent = ?, skew = ?, health = ?, auto_update = ?
-                       WHERE id = ?""",
-                    (now, now, self.source_ip(), v, state, err, agent, skew, health, auto_update, node["id"]),
-                )
-                lines = node_rules(conn, node)
-                want = rules_version(lines)
-
-                if v == want and state == "ok":
-                    conn.execute("DELETE FROM retired_ports WHERE node_id = ?", (node["id"],))
-                    conn.execute("DELETE FROM chain_pending WHERE node_id = ?", (node["id"],))
-                    finish_deleted_chains(conn)
-
-                if node["deleting"] and v == want and state == "ok":
-                    delete_node(conn, node["id"])
-                    out = "same\n"
-                elif v == want and state != "init":
-                    out = "same\n"
+                conn.execute('BEGIN IMMEDIATE')
+                node = conn.execute('SELECT * FROM nodes WHERE key=?', (candidate['key'],)).fetchone()
+                if node:
+                    out = sync_report(conn, node, fields, self.source_ip())
                 else:
-                    out = "".join(f"{x}\n" for x in [f"v={want}"] + lines)
-                # 节点端版本低于服务端：附带更新信号（目标版本和脚本哈希），节点再以 get=agent 下载脚本
-                if agent_update(agent, auto_update) == "pending":
-                    if fields.get("get") == "agent":
-                        return self.reply(200, seal_bytes(node["key"], req_tag, AGENT[2]))
-                    out += f"update={AGENT[0]} {AGENT[1]}\n"
-            self.reply(200, seal(node["key"], req_tag, out))
+                    receipt = conn.execute('SELECT * FROM deleted_receipts WHERE key=? AND expires>=?',
+                                           (candidate['key'], int(time.time()))).fetchone()
+                    if (receipt and fields.get('proto')=='2' and fields.get('phase')=='ack' and fields.get('state')=='ok'
+                            and fields.get('op')==receipt['op'] and fields.get('v')==receipt['hash']
+                            and fields.get('generation')==str(receipt['generation']) and fields.get('mode')==receipt['mode']
+                            and fields.get('t','').isdigit() and abs(int(fields['t'])-int(time.time()))<=MAX_SKEW):
+                        out = 'proto=2\nresult=deleted\n'
+        except (UserError, ValueError, UnicodeError):
+            pass
         finally:
             conn.close()
+        if out is None:
+            return self.not_found()
+        data = out if isinstance(out, bytes) else out.encode()
+        self.reply(200, seal_bytes(candidate['key'], req_tag, data))
 
     # ------------------------------------------------------------ 面板接口
 
@@ -1176,10 +1489,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 handler = {"GET": self.api_routes, "POST": self.api_route_save}.get(method)
             elif len(parts) == 2 and parts[0] == "routes" and parts[1].isdigit():
                 handler = {"PATCH": self.api_route_save, "DELETE": self.api_route_del}.get(method)
-            elif parts == ["tunnels"]:
-                handler = {"GET": self.api_tunnels, "POST": self.api_tunnel_save}.get(method)
-            elif len(parts) == 2 and parts[0] == "tunnels" and parts[1].isdigit():
-                handler = {"PATCH": self.api_tunnel_save, "DELETE": self.api_tunnel_del}.get(method)
+            elif parts == ["targets"]:
+                handler = {"GET": self.api_targets, "POST": self.api_target_save}.get(method)
+            elif len(parts) == 2 and parts[0] == "targets" and parts[1].isdigit():
+                handler = {"PATCH": self.api_target_save, "DELETE": self.api_target_del}.get(method)
             elif len(parts) == 2 and parts[0] in KINDS and parts[1] == "order":
                 handler = {"POST": self.api_order}.get(method)
                 parts = [parts[0]]   # 表名作为参数传入
@@ -1314,7 +1627,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def node_brief(self, conn, n, now):
         return {"id": n["id"], "kind": n["kind"], "name": n["name"], "note": n["note"], "addr": n["addr"],
                 "ports": n["ports"], "group_id": n["group_id"], "status": node_status(conn, n, now),
-                "last_seen": n["last_seen"]}
+                "last_seen": n["last_seen"], "desired_mode": n["desired_mode"], "reported_mode": n["reported_mode"],
+                "manual_required": bool(n["manual_required"]), "protocol_version": n["protocol_version"],
+                "desired_generation": n["desired_generation"], "applied_generation": n["applied_generation"],
+                "err": n["err"]}
 
     def api_nodes(self, conn, body):
         now = int(time.time())
@@ -1324,24 +1640,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  for n in conn.execute(ordered(table)).fetchall()]
         return {"now": now, "kind": kind, "groups": get_groups(conn, table), "nodes": nodes}
 
+    @track_mutation
     def api_node_add(self, conn, body):
         name = check_remark(body.get("name"), "name", "名称")
         note = check_note(body.get("note"))
         addr = check_host(body.get("addr"), "addr")
         ports = format_ports(parse_ports(body.get("ports", "10000-65535")))
         if "heartbeat_interval" in body or "tunnel_heartbeat" in body:
-            raise UserError("心跳间隔只能在系统设置中全局配置")
+            raise UserError("新版只支持主动／被动同步模式")
         kind = body.get("kind", "forward")
         table = node_table(kind)
         group_id = check_group(conn, table, body.get("group_id"))
-        with conn:
-            node_id = int(setting(conn, "next_node_id"))
-            set_setting(conn, "next_node_id", str(node_id + 1))
-            cur = conn.execute(
-                f"""INSERT INTO {table} (id, name, note, addr, key, ports, group_id, kind, sort)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM {table}))""",
-                (node_id, name, note, addr, new_key(), ports, group_id, kind))
-            add_event(conn, cur.lastrowid, f"创建节点，入站地址 {addr}")
+        node_id = int(setting(conn, "next_node_id"))
+        set_setting(conn, "next_node_id", str(node_id + 1))
+        cur = conn.execute(
+            f"""INSERT INTO {table} (id, name, note, addr, key, ports, group_id, kind, sort)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM {table}))""",
+            (node_id, name, note, addr, new_key(), ports, group_id, kind))
+        add_event(conn, cur.lastrowid, f"创建节点，入站地址 {addr}")
+        mode = body.get("desired_mode", "active")
+        if mode not in ("active", "passive"):
+            raise UserError("模式必须为主动或被动", "desired_mode")
+        if mode == "passive":
+            conn.execute("UPDATE nodes SET desired_mode='passive',manual_required=1 WHERE id=?", (cur.lastrowid,))
         return {"id": cur.lastrowid}
 
     def api_node_get(self, conn, body, node_id):
@@ -1363,15 +1684,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "agent_url": AGENT_URL,
             "version": VERSION,
             "forward_version": FORWARD_VERSION,
-            "tunnel_version": TUNNEL_VERSION,
-            "tunnel_path": setting(conn, "tunnel_path"),
-            "tunnel_installer_url": f"https://github.com/{REPO}/releases/download/v{VERSION}/install-tunnel.sh",
-            "heartbeat_interval": heartbeat_interval(conn),
             "node": {
                 **self.node_brief(conn, n, now), "bar": node_bar(conn, n, now), "key": n["key"],
                 "first_seen": n["first_seen"], "src_ip": n["src_ip"], "skew": n["skew"], "agent": n["agent"],
-                "core_version": n["core_version"],
-                "reported_v": n["reported_v"], "want_v": tunnel_snapshot(conn, n)["revision"] if n["kind"] == "tunnel" else rules_version(node_rules(conn, n)),
+                "reported_v": n["reported_v"], "want_v": rules_version(node_rules(conn, n)),
                 "state": n["state"], "err": n["err"], "group": group["name"],
                 "agent_update": agent_update(n["agent"], n["auto_update"]),
             },
@@ -1380,11 +1696,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "events": [dict(e) for e in events],
         }
 
+    @track_mutation
     def api_node_edit(self, conn, body, node_id):
         n = get_node(conn, node_id)
         table = node_table(n["kind"])
         if "heartbeat_interval" in body or "tunnel_heartbeat" in body:
-            raise UserError("心跳间隔只能在系统设置中全局配置")
+            raise UserError("新版只支持主动／被动同步模式")
         if "kind" in body and body["kind"] != n["kind"]:
             raise UserError("节点类型不能修改", "kind")
         name = check_remark(body["name"], "name", "名称") if "name" in body else n["name"]
@@ -1395,41 +1712,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
         outside = [r for r in conn.execute(
             """SELECT c.remark, h.port FROM hops h JOIN chains c ON c.id = h.chain_id
                WHERE h.node_id = ? ORDER BY h.port""", (node_id,)) if not in_ports(r["port"], ranges)]
-        for r in conn.execute("SELECT name AS remark, port FROM tunnels WHERE node_id = ? UNION ALL SELECT '等待移除' AS remark, port FROM retired_ports WHERE node_id = ?", (node_id, node_id)):
+        for r in conn.execute("SELECT '等待移除' AS remark, port FROM retired_ports WHERE node_id = ?", (node_id,)):
             if not in_ports(r["port"], ranges):
                 outside.append(r)
         if outside:
             used = "、".join(f"「{r['remark']}」{r['port']}" for r in outside)
             raise UserError(f"以下转发使用的端口不在新的允许范围内：{used}。请先修改这些转发。", "ports")
+        mode = body.get("desired_mode", n["desired_mode"])
+        if mode not in ("active", "passive"):
+            raise UserError("模式必须为主动或被动", "desired_mode")
+        if mode != n["desired_mode"] and n["first_seen"] and n["protocol_version"] < 2:
+            raise UserError("请先升级节点 Agent 并完成一次同步，再切换模式", "desired_mode")
         key = None
-        with conn:
-            conn.execute(f"UPDATE {table} SET name = ?, note = ?, addr = ?, ports = ? WHERE id = ?",
-                         (name, note, addr, format_ports(ranges), node_id))
-            if group_id != n["group_id"]:   # 换到其他分组时排在该组末尾
-                move_group(conn, table, node_id, group_id)
-            if addr != n["addr"]:
-                key = new_key()
-                conn.execute(f"UPDATE {table} SET key = ? WHERE id = ?", (key, node_id))
-                add_event(conn, node_id, f"入站地址 {n['addr']} → {addr}，已重新生成密钥")
-                for t in conn.execute("SELECT id FROM tunnels WHERE node_id = ?", (node_id,)).fetchall():
-                    conn.execute("UPDATE chains SET target_host = ? WHERE tunnel_id = ?", (addr, t["id"]))
-                    for c in conn.execute("SELECT id FROM chains WHERE tunnel_id = ?", (t["id"],)).fetchall():
-                        mark_config_nodes(conn, c["id"])
-                for r in conn.execute(
-                        """SELECT h.chain_id, h.node_id FROM hops h
-                           JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1
-                           WHERE h2.node_id = ?""", (node_id,)).fetchall():
-                    mark_pending(conn, r["chain_id"], [r["node_id"]])
+        if mode != n["desired_mode"]:
+            conn.execute("UPDATE nodes SET desired_mode=?,manual_required=1 WHERE id=?", (mode, node_id))
+            add_event(conn, node_id, "同步模式已修改，等待本机手动同步确认")
+        conn.execute(f"UPDATE {table} SET name = ?, note = ?, addr = ?, ports = ? WHERE id = ?",
+                     (name, note, addr, format_ports(ranges), node_id))
+        if group_id != n["group_id"]:   # 换到其他分组时排在该组末尾
+            move_group(conn, table, node_id, group_id)
+        if addr != n["addr"]:
+            key = new_key()
+            conn.execute(f"UPDATE {table} SET key = ? WHERE id = ?", (key, node_id))
+            add_event(conn, node_id, f"入站地址 {n['addr']} → {addr}，已重新生成密钥")
+            for r in conn.execute(
+                    """SELECT h.chain_id, h.node_id FROM hops h
+                       JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1
+                       WHERE h2.node_id = ?""", (node_id,)).fetchall():
+                mark_pending(conn, r["chain_id"], [r["node_id"]])
         return {"key": key, "upstream": upstream_nodes(conn, node_id) if key else []}
 
+    @track_mutation
     def api_node_rekey(self, conn, body, node_id):
         table = node_table(get_node(conn, node_id)["kind"])
         key = new_key()
-        with conn:
-            conn.execute(f"UPDATE {table} SET key = ? WHERE id = ?", (key, node_id))
-            add_event(conn, node_id, "重置密钥")
+        conn.execute(f"UPDATE {table} SET key = ? WHERE id = ?", (key, node_id))
+        add_event(conn, node_id, "重置密钥")
         return {"key": key}
 
+    @track_mutation
     def api_node_del(self, conn, body, node_id):
         n = get_node(conn, node_id)
         table = node_table(n["kind"])
@@ -1439,17 +1760,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for r in conn.execute("SELECT name, node_ids FROM routes"):
             if node_id in json.loads(r["node_ids"]):
                 used.append("链路：" + r["name"])
-        used.extend("隧道：" + t[0] for t in conn.execute("SELECT name FROM tunnels WHERE node_id = ?", (node_id,)))
         if used:
             raise UserError(f"节点仍被转发使用：{'、'.join(used)}。请先删除或修改这些转发。")
         force = self.query.get("force") == ["1"]
-        with conn:
-            if force or not n["first_seen"]:
-                delete_node(conn, node_id)
-                return {"deleted": True}
-            if not n["deleting"]:
-                conn.execute(f"UPDATE {table} SET deleting = 1 WHERE id = ?", (node_id,))
-                add_event(conn, node_id, "开始删除，等待节点清空规则")
+        if force or not n["first_seen"]:
+            delete_node(conn, node_id)
+            return {"deleted": True}
+        if not n["deleting"]:
+            conn.execute(f"UPDATE {table} SET deleting = 1 WHERE id = ?", (node_id,))
+            add_event(conn, node_id, "开始删除，等待节点清空规则")
         return {"deleted": False}
 
     # 转发
@@ -1458,15 +1777,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         now = int(time.time())
         nodes = {n["id"]: n for n in conn.execute("SELECT * FROM nodes").fetchall()}
         status = {nid: node_status(conn, n, now) for nid, n in nodes.items()}
-        node_info = lambda nid: {"node_id": nid, "name": nodes[nid]["name"], "status": status[nid]}
+        node_info = lambda nid: {"node_id": nid, "name": nodes[nid]["name"], "status": status[nid],
+                                 "desired_mode": nodes[nid]["desired_mode"], "err": nodes[nid]["err"]}
         chains = []
         for c in conn.execute(ordered("chains")).fetchall():
             hops = [{**node_info(h["node_id"]), "addr": nodes[h["node_id"]]["addr"], "port": h["port"]}
                     for h in conn.execute("SELECT * FROM hops WHERE chain_id = ? ORDER BY seq", (c["id"],))]
             pending = [node_info(r["node_id"]) for r in conn.execute(
                 "SELECT node_id FROM chain_pending WHERE chain_id = ? ORDER BY node_id", (c["id"],))]
-            chains.append({"id": c["id"], "remark": c["remark"], "target_host": c["target_host"],
-                           "target_port": c["target_port"], "deleting": bool(c["deleting"]),
+            target = get_target(conn, c["target_id"])
+            chains.append({"id": c["id"], "remark": c["remark"], "target_host": target["host"],
+                           "target_port": target["port"], "deleting": bool(c["deleting"]),
                            "group_id": c["group_id"], "hops": hops, "pending": pending})
         # 节点及其分组用于筛选下拉框
         node_list = [{"id": n["id"], "name": n["name"], "group_id": n["group_id"]}
@@ -1474,25 +1795,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return {"chains": chains, "groups": get_groups(conn, "chains"),
                 "nodes": node_list, "node_groups": get_groups(conn, "nodes")}
 
+    @track_mutation
     def api_chain_del(self, conn, body, chain_id):
         chain = get_chain(conn, chain_id)
         force = self.query.get("force") == ["1"]
-        with conn:
-            if force:
-                for h in conn.execute("SELECT node_id, port FROM hops WHERE chain_id = ?", (chain_id,)).fetchall():
-                    reserve_removed(conn, h["node_id"], h["port"])
-                delete_chain(conn, chain_id)
-                return {"deleted": True}
-            # 保留之前被移出、尚未确认的节点；只等待仍存在且连接过的节点。
-            conn.execute("""DELETE FROM chain_pending WHERE chain_id = ? AND node_id NOT IN
-                            (SELECT id FROM nodes WHERE first_seen IS NOT NULL)""", (chain_id,))
-            if not chain["deleting"]:
-                conn.execute("UPDATE chains SET deleting = 1 WHERE id = ?", (chain_id,))
-                mark_pending(conn, chain_id, [r[0] for r in conn.execute(
-                    """SELECT h.node_id FROM hops h JOIN nodes n ON n.id = h.node_id
-                       WHERE h.chain_id = ? AND n.first_seen IS NOT NULL""", (chain_id,))])
-            finish_deleted_chains(conn)
-            deleted = not conn.execute("SELECT 1 FROM chains WHERE id = ?", (chain_id,)).fetchone()
+        if force:
+            for h in conn.execute("SELECT node_id, port FROM hops WHERE chain_id = ?", (chain_id,)).fetchall():
+                reserve_removed(conn, h["node_id"], h["port"])
+            delete_chain(conn, chain_id)
+            return {"deleted": True}
+        # 保留之前被移出、尚未确认的节点；只等待仍存在且连接过的节点。
+        conn.execute("""DELETE FROM chain_pending WHERE chain_id = ? AND node_id NOT IN
+                        (SELECT id FROM nodes WHERE first_seen IS NOT NULL)""", (chain_id,))
+        if not chain["deleting"]:
+            conn.execute("UPDATE chains SET deleting = 1 WHERE id = ?", (chain_id,))
+            mark_pending(conn, chain_id, [r[0] for r in conn.execute(
+                """SELECT h.node_id FROM hops h JOIN nodes n ON n.id = h.node_id
+                   WHERE h.chain_id = ? AND n.first_seen IS NOT NULL""", (chain_id,))])
+        finish_deleted_chains(conn)
+        deleted = not conn.execute("SELECT 1 FROM chains WHERE id = ?", (chain_id,)).fetchone()
         return {"deleted": deleted}
 
     # 排序
@@ -1552,7 +1873,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             conn.execute("DELETE FROM item_groups WHERE id = ?", (group_id,))
         return {}
 
-    # 0.2.0：链路模板、组合配置、隧道及独立 Agent 协议。
+    # 链路模板、目标对象与组合配置。
 
     def api_routes(self, conn, body):
         result = []
@@ -1563,6 +1884,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "nodes": [{"id": nid, "name": get_node(conn, nid)["name"]} for nid in ids]})
         return {"routes": result, "groups": get_groups(conn, "routes")}
 
+    @track_mutation
     def api_route_save(self, conn, body, route_id=None):
         old = get_route(conn, route_id) if route_id is not None else None
         name = check_remark(body.get("name", old["name"] if old else None), "name", "名称")
@@ -1575,373 +1897,130 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise UserError("链路只能使用未删除的转发节点", "node_ids")
         group_id = check_group(conn, "routes", body.get("group_id", old["group_id"] if old else None))
         refs = conn.execute("SELECT * FROM chains WHERE route_id = ? AND deleting = 0 ORDER BY id", (route_id,)).fetchall()
-        with conn:
-            if old:
-                conn.execute("UPDATE routes SET name = ?, node_ids = ? WHERE id = ?", (name, json.dumps(ids), route_id))
-                if group_id != old["group_id"]:
-                    move_group(conn, "routes", route_id, group_id)
-            else:
-                route_id = conn.execute("INSERT INTO routes(name, node_ids, group_id, sort) VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM routes))", (name, json.dumps(ids), group_id)).lastrowid
-            if old and ids != json.loads(old["node_ids"]):
-                for c in refs:
-                    before = [r[0] for r in conn.execute("SELECT node_id FROM hops WHERE chain_id = ?", (c["id"],))]
-                    pairs, _ = route_hops(conn, get_route(conn, route_id), c["id"])
-                    apply_config_hops(conn, c["id"], pairs)
-                    mark_pending(conn, c["id"], before + [nid for nid, _ in pairs])
+        if old:
+            conn.execute("UPDATE routes SET name = ?, node_ids = ? WHERE id = ?", (name, json.dumps(ids), route_id))
+            if group_id != old["group_id"]:
+                move_group(conn, "routes", route_id, group_id)
+        else:
+            route_id = conn.execute("INSERT INTO routes(name, node_ids, group_id, sort) VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM routes))", (name, json.dumps(ids), group_id)).lastrowid
+        if old and ids != json.loads(old["node_ids"]):
+            for c in refs:
+                before = [r[0] for r in conn.execute("SELECT node_id FROM hops WHERE chain_id = ?", (c["id"],))]
+                pairs, _ = route_hops(conn, get_route(conn, route_id), c["id"])
+                apply_config_hops(conn, c["id"], pairs)
         return {"id": route_id, "affected": len(refs)}
 
+    @track_mutation
     def api_route_del(self, conn, body, route_id):
         get_route(conn, route_id)
         if conn.execute("SELECT 1 FROM chains WHERE route_id = ?", (route_id,)).fetchone():
             raise UserError("链路仍被配置引用，请先删除或修改引用它的配置")
-        with conn:
-            conn.execute("DELETE FROM routes WHERE id = ?", (route_id,))
+        conn.execute("DELETE FROM routes WHERE id = ?", (route_id,))
         return {"deleted": True}
 
     def api_configs(self, conn, body):
         data = self.api_chains(conn, body)
         for c in data["chains"]:
             row = get_chain(conn, c["id"])
+            t = get_target(conn, row["target_id"])
             c.update(route_id=row["route_id"], route_name=get_route(conn, row["route_id"])["name"] if row["route_id"] else None,
-                     tunnel_id=row["tunnel_id"], target_type="tunnel" if row["tunnel_id"] else "direct",
-                     ready=bool(row["ready"]), tunnel_name=None, connection=None)
-            if row["tunnel_id"]:
-                t = get_tunnel(conn, row["tunnel_id"])
-                external = t["source"] == "external"
-                n = None if external else get_node(conn, t["node_id"])
-                c["tunnel_name"] = t["name"]
-                c["tunnel_source"] = t["source"]
-                c["tunnel_status"] = self.tunnel_brief(conn, t)["status"]
-                c["tunnel_agent_status"] = None if external else node_status(conn, n, int(time.time()))
-                if not c["deleting"]:
-                    first = c["hops"][0] if c["hops"] else {
-                        "addr": t["external_host"] if external else n["addr"], "port": t["port"]}
-                    c["connection"] = tunnel_config.connection(t, first["addr"], first["port"], c["remark"])
-                    if not row["route_id"]:
-                        c["connection"].pop("tcp_only", None)
-            elif c["hops"] and not c["deleting"]:
-                first = c["hops"][0]
-                c["connection"] = {"protocol": "direct", "host": first["addr"], "port": first["port"],
-                                   "uri": f"{first['addr']}:{first['port']}"}
-            c["status"] = ("deleting" if c["deleting"] else
-                           "error" if ((row["tunnel_id"] and c["tunnel_status"] == "error") or
-                                       any(p["status"] in ("error", "skew") for p in c["pending"])) else
-                           "waiting" if not c["ready"] else "applying" if c["pending"] else
-                           "saved" if c.get("tunnel_source") == "external" and not c["hops"] else "applied")
+                     target_id=t["id"], target_name=t["name"], connection=None)
+            if not c["deleting"]:
+                first = c["hops"][0] if c["hops"] else {"addr": t["host"], "port": t["port"]}
+                c["connection"] = target_config.connection(t, first["addr"], first["port"], c["remark"])
+            c["status"] = ("deleting" if c["deleting"] else "applying" if c["pending"] else
+                           "saved" if not c["hops"] else "applied")
         return data
 
+    @track_mutation
     def api_config_save(self, conn, body, chain_id=None):
         old = get_chain(conn, chain_id) if chain_id is not None else None
         if old and old["deleting"]:
             raise UserError("配置正在删除，不能修改")
-        remark = check_remark(body.get("remark"))
-        route_id = body.get("route_id")
-        target_type = body.get("target_type", "direct")
+        if any(k in body for k in ("target_host", "target_port", "tunnel_id", "target_type")):
+            raise UserError("配置只能引用目标对象", "target_id")
+        remark = check_remark(body.get("remark", old["remark"] if old else None))
+        route_id = body.get("route_id", old["route_id"] if old else None)
         route = get_route(conn, route_id) if route_id is not None else None
-        if route is None and target_type != "tunnel":
-            raise UserError("IP/端口目标必须选择链路", "route_id")
+        target = get_target(conn, body.get("target_id", old["target_id"] if old else None))
         if route is None and body.get("ports") not in (None, []):
-            raise UserError("直连隧道不分配转发端口", "ports")
+            raise UserError("直连目标不分配转发端口", "ports")
         pairs, assigned = route_hops(conn, route, chain_id, body.get("ports")) if route else ([], [])
-        tunnel_id, ready = None, 1
-        if target_type == "tunnel":
-            t = get_tunnel(conn, body.get("tunnel_id"))
-            n = None if t["source"] == "external" else get_node(conn, t["node_id"])
-            if t["deleting"] or (n is not None and n["deleting"]):
-                raise UserError("隧道正在删除", "tunnel_id")
-            tunnel_id, host, port = t["id"], t["external_host"] if n is None else n["addr"], t["port"]
-            ready = 1 if n is None else int(tunnel_ready(conn, n["id"]))
-        elif target_type == "direct":
-            host = check_host(body.get("target_host"), "target_host")
-            port = check_port(body.get("target_port"), "target_port")
-        else:
-            raise UserError("目标类型无效", "target_type")
         group_id = check_group(conn, "chains", body.get("group_id", old["group_id"] if old else None))
-        before = [(h["node_id"], h["port"]) for h in conn.execute("SELECT * FROM hops WHERE chain_id = ? ORDER BY seq", (chain_id,))]
-        with conn:
-            if not old:
-                chain_id = conn.execute("""INSERT INTO chains(remark, target_host, target_port, group_id, route_id, tunnel_id, ready, sort)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM chains))""",
-                    (remark, host, port, group_id, route_id, tunnel_id, ready)).lastrowid
-            else:
-                conn.execute("""UPDATE chains SET remark = ?, target_host = ?, target_port = ?, group_id = ?,
-                    route_id = ?, tunnel_id = ?, ready = ? WHERE id = ?""",
-                    (remark, host, port, group_id, route_id, tunnel_id, ready, chain_id))
-            if old and group_id != old["group_id"]:
+        if old:
+            conn.execute("UPDATE chains SET remark=?,route_id=?,target_id=? WHERE id=?",
+                         (remark, route_id, target["id"], chain_id))
+            if group_id != old["group_id"]:
                 move_group(conn, "chains", chain_id, group_id)
-            if before != pairs:
-                apply_config_hops(conn, chain_id, pairs)
-            if not old or before != pairs or (old["target_host"], old["target_port"], old["ready"]) != (host, port, ready):
-                mark_pending(conn, chain_id, [nid for nid, _ in before + pairs])
+        else:
+            chain_id = conn.execute("""INSERT INTO chains(remark,route_id,target_id,group_id,sort)
+                VALUES (?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM chains))""",
+                (remark, route_id, target["id"], group_id)).lastrowid
+        apply_config_hops(conn, chain_id, pairs)
         return {"id": chain_id, "assigned": assigned}
 
-    def tunnel_brief(self, conn, t):
-        if t["source"] == "external":
-            return {"id": t["id"], "name": t["name"], "group_id": t["group_id"], "node_id": None,
-                    "node_name": "手动导入", "source": "external", "host": t["external_host"],
-                    "protocol": t["protocol"], "port": t["port"], "deleting": False, "status": "imported",
-                    "agent_status": None, "params": json.loads(t["params"]),
-                    "uri": tunnel_config.connection(t, t["external_host"], t["port"], t["name"])["uri"],
-                    "references": conn.execute("SELECT COUNT(*) FROM chains WHERE tunnel_id = ?", (t["id"],)).fetchone()[0]}
-        n = get_node(conn, t["node_id"])
-        want = tunnel_snapshot(conn, n)["revision"]
-        state = "deleting" if t["deleting"] else "applied" if tunnel_ready(conn, n["id"]) else "error" if n["state"] == "error" else "applying"
-        # 凭据只在已认证的面板中显示，私钥只下发给对应 Agent。
-        p = json.loads(t["params"])
-        p.pop("private_key", None)
-        return {"id": t["id"], "name": t["name"], "group_id": t["group_id"], "node_id": t["node_id"], "node_name": n["name"], "source": "agent",
-                "protocol": t["protocol"], "port": t["port"], "params": p, "deleting": bool(t["deleting"]),
-                "status": state, "agent_status": node_status(conn, n, int(time.time())),
-                "want_v": want, "err": n["err"] or "", "references": conn.execute(
-                    "SELECT COUNT(*) FROM chains WHERE tunnel_id = ?", (t["id"],)).fetchone()[0]}
+    def api_targets(self, conn, body):
+        targets = []
+        for t in conn.execute(ordered("targets")):
+            refs = [dict(c) for c in conn.execute("SELECT id,remark FROM chains WHERE target_id=? ORDER BY id", (t["id"],))]
+            targets.append({**dict(t), "params": json.loads(t["params"]), "configs": refs,
+                            "uri": target_config.connection(t, t["host"], t["port"], t["name"])["uri"]})
+        return {"targets": targets, "groups": get_groups(conn, "targets")}
 
-    def api_tunnels(self, conn, body):
-        return {"tunnels": [self.tunnel_brief(conn, t) for t in conn.execute(ordered("tunnels"))],
-                "groups": get_groups(conn, "tunnels")}
-
-    def api_tunnel_save(self, conn, body, tunnel_id=None):
-        old = get_tunnel(conn, tunnel_id) if tunnel_id is not None else None
-        if old and old["deleting"]:
-            raise UserError("隧道正在删除")
-        source = body.get("source", old["source"] if old else "agent")
-        if source not in ("agent", "external") or (old and source != old["source"]):
-            raise UserError("隧道来源无效或与原记录不一致", "source")
-        if source == "external":
-            return self.api_imported_tunnel_save(conn, body, old)
-        name = check_remark(body.get("name"), "name", "名称")
-        nid = body.get("node_id", old["node_id"] if old else None)
-        n = get_node(conn, nid)
-        if n["kind"] != "tunnel" or n["deleting"]:
-            raise UserError("请选择可用的隧道节点", "node_id")
-        protocol = body.get("protocol", old["protocol"] if old else None)
-        if protocol not in ("shadowsocks", "vless-reality", "socks5"):
-            raise UserError("协议不受支持", "protocol")
-        if old and (nid != old["node_id"] or protocol != old["protocol"]):
-            raise UserError("不能修改已有隧道的节点或协议，请新建隧道")
-        used = {r[0] for r in conn.execute("SELECT port FROM tunnels WHERE node_id = ? AND id IS NOT ?", (nid, tunnel_id))}
-        used |= {r[0] for r in conn.execute("SELECT port FROM retired_ports WHERE node_id = ?", (nid,))}
-        port = body.get("port", old["port"] if old else None)
-        port = check_port(port, "port") if str(port or "").strip() else pick_port(parse_ports(n["ports"]), used)
-        if port is None or not in_ports(port, parse_ports(n["ports"])):
-            raise UserError("没有可用端口，或端口不在节点允许范围内", "port")
-        if port in used:
-            raise UserError("端口已占用或尚在等待删除确认", "port")
-        group_id = check_group(conn, "tunnels", body.get("group_id", old["group_id"] if old else None))
-        params = json.loads(old["params"]) if old else tunnel_config.new_credentials(protocol)
-        supplied = body.get("params", {})
-        if not isinstance(supplied, dict):
-            raise UserError("协议参数格式错误", "params")
-        if protocol == "vless-reality":
-            params["server_name"] = check_host(supplied.get("server_name", params.get("server_name")), "server_name")
-            params["handshake_host"] = check_host(supplied.get("handshake_host", params.get("handshake_host", params["server_name"])), "handshake_host")
-            params["handshake_port"] = check_port(supplied.get("handshake_port", params.get("handshake_port", 443)), "handshake_port")
-        if protocol == "socks5":
-            for key in ("username", "password"):
-                if supplied.get(key):
-                    value = str(supplied[key])
-                    if not 1 <= len(value.encode()) <= 255 or any(ord(ch) < 32 for ch in value):
-                        raise UserError("用户名和密码需为 1-255 字节且不能包含控制字符", key)
-                    params[key] = value
-        with conn:
-            if not old:
-                tunnel_id = conn.execute("INSERT INTO tunnels(name, node_id, protocol, port, params, group_id, sort) VALUES (?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM tunnels))",
-                    (name, nid, protocol, port, tunnel_config.canonical(params), group_id)).lastrowid
-            else:
-                changed = old["port"] != port or json.loads(old["params"]) != params
-                if old["port"] != port:
-                    reserve_removed(conn, nid, old["port"])
-                conn.execute("UPDATE tunnels SET name = ?, port = ?, params = ? WHERE id = ?",
-                             (name, port, tunnel_config.canonical(params), tunnel_id))
-                if group_id != old["group_id"]:
-                    move_group(conn, "tunnels", tunnel_id, group_id)
-                if changed:
-                    block_tunnel_configs(conn, tunnel_id)
-                    conn.execute("UPDATE chains SET target_port = ? WHERE tunnel_id = ?", (port, tunnel_id))
-        return {"id": tunnel_id, "port": port}
-
-    def api_imported_tunnel_save(self, conn, body, old):
-        if any(key in body for key in ("node_id", "port", "protocol", "params")):
-            raise UserError("手动导入隧道的地址、协议和凭据请通过分享链接修改", "uri")
-        if "uri" in body or not old:
+    @track_mutation
+    def api_target_save(self, conn, body, target_id=None):
+        old = get_target(conn, target_id) if target_id is not None else None
+        if "uri" in body:
             try:
-                parsed = tunnel_config.import_uri(body.get("uri"))
-                host = check_host(parsed["host"], "uri")
-                if parsed["protocol"] == "vless-reality":
-                    check_host(parsed["params"]["server_name"], "uri")
+                parsed = target_config.import_uri(body["uri"])
             except ValueError as e:
                 raise UserError(str(e), "uri") from None
-            port, protocol, params = parsed["port"], parsed["protocol"], tunnel_config.canonical(parsed["params"])
-            fallback_name = old["name"] if old else parsed["name"]
+            host = check_host(parsed["host"], "uri")
+            kind, port, params = parsed["protocol"], parsed["port"], target_config.canonical(parsed["params"])
+            if kind == "vless-reality":
+                check_host(parsed["params"]["server_name"], "uri")
+            fallback = old["name"] if old else parsed["name"]
+        elif old and old["type"] != "endpoint":
+            if any(k in body for k in ("host", "port", "type", "params")):
+                raise UserError("SS／VLESS 的连接参数请通过分享链接修改", "uri")
+            host, port, kind, params, fallback = old["host"], old["port"], old["type"], old["params"], old["name"]
         else:
-            host, port, protocol, params = old["external_host"], old["port"], old["protocol"], old["params"]
-            fallback_name = old["name"]
-        name = check_remark(body.get("name") or fallback_name, "name", "名称")
-        group_id = check_group(conn, "tunnels", body.get("group_id", old["group_id"] if old else None))
-        with conn:
-            if old:
-                tunnel_id = old["id"]
-                conn.execute("""UPDATE tunnels SET name=?,external_host=?,port=?,protocol=?,params=? WHERE id=?""",
-                             (name, host, port, protocol, params, tunnel_id))
-                if group_id != old["group_id"]:
-                    move_group(conn, "tunnels", tunnel_id, group_id)
-                if (host, port) != (old["external_host"], old["port"]):
-                    conn.execute("UPDATE chains SET target_host=?,target_port=? WHERE tunnel_id=?", (host, port, tunnel_id))
-                    for c in conn.execute("SELECT id FROM chains WHERE tunnel_id=? AND deleting=0", (tunnel_id,)).fetchall():
-                        mark_config_nodes(conn, c["id"])
-            else:
-                tunnel_id = conn.execute("""INSERT INTO tunnels(name,protocol,port,params,group_id,sort,source,external_host)
-                    VALUES (?,?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM tunnels),'external',?)""",
-                    (name, protocol, port, params, group_id, host)).lastrowid
-        return {"id": tunnel_id, "port": port, "source": "external"}
+            if body.get("type", "endpoint") != "endpoint" or "params" in body:
+                raise UserError("SS／VLESS 请导入分享链接", "uri")
+            host = check_host(body.get("host", old["host"] if old else None), "host")
+            port = check_port(body.get("port", old["port"] if old else None), "port")
+            kind, params, fallback = "endpoint", "{}", old["name"] if old else host
+        name = check_remark(body.get("name") or fallback, "name", "名称")
+        group_id = check_group(conn, "targets", body.get("group_id", old["group_id"] if old else None))
+        if old:
+            conn.execute("UPDATE targets SET name=?,host=?,port=?,type=?,params=? WHERE id=?",
+                         (name, host, port, kind, params, target_id))
+            if group_id != old["group_id"]:
+                move_group(conn, "targets", target_id, group_id)
+        else:
+            target_id = conn.execute("""INSERT INTO targets(name,host,port,type,params,group_id,sort)
+                VALUES (?,?,?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM targets))""",
+                (name, host, port, kind, params, group_id)).lastrowid
+        return {"id": target_id}
 
-    def api_tunnel_del(self, conn, body, tunnel_id):
-        t = get_tunnel(conn, tunnel_id)
-        if conn.execute("SELECT 1 FROM chains WHERE tunnel_id = ?", (tunnel_id,)).fetchone():
-            raise UserError("隧道仍被配置引用，请先解除引用")
-        with conn:
-            if t["source"] == "external" or not get_node(conn, t["node_id"])["first_seen"]:
-                conn.execute("DELETE FROM tunnels WHERE id = ?", (tunnel_id,))
-                return {"deleted": True}
-            conn.execute("UPDATE tunnels SET deleting = 1 WHERE id = ?", (tunnel_id,))
-        return {"deleted": False}
-
-    def tunnel_api(self, method, path):
-        conn = db()
-        try:
-            peer = ipaddress.ip_address(self.client_address[0])
-            if self.headers.get("X-Forwarded-Proto") != "https" or not (peer.is_private or peer.is_loopback):
-                # 明文仅允许显式本地开发；生产 Agent 也强制验证 HTTPS。
-                if not (os.environ.get("ICTL_ALLOW_LOCAL_HTTP") == "1" and peer.is_loopback):
-                    raise UserError("隧道 Agent 接口需要 HTTPS", status=403)
-            authorization = self.headers.get("Authorization", "")
-            key = authorization[7:] if authorization.startswith("Bearer ") else ""
-            node = next((n for n in conn.execute("SELECT * FROM tunnel_nodes").fetchall()
-                         if hmac.compare_digest(n["key"], key)), None)
-            if node is None:
-                self.close_connection = True
-                return self.not_found()
-            if method == "GET" and path == "events":
-                return self.tunnel_events(conn, node)
-            if method == "GET" and path == "config":
-                return self.send_json(200, tunnel_snapshot(conn, node))
-            if method == "GET" and path == "components":
-                manifest = json.loads(json.dumps(COMPONENTS))
-                manifest["agent_assets"] = {}
-                for arch in ("amd64", "arm64"):
-                    filename = os.path.join(BASE_DIR, "assets", f"tunnel-agent-linux-{arch}")
-                    if os.path.isfile(filename):
-                        with open(filename, "rb") as f:
-                            manifest["agent_assets"][arch] = {"sha256": hashlib.sha256(f.read()).hexdigest(), "path": f"download/{arch}"}
-                return self.send_json(200, manifest)
-            if method == "GET" and path in ("download/amd64", "download/arm64"):
-                filename = os.path.join(BASE_DIR, "assets", "tunnel-agent-linux-" + path.split("/")[1])
-                if not os.path.isfile(filename):
-                    return self.not_found()
-                with open(filename, "rb") as f:
-                    return self.reply(200, f.read(), "application/octet-stream", [("Cache-Control", "no-store")])
-            if method != "POST" or path != "heartbeat":
-                return self.not_found()
-            if not self.headers.get("Content-Type", "").startswith("application/json"):
-                raise UserError("请求格式错误")
-            body = self.read_json()
-            if body.get("api") != 1 or body.get("state") not in ("init", "ok", "error"):
-                raise UserError("不兼容的 Agent 协议")
-            now = int(time.time())
-            with conn:
-                conn.execute("BEGIN IMMEDIATE")
-                node = get_node(conn, node["id"])
-                if not hmac.compare_digest(node["key"], key):
-                    return self.not_found()
-                until = now + 3 * heartbeat_interval(conn)
-                last = conn.execute("SELECT start, end FROM tunnel_presence WHERE node_id = ? ORDER BY start DESC LIMIT 1", (node["id"],)).fetchone()
-                if last and last["end"] >= now:
-                    conn.execute("UPDATE tunnel_presence SET end = ? WHERE node_id = ? AND start = ?", (until, node["id"], last["start"]))
-                else:
-                    conn.execute("INSERT INTO tunnel_presence VALUES (?, ?, ?)", (node["id"], now, until))
-                    add_event(conn, node["id"], "Agent 首次连接" if not node["first_seen"] else "Agent 恢复在线", now)
-                state = body["state"]
-                report = str(body.get("revision", ""))[:64]
-                err = str(body.get("error", ""))[:500]
-                agent = str(body.get("agent_version", ""))[:32]
-                core = str(body.get("core_version", ""))[:32]
-                if state == "error" and (node["state"] != state or node["err"] != err):
-                    add_event(conn, node["id"], "配置应用失败：" + err, now)
-                conn.execute("""UPDATE tunnel_nodes SET first_seen = COALESCE(first_seen, ?), last_seen = ?, online_until = ?,
-                    src_ip = ?, reported_v = ?, state = ?, err = ?, agent = ?, core_version = ? WHERE id = ?""",
-                    (now, now, until, self.source_ip(), report, state, err, agent, core, node["id"]))
-                want = tunnel_snapshot(conn, node)["revision"]
-                removed = False
-                if state == "ok" and report == want:
-                    conn.execute("DELETE FROM retired_ports WHERE node_id = ?", (node["id"],))
-                    conn.execute("DELETE FROM tunnels WHERE node_id = ? AND deleting = 1", (node["id"],))
-                    for c in conn.execute("""SELECT c.id FROM chains c JOIN tunnels t ON t.id = c.tunnel_id
-                        WHERE t.node_id = ? AND c.ready = 0 AND c.deleting = 0""", (node["id"],)).fetchall():
-                        conn.execute("UPDATE chains SET ready = 1 WHERE id = ?", (c["id"],))
-                        mark_config_nodes(conn, c["id"])
-                    if node["deleting"]:
-                        delete_node(conn, node["id"])
-                        removed = True
-            return self.send_json(200, {"api": 1, "revision": want, "heartbeat_interval": heartbeat_interval(conn),
-                                       "deleted": removed, "agent_version": TUNNEL_VERSION})
-        except UserError as e:
-            self.close_connection = True
-            self.send_json(e.status, {"error": str(e), "field": e.field})
-        finally:
-            conn.close()
-
-    def tunnel_events(self, conn, node):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache, no-store")
-        self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-        self.connection.settimeout(20)
-        last, keepalive = None, 0
-        # 定期重连释放线程，逐轮验证节点和密钥，重置凭据会关闭旧订阅。
-        deadline = time.monotonic() + 300
-        try:
-            while time.monotonic() < deadline:
-                n = conn.execute("SELECT * FROM tunnel_nodes WHERE id = ?", (node["id"],)).fetchone()
-                if not n or not hmac.compare_digest(n["key"], node["key"]):
-                    break
-                revision = tunnel_snapshot(conn, n)["revision"]
-                if revision != last:
-                    data = json.dumps({"revision": revision})
-                    self.wfile.write(f"event: config\ndata: {data}\n\n".encode())
-                    last = revision
-                    self.wfile.flush()
-                if time.monotonic() >= keepalive:
-                    self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
-                    keepalive = time.monotonic() + 15
-                time.sleep(1)
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
-            pass
-
-    # 设置
+    @track_mutation
+    def api_target_del(self, conn, body, target_id):
+        get_target(conn, target_id)
+        if conn.execute("SELECT 1 FROM chains WHERE target_id=?", (target_id,)).fetchone():
+            raise UserError("目标仍被配置引用，请先解除引用")
+        conn.execute("DELETE FROM targets WHERE id=?", (target_id,))
+        return {"deleted": True}
 
     def api_settings(self, conn, body):
         return {"public_url": setting(conn, "public_url", ""), "sync_path": setting(conn, "sync_path"),
                 "panel_path": setting(conn, "panel_path"), "username": setting(conn, "admin_user"),
-                "version": VERSION, "components": COMPONENTS, "tunnel_path": setting(conn, "tunnel_path"),
-                "tunnel_heartbeat": heartbeat_interval(conn)}
+                "version": VERSION, "components": COMPONENTS}
 
     def api_settings_save(self, conn, body):
         url = str(body.get("public_url", setting(conn, "public_url", ""))).strip().rstrip("/")
         if url and not re.fullmatch(r"https?://(?:[A-Za-z0-9.-]+|\[[0-9a-fA-F:]+\])(?::[0-9]{1,5})?", url):
             raise UserError("格式应为 http(s)://域名或IP[:端口]，不带路径", "public_url")
-        interval = body.get("tunnel_heartbeat", heartbeat_interval(conn))
-        if type(interval) is not int or not 5 <= interval <= 3600:
-            raise UserError("心跳间隔须为 5-3600 秒的整数", "tunnel_heartbeat")
-        with conn:
-            now = int(time.time())
-            if interval != heartbeat_interval(conn):
-                conn.execute("UPDATE tunnel_nodes SET online_until = MAX(online_until, ? + ?) WHERE online_until >= ?", (now, 3 * interval, now))
-                conn.execute("UPDATE tunnel_presence SET end = MAX(end, ? + ?) WHERE end >= ?", (now, 3 * interval, now))
-            set_setting(conn, "tunnel_heartbeat", str(interval))
-            set_setting(conn, "public_url", url)
+        set_setting(conn, "public_url", url)
         return {"public_url": url}
 
 
@@ -1972,13 +2051,14 @@ def cmd_serve(args):
     missing = [f for f in STATIC if not os.path.isfile(os.path.join(WEB_DIR, f))]
     if missing:
         raise UserError(f"缺少面板文件：{', '.join(missing)}（应位于 {WEB_DIR}）")
+    if sqlite3.sqlite_version_info < (3, 35, 0):
+        raise UserError("需要 SQLite 3.35 或以上版本")
     conn = init_db()
     load_agent()
     Handler.sync_path = setting(conn, "sync_path")
     Handler.panel_path = setting(conn, "panel_path")
-    Handler.tunnel_path = setting(conn, "tunnel_path")
     host, _, port = args.listen.rpartition(":")
-    server = http.server.ThreadingHTTPServer((host or "0.0.0.0", int(port)), Handler)
+    server = LimitedHTTPServer((host or "0.0.0.0", int(port)), Handler)
     print(f"ictl-server {VERSION} 监听 {args.listen}", flush=True)
     print_info(conn, args.listen)
     sys.stdout.flush()
@@ -1988,11 +2068,33 @@ def cmd_serve(args):
 
 
 def cmd_info(args):
-    print_info(init_db())
+    conn = read_db()
+    try:
+        print_info(conn)
+    finally:
+        conn.close()
+
+
+def cmd_health(args):
+    conn = read_db()
+    try:
+        if conn.execute('PRAGMA user_version').fetchone()[0] != 300:
+            raise UserError('数据库尚未就绪')
+        path = setting(conn, 'panel_path') + '/'
+    finally:
+        conn.close()
+    client = http.client.HTTPConnection('127.0.0.1', 8730, timeout=2)
+    try:
+        client.request('GET', path)
+        response = client.getresponse()
+        if response.status != 200 or b'<title>ictl</title>' not in response.read():
+            raise UserError('HTTP 服务尚未就绪')
+    finally:
+        client.close()
 
 
 def cmd_reset_admin(args):
-    conn = init_db()
+    conn = db()
     with conn:
         reset_admin(conn)
     print(f"管理员已重置为 {DEFAULT_USER} / {DEFAULT_PASS}，所有登录会话已失效。首次登录后须修改。")
@@ -2006,6 +2108,8 @@ def main():
     s.set_defaults(func=cmd_serve)
     s = sub.add_parser("info", help="显示面板地址和同步路径")
     s.set_defaults(func=cmd_info)
+    s = sub.add_parser("health", help="只读数据库与 HTTP 就绪检查")
+    s.set_defaults(func=cmd_health)
     s = sub.add_parser("reset-admin", help="重置管理员账号为默认值")
     s.set_defaults(func=cmd_reset_admin)
 

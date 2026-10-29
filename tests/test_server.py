@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import socket
 import sys
 import tempfile
 import threading
@@ -44,28 +45,27 @@ class Fixture:
     def route(self, ids, name='route'):
         return self.call('api_route_save', dict(name=name, node_ids=ids))['id']
 
+    def target(self, host='198.51.100.1', port=443):
+        return self.call('api_target_save', dict(name='target',host=host,port=port))['id']
+
     def config(self, route, ports=None, **kw):
+        tid = kw.pop('target_id', None) or self.target()
         return self.call('api_config_save', dict(remark='config', route_id=route, ports=ports,
-            target_type='direct', target_host='198.51.100.1', target_port=443, **kw))['id']
+            target_id=tid, **kw))['id']
 
     def seen(self, nid):
         with self.db:
             self.db.execute(f'UPDATE {s.node_table(s.get_node(self.db,nid)["kind"])} SET first_seen = 1, last_seen = ? WHERE id = ?', (int(time.time()), nid))
 
-    def tunnel(self, protocol='shadowsocks', **kw):
-        nid = self.node('T', 'tunnel')
-        body = dict(name='tunnel', node_id=nid, protocol=protocol)
-        body.update(kw)
-        return nid, self.call('api_tunnel_save', body)['id']
 
 
 class ServerTests(Fixture, unittest.TestCase):
     def test_versions_are_independent(self):
         s.load_agent()
-        self.assertEqual(s.AGENT[0], '0.1.8')
-        self.assertEqual(s.agent_update('0.1.8', 1), 'same')
+        self.assertEqual(s.AGENT[0], '0.2.0')
+        self.assertEqual(s.agent_update('0.2.0', 1), 'same')
         self.assertEqual(s.agent_update('0.1.7', 1), 'pending')
-        self.assertEqual(s.VERSION, '0.2.1')
+        self.assertEqual(s.VERSION, '0.3.0')
 
     def test_route_allocates_no_ports(self):
         a, b = self.node(), self.node('B')
@@ -113,51 +113,12 @@ class ServerTests(Fixture, unittest.TestCase):
         a=self.node();r=self.route([a]);c=self.config(r,[10001])
         before=s.node_rules(self.db,s.get_node(self.db,a))
         self.call('api_route_save',{'name':'rename','node_ids':[a]},r)
-        self.call('api_config_save',dict(remark='rename',route_id=r,ports=[10001],target_type='direct',target_host='198.51.100.1',target_port=443),c)
+        self.call('api_config_save',dict(remark='rename',route_id=r,ports=[10001],target_id=s.get_chain(self.db,c)['target_id']),c)
         self.assertEqual(before,s.node_rules(self.db,s.get_node(self.db,a)))
 
-    def test_type_and_references_guarded(self):
-        n,t=self.tunnel();a=self.node();r=self.route([a])
-        with self.assertRaises(s.UserError):self.route([n])
-        with self.assertRaises(s.UserError):self.call('api_node_edit',{'kind':'tunnel'},a)
-        with self.assertRaises(s.UserError):self.call('api_node_del',{},a)
-        with self.assertRaises(s.UserError):self.call('api_node_del',{},n)
-        c=self.call('api_config_save',dict(remark='t',route_id=r,target_type='tunnel',tunnel_id=t))['id']
-        with self.assertRaises(s.UserError):self.call('api_tunnel_del',{},t)
-        with self.assertRaises(s.UserError):self.call('api_route_del',{},r)
-        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,a)),[])
-        self.assertFalse(s.get_chain(self.db,c)['ready'])
 
-    def test_global_heartbeat_and_bar(self):
-        n=self.node('T','tunnel');now=int(time.time())
-        with self.db:
-            self.db.execute('UPDATE tunnel_nodes SET first_seen=?,last_seen=?,online_until=? WHERE id=?',(now-20,now-20,now+10,n))
-            self.db.execute('INSERT INTO tunnel_presence VALUES (?,?,?)',(n,now-20,now+10))
-        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),now),'online')
-        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),now+11),'offline')
-        self.assertEqual(s.node_bar(self.db,s.get_node(self.db,n),now)['levels'][-1],'ok')
-        self.call('api_settings_save',{'tunnel_heartbeat':60})
-        self.assertGreaterEqual(s.get_node(self.db,n)['online_until'],now+180)
-        self.assertEqual(s.heartbeat_interval(self.db),60)
-        with self.assertRaises(s.UserError):self.call('api_settings_save',{'tunnel_heartbeat':0})
 
-    def test_tunnel_port_edit_reserves_old(self):
-        n,t=self.tunnel(port=10001);self.seen(n)
-        self.call('api_tunnel_save',dict(name='tunnel',port=10002),t)
-        with self.assertRaises(s.UserError):self.call('api_tunnel_save',dict(name='t2',node_id=n,protocol='socks5',port=10001))
-        with self.assertRaises(s.UserError):self.call('api_node_edit',dict(ports='10002-10020'),n)
 
-    def test_protocol_templates_and_shared_credentials(self):
-        for protocol in ('shadowsocks','vless-reality','socks5'):
-            n,t=self.tunnel(protocol,params={'server_name':'example.com'})
-            tunnel=s.get_tunnel(self.db,t); core=s.tunnel_snapshot(self.db,s.get_node(self.db,n))
-            self.assertEqual(len(core['config']['inbounds']),1)
-            one=s.tunnel_config.connection(tunnel,'192.0.2.1',10001,'test')
-            two=s.tunnel_config.connection(tunnel,'192.0.2.2',10002,'test')
-            self.assertNotEqual(one['uri'],two['uri'])
-            for key in ('password','uuid','public_key'):
-                if key in one:self.assertEqual(one[key],two[key])
-            self.assertNotIn('private_key',json.dumps(one))
 
     def test_migration_preserves_rules_pending_and_backup(self):
         self.db.close()
@@ -172,7 +133,7 @@ class ServerTests(Fixture, unittest.TestCase):
         old.execute('INSERT INTO hops(id,chain_id,seq,node_id,port) VALUES (81,9,0,7,12345)')
         old.execute('INSERT INTO chain_pending VALUES (9,8)')
         s.set_setting(old,'window','60');s.set_setting(old,'sync_path','/oldsync');s.set_setting(old,'panel_path','/oldpanel')
-        old.commit();before=s.node_rules(old,old.execute('SELECT * FROM nodes WHERE id=7').fetchone());old.close()
+        old.commit();before=s.legacy_node_rules(old,old.execute('SELECT * FROM nodes WHERE id=7').fetchone());old.close()
         self.db=s.init_db()
         self.assertEqual(s.node_rules(self.db,s.get_node(self.db,7)),before)
         self.assertEqual(s.get_node(self.db,7)['key'],'ab'*32)
@@ -200,8 +161,7 @@ class HTTPTests(Fixture, unittest.TestCase):
         super().setUp()
         s.Handler.panel_path=s.setting(self.db,'panel_path')
         s.Handler.sync_path=s.setting(self.db,'sync_path')
-        s.Handler.tunnel_path=s.setting(self.db,'tunnel_path')
-        self.server=s.http.server.ThreadingHTTPServer(('127.0.0.1',0),s.Handler)
+        self.server=s.LimitedHTTPServer(('127.0.0.1',0),s.Handler)
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
         self.port=self.server.server_address[1]
 
@@ -214,26 +174,7 @@ class HTTPTests(Fixture, unittest.TestCase):
         c.request('POST' if body is not None else 'GET',path,body,hs)
         r=c.getresponse();data=r.read();c.close();return r.status,data
 
-    def heartbeat(self,nid,state='ok',revision=None):
-        node=s.get_node(self.db,nid)
-        return self.req(s.Handler.tunnel_path+'/heartbeat',json.dumps(dict(api=1,state=state,
-            revision=revision or s.tunnel_snapshot(self.db,node)['revision'],agent_version='0.1.0',core_version='1.14.4')),
-            {'Authorization':'Bearer '+node['key'],'Content-Type':'application/json','X-Forwarded-Proto':'https'})
 
-    def test_tunnel_ack_enables_forwarding_and_deletion(self):
-        n,t=self.tunnel();a=self.node();r=self.route([a])
-        c=self.call('api_config_save',dict(remark='t',route_id=r,target_type='tunnel',tunnel_id=t))['id']
-        status,_=self.heartbeat(n,'error');self.assertEqual(status,200)
-        self.assertFalse(s.get_chain(self.db,c)['ready'])
-        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())),'online')
-        status,_=self.heartbeat(n);self.assertEqual(status,200)
-        self.assertTrue(s.get_chain(self.db,c)['ready'])
-        self.assertTrue(s.node_rules(self.db,s.get_node(self.db,a)))
-        self.call('api_chain_del',{},c)
-        self.call('api_tunnel_del',{},t)
-        self.assertTrue(s.get_tunnel(self.db,t)['deleting'])
-        self.heartbeat(n)
-        with self.assertRaises(s.UserError):s.get_tunnel(self.db,t)
 
     def test_forward_sync_keeps_protocol_and_ack_gate(self):
         n=self.node();self.seen(n);r=self.route([n]);c=self.config(r,[10001]);node=s.get_node(self.db,n)
@@ -250,11 +191,54 @@ class HTTPTests(Fixture, unittest.TestCase):
         self.assertEqual(sync('ok'),'same\n')
         self.assertFalse(self.db.execute('SELECT 1 FROM chain_pending WHERE chain_id=?',(c,)).fetchone())
 
-    def test_auth_and_transport_required(self):
-        n,t=self.tunnel();node=s.get_node(self.db,n);path=s.Handler.tunnel_path+'/config'
-        self.assertEqual(self.req(path,headers={'Authorization':'Bearer '+node['key']})[0],403)
-        self.assertEqual(self.req(path,headers={'X-Forwarded-Proto':'https','Authorization':'Bearer wrong'})[0],404)
-        self.assertEqual(self.req(path,headers={'X-Forwarded-Proto':'https','Authorization':'Bearer '+node['key']})[0],200)
+
+    def encrypted(self, key, payload):
+        ek,mk=s.derive(key);msg=s.aes(ek,payload.encode())[8:];tag=s.mac(mk,msg)
+        code,raw=self.req(s.Handler.sync_path,base64.b64encode(msg+tag),{'Content-Type':'text/plain'})
+        if code!=200:return code,raw
+        raw=base64.b64decode(raw);self.assertEqual(raw[-32:],s.mac(mk,tag+raw[:-32]))
+        return code,s.aes(ek,b'Salted__'+raw[:-32],True).decode()
+
+    def test_auth_body_limits_and_removed_endpoints(self):
+        self.assertEqual(self.req(s.Handler.panel_path+'/api/targets')[0],401)
+        self.assertEqual(self.req('/obsolete/tunnel/config')[0],404)
+        self.assertEqual(self.req(s.Handler.sync_path,'not-base64',{'Content-Type':'text/plain'})[0],404)
+        self.assertEqual(self.req(s.Handler.sync_path,'x'*(s.MAX_BODY+1),{'Content-Type':'text/plain'})[0],404)
+        n=self.node();key=s.get_node(self.db,n)['key']
+        text=f't={int(time.time())}\nstate=ok\nstate=ok\n'
+        self.assertEqual(self.encrypted(key,text)[0],404)
+        self.assertIsNone(s.get_node(self.db,n)['first_seen'])
+
+    def test_deleted_node_receipt_can_be_retried_without_config_access(self):
+        n=self.node();self.seen(n);key=s.get_node(self.db,n)['key']
+        self.call('api_node_del',{},n)
+        base=f't={int(time.time())}\nstate=ok\nproto=2\nsource=manual\nop={"ab"*16}\nagent=0.2.0\nau=0\n'
+        code,out=self.encrypted(key,base+'phase=begin\nmode=active\nv=\ngeneration=0\n')
+        self.assertEqual(code,200)
+        f=dict(line.split('=',1) for line in out.splitlines() if '=' in line)
+        ack=base+f'phase=ack\nmode={f["mode"]}\nv={f["v"]}\ngeneration={f["generation"]}\n'
+        self.assertIn('result=deleted',self.encrypted(key,ack)[1])
+        self.assertIn('result=deleted',self.encrypted(key,ack)[1])
+        self.assertEqual(self.encrypted(key,base+'phase=begin\n')[0],404)
+
+    def test_idle_partial_headers_timeout_without_db_lock(self):
+        previous=s.Handler.timeout;s.Handler.timeout=0.15
+        client=socket.create_connection(('127.0.0.1',self.port),timeout=2)
+        try:
+            client.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\nX-Slow: ')
+            with self.db:self.db.execute('BEGIN IMMEDIATE')
+            self.assertEqual(client.recv(1),b'')
+        finally:client.close();s.Handler.timeout=previous
+
+    def test_connection_cap_rejects_and_releases_slots(self):
+        for _ in range(self.server.max_connections):self.assertTrue(self.server.slots.acquire(False))
+        try:
+            with self.assertRaises((OSError,http.client.HTTPException)):
+                self.req(s.Handler.panel_path+'/')
+        finally:
+            for _ in range(self.server.max_connections):self.server.slots.release()
+        self.assertEqual(self.req(s.Handler.panel_path+'/')[0],200)
+
 
 
 if __name__ == '__main__':unittest.main()

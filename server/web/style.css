@@ -585,3 +585,6 @@ body.auth-page {
 .kv-grid code { overflow-wrap:anywhere; min-width:0; }
 [hidden] { display:none !important; }
 @media(max-width:600px) { .nav-inner { flex-wrap:wrap; } header nav { order:3; width:100%; justify-content:space-between; } .card-head .actions { flex-wrap:wrap; } }
+
+/* Passive nodes record manual activity on a white timeline in both themes. */
+.bar .lv-white { background: #fff; border: 1px solid #d1d5db; }

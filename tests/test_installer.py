@@ -1,89 +1,114 @@
-"""Exercise the installer with all managed paths relocated into a temporary directory."""
-import hashlib
+"""Docker upgrade failures restore the paired image/container and database, using mocks only."""
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import unittest
+from test_server import ROOT
 
-ROOT=Path(__file__).resolve().parents[1]
+DOCKER = r'''#!/usr/bin/env python3
+import sys,os,pathlib,json,sqlite3
+root=pathlib.Path(os.environ['MOCK_ROOT']);args=sys.argv[1:]
+state=root/'containers';data=json.loads(state.read_text())
+with (root/'docker.log').open('a') as f:f.write(' '.join(args[:4])+'\n')
+def save():state.write_text(json.dumps(data))
+if args[0] in ('info','pull'):sys.exit(0)
+if args[:2]==['container','inspect']:
+ name=args[-1]
+ if name not in data:sys.exit(1)
+ if '-f' not in args:print('{}');sys.exit(0)
+ fmt=args[args.index('-f')+1]
+ if 'Config.Image' in fmt:print(data[name]['image'])
+ elif 'PortBindings' in fmt:print('127.0.0.1|8730')
+ elif 'Mounts' in fmt:print('volume|ictl-data|unused|true')
+ elif 'Config.Env' in fmt:print('ICTL_DB=/data/ictl.db')
+ sys.exit(0)
+if args[0]=='run':
+ if '--rm' in args:
+  if '-c' in args:
+   code=args[args.index('-c')+1].replace('/data/',str(root/'data')+'/')
+   if '.restore' in code and os.environ.get('FAIL_RESTORE'):sys.exit(1)
+   sys.argv=['python']+[a.replace('/data/',str(root/'data')+'/') for a in args[args.index('-c')+2:]]
+   exec(code)
+  sys.exit(0)
+ if os.environ.get('FAIL_RUN'):sys.exit(1)
+ name=args[args.index('--name')+1];data[name]={'image':args[-1],'running':True};save()
+ conn=sqlite3.connect(root/'data/ictl.db');conn.execute('PRAGMA user_version=300');conn.execute("UPDATE example SET value='new'");conn.commit();conn.close();sys.exit(0)
+if args[0]=='rename':data[args[2]]=data.pop(args[1]);save();sys.exit(0)
+if args[0] in ('stop','start'):
+ data[args[1]]['running']=args[0]=='start';save();sys.exit(0)
+if args[0]=='rm':data.pop(args[-1],None);save();sys.exit(0)
+if args[0]=='exec':
+ if args[-1]=='health' and os.environ.get('FAIL_HEALTH'):sys.exit(1)
+ print('ready');sys.exit(0)
+sys.exit(1)
+'''
 
 
 class InstallerTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory()
-        self.root=Path(self.tmp.name)
-        self.bin=self.root/'bin';self.bin.mkdir()
-        self.managed=self.root/'managed';self.managed.mkdir()
-        self.env={**os.environ,'PATH':str(self.bin)+':'+os.environ['PATH']}
-        text=(ROOT/'tunnel-agent/install-tunnel.sh').read_text()
-        text=text.replace('[[ $EUID == 0 ]]','true')
-        for prefix in ('/etc/','/usr/local/','/var/lib/'):
-            text=text.replace(prefix,str(self.managed)+prefix)
-        self.installer=self.root/'installer.sh';self.installer.write_text(text)
-        self.agent=self.root/'agent'
-        self.agent.write_text('#!/bin/sh\nif [ "$1" = version ]; then echo 0.1.0; exit 0; fi\n'
-            f'mkdir -p "{self.managed}/usr/local/lib/ictl-tunnel"\n'
-            f'echo new-core > "{self.managed}/usr/local/lib/ictl-tunnel/sing-box"\n')
-        self.agent.chmod(0o755)
-        self.manifest=self.root/'components.json'
-        self.manifest.write_text(json.dumps(dict(api=1,tunnel_agent='0.1.0',agent_assets={
-            'amd64':dict(sha256=hashlib.sha256(self.agent.read_bytes()).hexdigest()),
-            'arm64':dict(sha256=hashlib.sha256(self.agent.read_bytes()).hexdigest())})))
-        self.script('curl',f'''#!/usr/bin/env python3
-import sys,shutil
-args=sys.argv[1:];target=args[args.index('-o')+1]
-url=next(a for a in args if a.startswith('https://'))
-shutil.copyfile({str(self.manifest)!r} if url.endswith('/components') else {str(self.agent)!r},target)
-''')
-        self.script('systemctl',f'''#!/usr/bin/env python3
-import sys,pathlib
-args=sys.argv[1:]
-with open({str(self.root/'commands')!r},'a') as f:f.write(' '.join(args)+'\\n')
-if args[0] in ('cat','is-active'):sys.exit(0)
-if args[:2]==['restart','ictl-tunnel-agent'] and pathlib.Path({str(self.root/'fail')!r}).exists():sys.exit(1)
-''')
-        for path in ('etc/systemd/system','usr/local/bin','usr/local/lib/ictl-tunnel','etc/ictl-tunnel','var/lib/ictl-tunnel'):
-            (self.managed/path).mkdir(parents=True,exist_ok=True)
-
-    def script(self,name,text):
-        path=self.bin/name;path.write_text(text);path.chmod(0o755)
+        self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name);(self.root/'bin').mkdir();(self.root/'data').mkdir()
+        self.env={**os.environ,'PATH':str(self.root/'bin')+':'+os.environ['PATH'],'MOCK_ROOT':str(self.root)}
+        for name,text in [('docker',DOCKER),('sleep','#!/bin/sh\nexit 0\n')]:
+            p=self.root/'bin'/name;p.write_text(text);p.chmod(0o755)
+        (self.root/'containers').write_text(json.dumps({'ictl-server':{'image':'ghcr.io/moran1024a/ictl-server:0.2.1','running':True}}))
+        c=sqlite3.connect(self.root/'data/ictl.db');c.executescript("PRAGMA user_version=202; CREATE TABLE example(value TEXT);INSERT INTO example VALUES ('old');");c.close()
 
     def tearDown(self):self.tmp.cleanup()
 
-    def run_install(self):
-        return subprocess.run(['bash',str(self.installer),'--url','https://example.com/agent','--token','ab'*32],
-            env=self.env,capture_output=True,text=True,timeout=15)
+    def run_install(self,**env):
+        return subprocess.run(['bash',str(ROOT/'deploy/install-server.sh')],env={**self.env,**env},capture_output=True,text=True,timeout=15)
 
-    def test_installs_separate_services_and_private_credentials(self):
+    def assert_old(self):
+        containers=json.loads((self.root/'containers').read_text())
+        self.assertEqual(list(containers),['ictl-server']);self.assertTrue(containers['ictl-server']['running'])
+        self.assertTrue(containers['ictl-server']['image'].endswith('0.2.1'))
+        c=sqlite3.connect(self.root/'data/ictl.db')
+        self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],202)
+        self.assertEqual(c.execute('SELECT value FROM example').fetchone()[0],'old');c.close()
+
+    def test_failed_new_container_recovers_old(self):
+        r=self.run_install(FAIL_RUN='1');self.assertNotEqual(r.returncode,0);self.assert_old()
+        self.assertTrue(list((self.root/'data').glob('*.bak')))
+
+    def test_health_failure_restores_old_database_after_migration(self):
+        r=self.run_install(FAIL_HEALTH='1');self.assertNotEqual(r.returncode,0);self.assert_old()
+        self.assertNotIn('volume rm',(self.root/'docker.log').read_text())
+
+    def test_failed_restore_keeps_old_stopped(self):
+        r=self.run_install(FAIL_HEALTH='1',FAIL_RESTORE='1');self.assertNotEqual(r.returncode,0)
+        containers=json.loads((self.root/'containers').read_text());self.assertEqual(len(containers),1)
+        self.assertFalse(next(iter(containers.values()))['running']);self.assertIn('数据库恢复失败',r.stderr)
+
+    def test_success_removes_only_old_container_and_keeps_backup(self):
         r=self.run_install();self.assertEqual(r.returncode,0,r.stderr)
-        cfg=self.managed/'etc/ictl-tunnel/agent.json'
-        self.assertEqual(cfg.stat().st_mode&0o777,0o600)
-        self.assertEqual(json.loads(cfg.read_text())['url'],'https://example.com/agent')
-        self.assertTrue((self.managed/'etc/systemd/system/ictl-tunnel-core.service').exists())
-        self.assertTrue((self.managed/'usr/local/bin/ictl-tunnel-agent').exists())
-        self.assertFalse((self.managed/'usr/local/bin/ictl').exists())
+        containers=json.loads((self.root/'containers').read_text());self.assertEqual(list(containers),['ictl-server'])
+        self.assertTrue(containers['ictl-server']['image'].endswith('0.3.0'))
+        backup=next((self.root/'data').glob('*.bak'));c=sqlite3.connect(backup)
+        self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],202);c.close()
 
-    def test_restart_failure_restores_old_installation(self):
-        files=['etc/ictl-tunnel/agent.json','usr/local/bin/ictl-tunnel-agent','usr/local/lib/ictl-tunnel/sing-box',
-               'etc/systemd/system/ictl-tunnel-agent.service','etc/systemd/system/ictl-tunnel-core.service','var/lib/ictl-tunnel/config.json']
-        for path in files:(self.managed/path).write_text('old:'+path)
-        (self.root/'fail').touch()
-        r=self.run_install();self.assertNotEqual(r.returncode,0)
-        for path in files:self.assertEqual((self.managed/path).read_text(),'old:'+path)
-        self.assertIn('start ictl-tunnel-agent',(self.root/'commands').read_text())
-
-    def test_bad_checksum_does_not_stop_existing_services(self):
-        self.agent.write_text(self.agent.read_text()+'# corruption\n')
-        r=self.run_install();self.assertNotEqual(r.returncode,0)
-        log=self.root/'commands'
-        self.assertFalse(log.exists() and 'stop' in log.read_text())
-
-    def test_missing_argument_rejected(self):
-        r=subprocess.run(['bash',str(self.installer),'--url'],env=self.env,capture_output=True,text=True)
-        self.assertNotEqual(r.returncode,0)
-        self.assertIn('缺少参数',r.stderr)
+    def test_missing_port_value_rejected(self):
+        r=subprocess.run(['bash',str(ROOT/'deploy/install-server.sh'),'--port'],env=self.env,capture_output=True,text=True)
+        self.assertNotEqual(r.returncode,0);self.assertIn('缺少参数',r.stderr)
 
 
-if __name__=='__main__':unittest.main()
+class LegacyDDNSTests(unittest.TestCase):
+    def test_failed_change_restores_old_address_and_managed_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);script=root/'ipt-lib.sh';script.write_text((ROOT/'ipt.sh').read_text().rsplit('main "$@"',1)[0])
+            conf=root/'managed';conf.write_text('10001 example.com 443 tcp test\n')
+            code=r'''
+source "$1"
+CONF_DIR="$2"; MANAGED_CONF="$CONF_DIR/managed"
+safe_mkdirs() { :; }; lock_acquire() { :; }; log() { :; }
+resolve_target() { echo 192.0.2.2; }; current_target_ip() { echo 192.0.2.1; }
+delete_forward_rules() { echo "delete $4" >> "$CONF_DIR/log"; }
+add_one_forward() { echo "add $6" >> "$CONF_DIR/log"; echo corrupted > "$MANAGED_CONF"; [ "$6" = 192.0.2.1 ]; }
+save_rules() { echo saved >> "$CONF_DIR/log"; }
+refresh_managed_domain_forwards
+'''
+            r=subprocess.run(['bash','-c',code,'test',str(script),str(root)],capture_output=True,text=True)
+            self.assertNotEqual(r.returncode,0);self.assertEqual(conf.read_text(),'10001 example.com 443 tcp test\n')
+            self.assertIn('add 192.0.2.1',(root/'log').read_text());self.assertNotIn('saved',(root/'log').read_text())

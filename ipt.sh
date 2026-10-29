@@ -646,7 +646,7 @@ add_one_forward() {
   fi
   [ "$rc" -eq 0 ] && fwd_added=1
 
-  register_forward_config "$in_port" "$host" "$tport" "$proto" "$comment"
+  register_forward_config "$in_port" "$host" "$tport" "$proto" "$comment" || return 1
   log "add forward proto=$proto in=$in_port target=$host($ip):$tport comment=$comment"
 
   if [ $((pre_added + post_added + fwd_added)) -eq 0 ]; then
@@ -1291,7 +1291,7 @@ refresh_managed_domain_forwards() {
 
   lock_acquire 120 || { log "ddns refresh skipped: lock busy"; return 1; }
 
-  local entries=() e in_port host tport proto comment rest ip cur domains=0 changed=0 failed=0
+  local entries=() e in_port host tport proto comment rest ip cur saved domains=0 changed=0 failed=0 rollback_failed=0
   mapfile -t entries < "$MANAGED_CONF"
 
   for e in "${entries[@]}"; do
@@ -1320,16 +1320,25 @@ refresh_managed_domain_forwards() {
     fi
 
     info "$host：${cur:-无} → $ip（${proto^^} $in_port → $tport）"
-    [ -n "$cur" ] && delete_forward_rules "$comment" "$proto" "$in_port" "$cur" "$tport"
+    saved="$(mktemp "$CONF_DIR/ddns.XXXXXX")" || return 1
+    cp "$MANAGED_CONF" "$saved" || { rm -f "$saved"; return 1; }
+    [ -z "$cur" ] || delete_forward_rules "$comment" "$proto" "$in_port" "$cur" "$tport"
     if add_one_forward "$in_port" "$host" "$tport" "$proto" "$comment" "$ip"; then
       changed=$((changed + 1))
     else
       failed=$((failed + 1))
+      delete_forward_rules "$comment" "$proto" "$in_port" "$ip" "$tport"
+      if [ -n "$cur" ] && ! add_one_forward "$in_port" "$host" "$tport" "$proto" "$comment" "$cur"; then
+        rollback_failed=1
+        err "DDNS 更新失败且旧规则恢复失败：$host；请检查规则后重试。"
+      fi
+      cp "$saved" "$MANAGED_CONF" || { err "恢复托管配置失败：$saved"; return 1; }
     fi
+    rm -f "$saved"
   done
 
-  if [ "$changed" -gt 0 ]; then
-    save_rules
+  if [ "$changed" -gt 0 ] && [ "$rollback_failed" -eq 0 ]; then
+    save_rules || failed=$((failed + 1))
     log "ddns refresh changed=$changed failed=$failed"
   else
     log "ddns refresh no changes (domains=$domains failed=$failed)"
@@ -1342,6 +1351,7 @@ refresh_managed_domain_forwards() {
   else
     info "已更新 $changed 条，失败 $failed 条"
   fi
+  [ "$failed" -eq 0 ]
 }
 
 install_self_check_service() {
@@ -1427,8 +1437,10 @@ self_check() {
   log "dnat rule count=${count:-0}"
 
   refresh_managed_domain_forwards
+  local rc=$?
   lock_release
   log "self-check end"
+  return "$rc"
 }
 
 view_log() {
@@ -1496,7 +1508,7 @@ menu() {
 main() {
   if [ "${1:-}" = "--self-check" ]; then
     self_check
-    exit 0
+    exit $?
   fi
 
   need_root
