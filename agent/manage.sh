@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.4.0-rc.1"
+VERSION="0.4.0-rc.3"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -81,7 +81,7 @@ finish() {
   install_unit || return 1
   install -m 755 "$WORK/manage.sh" /usr/local/bin/ictl.new && mv /usr/local/bin/ictl.new /usr/local/bin/ictl || return 1
   install -m 755 "$WORK/manage.sh" "$PKG/manage.sh"
-  if [ "$TARGET" = active ]; then rm -f "$PKG/passive.sh"; else rm -f "$PKG/active"; fi
+  if [ "$TARGET" = active ]; then rm -f "$PKG/passive.sh" "$PKG/wake" "$PKG/wake.sh"; else rm -f "$PKG/active"; fi
   local old
   for old in /root/ictl.sh /ictl.sh; do
     if [ -L "$old" ] && [ "$(readlink "$old")" = /usr/local/bin/ictl ]; then continue; fi
@@ -93,6 +93,9 @@ finish() {
   done
   PHASE=confirmed; journal || return 1
   systemctl start ictl-agent || { die '已完成切换，但服务启动失败，请检查 journalctl -u ictl-agent'; return 1; }
+  if [ "$TARGET" = passive ] && [ -f /etc/ictl/wake.conf ] && grep -qx 'ENABLED=1' /etc/ictl/wake.conf; then
+    bash "$PKG/wake.sh" --restore || return 1
+  fi
   mkdir -p "$LIB/rollback"
   [ ! -f "$WORK/backup.tar" ] || mv -f "$WORK/backup.tar" "$LIB/rollback/previous.tar"
   rm -f "$WORK/transaction"
@@ -125,6 +128,9 @@ rollback() {
   if [ "$result" = 0 ] && [ "$FROM" = active ] && [ "$TARGET" = active ]; then
     rm -f "$LIB/paused"
     systemctl start ictl-agent || result=1
+  fi
+  if [ "$FROM" = passive ] && [ -f "$PKG/wake.sh" ] && [ -f /etc/ictl/wake.conf ]; then
+    bash "$PKG/wake.sh" --restore || result=1
   fi
   [ "$result" = 0 ] || die '自动恢复未完成；备份和事务已保留，请勿删除 switch-work'
   return 1
@@ -168,6 +174,9 @@ perform_sync() {
   fetch_component "$artifact" "$digest" "$WORK/target" || return 1
   fetch_component manage.sh "$manager_digest" "$WORK/manage.sh" || return 1
   fetch_component passive.sh "$helper_digest" "$WORK/passive-helper.sh" || return 1
+  if [ "$TARGET" = passive ] && [ -f /etc/ictl/wake.conf ] && grep -qx 'ENABLED=1' /etc/ictl/wake.conf; then
+    prepare_wake || return 1
+  fi
   bash -n "$WORK/manage.sh" && bash -n "$WORK/passive-helper.sh" || return 1
   if [ "$TARGET" = active ]; then
     [ "$("$WORK/target" --version)" = "$NEW_VERSION" ] || { die '主动组件版本不匹配'; return 1; }
@@ -180,11 +189,14 @@ perform_sync() {
   fi
   PHASE=prepared; journal || return 1
   systemctl stop ictl-agent 2>/dev/null || { [ ! -f "$UNIT" ] || return 1; }
+  if [ -f /etc/systemd/system/ictl-wake.service ]; then
+    systemctl stop ictl-wake || return 1
+  fi
   if [ "$FROM" = active ]; then "$PKG/active" --flush-traffic || return 1; fi
   exec 9>/run/ictl.lock
   flock -w 60 9 || { die '等待规则锁超时'; return 1; }
   local files=()
-  for item in /etc/ictl /usr/local/bin/ictl "$PKG" "$UNIT" "$LIB/config" "$LIB/applied" "$LIB/resolved" "$LIB/state" "$LIB/mode" "$LIB/agent-kind" "$LIB/active"; do
+  for item in /etc/ictl /usr/local/bin/ictl "$PKG" "$UNIT" /etc/systemd/system/ictl-wake.service "$LIB/config" "$LIB/applied" "$LIB/resolved" "$LIB/state" "$LIB/mode" "$LIB/agent-kind" "$LIB/active"; do
     [ ! -e "$item" ] || files+=("${item#/}")
   done
   if [ "$FROM" = active ]; then
@@ -217,6 +229,15 @@ perform_sync() {
     ICTL_LOCK_HELD=1 bash "$PKG/passive.sh" --apply-file "$WORK/config" "$GEN" > "$WORK/apply.log" 2>&1 || { cat "$WORK/apply.log" >&2; rollback; return 1; }
   fi
   printf '%s\n' "$TARGET" > "$LIB/agent-kind"
+  if [ "$TARGET" = passive ] && [ -f /etc/ictl/wake.conf ] && grep -qx 'ENABLED=1' /etc/ictl/wake.conf; then
+    install_wake || { rollback; return 1; }
+  fi
+  if [ "$TARGET" = active ] && [ -f "$PKG/wake.sh" ]; then
+    # The helper takes the same rule lock; release it for the owned-rule cleanup.
+    flock -u 9
+    bash "$PKG/wake.sh" --remove || return 1
+    flock -w 60 9 || return 1
+  fi
   PHASE=installed; journal || return 1
   flock -u 9; exec 9>&-
   commit || { die '已应用，等待服务端确认；再次执行 --sync 重试确认'; return 1; }
@@ -242,6 +263,38 @@ commit() {
   fi
   rpc commit "held_ports=$held"
 }
+prepare_wake() {
+  local saved="$REPLY" name digest script_digest
+  rpc wake-assets || return 1
+  name="$(field wake_artifact)" digest="$(field wake_sha256)" script_digest="$(field wake_script_sha256)"
+  [[ "$name" = "ictl-wake-linux-$ARCH" ]] || return 1
+  fetch_component "$name" "$digest" "$WORK/wake" || return 1
+  fetch_component wake.sh "$script_digest" "$WORK/wake.sh" || return 1
+  bash -n "$WORK/wake.sh" || return 1
+  REPLY="$saved"
+}
+install_wake() {
+  local file
+  for file in wake wake.sh; do
+    install -m 755 "$WORK/$file" "$PKG/$file.new" && mv "$PKG/$file.new" "$PKG/$file" || return 1
+  done
+}
+wake_settings() {
+  local choice port allow
+  [ "$(cat "$LIB/agent-kind" 2>/dev/null)" = passive ] || { die '只有被动 Agent 可以设置远程唤醒'; return 1; }
+  printf '远程唤醒：默认关闭，白名单只接受 Server 实际出口 IP。\n'
+  if [ -f /etc/ictl/wake.conf ]; then cat /etc/ictl/wake.conf; else printf '当前：关闭\n'; fi
+  printf '1) 设置并启用\n2) 关闭并清除本地设置\n0) 返回\n'
+  read -r -p '请选择：' choice
+  case "$choice" in
+    1)
+      read -r -p 'UDP 监听端口：' port
+      read -r -p 'Server 出口 IP（多个用英文逗号分隔）：' allow
+      prepare_wake && install_wake || return 1
+      bash "$PKG/wake.sh" --configure "$port" "$allow" ;;
+    2) [ ! -f "$PKG/wake.sh" ] || bash "$PKG/wake.sh" --disable ;;
+  esac
+}
 main() {
   [ "$(id -u)" = 0 ] || { die '请使用 sudo ictl'; return 1; }
   [ -f "$PKG/control.sh" ] || { die '管理组件不完整，请重新运行本版本安装脚本'; return 1; }
@@ -253,11 +306,13 @@ main() {
   flock -n 8 || { die '另一项安装或同步正在执行'; return 1; }
   local action="${1:-}" choice
   if [ -z "$action" ]; then
-    printf 'ictl %s\n1) 同步更新／确认切换\n2) 本地状态\n3) 更新当前 Agent\n4) 卸载\n0) 退出\n' "$VERSION"
+    printf 'ictl %s\n1) 同步更新／确认切换\n2) 本地状态\n3) 更新当前 Agent\n4) 卸载\n5) 被动节点远程唤醒设置\n0) 退出\n' "$VERSION"
     read -r -p '请选择：' choice
-    case "$choice" in 1) action=--sync ;; 2) action=--status ;; 3) action=--update ;; 4) action=--uninstall ;; *) return 0 ;; esac
+    case "$choice" in 1) action=--sync ;; 2) action=--status ;; 3) action=--update ;; 4) action=--uninstall ;; 5) action=--wake-settings ;; *) return 0 ;; esac
   fi
   case "$action" in
+    --wake-settings) wake_settings ;;
+    --wake-sync) bash "$PKG/passive.sh" --wake-sync "${2:-}" ;;
     --sync|--install) perform_sync ;;
     --update) UPDATE_ONLY=1 perform_sync ;;
     --auto-update)
@@ -269,14 +324,20 @@ main() {
     --status)
       printf '已安装：'; cat "$LIB/agent-kind" 2>/dev/null || printf '旧版\n'
       if [ -f "$LIB/paused" ]; then printf '后台已暂停，等待手动确认\n'; fi
-      systemctl status ictl-agent --no-pager || true ;;
+      systemctl status ictl-agent --no-pager || true
+      if [ -f /etc/ictl/wake.conf ]; then
+        printf '\n远程唤醒本地设置：\n'; cat /etc/ictl/wake.conf
+        systemctl status ictl-wake --no-pager || true
+      else printf '\n远程唤醒：关闭\n'; fi ;;
     --recover)
       load_journal || return 1
       case "$PHASE" in handover|failed) ;; *) die '请执行 --sync 确认当前事务，不能回退已提交或尚未交接的事务'; return 1 ;; esac
+      if [ -f /etc/systemd/system/ictl-wake.service ]; then systemctl stop ictl-wake || return 1; fi
       systemctl stop ictl-agent || true
       exec 9>/run/ictl.lock; flock -w 60 9 || return 1; rollback ;;
     --uninstall)
       if [ "${2:-}" != -y ]; then read -r -p '删除本节点 Agent、身份和转发？[y/N] ' choice; [ "$choice" = y ] || return 0; fi
+      if [ -f "$PKG/wake.sh" ]; then bash "$PKG/wake.sh" --remove || return 1; fi
       systemctl stop ictl-agent || return 1
       local kind; read -r kind < "$LIB/agent-kind"
       if [ "$kind" = active ]; then "$PKG/active" --clear || return 1; else bash "$PKG/passive.sh" --clear-owned || return 1; fi
@@ -289,7 +350,7 @@ main() {
         if [ -L "$old" ] && [ "$(readlink "$old")" = /usr/local/bin/ictl ]; then rm -f "$old"; fi
       done
       systemctl daemon-reload ;;
-    *) die '用法：ictl [--sync|--switch active/passive|--update|--status|--recover|--uninstall [-y]]'; return 1 ;;
+    *) die '用法：ictl [--sync|--switch active/passive|--update|--status|--wake-settings|--recover|--uninstall [-y]]'; return 1 ;;
   esac
 }
 if [ "${ICTL_LIBRARY:-0}" != 1 ]; then main "$@"; fi

@@ -4,7 +4,7 @@
 
 支持多跳链路、SS／SS2022／VLESS Reality 目标、主动与被动同步，以及 Agent 与单机脚本共存。
 
-**当前开发版：0.4.0-rc.2（测试版）**。主动节点改用 Go + nftables 和长连接；被动节点保留 Bash + iptables。RC2 增加主动节点间的网络质量监测与 24 小时趋势。正式版仍为 0.3.1，RC 不更新 `latest`。转发节点无需安装代理核心，目标服务需自行准备。
+**当前开发版：0.4.0-rc.3（测试版）**。主动节点改用 Go + nftables 和长连接；被动节点保留 Bash + iptables。支持主动节点间的网络质量监测与 24 小时趋势；RC3 增加默认关闭的被动节点远程唤醒。正式版仍为 0.3.1，RC 不更新 `latest`。转发节点无需安装代理核心，目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -15,6 +15,7 @@
 - [切换主动与被动](#切换主动与被动)
 - [卸载与删除](#卸载与删除)
 - [使用指南](#使用指南)
+- [被动节点远程唤醒](#被动节点远程唤醒)
 - [网络质量监测](#网络质量监测)
 - [单机脚本与共存](#单机脚本与共存)
 - [常用命令](#常用命令)
@@ -32,7 +33,7 @@
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.2/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.3/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -40,7 +41,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.2/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.3/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
 新主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口（默认 `8730`），并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址，再接入节点。
@@ -64,7 +65,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.2/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.3/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -93,7 +94,7 @@ sudo ictl --update  # 只更新当前类型
 sudo ictl --sync    # 同步配置，或确认面板要求的类型切换
 ```
 
-新版主动 Agent 在 `AUTO_UPDATE=1` 时接受同类型更新通知；被动节点仅在本机手动操作时更新。可在 `/etc/ictl/agent.conf` 将 `AUTO_UPDATE` 设为 `0` 关闭主动自动更新，随后重启 `ictl-agent`。手动 `--update` 不受此开关限制。
+新版主动 Agent 在 `AUTO_UPDATE=1` 时接受同类型更新通知；被动 Agent 程序仅在本机手动操作时更新；远程唤醒只同步转发配置。可在 `/etc/ictl/agent.conf` 将 `AUTO_UPDATE` 设为 `0` 关闭主动自动更新，随后重启 `ictl-agent`。手动 `--update` 不受此开关限制。
 
 迁移会替换可识别的 `/root/ictl.sh`、`/ictl.sh` 旧入口，使其指向新版 `ictl`。后端交接期间允许短暂断线；已有防火墙若默认拒绝 FORWARD，需要先明确放行自己的转发范围。
 
@@ -118,7 +119,7 @@ sudo ictl --sync    # 同步配置，或确认面板要求的类型切换
 删除容器和镜像，保留数据卷，之后可重新安装恢复使用：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.2/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.3/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；若要完整停用，请先处理节点。
@@ -126,7 +127,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 ### 卸载节点 Agent
 
 1. 在面板解除该节点的链路和配置引用，再删除节点。
-2. 等待节点完成清理同步；被动节点需在本机运行 `sudo ictl --sync`。
+2. 等待节点完成清理同步；未启用远程唤醒或唤醒失败的被动节点，需在本机运行 `sudo ictl --sync`。
 3. 清理确认后，在节点卸载 Agent：
 
 ```bash
@@ -165,7 +166,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 1. **添加目标**：进入“目标”，点击“添加地址目标”填写实际 IPv4／域名和端口；已有 SS／SS2022／VLESS Reality 分享链接时，选择“导入分享链接”。
 2. **创建链路**：进入“链路 → 新增链路”，按流量经过的顺序选择节点。单跳转发也需要创建一条只含一个节点的链路。
 3. **创建配置**：进入“配置 → 新增配置”，选择链路和目标。各跳端口留空时自动分配，也可在节点允许范围内手动指定。目标必须先在“目标”中保存。
-4. **等待生效**：主动节点自动同步；链路里有被动节点时，需到每个被动节点运行 `sudo ictl --sync`。配置显示“已应用”后，说明相关节点已确认规则。
+4. **等待生效**：主动节点和已启用远程唤醒的被动节点自动同步；其余被动节点或唤醒超时的节点，运行 `sudo ictl --sync`。配置显示“已应用”后，说明相关节点已确认规则。
 5. **连接使用**：普通地址目标使用配置中展示的入口地址和端口；SS／VLESS 目标可点击“连接信息 → 查看 / 复制”，将分享链接导入客户端。
 
 选择“无链路（直连目标）”会直接使用目标地址，不经过转发节点，状态显示“已保存”。链路模板本身不占用端口，创建配置后才分配端口。
@@ -176,10 +177,10 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 | 行为 | 主动模式 | 被动模式 |
 | --- | --- | --- |
-| 配置同步 | WSS 长连接，配置变更即时推送 | 仅本机手动同步 |
-| 面板修改后 | 自动获取并应用 | 保持“等待中”，直到同步成功 |
+| 配置同步 | WSS 长连接，配置变更即时推送 | 默认手动，可选认证 UDP 唤醒 |
+| 面板修改后 | 自动获取并应用 | 启用唤醒则自动同步，30 秒超时后等待手动同步 |
 | 开机后 | 离线恢复规则，然后建立管理连接 | 只恢复已应用规则，不联网、不刷新域名 |
-| 状态条 | 每格 20 秒，显示最近 20 分钟 | 每格 60 秒，显示最近 1 小时；白底，手动同步时标绿 |
+| 状态条 | 每格 20 秒，显示最近 20 分钟 | 每格 60 秒，显示最近 1 小时；白底，手动同步活动或远程同步成功标绿 |
 | 长时间无上报 | 新主动 30 秒；旧版轮询 120 秒 | 不因时间流逝判离线 |
 
 模式切换见[切换主动与被动](#切换主动与被动)。同步先上报，再获取并应用配置，最后上报结果。失败原因见节点详情和事件；被动状态条的绿色只表示发生了同步，是否成功以状态和事件为准。
@@ -192,9 +193,22 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 本次仍使用手动链路，不包含池、自动择路或自动灾备。
 
+## 被动节点远程唤醒
+
+此功能默认关闭。被动节点不轮询、不保持管理长连接；启用后只有收到有效的认证唤醒包才主动同步配置。
+
+1. 先手动升级被动 Agent，再在节点运行 `sudo ictl --wake-settings`（或菜单 5）。
+2. 选择“设置并启用”，填写一个未使用的 UDP 端口和 **Server 的实际出口 IP**。多个 IP 用英文逗号分隔，可填 IPv4／IPv6；白名单不能为空。监听组件支持 amd64／arm64，首次启用会下载同版本组件。
+3. 在面板编辑对应被动节点，填写相同的唤醒端口并开启“被动节点远程唤醒”。节点需要能接收入站 UDP，云安全组也需允许 Server 访问。
+4. 之后影响该节点的配置变更会自动触发同步。Server 在第 0、10、20 秒尝试唤醒，30 秒内没有收到对应配置的成功回执，就显示“同步超时，等待手动同步”。晚到的有效成功回执仍会恢复状态。
+
+非白名单来源收到 ICMP“端口不可达”；白名单来源无论认证结果如何都收不到唤醒回复。认证通过后，节点通过现有同步地址上报、获取配置、应用并确认；这个后续连接仍会产生可观察的通信。白色状态条保留，远程同步成功标绿。
+
+在节点菜单关闭功能会停止监听、清理专用规则；只关闭面板开关会停止 Server 的唤醒尝试，不会远程更改节点的本地授权。Server 出口 IP 变化后，需要在节点手动更新白名单。Agent 程序升级和主被动模式切换仍需本机确认。
+
 ## 网络质量监测
 
-服务端和主动 Agent 升级到 **0.4.0-rc.2** 后，在“链路”或“配置”卡片点击 **网络质量与趋势**。
+服务端和主动 Agent 使用 **0.4.0-rc.2 或更新版本** 后，在“链路”或“配置”卡片点击 **网络质量与趋势**。
 
 1. 在两个主动节点的防火墙／云安全组中，允许参与探测的节点访问 **UDP 33445**，并按需允许 **ICMP Echo（Ping）**。ICMP 不占用 TCP／UDP 端口，Agent 内置实现，不需要安装 ping 命令。程序不会自动修改防火墙。
 2. 默认使用节点的入站地址。端口冲突时，在“编辑节点 → 质量探测 UDP 端口”修改；填写 `0` 可停止该节点的全部质量探测。已有转发规则保持原样。
@@ -259,7 +273,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 **配置一直“等待中”？**
 
-查看配置中尚未确认的节点。被动节点和切换模式后的节点需要本机手动同步；主动节点则检查服务、网络和节点详情中的错误。链路上的节点全部确认后才会显示“已应用”。
+查看配置中尚未确认的节点。未启用唤醒、唤醒超时的被动节点和切换模式后的节点需要本机手动同步；主动节点则检查服务、网络和节点详情中的错误。链路上的节点全部确认后才会显示“已应用”。
 
 **节点显示“端口冲突”或“端口检查失败”？**
 
@@ -275,7 +289,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 **升级后需要回退怎么办？**
 
-Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-deploy-*.bak`，0.4.0 迁移还会在数据库旁保留 `ictl.db.pre-0.4.0.bak`，RC1 → RC2 升级另外保留 `ictl.db.pre-0.4.0-rc.2.bak`。人工回退需停止服务，恢复升级前数据库及对应旧镜像，移除新数据库的 `-wal`／`-shm` 文件后再启动；回退会丢弃升级后的数据。源码部署或自定义数据库路径需自行备份和恢复。
+Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-deploy-*.bak`，0.4.0 迁移还会在数据库旁保留 `ictl.db.pre-0.4.0.bak`，RC2／RC3 升级分别保留 `ictl.db.pre-0.4.0-rc.2.bak`／`ictl.db.pre-0.4.0-rc.3.bak`。人工回退需停止服务，恢复升级前数据库及对应旧镜像，移除新数据库的 `-wal`／`-shm` 文件后再启动；回退会丢弃升级后的数据。源码部署或自定义数据库路径需自行备份和恢复。
 
 ## 开发与贡献
 
@@ -312,6 +326,8 @@ for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
 ```bash
 (cd agent/active && go build -o /tmp/ictl-active .)
 sudo unshare -nm env ICTL_KERNEL_TEST=1 python3 tests/kernel_network.py /tmp/ictl-active
+(cd agent/wake && go build -o /tmp/ictl-wake .)
+sudo unshare -n python3 tests/kernel_wake.py /tmp/ictl-wake
 ```
 
 该测试在新的网络和挂载命名空间内执行，检查真实转发、计数、冲突与清理。
@@ -322,10 +338,10 @@ sudo unshare -nm env ICTL_KERNEL_TEST=1 python3 tests/kernel_network.py /tmp/ict
 
 | 组件 | 当前版本 |
 | --- | --- |
-| 服务端／主动 Agent | 0.4.0-rc.2 |
-| 被动 Agent／管理器 | 0.4.0-rc.1 |
+| 服务端／被动 Agent／管理器／唤醒组件 | 0.4.0-rc.3 |
+| 主动 Agent | 0.4.0-rc.2 |
 | 旧版兼容 Agent | 0.2.1 |
-| 单机脚本 | 3.2-rc.1 |
+| 单机脚本 | 3.2-rc.2 |
 
 各组件版本号独立维护，具体变化见 [CHANGELOG.md](CHANGELOG.md)。
 

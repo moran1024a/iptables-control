@@ -27,6 +27,12 @@ daemon
  }
 }
 ''')
+
+    def test_wake_port_is_reserved_even_if_listener_has_stopped(self):
+        (self.conf/'wake.conf').write_text('ENABLED=1\nPORT=10001\nALLOW=192.0.2.2\n')
+        self.assertShell('''if check_port_conflicts $'v=abc\\n1 both 10001 192.0.2.1 443'; then exit 1; fi
+[[ "${ERRS[*]}" == *远程唤醒* ]]
+''')
         self.assertShell('''if check_port_conflicts $'v=abc\\n1 both 10001 192.0.2.1 443'; then exit 1; fi
 [[ "${ERRS[*]}" == *端口冲突* ]]
 ''')

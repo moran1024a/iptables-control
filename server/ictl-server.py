@@ -26,12 +26,13 @@ from urllib.parse import parse_qs
 import target_config
 import agent_v3
 import network_quality
+import wake
 import types
 
 def _module():
     return types.SimpleNamespace(**globals())
 
-VERSION = "0.4.0-rc.2"
+VERSION = "0.4.0-rc.3"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -363,11 +364,12 @@ def init_db():
     conn = db() if os.path.isfile(DB_PATH) else None
     if conn is not None:
         version = conn.execute('PRAGMA user_version').fetchone()[0]
-        if version > 401:
+        if version > 402:
             conn.close()
             raise UserError('数据库版本高于本服务端')
         if version >= 400:
             network_quality.migrate(_module(), conn)
+            wake.migrate(_module(), conn)
             with conn:
                 ensure_active_windows(conn)
             return conn
@@ -375,6 +377,7 @@ def init_db():
     conn = init_db_v030()
     agent_v3.migrate(_module(), conn)
     network_quality.migrate(_module(), conn)
+    wake.migrate(_module(), conn)
     return conn
 
 
@@ -466,6 +469,8 @@ def track_mutation(method):
                            any(n[k] != old.get(k, n[k]) for k in ('key','desired_mode','deleting')))
                 if changed:
                     conn.execute('UPDATE nodes SET desired_generation=desired_generation+1 WHERE id=?', (nid,))
+                if changed or any(n[k] != old.get(k, n[k]) for k in ('wake_enabled', 'wake_port')):
+                    wake.queue(_module(), conn, get_node(conn, nid))
                 for cid in {r['chain_id'] for r in old_rows + rows}:
                     if [key(r) for r in old_rows if r['chain_id']==cid] != [key(r) for r in rows if r['chain_id']==cid]:
                         if conn.execute('SELECT 1 FROM chains WHERE id=?', (cid,)).fetchone():
@@ -544,7 +549,7 @@ def delete_node(conn, node_id):
     conn.execute("DELETE FROM active_windows WHERE node_id = ?", (node_id,))
     conn.execute("DELETE FROM events WHERE node_id = ?", (node_id,))
     conn.execute("DELETE FROM chain_pending WHERE node_id = ?", (node_id,))
-    for table in ('node_snapshots', 'metric_windows', 'metric_hours', 'agent_switches'):
+    for table in ('node_snapshots', 'metric_windows', 'metric_hours', 'agent_switches', 'wake_jobs'):
         conn.execute(f'DELETE FROM {table} WHERE node_id=?', (node_id,))
     finish_deleted_chains(conn)
 
@@ -999,6 +1004,8 @@ def parse_hops(conn, hops, chain_id=None):
     for i, (node, port) in enumerate(result, 1):
         if port is None:
             continue
+        if node['wake_enabled'] and port == node['wake_port']:
+            raise UserError(f"第 {i} 跳：端口 {port} 已预留为远程唤醒端口", 'hops')
         if node["desired_mode"] == "active" and port == node["quality_port"] and not conn.execute("SELECT 1 FROM hops WHERE node_id=? AND port=? AND chain_id=?", (node["id"], port, chain_id)).fetchone():
             raise UserError(f"第 {i} 跳：端口 {port} 已预留为质量探测端口，请修改节点探测端口或转发端口", "hops")
         if (node["id"], port) in seen:
@@ -1027,6 +1034,8 @@ def parse_hops(conn, hops, chain_id=None):
         used |= {p for n, p in result if n["id"] == node["id"] and p is not None}
         if node["desired_mode"] == "active":
             used.add(node["quality_port"])
+        if node['wake_enabled']:
+            used.add(node['wake_port'])
         item[1] = pick_port(parse_ports(node["ports"]), used)
         if item[1] is None:
             raise UserError(f"第 {i} 跳：节点 {node['name']} 允许的端口 {node['ports']} 已全部被占用", "hops")
@@ -1118,6 +1127,13 @@ def node_status(conn, node, now):
         return "deleting"
     if node['state'] == 'error' and port_error(node['err']):
         return 'error'
+    if node['desired_mode'] == 'passive' and node['wake_enabled'] and not node['manual_required']:
+        job = wake.summary(conn, node)
+        if job and job['generation'] == node['desired_generation']:
+            if job['state'] in ('timeout', 'failed'):
+                return 'error'
+            if job['state'] == 'waiting':
+                return 'syncing'
     if node["manual_required"] or node["desired_mode"] == "passive":
         return "syncing" if (node["manual_required"] or node["applied_generation"] != node["desired_generation"]
                               or node["state"] != "ok") else "synced"
@@ -1236,8 +1252,10 @@ def sync_report(conn, node, fields, source_ip, now=None):
         return 'proto=2\naction=switch\nmode=active\n'
     if proto and phase in ('poll', 'begin') and node['state'] == 'error' and port_error(node['err']):
         health, err = 'error', node['err']
-    if proto and (source not in ('manual','auto') or phase not in ('begin','poll','ack','asset')):
+    if proto and (source not in ('manual','auto','wake') or phase not in ('begin','poll','ack','asset')):
         raise UserError('无效同步阶段')
+    if source == 'wake' and phase != 'ack' and not wake.authorized(conn, node, fields):
+        return 'proto=2\naction=pause\nmode=passive\n'
     au = {'0': 0, '1': 1}.get(fields.get('au'))
     # Asset downloads never acknowledge state, register activity, or mutate operation context.
     if fields.get('get') == 'agent':
@@ -1252,7 +1270,7 @@ def sync_report(conn, node, fields, source_ip, now=None):
         conn.execute('UPDATE nodes SET reported_mode=? WHERE id=?', (fields['mode'], node['id']))
     lines = node_rules(conn, node)
     want = rules_version(lines)
-    update = f'update={AGENT[0]} {AGENT[1]}\n' if agent_update(agent, au)=='pending' else ''
+    update = f'update={AGENT[0]} {AGENT[1]}\n' if source != 'wake' and agent_update(agent, au)=='pending' else ''
     if not proto:
         if node['protocol_version'] >= 2 or node['manual_required'] or node['desired_mode'] != 'active':
             return 'same\n' + update  # Legacy requests cannot clear v2 waits.
@@ -1286,8 +1304,13 @@ def sync_report(conn, node, fields, source_ip, now=None):
         if state == 'ok':
             conn.execute('UPDATE nodes SET reported_v=?,reported_mode=?,applied_generation=?,last_success=? WHERE id=?',
                          (op['hash'], op['mode'], op['generation'], now, node['id']))
-        add_event(conn, node['id'], ('手动' if source=='manual' else '自动') + '同步：' +
+        add_event(conn, node['id'], {'manual':'手动','auto':'自动','wake':'远程唤醒'}[source] + '同步：' +
                   {'confirmed':'确认成功','changed':'已应用旧快照，仍有新变更','failed':'失败：'+err}[result], now)
+        wake.receipt(conn, node, op['generation'], result, err)
+        if source == 'wake' and result == 'confirmed':
+            conn.execute('''INSERT INTO windows(node_id,win,level,manual_count,last_activity) VALUES (?,?,2,1,?)
+                ON CONFLICT(node_id,win) DO UPDATE SET manual_count=manual_count+1,last_activity=excluded.last_activity''',
+                         (node['id'], now//WINDOW, now))
         if result == 'confirmed':
             if source == 'manual':
                 conn.execute('UPDATE nodes SET manual_required=0 WHERE id=?', (node['id'],))
@@ -1298,9 +1321,9 @@ def sync_report(conn, node, fields, source_ip, now=None):
                 delete_node(conn, node['id'])
                 return 'proto=2\nresult=deleted\n'
         return f'proto=2\nresult={result}\n'
-    if phase not in ('begin','poll') or (source=='manual' and phase!='begin') or (source=='auto' and phase!='poll'):
+    if phase not in ('begin','poll') or (source in ('manual','wake') and phase!='begin') or (source=='auto' and phase!='poll'):
         raise UserError('无效同步阶段')
-    if source == 'auto' and op and op['source']=='manual' and not op['result'] and op['expires'] >= now:
+    if source in ('auto','wake') and op and op['source']=='manual' and not op['result'] and op['expires'] >= now:
         return 'proto=2\naction=busy\n'
     if (source == 'auto' and op and op['result'] == 'failed' and port_error(node['err'])
             and op['generation'] == node['desired_generation'] and op['mode'] == node['desired_mode'] and op['hash'] == want):
@@ -1687,7 +1710,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "manual_required": bool(n["manual_required"]), "protocol_version": n["protocol_version"],
                 "desired_generation": n["desired_generation"], "applied_generation": n["applied_generation"],
                 "err": n["err"], "installed_agent": n["installed_agent"], "backend": n["backend"],
-                "connection_state": n["connection_state"], "quality_port": n["quality_port"]}
+                "connection_state": n["connection_state"], "quality_port": n["quality_port"],
+                "wake_enabled": bool(n['wake_enabled']), "wake_port": n['wake_port'], "wake": wake.summary(conn, n)}
 
     def api_nodes(self, conn, body):
         now = int(time.time())
@@ -1722,7 +1746,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             conn.execute("UPDATE nodes SET desired_mode='passive',manual_required=1 WHERE id=?", (cur.lastrowid,))
         quality_port = check_port(body.get("quality_port", network_quality.PORT), "quality_port") if body.get("quality_port", network_quality.PORT) != 0 else 0
         conn.execute("UPDATE nodes SET quality_port=? WHERE id=?", (quality_port, cur.lastrowid))
+        self.set_wake(conn, body, get_node(conn, cur.lastrowid), mode)
         return {"id": cur.lastrowid}
+
+    def set_wake(self, conn, body, node, mode):
+        enabled = body.get('wake_enabled', bool(node['wake_enabled']))
+        if type(enabled) is not bool:
+            raise UserError('远程唤醒开关无效', 'wake_enabled')
+        port = body.get('wake_port', node['wake_port'])
+        port = check_port(port, 'wake_port') if port != 0 else 0
+        if mode != 'passive':
+            enabled = False
+        if enabled:
+            if not port:
+                raise UserError('启用远程唤醒需要填写端口', 'wake_port')
+            if conn.execute('SELECT 1 FROM hops WHERE node_id=? AND port=? UNION ALL SELECT 1 FROM retired_ports WHERE node_id=? AND port=?',
+                            (node['id'], port, node['id'], port)).fetchone():
+                raise UserError('唤醒端口已被转发配置占用或正在等待释放', 'wake_port')
+        conn.execute('UPDATE nodes SET wake_enabled=?,wake_port=? WHERE id=?', (int(enabled), port, node['id']))
 
     def api_node_get(self, conn, body, node_id):
         now = int(time.time())
@@ -1788,6 +1829,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         quality_port = body.get("quality_port", n["quality_port"])
         quality_port = check_port(quality_port, "quality_port") if quality_port != 0 else 0
         conn.execute("UPDATE nodes SET quality_port=? WHERE id=?", (quality_port, node_id))
+        self.set_wake(conn, body, n, mode)
         key = None
         if mode != n["desired_mode"]:
             conn.execute("UPDATE nodes SET desired_mode=?,manual_required=1 WHERE id=?", (mode, node_id))
@@ -1843,7 +1885,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         nodes = {n["id"]: n for n in conn.execute("SELECT * FROM nodes").fetchall()}
         status = {nid: node_status(conn, n, now) for nid, n in nodes.items()}
         node_info = lambda nid: {"node_id": nid, "name": nodes[nid]["name"], "status": status[nid],
-                                 "desired_mode": nodes[nid]["desired_mode"], "err": nodes[nid]["err"]}
+                                 "desired_mode": nodes[nid]["desired_mode"], "err": nodes[nid]["err"],
+                                 "wake_enabled": bool(nodes[nid]['wake_enabled']),
+                                 "wake": wake.summary(conn, nodes[nid])}
         chains = []
         for c in conn.execute(ordered("chains")).fetchall():
             hops = [{**node_info(h["node_id"]), "addr": nodes[h["node_id"]]["addr"], "port": h["port"]}
@@ -2142,7 +2186,7 @@ def cmd_info(args):
 def cmd_health(args):
     conn = read_db()
     try:
-        if conn.execute('PRAGMA user_version').fetchone()[0] != 401:
+        if conn.execute('PRAGMA user_version').fetchone()[0] != 402:
             raise UserError('数据库尚未就绪')
         path = setting(conn, 'panel_path') + '/'
     finally:

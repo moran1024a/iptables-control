@@ -69,12 +69,13 @@ def newer(candidate, current):
 
 
 def artifact(s, name):
-    allowed = {'ictl-active-linux-amd64', 'ictl-active-linux-arm64', 'passive.sh', 'manage.sh', 'control.sh'}
+    allowed = {'ictl-active-linux-amd64', 'ictl-active-linux-arm64', 'ictl-wake-linux-amd64',
+               'ictl-wake-linux-arm64', 'passive.sh', 'manage.sh', 'control.sh', 'wake.sh'}
     if name not in allowed:
         raise s.UserError('无效组件名称')
     root = Path(s.BASE_DIR)
     candidates = [root / 'assets' / name, root.parent / 'dist' / name]
-    if name in ('passive.sh', 'manage.sh', 'control.sh'):
+    if name in ('passive.sh', 'manage.sh', 'control.sh', 'wake.sh'):
         candidates += [root / 'agent' / name, root.parent / 'agent' / name]
     path = next((p for p in candidates if p.is_file()), None)
     if path is None:
@@ -226,6 +227,14 @@ def manage(s, conn, node, data):
         return path.read_bytes()
     if action == 'info':
         return f"proto=2\nmode={node['desired_mode']}\ninstalled={node['installed_agent']}\n"
+    if action == 'wake-assets':
+        arch = data.get('arch')
+        if arch not in ('amd64', 'arm64'):
+            raise s.UserError('远程唤醒组件只支持 amd64 / arm64')
+        name = f'ictl-wake-linux-{arch}'
+        _, digest = artifact(s, name)
+        _, script_digest = artifact(s, 'wake.sh')
+        return f'proto=2\nwake_artifact={name}\nwake_sha256={digest}\nwake_script_sha256={script_digest}\n'
     if action == 'prepare':
         target = data.get('target')
         if target not in ('active', 'passive') or target != node['desired_mode']:

@@ -14,6 +14,7 @@ checks = [
     ("agent/passive.sh", r'^VERSION="([^"]+)"', manifest["passive_agent"]),
     ("agent/manage.sh", r'^VERSION="([^"]+)"', manifest["manager"]),
     ("agent/active/model.go", r'^const version = "([^"]+)"', manifest["active_agent"]),
+    ("agent/wake/main.go", r'^const version = "([^"]+)"', manifest["wake_agent"]),
     ("deploy/install-agent.sh", r'^VERSION="([^"]+)"', manifest["server"]),
     ("ipt.sh", r'^VERSION=([0-9A-Za-z.-]+)$', manifest["standalone"]),
 ]

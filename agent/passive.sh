@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.4.0-rc.1"
+VERSION="0.4.0-rc.3"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/lib/ictl/passive.sh"
@@ -308,6 +308,12 @@ check_port_conflicts() {
     for p in $(protos "$proto"); do requested["$p:$port"]=1; done
   done <<< "$config"
   [ "${#requested[@]}" -gt 0 ] || return 0
+  if [ "${ICTL_WAKE_CHECK:-0}" != 1 ] && [ -f "$CONF_DIR/wake.conf" ] && grep -qx 'ENABLED=1' "$CONF_DIR/wake.conf"; then
+    local wake_port
+    wake_port="$(sed -n 's/^PORT=//p' "$CONF_DIR/wake.conf")"
+    if [[ ! "$wake_port" =~ ^[0-9]+$ ]]; then ERRS+=('端口检查失败：远程唤醒配置损坏'); return 1; fi
+    if [ "${requested[udp:$wake_port]:-0}" = 1 ]; then ERRS+=("端口冲突：UDP $wake_port 已预留为远程唤醒端口"); return 1; fi
+  fi
   if ! error="$(check_peer_ports)"; then ERRS+=("$error"); return 1; fi
   if ! error="$(check_native_ports)"; then ERRS+=("$error"); return 1; fi
   d="$(mktemp -d "$LIB/ports.XXXXXX")" || { ERRS+=('端口检查失败：无法创建临时文件'); return 1; }
@@ -659,6 +665,7 @@ ensure_service_policy() {
 }
 
 request_text() {
+  printf 'wake_id=%s\n' "${WAKE_ID:-}"
   printf 'agent_kind=passive\nt=%s\nv=%s\nstate=%s\nerr=%s\nagent=%s\nau=%s\nproto=2\nsource=%s\nphase=%s\nop=%s\ngeneration=%s\nmode=%s\n' \
     "$(date +%s)" "$R_V" "$1" "$R_ERR" "$VERSION" "$AUTO_UPDATE" "$SOURCE" "$PHASE" "$OP" "$R_GEN" "$MODE"
 }
@@ -769,7 +776,7 @@ cycle() {
     if [ "$CONFIRM" = deleted ]; then save_state; return 0; fi
     if [ "${1:-auto}" = auto ] && [ "$MODE" = passive ]; then save_state; return 0; fi
   fi
-  SOURCE="${1:-auto}" PHASE=poll; [ "$SOURCE" != manual ] || PHASE=begin
+  SOURCE="${1:-auto}" PHASE=poll; [[ "$SOURCE" != manual && "$SOURCE" != wake ]] || PHASE=begin
   OP="$(openssl rand -hex 16)" || return 1
   request="$(mktemp /run/ictl.XXXXXX)" || return 1
   request_text "$R_STATE" > "$request"
@@ -805,6 +812,7 @@ cycle() {
     NET=bad; save_state; return 1
   fi
   generation="$(response_field generation)" mode="$(response_field mode)" hash="$(response_field v)"
+  if [ "$SOURCE" = wake ] && [ "$mode" != passive ]; then NET=bad; save_state; return 1; fi
   config="$(sed -n '/^v=/,$p' <<< "$RESPONSE" | sed '/^update=/d;/^$/d')"
   if [[ ! "$generation" =~ ^[1-9][0-9]{0,14}$ ]] || [[ "$mode" != active && "$mode" != passive ]] || ! valid_config "$config" ||
       [ "$(printf '%s' "$(tail -n +2 <<< "$config")" | sha256_hex | cut -c1-12)" != "$hash" ]; then
@@ -1266,6 +1274,16 @@ menu() {
 
 main() {
   case "${1:-}" in
+    --wake-sync)
+      need_root || return 1
+      WAKE_ID="${2:-}"
+      [[ "$WAKE_ID" =~ ^[0-9a-f]{32}$ ]] || return 1
+      [ "$(cat "$LIB/agent-kind" 2>/dev/null)" = passive ] || return 1
+      [ ! -f "$LIB/switch-work/transaction" ] || return 1
+      [ -f "$CONF_DIR/wake.conf" ] && grep -qx 'ENABLED=1' "$CONF_DIR/wake.conf" || return 1
+      ACK_FILE="$LIB/wake-ack"
+      with_lock cycle wake
+      return $? ;;
     --apply-file)
       need_root || return 1
       MODE=passive

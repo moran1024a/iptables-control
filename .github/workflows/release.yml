@@ -41,17 +41,20 @@ jobs:
           for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
           mkdir -p dist
           (cd agent/active && go test ./...)
+          (cd agent/wake && go test ./...)
           for arch in amd64 arm64; do
             (cd agent/active && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags='-s -w' -o ../../dist/ictl-active-linux-$arch .)
+            (cd agent/wake && CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags='-s -w' -o ../../dist/ictl-wake-linux-$arch .)
           done
           cp agent/*.sh deploy/install-server.sh deploy/install-agent.sh server/components.json ipt.sh dist/
-          (cd dist && sha256sum *.sh components.json ictl-active-* > SHA256SUMS)
+          (cd dist && sha256sum *.sh components.json ictl-active-* ictl-wake-* > SHA256SUMS)
 
       - name: 验证隔离网络中的实际转发
         run: |
           sudo apt-get update
-          sudo apt-get install -y nftables iproute2 conntrack
+          sudo apt-get install -y nftables iptables iproute2 conntrack
           sudo unshare -nm env ICTL_KERNEL_TEST=1 python3 tests/kernel_network.py "$PWD/dist/ictl-active-linux-amd64"
+          sudo unshare -n python3 tests/kernel_wake.py "$PWD/dist/ictl-wake-linux-amd64"
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3

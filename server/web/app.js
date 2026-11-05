@@ -495,6 +495,7 @@ function drawNodes() {
         <div class="meta"><span class="muted">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${pill(n.status)}<span class="muted">${ago(n.last_seen, d.now)}</span></div>
       </div>
       ${bar(n.bar)}
+      ${n.wake?.error ? `<p class="hint t-yellow">${esc(n.wake.error)}</p>` : ""}
     </a>`;
   const summary = (ns) =>
     countText(ns.filter((n) => n.status === "offline").length, "离线", "t-red") +
@@ -573,8 +574,10 @@ async function nodeDetail(id, request) {
     </div>
     ${n.note ? `<div class="panel note-full"><h2>备注</h2><div>${esc(n.note)}</div></div>` : ""}
     <div class="panel">${bar(n.bar)}
-      ${n.desired_mode === "passive" || n.manual_required ? `<p class="hint">本机运行 <code>sudo ictl --sync</code> 或菜单「同步更新」。等待状态会持续到当前变更确认成功。白条上的绿色表示收到手动同步，执行结果见下方事件。</p>` : ""}
+      ${n.desired_mode === "passive" || n.manual_required ? `<p class="hint">本机运行 <code>sudo ictl --sync</code> 或菜单「同步更新」。等待状态会持续到当前变更确认成功。白条上的绿色表示手动同步活动或远程同步成功，执行结果见下方事件。</p>` : ""}
       ${n.desired_mode === "passive" ? `<p class="hint">已同步表示最近一次确认结果，不表示实时在线；被动模式不自动轮询。</p>` : ""}
+      ${n.desired_mode === "passive" ? `<p class="hint">远程唤醒：${n.wake_enabled ? `已开启，UDP ${n.wake_port}。${n.wake?.state === 'waiting' ? '正在等待同步确认，超过 30 秒转为等待手动同步。' : n.wake?.state === 'confirmed' ? '最近一次同步已确认。' : '请确保节点本地已配置白名单和相同端口。'}` : '未开启，配置变更需要本机手动同步。'}</p>` : ""}
+      ${n.wake?.error ? `<p class="t-yellow">${esc(n.wake.error)}</p>` : ""}
       ${n.err ? `<p class="t-yellow">最近错误：${esc(n.err)}</p>` : ""}
     </div>
     <div class="panel">
@@ -645,7 +648,8 @@ function pendingLine(c) {
   if (!c.pending.length) return "";
   const who = c.pending.map((p) => {
     const note = ["synced", "syncing"].includes(p.status) ? "" : `<span class="muted">（${STATUS[p.status]?.[0] || p.status}）</span>`;
-    return `<span class="who" title="${esc(p.err || '')}">${dot(p.status)}${esc(p.name)}${note}${p.desired_mode === "passive" ? `<span class="muted">（需本机同步）</span>` : ""}</span>`;
+    const passiveNote = p.wake_enabled && p.wake?.state === 'waiting' ? '等待自动同步' : '需本机同步';
+    return `<span class="who" title="${esc(p.wake?.error || p.err || '')}">${dot(p.status)}${esc(p.name)}${note}${p.desired_mode === "passive" ? `<span class="muted">（${passiveNote}）</span>` : ""}</span>`;
   });
   return `<div class="pending">等待确认：${who.join("")}</div>`;
 }
@@ -832,9 +836,12 @@ async function nodeForm(node) {
       <p class="hint">请在防火墙／云安全组放行其他探测节点访问此端口。探测异常不影响现有转发。</p>
       <label><span>同步模式</span><select name="desired_mode" ${node?.first_seen && node.protocol_version < 2 ? "disabled" : ""}>
         <option value="active" ${node?.desired_mode !== "passive" ? "selected" : ""}>主动（长连接自动同步）</option>
-        <option value="passive" ${node?.desired_mode === "passive" ? "selected" : ""}>被动（仅本机手动同步）</option>
+        <option value="passive" ${node?.desired_mode === "passive" ? "selected" : ""}>被动（默认手动，可选远程唤醒）</option>
       </select></label>
       <p class="hint">${node?.first_seen && node.protocol_version < 2 ? "请先升级 Agent 并同步一次，才能切换模式。" : "切换模式后需在本机运行 sudo ictl --sync 确认；被动转主动也需要本机操作。"}</p>
+      <label><span>被动节点远程唤醒</span><select name="wake_enabled"><option value="0" ${!node?.wake_enabled ? 'selected' : ''}>关闭（默认）</option><option value="1" ${node?.wake_enabled ? 'selected' : ''}>开启：配置变化时自动唤醒</option></select></label>
+      <label><span>唤醒 UDP 端口（与节点本地一致，0 为未设置）</span><input name="wake_port" type="number" min="0" max="65535" value="${node?.wake_port ?? 0}" required></label>
+      <p class="hint">先在节点运行 sudo ictl，设置 Server 出口 IP 白名单及监听端口。面板开关不会开启节点监听。30 秒未收到成功回执时提示手动同步；程序升级和模式切换仍需本机操作。</p>
       ${node ? `<p class="hint">修改入站地址会重新生成密钥。</p>` : ""}
       <div class="form-error"></div>
       <div class="form-actions">
@@ -969,12 +976,12 @@ const FORMS = {
   async node(form, data) {
     const id = form.dataset.id;
     if (!id) {
-      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), group_id: groupId(data) });
+      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
       closeModal();
       location.hash = `#/nodes/${r.id}`;
       return;
     }
-    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), group_id: groupId(data) });
+    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
     closeModal();
     if (r.key) {
       const ups = r.upstream.length ? `<p>以下节点需要同步规则：${r.upstream.map(esc).join("、")}</p>` : "";
@@ -1428,7 +1435,7 @@ function targetForm(t, imported = false) {
     ${groupSelect(list.data.groups, t?.group_id)}
     ${imported ? `<label><span>分享链接</span><textarea name="uri" rows="5" maxlength="8192" class="mono" placeholder="ss://… 或 vless://…?security=reality…" required>${esc(t?.uri)}</textarea></label><p class="hint">支持 SS、SS2022 和 VLESS Reality，地址需为 IPv4 或域名。</p>` :
       `<label><span>IPv4 或域名</span><input name="host" value="${esc(t?.host)}" required></label><label><span>端口</span><input name="port" type="number" min="1" max="65535" value="${t?.port || ""}" required></label>`}
-    ${t?.configs.length ? `<p class="t-yellow">修改会影响 ${t.configs.length} 个引用配置；被动节点需要手动同步地址变更。</p>` : ""}
+    ${t?.configs.length ? `<p class="t-yellow">修改会影响 ${t.configs.length} 个引用配置；未启用远程唤醒或唤醒失败的被动节点需要手动同步。</p>` : ""}
     <div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
 }
 

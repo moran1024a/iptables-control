@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-VERSION=3.2-rc.1
+VERSION=3.2-rc.2
 SELF_PATH="$(readlink -f -- "$0")"
 
 error() { printf '错误：%s\n' "$*" >&2; }
@@ -81,6 +81,7 @@ BACKUPS = Path('/root/iptables-backup')
 PERSIST = CONF.parent / 'rules.v4'
 LEGACY_PERSIST = Path('/etc/iptables/rules.v4')
 AGENT_CONF = Path('/var/lib/ictl/config')
+WAKE_CONF = Path('/etc/ictl/wake.conf')
 AGENT_LOCK = Path('/run/ictl.lock')
 SYSCTL = Path('/etc/sysctl.d/99-ipt-forward-manager.conf')
 IP_FORWARD = Path('/proc/sys/net/ipv4/ip_forward')
@@ -544,13 +545,20 @@ def check_conflicts(check_rows, all_rows, snap, owned):
                               f'{rule["table"]}/{rule["chain"]} ' + shlex.join(rule['spec']))
 
 def agent_ports():
-    if not AGENT_CONF.exists() and not AGENT_CONF.is_symlink():
-        return set()
     try:
+        result = set()
+        if WAKE_CONF.exists() or WAKE_CONF.is_symlink():
+            wake = dict(line.split('=', 1) for line in WAKE_CONF.read_text().splitlines() if line)
+            if wake.get('ENABLED') == '1':
+                port = wake.get('PORT', '')
+                if not port.isdigit() or not 1 <= int(port) <= 65535:
+                    raise ValueError('远程唤醒端口无效')
+                result.add(('udp', str(int(port))))
+        if not AGENT_CONF.exists() and not AGENT_CONF.is_symlink():
+            return result
         lines = AGENT_CONF.read_text().splitlines()
         if not lines or not re.fullmatch(r'v=[0-9a-f]{1,64}', lines[0]):
             raise ValueError('版本头无效')
-        result = set()
         for line in lines[1:]:
             if not line.strip():
                 continue
@@ -850,7 +858,7 @@ def dispatch(args, script):
         output = '# 入站端口 目标IP或域名 目标端口 协议 备注\n'
         output += ''.join(' '.join(row[k] for k in ('incoming', 'host', 'target', 'proto', 'comment')) + '\n' for row in old_rows)
         destination = Path(args[1]).resolve()
-        if (destination in {CONF.resolve(), PERSIST.resolve(), LEGACY_PERSIST.resolve(), AGENT_CONF.resolve(),
+        if (destination in {CONF.resolve(), PERSIST.resolve(), LEGACY_PERSIST.resolve(), AGENT_CONF.resolve(), WAKE_CONF.resolve(),
                             SYSCTL.resolve(), Path(script).resolve(), Path('/usr/local/bin/ictl'),
                             UNIT_DIR / 'ictl-agent.service'}
                 or Path('/var/lib/ictl') in destination.parents or Path('/etc/ictl') in destination.parents):

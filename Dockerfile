@@ -6,6 +6,10 @@ COPY agent/active/*.go ./
 RUN mkdir /out && for arch in amd64 arm64; do \
     CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags='-s -w' -o /out/ictl-active-linux-$arch .; \
     done
+COPY agent/wake /wake
+RUN cd /wake && for arch in amd64 arm64; do \
+    CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags='-s -w' -o /out/ictl-wake-linux-$arch .; \
+    done
 
 FROM python:3.12-alpine
 
@@ -20,7 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server/*.py server/components.json ./
 COPY server/web ./web
 COPY agent/ictl.sh ./agent/ictl.sh
-COPY agent/passive.sh agent/manage.sh agent/control.sh ./agent/
+COPY agent/passive.sh agent/manage.sh agent/control.sh agent/wake.sh ./agent/
 COPY --from=agent-build /out/ ./assets/
 
 ENV ICTL_DB=/data/ictl.db \

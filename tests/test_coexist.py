@@ -26,7 +26,7 @@ class CoexistTests(AgentHarness,unittest.TestCase):
         paths={'CONF':self.root/'managed','BACKUPS':self.root/'backups','PERSIST':self.root/'ipt-rules.v4',
                'LEGACY_PERSIST':self.root/'system-rules.v4','SYSCTL':self.root/'sysctl',
                'IP_FORWARD':self.root/'ip_forward','LOCK':self.root/'ipt.lock','AGENT_LOCK':self.root/'lock',
-               'AGENT_CONF':self.lib/'config','LOG':self.root/'ipt.log','UNIT_DIR':self.root/'units'}
+               'AGENT_CONF':self.lib/'config','WAKE_CONF':self.conf/'wake.conf','LOG':self.root/'ipt.log','UNIT_DIR':self.root/'units'}
         for name,value in paths.items():setattr(self.ipt,name,value)
         self.ipt.IP_FORWARD.write_text('1\n')
         self.ipt.scheduler=lambda *args:None
@@ -66,6 +66,12 @@ class CoexistTests(AgentHarness,unittest.TestCase):
         (self.lib/'config').write_text('v=abc\n1 both 10001 192.0.2.1 443\n')
         with self.assertRaisesRegex(self.ipt.Failure,'Agent 保存的配置'):self.add()
         self.assertFalse(self.ipt.CONF.exists());self.assertFalse((self.root/'kernel.json').exists())
+
+    def test_wake_port_remains_reserved_without_a_listening_process(self):
+        self.ipt.WAKE_CONF.write_text('ENABLED=1\nPORT=10001\nALLOW=192.0.2.2\n')
+        with self.assertRaisesRegex(self.ipt.Failure, '端口冲突'):
+            self.add(proto='udp')
+        self.add(proto='tcp')
 
     def test_agent_conflict_with_standalone_saved_configuration(self):
         self.ipt.CONF.write_text('# ipt-forward-manager v3\n'+'a'*32+' 10001 example.com 443 udp single 192.0.2.5\n')
