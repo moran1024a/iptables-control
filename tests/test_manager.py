@@ -123,3 +123,35 @@ fetch_component() { if [ "$1" = manage.sh ]; then cp "$CASE_ROOT/manager" "$3"; 
         r=self.run_manager('UPDATE_ONLY=1 perform_sync')
         self.assertNotEqual(r.returncode,0);self.assertIn('更新不能转换',r.stderr)
         self.assertFalse((self.root/'tools.log').exists())
+
+    def test_failed_active_retry_repairs_before_replacing_journal_and_backup(self):
+        (self.root/'mode').write_text('active')
+        work=self.root/'lib/switch-work';work.mkdir()
+        journal='OP='+'a'*32+'\nTARGET=active\nGEN=7\nHASH=e3b0c44298fc\nNEW_VERSION=0.4.0\nPHASE=failed\nFROM=none\n'
+        (work/'transaction').write_text(journal)
+        (work/'backup.tar').write_bytes(b'old backup')
+        target=self.root/'target'
+        target.write_text(target.read_text().replace(' --version)', ''' --recover-empty-table)
+  grep -qx 'PHASE=failed' "$CASE_ROOT/lib/switch-work/transaction" || exit 2
+  [ "$(cat "$CASE_ROOT/lib/switch-work/backup.tar")" = 'old backup' ] || exit 3
+  [ ! -e "$CASE_ROOT/fail-recover" ] || exit 4 ;;
+ --version)'''))
+        (self.root/'fail-recover').touch()
+        r=self.run_manager();self.assertNotEqual(r.returncode,0)
+        self.assertEqual((work/'transaction').read_text(),journal)
+        self.assertEqual((work/'backup.tar').read_bytes(),b'old backup')
+        self.assertFalse((self.root/'tools.log').exists())
+        (self.root/'fail-recover').unlink()
+        r=self.run_manager();self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertFalse((work/'transaction').exists())
+        self.assertTrue((self.root/'lib/active/enabled').exists())
+
+    def test_backup_includes_installation_identity(self):
+        import tarfile
+        self.existing()
+        identity=self.root/'lib/installation-id';identity.write_text('a'*32)
+        (self.root/'mode').write_text('active')
+        r=self.run_manager();self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        with tarfile.open(self.root/'lib/rollback/previous.tar') as archive:
+            saved=archive.extractfile(str(identity).lstrip('/')).read().decode()
+        self.assertEqual(saved,'a'*32)

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 
 assert os.environ.get('ICTL_KERNEL_TEST') == '1' and os.geteuid() == 0
 assert os.readlink('/proc/self/ns/net') != os.readlink('/proc/1/ns/net'), 'refusing host network'
@@ -111,6 +112,31 @@ s.close()
         assert 30123 in json.loads(agent('--held-ports')), 'old UDP flows lost reservation'
         agent('--clear')
         assert '30124' in run('nft','list','table','ip','unrelated')
-        print('PASS: TCP/UDP forwarding, exact UDP byte counters, restart/update continuity, native conflict and scoped cleanup')
+        # Feed the passive/wake checker actual iptables-nft output produced by
+        # the standalone backend, including its ct status dnat ACCEPT rules.
+        repo=Path(__file__).resolve().parents[1]
+        standalone=types.ModuleType('standalone')
+        source=(repo/'ipt.sh').read_text().split("<<'IPT_PYTHON'\n",1)[1].split('\nIPT_PYTHON',1)[0]
+        exec(compile(source,'ipt.sh:backend','exec'),standalone.__dict__)
+        row=dict(id='a'*32,incoming='10001',host='198.51.100.2',ip='198.51.100.2',target='443',proto='udp',comment='coexist')
+        for rule in standalone.make_rules([row]):
+            run('iptables','-w','-t',rule['table'],'-A',rule['chain'],*rule['spec'])
+        listing=run('nft','-n','list','ruleset')
+        assert 'ct status dnat' in listing, listing
+        check='''source "$1"
+LIB="$2"; CONF_DIR="$2"; IPT_CONFIG="$2/standalone.conf"
+ERRS=(); ICTL_WAKE_CHECK=1
+check_port_conflicts "$3" || { printf '%s\\n' "${ERRS[@]}" >&2; exit 1; }
+'''
+        def wake_check(port):
+            return run('bash','-c',check,'test',str(repo/'agent/passive.sh'),str(root),
+                       f'v=check\n1 udp {port} 127.0.0.1 1\n',env={**os.environ,'ICTL_LIBRARY':'1'})
+        before=run('nft','-j','list','ruleset')
+        for port in (443,61024,62000):wake_check(port)
+        try:wake_check(10001)
+        except subprocess.CalledProcessError as exc:assert '端口冲突' in exc.stderr, exc.stderr
+        else:raise AssertionError('standalone DNAT port accepted as a wake port')
+        assert run('nft','-j','list','ruleset')==before, 'port checks changed firewall rules'
+        print('PASS: TCP/UDP forwarding, exact counters, update continuity, native conflicts, scoped cleanup and passive wake checks with real ipt.sh rules')
 finally:
     echo.terminate();echo.wait(timeout=5)

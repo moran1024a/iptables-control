@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.4.0"
+VERSION="0.4.2"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -137,6 +137,7 @@ rollback() {
 }
 perform_sync() {
   local wanted="${1:-}" artifact digest manager_digest helper_digest old_kind item
+  local failed_active=0
   mkdir -p "$WORK" "$PKG"
   if [ -f "$WORK/transaction" ]; then
     [ "${UPDATE_ONLY:-0}" != 1 ] || { die '存在未完成的同步，请使用 --sync 确认后再更新'; return 1; }
@@ -155,6 +156,7 @@ perform_sync() {
         # A newer server snapshot needs another explicit local application below.
         rm -f "$WORK/transaction" ;;
       handover) die '检测到交接中断；执行 sudo ictl --recover 恢复旧规则后重试'; return 1 ;;
+      failed) [ "$TARGET" != active ] || failed_active=1 ;;
     esac
   fi
   OP='' NEW_VERSION=''
@@ -181,6 +183,9 @@ perform_sync() {
   if [ "$TARGET" = active ]; then
     [ "$("$WORK/target" --version)" = "$NEW_VERSION" ] || { die '主动组件版本不匹配'; return 1; }
     for item in nft ss conntrack; do command -v "$item" >/dev/null || { die "缺少依赖：$item"; return 1; }; done
+    # Inspect the old failure journal before replacing it or its backup. Only
+    # the new binary knows how to recover pre-1.0.8 empty, unmarked tables.
+    if [ "$failed_active" = 1 ]; then "$WORK/target" --recover-empty-table || return 1; fi
     if [ "$FROM" != active ] && command -v iptables >/dev/null && iptables -S FORWARD | grep -qx -- '-P FORWARD DROP'; then
       printf '提示：当前 FORWARD 默认拒绝，请确认已单独放行本节点的转发范围；安装器不会修改该策略。\n' >&2
     fi
@@ -196,7 +201,7 @@ perform_sync() {
   exec 9>/run/ictl.lock
   flock -w 60 9 || { die '等待规则锁超时'; return 1; }
   local files=()
-  for item in /etc/ictl /usr/local/bin/ictl "$PKG" "$UNIT" /etc/systemd/system/ictl-wake.service "$LIB/config" "$LIB/applied" "$LIB/resolved" "$LIB/state" "$LIB/mode" "$LIB/agent-kind" "$LIB/active"; do
+  for item in /etc/ictl /usr/local/bin/ictl "$PKG" "$UNIT" /etc/systemd/system/ictl-wake.service "$LIB/config" "$LIB/applied" "$LIB/resolved" "$LIB/state" "$LIB/mode" "$LIB/agent-kind" "$LIB/installation-id" "$LIB/active"; do
     [ ! -e "$item" ] || files+=("${item#/}")
   done
   if [ "$FROM" = active ]; then

@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const version = "0.4.0"
+const version = "0.4.2"
 const tableName = "ictl_active"
 
 type M = map[string]any
@@ -207,13 +207,18 @@ func loadAgent(root, conf string) (*Agent, error) {
 	if e = readJSON(a.path("active/traffic.json"), &a.usage); e != nil && !os.IsNotExist(e) {
 		return nil, e
 	}
-	id, _ := os.ReadFile(a.path("installation-id"))
+	id, e := os.ReadFile(a.path("installation-id"))
+	if e != nil && !os.IsNotExist(e) {
+		return nil, e
+	}
 	a.installation = strings.TrimSpace(string(id))
-	if a.installation == "" {
+	if os.IsNotExist(e) {
 		a.installation = randomID()
 		if e = atomicBytes(a.path("installation-id"), []byte(a.installation), 0600); e != nil {
 			return nil, e
 		}
+	} else if raw, err := hex.DecodeString(a.installation); err != nil || len(raw) != 16 {
+		return nil, errors.New("本地 installation-id 损坏，请保留安装状态并恢复原文件")
 	}
 	boot, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	a.boot = strings.TrimSpace(string(boot))

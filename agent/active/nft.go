@@ -35,6 +35,14 @@ func connMatch(r Rule, p string) []any {
 }
 
 func (a *Agent) nftState() (M, bool, error) {
+	d, exists, err := readNFTState()
+	if err == nil && exists {
+		err = a.checkNFTOwner(d)
+	}
+	return d, exists, err
+}
+
+func readNFTState() (M, bool, error) {
 	b, e := run(nil, "nft", "-j", "list", "tables")
 	if e != nil {
 		return nil, false, e
@@ -62,15 +70,118 @@ func (a *Agent) nftState() (M, bool, error) {
 	if e != nil {
 		return nil, false, e
 	}
+	return d, true, nil
+}
+
+// Empty, unhooked chains work on nft 1.0.x, whose JSON frontend does not
+// preserve table comments until 1.0.8. Keep accepting comments from old agents.
+func (a *Agent) ownerChain() string { return "owner_" + a.installation }
+
+func (a *Agent) checkNFTOwner(d M) error {
+	owned := false
 	for _, x := range array(d["nftables"]) {
 		m, _ := x.(map[string]any)
 		if t, ok := m["table"].(map[string]any); ok && t["name"] == tableName {
-			if t["comment"] != "ictl:"+a.installation {
-				return nil, false, errors.New("同名 nft 表不属于本节点安装")
+			if comment, _ := t["comment"].(string); comment != "" {
+				if comment != "ictl:"+a.installation {
+					return errors.New("同名 nft 表不属于本节点安装")
+				}
+				owned = true
+			}
+		}
+		if ch, ok := m["chain"].(map[string]any); ok {
+			if name, _ := ch["name"].(string); strings.HasPrefix(name, "owner_") {
+				if name != a.ownerChain() || ch["hook"] != nil {
+					return errors.New("同名 nft 表不属于本节点安装")
+				}
+				owned = true
 			}
 		}
 	}
-	return d, true, nil
+	if !owned {
+		return errors.New("同名 nft 表缺少本节点归属标记；请保留失败事务并重新运行新版安装器")
+	}
+	return nil
+}
+
+// Only repair the empty table left by the pre-1.0.8 JSON comment bug, and only
+// when a failed local installation records that exact empty configuration.
+func (a *Agent) recoverEmptyTable() error {
+	return a.locked(func() error {
+		d, exists, err := readNFTState()
+		if err != nil || !exists {
+			return err
+		}
+		if a.checkNFTOwner(d) == nil {
+			return nil
+		}
+		journal, err := os.ReadFile(a.path("switch-work/transaction"))
+		if err != nil {
+			return err
+		}
+		fields := map[string]string{}
+		for _, line := range strings.Split(string(journal), "\n") {
+			k, v, ok := strings.Cut(line, "=")
+			if ok {
+				fields[k] = v
+			}
+		}
+		if fields["PHASE"] != "failed" || fields["TARGET"] != "active" || fields["HASH"] != "e3b0c44298fc" ||
+			(fields["FROM"] != "none" && fields["FROM"] != "legacy" && fields["FROM"] != "passive") || !emptyLegacyTable(d) {
+			return errors.New("无法自动恢复：同名 nft 表不是已确认的空配置安装残留，请保留现场")
+		}
+		// Old JSON output hides even comments written through the text frontend.
+		// Do not claim an explicitly labelled table belonging to another tool.
+		text, err := run(nil, "nft", "-n", "list", "table", "ip", tableName)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(text), "comment ") {
+			return errors.New("无法自动恢复：同名 nft 表已有注释标记，请保留现场")
+		}
+		// Claim it atomically instead of deleting it. The normal apply or rollback
+		// can now handle it using the same ownership checks as every other table.
+		return executeNFT(M{"nftables": []any{op("add", "chain", M{"family": "ip", "table": tableName, "name": a.ownerChain()})}}, false)
+	})
+}
+
+func emptyLegacyTable(d M) bool {
+	want := map[string]struct {
+		kind, hook string
+		priority   int64
+	}{"pre": {"nat", "prerouting", -105}, "post": {"nat", "postrouting", 105}, "forward": {"filter", "forward", 10}}
+	tables := 0
+	for _, x := range array(d["nftables"]) {
+		m, ok := x.(map[string]any)
+		if !ok || len(m) != 1 {
+			return false
+		}
+		for kind, raw := range m {
+			v, ok := raw.(map[string]any)
+			if !ok {
+				return false
+			}
+			switch kind {
+			case "metainfo":
+			case "table":
+				if v["family"] != "ip" || v["name"] != tableName || v["comment"] != nil || v["flags"] != nil {
+					return false
+				}
+				tables++
+			case "chain":
+				name, _ := v["name"].(string)
+				ch, ok := want[name]
+				if !ok || v["family"] != "ip" || v["table"] != tableName || v["type"] != ch.kind ||
+					v["hook"] != ch.hook || fmt.Sprint(v["prio"]) != fmt.Sprint(ch.priority) || v["policy"] != "accept" || v["comment"] != nil {
+					return false
+				}
+				delete(want, name)
+			default:
+				return false // Rules, counters, sets and other objects are not empty.
+			}
+		}
+	}
+	return tables == 1 && len(want) == 0
 }
 func array(v any) []any { a, _ := v.([]any); return a }
 func (a *Agent) transaction(c Config, current M, exists bool) M {
@@ -88,6 +199,9 @@ func (a *Agent) transaction(c Config, current M, exists bool) M {
 	}
 	if !exists {
 		commands = append(commands, op("add", "table", M{"family": "ip", "name": tableName, "comment": "ictl:" + a.installation}))
+	}
+	if !chains[a.ownerChain()] {
+		commands = append(commands, op("add", "chain", M{"family": "ip", "table": tableName, "name": a.ownerChain()}))
 	}
 	for _, ch := range []struct {
 		name, kind, hook string

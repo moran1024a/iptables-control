@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.4.0"
+VERSION="0.4.2"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/lib/ictl/passive.sh"
@@ -270,30 +270,68 @@ check_peer_ports() {
   done <<< "$content"
 }
 
-# Native nft rules are checked read-only; complex overlapping expressions need manual review.
+# Inspect ingress translation actions, not conntrack status matches such as
+# "ct status dnat" in ipt.sh FORWARD accept rules. No Python dependency here.
 check_native_ports() {
   command -v nft >/dev/null 2>&1 || return 0
   local listing key proto port result
-  listing="$(nft list ruleset 2>/dev/null)" || { echo '端口检查失败：无法读取原生 nftables'; return 1; }
+  listing="$(nft -n list ruleset 2>/dev/null)" || { echo '端口检查失败：无法读取原生 nftables'; return 1; }
   for key in "${!requested[@]}"; do
     proto="${key%:*}" port="${key#*:}"
     result="$(awk -v p="$proto" -v port="$port" '
-      /^[ \t]*table / { family=$2; table=$3 }
-      /^[ \t]*chain / { chain=$2 }
-      { line=$0; gsub(/"([^"\\]|\\.)*"/,"",line) }
-      family!="ip" && family!="inet" { next }
-      chain ~ /^ICTL-(PRE|POST|FWD)$/ { next }
-      line ~ /(^|[ \t])vmap([ \t;]|$)/ { print "端口冲突：动态 nft 映射需人工确认 "; exit }
-      line ~ /(^|[ \t])(dnat|redirect|tproxy)([ \t;]|$)/ {
-        if (line ~ /tcp dport/ && p!="tcp") next
-        if (line ~ /udp dport/ && p!="udp") next
-        n=split(line,a,/[ \t]+/); decided=0; hit=0
-        for(i=1;i<n;i++) if(a[i]=="dport" && a[i+1] ~ /^[0-9]+(-[0-9]+)?$/) {
-          m=split(a[i+1],r,"-"); decided=1; hit=(port>=r[1] && port<=(m==1?r[1]:r[2]))
+      function possible(line,    n,a,i,m,r,hit) {
+        if (line ~ /tcp dport/ && p!="tcp") return 0
+        if (line ~ /udp dport/ && p!="udp") return 0
+        n=split(line,a,/[ \t]+/)
+        for(i=1;i<n;i++) {
+          if ((a[i]=="l4proto" || (a[i]=="protocol" && a[i-1]=="ip")) && a[i+1] ~ /^(tcp|udp|6|17)$/) {
+            if (a[i+1]!=p && a[i+1]!=(p=="tcp"?"6":"17")) return 0
+          }
+          if(a[i]=="dport" && a[i+1] ~ /^[0-9]+(-[0-9]+)?$/) {
+            m=split(a[i+1],r,"-"); hit=(port>=r[1] && port<=(m==1?r[1]:r[2]))
+            if (!hit) return 0
+          }
         }
-        if (!decided || hit) { print "端口冲突：" p " " port " 与原生 nft " table "/" chain " 规则可能重叠"; exit }
+        return 1
       }
-    ' <<< "$listing")"
+      function visit(k,    i,line,n,a,j,target) {
+        if (visited[k] || own[k]) return 0
+        visited[k]=1
+        for(i=1;i<=count[k];i++) {
+          line=rules[k,i]
+          if (!possible(line)) continue
+          if (line ~ /(^|[ \t])(dnat|tproxy)([ \t]+ip6?)?[ \t]+to([ \t]|$)/ ||
+              line ~ /(^|[ \t])(redirect|vmap)([ \t;]|$)/) {
+            print "端口冲突：" p " " port " 与原生 nft " label[k] " 规则可能重叠"; return 1
+          }
+          n=split(line,a,/[ \t]+/)
+          for(j=1;j<=n;j++) if(a[j]=="jump" || a[j]=="goto") {
+            target=a[j+1]; gsub(/[;]$/, "", target)
+            if (!((scope[k] SUBSEP target) in label)) {
+              print "端口检查失败：无法解析 nft " label[k] " 的跳转目标"; return 1
+            }
+            if (visit(scope[k] SUBSEP target)) return 1
+          }
+        }
+        return 0
+      }
+      /^[ \t]*table / { family=$2; table=$3; chain=""; next }
+      family!="ip" && family!="inet" { next }
+      /^[ \t]*chain / {
+        chain=$2; k=family SUBSEP table SUBSEP chain
+        scope[k]=family SUBSEP table; label[k]=table "/" chain
+        own[k]=(chain ~ /^ICTL-(PRE|POST|FWD)$/); next
+      }
+      /^[ \t]*}[ \t]*$/ { chain=""; next }
+      chain!="" {
+        line=$0; gsub(/"([^"\\]|\\.)*"/,"",line)
+        if (line ~ /hook prerouting([ \t;]|$)/) { starts[k]=1; next }
+        rules[k,++count[k]]=line
+      }
+      END {
+        for (k in starts) if (visit(k)) exit
+      }
+    ' <<< "$listing")" || { echo '端口检查失败：无法解析原生 nftables'; return 1; }
     [ -z "$result" ] || { echo "$result"; return 1; }
   done
 }

@@ -310,6 +310,7 @@ func main() {
 	genOnly := flag.Bool("generation-only", false, "print local generation")
 	held := flag.Bool("held-ports", false, "print draining ports")
 	checkpoint := flag.Bool("checkpoint", false, "persist counters")
+	recoverEmpty := flag.Bool("recover-empty-table", false, "repair an empty table from a recorded failed installation")
 	daemon := flag.Bool("daemon", false, "run active agent")
 	status := flag.Bool("status", false, "print local state")
 	flag.Parse()
@@ -325,6 +326,8 @@ func main() {
 		log.Fatal(e)
 	}
 	switch {
+	case *recoverEmpty:
+		e = a.recoverEmptyTable()
 	case *held:
 		e = json.NewEncoder(os.Stdout).Encode(a.heldPorts())
 	case *genOnly:
