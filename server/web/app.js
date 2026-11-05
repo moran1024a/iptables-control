@@ -266,7 +266,13 @@ function refresh() {
   return safe(() => currentView(request));
 }
 
+let renderedHash = location.hash;
 async function route() {
+  if ((modalChanged() || modalState?.busy) && !(await requestCloseModal())) {
+    history.replaceState(null, '', location.pathname + location.search + renderedHash);
+    return;
+  }
+  renderedHash = location.hash;
   leaveView();
   const version = pageVersion;
   closeModal();
@@ -774,18 +780,95 @@ async function settingsPage(request) {
 
 // ------------------------------------------------------------ 弹窗
 
-function openModal(html) {
+let modalState = null;
+const modalValues = () => JSON.stringify([...document.querySelectorAll('#modal form input, #modal form select, #modal form textarea')]
+  .filter(el => !el.hasAttribute('data-ignore-dirty')).map(el => [el.name || el.id, el.type === 'checkbox' ? el.checked : el.value]));
+const modalChanged = () => modalState && (modalState.dirty || modalValues() !== modalState.initial);
+
+function openModal(html, preserve = false) {
   const m = $("#modal");
-  m.innerHTML = `<div class="modal-box">${html}</div>`;
+  if (!preserve || !modalState) {
+    const trigger = document.activeElement;
+    closeModal();
+    modalState = {trigger, dirty:false};
+  }
+  const scroll = preserve ? m.scrollTop : 0;
+  const focused = preserve ? document.activeElement : null;
+  const row = focused?.closest('[data-order]')?.dataset.order, action = focused?.dataset.action;
+  m.innerHTML = `<div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabindex="-1">${html}</div>`;
   m.hidden = false;
-  m.querySelector("input, select")?.focus();
+  const heading = m.querySelector('h2'); if (heading) heading.id = 'modal-title';
+  if (!preserve) modalState.initial = modalValues();
+  const restore = row != null && action ? m.querySelector(`[data-order="${CSS.escape(row)}"] [data-action="${CSS.escape(action)}"]:not(:disabled)`) : null;
+  const first = [...m.querySelectorAll('input:not([data-ignore-dirty]), select:not([hidden]), button:not(:disabled)')].find(el=>el.getClientRects().length);
+  (restore || first || m.querySelector('.modal-box'))?.focus();
+  m.scrollTop = scroll;
 }
 
-function closeModal() {
-  const m = $("#modal");
+function closeModal(result = false) {
+  const m = $("#modal"), state = modalState;
+  modalState = null;
   m.hidden = true;
   m.innerHTML = "";
+  state?.cleanup?.();
+  state?.onClose?.(result);
+  state?.discard?.(false);
+  if (state?.trigger?.isConnected) state.trigger.focus({preventScroll:true});
 }
+
+function requestCloseModal() {
+  if (modalState?.busy) return Promise.resolve(false);
+  if (!modalChanged()) { closeModal(); return Promise.resolve(true); }
+  if (modalState.discardPromise) return modalState.discardPromise;
+  const box = $('#modal .modal-box'), previous = document.activeElement;
+  box.inert = true;
+  $('#modal').insertAdjacentHTML('beforeend', `<div class="discard-shade"><div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="discard-title"><h2 id="discard-title">放弃未保存的修改？</h2><div class="form-actions"><button data-discard="no">继续编辑</button><button class="primary danger-bg" data-discard="yes">放弃修改</button></div></div></div>`);
+  const state = modalState;
+  state.discardPromise = new Promise(resolve => state.discard = resolve);
+  $('#modal [data-discard=no]').focus();
+  $('#modal .discard-shade').addEventListener('click', e => {
+    const action = e.target.closest('[data-discard]')?.dataset.discard;
+    if (!action) return;
+    const resolve = state.discard; state.discard = null; state.discardPromise = null;
+    if (action === 'yes') closeModal();
+    else { $('#modal .discard-shade').remove(); box.inert = false; previous?.focus(); }
+    resolve(action === 'yes');
+  });
+  return state.discardPromise;
+}
+
+function markModalDirty() { if (modalState) modalState.dirty = true; }
+
+// Keep a real select as the form value; searching never changes the selection.
+function resourceSelect(name, items, value = '', placeholder = '请选择', byId = false) {
+  const options = [{id:'',name:placeholder}, ...items];
+  const selected = options.find(x => String(x.id) === String(value ?? '')) || options[0];
+  return `<details class="resource-picker"><summary>${esc(selected.name)}</summary><div class="resource-menu"><input type="search" data-resource-search data-ignore-dirty placeholder="搜索名称或地址" aria-label="搜索资源"><div class="resource-options">${options.map(x => `<button type="button" data-resource-value="${esc(x.id)}" data-search="${esc((x.name+' '+(x.addr||'')).toLowerCase())}" aria-pressed="${String(x.id)===String(selected.id)}">${esc(x.name)}${x.addr?`<small>${esc(x.addr)}</small>`:''}</button>`).join('')}<span class="resource-empty" hidden>没有匹配项</span></div></div><select hidden ${byId?'id':'name'}="${name}">${options.map(x => `<option value="${esc(x.id)}" ${String(x.id)===String(selected.id)?'selected':''}>${esc(x.name)}</option>`).join('')}</select></details>`;
+}
+
+document.addEventListener('input', e => {
+  if (!e.target.hasAttribute('data-resource-search')) return;
+  const menu = e.target.closest('.resource-menu'), q = e.target.value.trim().toLowerCase();
+  let count = 0;
+  menu.querySelectorAll('[data-search]').forEach(el => { el.hidden = !el.dataset.search.includes(q); if(!el.hidden)count++; });
+  const empty = menu.querySelector('.resource-empty'); if(empty)empty.hidden = count > 0;
+});
+document.addEventListener('click', e => {
+  const choice = e.target.closest('[data-resource-value]');
+  if (choice) {
+    const picker = choice.closest('.resource-picker'), select = picker.querySelector('select');
+    select.value = choice.dataset.resourceValue;
+    picker.querySelector('summary').textContent = select.selectedOptions[0].textContent;
+    picker.querySelectorAll('[data-resource-value]').forEach(el => el.setAttribute('aria-pressed', el===choice));
+    select.dispatchEvent(new Event('change', {bubbles:true}));
+    picker.open = false; picker.querySelector('summary').focus();
+  }
+  document.querySelectorAll('.resource-picker[open]').forEach(el => { if(!el.contains(e.target))el.open=false; });
+});
+document.addEventListener('toggle', e => {
+  if(e.target.matches?.('.resource-picker[open]'))e.target.querySelector('input').focus();
+}, true);
+window.addEventListener('beforeunload', e => { if(modalChanged()) {e.preventDefault();e.returnValue='';} });
 
 function confirmBox(title, text, okLabel = "确定", danger = false) {
   return new Promise((resolve) => {
@@ -796,10 +879,10 @@ function confirmBox(title, text, okLabel = "确定", danger = false) {
         <button type="button" data-confirm="0">取消</button>
         <button type="button" class="${danger ? "primary danger-bg" : "primary"}" data-confirm="1">${esc(okLabel)}</button>
       </div>`);
+    modalState.onClose = resolve;
     $("#modal").querySelectorAll("[data-confirm]").forEach((b) =>
       b.addEventListener("click", () => {
-        closeModal();
-        resolve(b.dataset.confirm === "1");
+        closeModal(b.dataset.confirm === "1");
       }));
   });
 }
@@ -931,14 +1014,15 @@ function clearFormErrors(form) {
 
 function showFormError(form, err) {
   const msg = err.message || String(err);
-  const slot = err.field && form.querySelector(`[data-error="${err.field}"]`);
-  const input = err.field && form.querySelector(`[name="${err.field}"]`);
+  const slot = err.field && form.querySelector(`[data-error="${CSS.escape(err.field)}"]`);
+  const field = err.field === 'target_id' && !form.elements.target_id ? 'target' : err.field?.startsWith('capacity:') ? 'port' : err.field;
+  const input = field && form.querySelector(`[name="${CSS.escape(field)}"], #${CSS.escape(field)}`);
   if (slot) {
     slot.textContent = msg;
   } else if (input) {
     input.classList.add("invalid");
-    input.insertAdjacentHTML("afterend", `<div class="field-error">${esc(msg)}</div>`);
-    input.focus();
+    (input.closest('.resource-picker') || input).insertAdjacentHTML("afterend", `<div class="field-error">${esc(msg)}</div>`);
+    (input.closest('.resource-picker')?.querySelector('summary') || input).focus();
   } else {
     const fe = $(".form-error", form);
     if (fe) fe.textContent = msg;
@@ -1023,6 +1107,10 @@ document.addEventListener("submit", async (e) => {
   const handler = FORMS[form.dataset.form];
   if (!handler) return;
   e.preventDefault();
+  if (form.dataset.busy) return;
+  form.dataset.busy = '1';
+  const session = form.closest('#modal') ? modalState : null;
+  if (session) session.busy = true;
   clearFormErrors(form);
   const button = form.querySelector("button.primary");
   if (button) button.disabled = true;
@@ -1033,6 +1121,8 @@ document.addEventListener("submit", async (e) => {
     if (err instanceof ApiError && err.status === 403 && err.data.must_change) return;
     showFormError(form, err);
   } finally {
+    delete form.dataset.busy;
+    if (session) session.busy = false;
     if (button && button.isConnected) button.disabled = false;
   }
 });
@@ -1043,7 +1133,7 @@ const chainById = (id) => list.data.chains.find((c) => c.id === Number(id));
 
 const ACTIONS = {
   copy: (el) => copy(el.dataset.text),
-  "modal-close": () => closeModal(),
+  "modal-close": () => requestCloseModal(),
 
   async logout() {
     await safe(() => api("POST", "logout"));
@@ -1186,7 +1276,7 @@ const ACTIONS = {
 };
 
 document.addEventListener("click", (e) => {
-  if (e.target.id === "modal") return closeModal();
+  if (e.target.id === "modal") return void requestCloseModal();
   if (e.target.closest(".drag-handle")) return;   // 拖动分组标题时不触发折叠
   const el = e.target.closest("[data-action]");
   if (!el || !ACTIONS[el.dataset.action]) return;
@@ -1195,7 +1285,24 @@ document.addEventListener("click", (e) => {
 });
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("#modal").hidden) closeModal();
+  if ($("#modal").hidden) return;
+  if (e.target.matches?.('[data-resource-search]') && e.key === 'Enter') {e.preventDefault();return;}
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    const discard = $('#modal [data-discard=no]');
+    const picker = $('#modal .resource-picker[open]');
+    if (discard) discard.click();
+    else if (picker) { picker.open = false; picker.querySelector('summary').focus(); }
+    else void requestCloseModal();
+  }
+  if (e.key === 'Tab') {
+    const box = [...document.querySelectorAll('#modal .modal-box')].at(-1);
+    const items = [...box.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea, a[href], summary, [tabindex="0"]')].filter(el => el.getClientRects().length);
+    const first=items[0], last=items.at(-1);
+    if (!first) {e.preventDefault();box.focus();}
+    else if (e.shiftKey && (document.activeElement===first || !items.includes(document.activeElement))) {e.preventDefault();last.focus();}
+    else if (!e.shiftKey && (document.activeElement===last || !items.includes(document.activeElement))) {e.preventDefault();first.focus();}
+  }
 });
 
 // ------------------------------------------------------------ 拖动排序
@@ -1219,8 +1326,9 @@ document.addEventListener("pointermove", (e) => {
   const { card } = drag;
   const parent = card.parentNode;
   const y = e.clientY;
-  if (y < 60) scrollBy(0, -12);
-  else if (y > innerHeight - 60) scrollBy(0, 12);
+  const scroller = card.closest('#modal');
+  if (y < 60) scroller ? scroller.scrollBy(0,-12) : scrollBy(0,-12);
+  else if (y > innerHeight - 60) scroller ? scroller.scrollBy(0,12) : scrollBy(0,12);
 
   const others = [...parent.children].filter((c) => c !== card && c.classList.contains("sort-item"));
   const before = others.find((c) => {
@@ -1248,7 +1356,9 @@ function endDrag() {
   if (!drag) return;
   drag.card.style.transform = "";
   drag.card.classList.remove("dragging");
+  const parent = drag.card.parentElement;
   drag = null;
+  parent.dispatchEvent(new Event('reordered', {bubbles:true}));
 }
 document.addEventListener("pointerup", endDrag);
 document.addEventListener("pointercancel", endDrag);

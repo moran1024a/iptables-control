@@ -613,7 +613,7 @@ body.auth-page {
 .mode-tag.passive { color:var(--muted); }
 .member-list { margin: 12px 0; }
 .member-row { display:flex; align-items:center; gap:6px; padding:8px 0; border-bottom:1px solid var(--border); flex-wrap:wrap; }
-.member-row > span:first-child { flex:1; min-width:120px; }
+.member-row > .member-label { flex:1; min-width:0; }
 .inline-fields { display:flex; align-items:end; gap:10px; margin:12px 0; }
 .inline-fields > label,.inline-fields > select { flex:1; min-width:0; }
 /* The topology uses one shared coordinate system for cards and SVG connections. */
@@ -678,3 +678,83 @@ main:has(.topology) { max-width:1320px; }
 .table-scroll td small { display:block; max-width:260px; }
 .link-card { display:block; }
 @media(max-width:600px) { .node-card .card-head { gap:8px; } .node-card .meta { font-size:11px; flex-wrap:wrap; } .member-row { gap:4px; } .inline-fields { flex-wrap:wrap; } }
+
+/* Compact resource lists and common editors. */
+.collection-tools { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+.collection-tools input { flex:1; max-width:420px; min-width:0; }
+.collection-tools select { width:auto; max-width:160px; }
+.collection-tools .count { margin-left:auto; white-space:nowrap; }
+.collection { border:1px solid var(--border); border-radius:var(--radius); background:var(--card); overflow:hidden; }
+.collection-row { display:flex; align-items:center; gap:16px; padding:13px 18px; border-bottom:1px solid var(--border); color:var(--text); }
+.collection-row:last-child { border-bottom:0; }
+a.collection-row:hover { text-decoration:none; background:var(--code); }
+.collection-main { flex:1; min-width:0; }
+.collection-main .title,.plain-title { font-size:14px; font-weight:600; overflow-wrap:anywhere; }
+.collection-main .sub { font-size:12px; margin-top:5px; overflow-wrap:anywhere; }
+.plain-title { display:inline; border:0; background:none; padding:0; color:var(--text); text-align:left; }
+.plain-title:hover { background:none; color:var(--primary); }
+.collection-meta { font-size:12px; white-space:nowrap; }
+.row-actions { display:flex; align-items:center; gap:6px; }
+.row-error { font-size:12px; color:var(--red); margin-top:6px; overflow-wrap:anywhere; }
+.member-tags { display:flex; flex-wrap:wrap; gap:4px; margin-top:7px; }
+.member-tags > span { font-size:11px; padding:2px 7px; border-radius:4px; background:var(--code); color:var(--muted); }
+.member-row .member-label { flex:1; min-width:100px; overflow-wrap:anywhere; }
+.member-row .drag-handle { flex:none; width:22px; min-width:22px; padding:4px 0; font-size:19px; color:var(--muted); }
+.member-row.sort-item { transition:transform .15s; background:var(--card); }
+.member-row.dragging { position:relative; z-index:4; box-shadow:var(--shadow); }
+.member-picker,.resource-picker { position:relative; padding:0; margin:0; box-shadow:none; border:1px solid var(--border); border-radius:8px; font-weight:normal; }
+.resource-picker { min-width:0; background:var(--card); }
+.resource-picker > summary,.member-picker > summary { padding:9px 11px; font-size:13px; font-weight:normal; overflow-wrap:anywhere; }
+.resource-picker > summary { min-height:38px; }
+.resource-picker:has(.invalid) { border-color:var(--red); }
+.resource-picker .resource-menu { position:absolute; top:calc(100% + 4px); left:0; right:0; z-index:10; min-width:210px; box-shadow:0 8px 24px #0002; }
+.resource-menu { padding:10px; border:1px solid var(--border); border-radius:8px; background:var(--card); }
+.resource-menu input[type=search] { margin-bottom:7px; width:100%; }
+.resource-options,.member-options { max-height:220px; overflow-y:auto; overscroll-behavior:contain; }
+.resource-options > button { display:flex; flex-direction:column; width:100%; padding:8px; text-align:left; border:0; border-radius:5px; white-space:normal; background:transparent; }
+.resource-options > button[aria-pressed=true] { background:var(--primary-soft); color:var(--primary); }
+.resource-options > button:hover { background:var(--code); }
+.resource-options small,.member-options small { display:block; font-size:11px; color:var(--muted); margin-top:3px; }
+.resource-empty { display:block; padding:12px 4px; color:var(--muted); font-size:12px; }
+.member-options > label { display:flex; align-items:center; gap:9px; padding:8px; margin:0; cursor:pointer; }
+.member-options > label:hover { background:var(--code); border-radius:6px; }
+.member-options input { flex:none; width:16px; }
+.member-options > label > span { font-size:13px; }
+.member-picker > .resource-menu { border:0; border-top:1px solid var(--border); border-radius:0 0 8px 8px; }
+.inline-fields > .resource-picker { flex:1; }
+.resource-menu [hidden] { display:none; }
+.discard-shade { position:fixed; inset:0; z-index:2; display:flex; justify-content:center; align-items:flex-start; padding:20vh 16px 16px; background:#0006; }
+
+/* Focus the current route without losing the canvas camera. */
+.topology-canvas.has-highlight path[data-from]:not(.is-focused) { opacity:.07; }
+.topology-hit { stroke:transparent; stroke-width:14; pointer-events:stroke; cursor:pointer; vector-effect:non-scaling-stroke; }
+.topology-hit:hover,.topology-hit:focus-visible { stroke:var(--blue); stroke-width:3; opacity:.8; outline:none; }
+.topology-tools { flex-wrap:wrap; }
+body.canvas-fullscreen { overflow:hidden; }
+.topology-panel.is-fullscreen { position:fixed; inset:12px; z-index:70; display:flex; flex-direction:column; margin:0; padding:18px; }
+.topology-panel.is-fullscreen .topology { flex:1; min-height:0; height:auto; }
+.topology-panel.is-fullscreen .topology-toolbar { flex:none; }
+.sync-feedback { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:14px; font-size:12px; }
+.sync-feedback p { width:100%; margin:0; }
+.sync-nodes { display:flex; flex-wrap:wrap; gap:8px; }
+.sync-nodes a { border:1px solid var(--border); padding:4px 8px; border-radius:5px; }
+.sync-nodes span { color:var(--muted); margin-left:6px; }
+.manual-sync { display:flex; flex-wrap:wrap; align-items:center; gap:5px; }
+.quality-dialog { max-width:900px; }
+.edge-quality .quality-heading select { width:auto; margin-left:auto; }
+.edge-stats { display:flex; gap:12px; }
+.edge-stats > div { display:flex; flex:1; flex-wrap:wrap; gap:7px 14px; border:1px solid var(--border); border-radius:8px; padding:12px; font-size:12px; }
+.edge-stats strong { width:100%; }
+.edge-stats small { width:100%; color:var(--muted); }
+@media(max-width:600px) {
+  .collection-row { flex-wrap:wrap; gap:9px; padding:12px; }
+  .collection-main { flex-basis:65%; }
+  .collection-meta { margin-right:auto; }
+  .collection-tools { gap:6px; }
+  .collection-tools select { max-width:112px; }
+  .collection-tools .count { font-size:11px; }
+  .modal-box { padding:18px 16px; }
+  .topology-panel.is-fullscreen { inset:0; border-radius:0; padding:12px; }
+  .edge-stats { flex-direction:column; }
+  .resource-picker .resource-menu { min-width:0; }
+}

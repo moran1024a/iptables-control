@@ -63,7 +63,7 @@ def stopped(nodes, pair):
         if n['desired_mode'] != 'active' or n['installed_agent'] == 'passive' or n['manual_required']:
             return 'stopped', '仅已确认的主动节点参与探测'
         if n['installed_agent'] != 'active' or 'network_quality' not in json.loads(n['capabilities']):
-            return 'unsupported', '请将两端主动 Agent 升级到 RC2'
+            return 'unsupported', '请将两端主动 Agent 升级到 0.4.0'
         if not n['quality_port']:
             return 'disabled', '节点已关闭质量探测'
     if pair['protocol'] == 'icmp-echo-v1' and 'network_quality_icmp' not in json.loads(nodes[pair['source']]['capabilities']):

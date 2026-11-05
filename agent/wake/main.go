@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const version = "0.4.0-rc.3"
+const version = "0.4.0"
 const configPath = "/etc/ictl/wake.conf"
 const replayPath = "/var/lib/ictl/wake-replay.json"
 

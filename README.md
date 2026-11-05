@@ -4,7 +4,7 @@
 
 支持多跳链路、SS／SS2022／VLESS Reality 目标、主动与被动同步，以及 Agent 与单机脚本共存。
 
-**当前开发版：0.4.0-rc.5（测试版，未发布）**。支持池模板、可视化链路、手动优先级及节点失联灾备。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，可选择开启认证唤醒。正式版仍为 0.3.1，RC 不更新 `latest`。转发节点无需安装代理核心，目标服务需自行准备。
+**当前正式版：0.4.0**。支持池模板、可视化链路、手动优先级及节点失联灾备。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，可选择开启认证唤醒。转发节点无需安装代理核心，目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -26,14 +26,14 @@
 
 ## 安装
 
-按使用场景选择：管理多台服务器，安装**服务端 + 节点 Agent**；只管理本机转发，安装**单机脚本**即可。以下命令固定使用本次 RC，需对应 Release 发布后才能下载；稳定版请使用 [0.3.1 文档](https://github.com/moran1024a/iptables-control/tree/v0.3.1)。
+按使用场景选择：管理多台服务器，安装**服务端 + 节点 Agent**；只管理本机转发，安装**单机脚本**即可。以下命令固定使用 0.4.0 正式版；旧版用户升级前请先阅读[升级说明](#升级)。
 
 ### 服务端
 
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.5/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -41,7 +41,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.5/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
 新主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口（默认 `8730`），并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址，再接入节点。
@@ -65,7 +65,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.5/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -83,13 +83,13 @@ sudo bash /root/ipt.sh
 
 **从 0.3.x 升级到 0.4.x：只保留节点、目标及其分组，旧链路、转发配置和运行历史全部清空，需要重新创建链路。** 节点密钥、目标连接参数以及登录和接入地址等服务端设置保留。旧 Agent 在下一次成功同步时清理原转发规则；被动节点需要本机手动同步。清理确认前，原端口仍标记为占用，不能分配给新链路。升级前数据库备份为 `ictl.db.pre-0.4.0.bak`。
 
-> 从 0.2.x 或更早版本升级：数据库中的全部隧道节点、受管隧道及其关联配置会被删除。对应远端的旧隧道 Agent、sing-box 和配置文件需自行卸载。外部导入的 SS／VLESS 会转为“目标”，其余有效配置和节点信息保留。详情见 [0.3.0 更新记录](CHANGELOG.md)。
+> 从 0.2.x 或更早版本升级：数据库中的全部隧道节点、受管隧道及其关联配置会被删除。对应远端的旧隧道 Agent、sing-box 和配置文件需自行卸载。外部导入的 SS／VLESS 会转为“目标”；进入 0.4.0 时仍按上面的规则清空旧链路和转发配置。详情见 [更新记录](CHANGELOG.md)。
 
 ### 节点 Agent 升级
 
-**服务端升级不会把旧 Bash Agent 自动替换为 Go。** 旧节点继续使用 Agent 0.2.1；要迁移到本次 RC，请在节点详情中重新复制“一键接入”命令执行。安装器保留节点身份和配置，并根据面板所选模式安装对应 Agent。
+**服务端升级不会把旧 Bash Agent 自动替换为 Go。** 旧节点继续使用 Agent 0.2.1；要迁移到 0.4.0，请在节点详情中重新复制“一键接入”命令执行。安装器保留节点身份和配置，并根据面板所选模式安装对应 Agent。
 
-被动节点升级到 RC4 前，需要先安装 `conntrack-tools`。Debian／Ubuntu 可运行 `sudo apt-get install conntrack`；重新运行新版一键接入安装器也会检查依赖。
+旧被动节点升级前，需要先安装 `conntrack-tools`。Debian／Ubuntu 可运行 `sudo apt-get install conntrack`；重新运行新版一键接入安装器也会检查依赖。
 
 已完成迁移的节点可执行：
 
@@ -123,7 +123,7 @@ sudo ictl --sync    # 同步配置，或确认面板要求的类型切换
 删除容器和镜像，保留数据卷，之后可重新安装恢复使用：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.5/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；若要完整停用，请先处理节点。
@@ -169,14 +169,16 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 接入节点后，按以下步骤操作：
 
 1. **添加目标**：进入“目标”，点击“添加地址目标”填写实际 IPv4／域名和端口；已有 SS／SS2022／VLESS Reality 分享链接时，选择“导入分享链接”。
-2. **创建池（可选）**：进入“池”，添加已确认的主动节点，调整初始优先级。一个节点可以属于多个池。
-3. **创建链路**：选择入口、入口端口、中间池或固定节点及目标，点击“保存并应用”。入口端口留空自动分配，内部端口由服务端管理；也可以保存草稿。
+2. **创建池（可选）**：进入“池”，添加已确认的主动节点，可搜索并批量添加成员，拖动或使用上下按钮调整初始优先级。一个节点可以属于多个池。
+3. **创建链路**：选择入口、入口端口、中间池或固定节点及目标，可拖动调整中间路径顺序，点击“保存并应用”。入口端口留空自动分配，内部端口由服务端管理；也可以保存草稿。
 4. **等待生效**：主动节点和已启用远程唤醒的被动节点自动同步；其余被动节点或唤醒超时的节点，运行 `sudo ictl --sync`。配置显示“已应用”后，说明相关节点已确认规则。
 5. **连接使用**：在“配置”中复制入口地址或 SS／VLESS 导入链接。编辑路径时，从配置名称进入对应链路。
 
 选择“无入口（直达目标）”且不添加中间阶段时，直接使用目标地址。池模板和链路草稿不占用转发端口。
 
 节点和目标保留原有分组、排序与筛选。更换入口节点或入口端口后，需要更新客户端的连接信息；池成员切换保持入口不变。
+
+池、链路和配置列表支持搜索与状态筛选。链路画布可全屏、缩放和平移，点击“当前路径”聚焦已确认节点；点击两个主动节点之间的连线，可查看 UDP／ICMP 曲线。离开有修改的弹窗前会提醒保存，保存失败会保留输入。
 
 ### 池与灾备切换
 
@@ -190,9 +192,9 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 切换先准备下游，再修改入口，收到确认后显示生效；可能短暂断线。新旧路径短时共存，内部节点需有空闲转发端口。等待超过 30 秒会显示待人工处理，晚到回执仍可完成切换。旧规则未确认清理时继续保留端口，不能移除相关成员。遇到端口冲突，修改配置或处理占用后再重试，不自动换端口；灾备可继续尝试其他候选节点。
 
-被动节点只能作为固定节点；参与池切换前，手动升级到 RC4 并安装 conntrack-tools。未开启远程唤醒时，需要在每个待同步阶段运行 `sudo ictl --sync`。
+被动节点只能作为固定节点；参与池切换前，手动升级到 0.4.0 并安装 conntrack-tools。未开启远程唤醒时，需要在每个待同步阶段运行 `sudo ictl --sync`。
 
-已有 0.4.x RC 升级到 RC4 时，会备份数据库，将每条旧配置转换为一个固定路径链路组，保留原入口、端口、目标和规则；未使用的旧链路保留为草稿。0.3.x 升级则按前述规则清空旧链路和配置。两种升级都不会自动增加池。
+从 RC1–RC3 升级到 0.4.0 时，会备份数据库，将每条旧配置转换为一个固定路径链路组，保留原入口、端口、目标和规则；未使用的旧链路保留为草稿。0.3.x 升级则按前述规则清空旧链路和配置。RC4 及之后的版本升级保留已有池和链路。升级不会自动增加池。
 
 ### 主动与被动模式
 
@@ -310,7 +312,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 **升级后需要回退怎么办？**
 
-Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-deploy-*.bak`，RC4 数据迁移另保留 `ictl.db.pre-0.4.0-rc.4.bak`；此前 RC 的迁移备份也会保留。人工回退需停止服务，恢复升级前数据库及对应旧镜像，移除新数据库的 `-wal`／`-shm` 文件后再启动；回退会丢弃升级后的数据。源码部署或自定义数据库路径需自行备份和恢复。
+Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-deploy-*.bak`，池模式的数据迁移另保留 `ictl.db.pre-0.4.0-rc.4.bak`；此前 RC 的迁移备份也会保留。人工回退需停止服务，恢复升级前数据库及对应旧镜像，移除新数据库的 `-wal`／`-shm` 文件后再启动；回退会丢弃升级后的数据。源码部署或自定义数据库路径需自行备份和恢复。
 
 ## 开发与贡献
 
@@ -361,11 +363,11 @@ sudo unshare -nm python3 tests/kernel_pool_switch.py /tmp/ictl-active
 
 | 组件 | 当前版本 |
 | --- | --- |
-| 服务端 | 0.4.0-rc.5 |
-| 主动 Agent／被动 Agent／管理器 | 0.4.0-rc.4 |
-| 唤醒组件 | 0.4.0-rc.3 |
+| 服务端 | 0.4.0 |
+| 主动 Agent／被动 Agent／管理器 | 0.4.0 |
+| 唤醒组件 | 0.4.0 |
 | 旧版兼容 Agent | 0.2.1 |
-| 单机脚本 | 3.2-rc.2 |
+| 单机脚本 | 3.2 |
 
 各组件版本号独立维护，具体变化见 [CHANGELOG.md](CHANGELOG.md)。
 

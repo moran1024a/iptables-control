@@ -33,7 +33,7 @@ import types
 def _module():
     return types.SimpleNamespace(**globals())
 
-VERSION = "0.4.0-rc.5"
+VERSION = "0.4.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -2118,7 +2118,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if link:
                 link = dict(link)
                 link['state'], link['error'] = pools.display_state(_module(), conn, link)
-                c.update(link_id=link['id'], link_state=link['state'], link_error=link['error'])
+                c.update(link_id=link['id'], link_state=link['state'], link_error=link['error'],
+                         link_sync=pools.sync_status(_module(), conn, link))
                 if link['state'] in ('preparing', 'switching', 'pending', 'waiting', 'error'):
                     c['status'] = 'error' if link['state'] in ('waiting','error') else 'applying'
                 if not c['hops'] and link['state'] in ('preparing', 'switching', 'waiting'):

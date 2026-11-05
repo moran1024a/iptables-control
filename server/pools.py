@@ -358,7 +358,7 @@ def begin(s, c, link, plan, selected, path, reason):
             raise s.UserError(f"{n['name']} 正在删除或等待模式确认")
         if (any(x['kind'] == 'pool' for x in plan['stages']) and n['desired_mode'] == 'passive'
                 and s.agent_v3.newer('0.4.0-rc.4', n['agent'] or '0.0.0')):
-            raise s.UserError(f"请先将被动节点 {n['name']} 升级到 RC4，以支持切换时清理旧连接")
+            raise s.UserError(f"请先将被动节点 {n['name']} 升级到 0.4.0，以支持切换时清理旧连接")
         existing = old_hops[0] if index == 0 and old_hops and old_hops[0]['node_id'] == nid else None
         port = (plan['port'] or (existing['port'] if existing else None)) if index == 0 else None
         used = reserved(c, nid) | {r[0] for r in c.execute('SELECT port FROM hops WHERE node_id=? UNION SELECT port FROM retired_ports WHERE node_id=?', (nid, nid))}
@@ -596,9 +596,50 @@ def display_state(s, c, link):
     return state, error
 
 
+def sync_status(s, c, link):
+    """UI-only receipt summary; scheduling and the stored link state stay unchanged."""
+    state, _ = display_state(s, c, link)
+    job = json.loads(link['job']) if link['job'] else None
+    ids = job['wait'] if job else [r[0] for r in c.execute(
+        'SELECT node_id FROM hops WHERE chain_id=? ORDER BY seq', (link['chain_id'],))]
+    if not job and link['state'] == 'error':
+        ids = list(dict.fromkeys(ids + json.loads(link['failures'])))
+    pending = []
+    for nid in ids:
+        node = c.execute('SELECT * FROM nodes WHERE id=?', (nid,)).fetchone()
+        if node is None:
+            continue
+        status = s.node_status(c, node, int(time.time()))
+        if confirmed(s, c, [nid]) and status == 'synced':
+            continue
+        wake = s.wake.summary(c, node)
+        current_wake = wake if wake and wake['generation'] == node['desired_generation'] else None
+        if node['state'] == 'error' or (current_wake and current_wake['state'] == 'failed'):
+            reason = 'failed'
+        elif node['manual_required']:
+            reason = 'manual'
+        elif current_wake and current_wake['state'] == 'timeout':
+            reason = 'timeout'
+        elif node['desired_mode'] == 'passive' and not s.wake.eligible(node):
+            reason = 'manual'
+        elif status == 'offline':
+            reason = 'offline'
+        elif state == 'waiting':
+            reason = 'timeout'
+        else:
+            reason = 'pending'
+        pending.append(dict(id=nid, name=node['name'], mode=node['desired_mode'], reason=reason,
+                            error=node['err'] or (current_wake['error'] if current_wake else '')))
+    reasons = {n['reason'] for n in pending}
+    if state not in ('draft', 'deleting'):
+        state = next((x for x in ('failed', 'offline', 'timeout', 'manual') if x in reasons), state)
+    return dict(state=state, nodes=pending, retry=state in ('failed', 'offline', 'timeout', 'error', 'waiting'))
+
+
 def detail(s, c, link):
     result = dict(link)
     result['state'], result['error'] = display_state(s, c, link)
+    result['sync'] = sync_status(s, c, link)
     for key in ('plan', 'selected', 'failures'):
         result[key] = json.loads(result[key])
     for stage in result['plan']['stages']:

@@ -52,6 +52,34 @@ class PoolTests(Fixture, unittest.TestCase):
             if self.get(lid)['job'] is None:return
         self.fail('switch did not finish')
 
+    def test_receipt_summary_distinguishes_manual_timeout_and_failure(self):
+        with self.db:
+            self.db.execute("UPDATE nodes SET desired_mode='passive',installed_agent='passive',agent='0.4.0-rc.4' WHERE id=?", (self.entry,))
+        lid = self.link()
+        self.assertEqual(self.get(lid)['sync']['state'], 'preparing')
+        self.ack(self.a); self.tick()
+        before = self.get(lid)
+        self.assertEqual(before['state'], 'switching')
+        self.assertEqual(before['sync']['state'], 'manual')
+        self.assertEqual([n['id'] for n in before['sync']['nodes']], [self.entry])
+        self.assertFalse(before['sync']['retry'])
+        with self.db:
+            self.db.execute('UPDATE nodes SET wake_enabled=1,wake_port=33446 WHERE id=?', (self.entry,))
+            s.wake.queue(s._module(), self.db, s.get_node(self.db,self.entry))
+        self.assertEqual(self.get(lid)['sync']['state'], 'switching')
+        with self.db:
+            self.db.execute("UPDATE wake_jobs SET state='timeout' WHERE node_id=?", (self.entry,))
+        self.assertEqual(self.get(lid)['sync']['state'], 'timeout')
+        self.assertTrue(self.get(lid)['sync']['retry'])
+        with self.db:
+            self.db.execute("UPDATE nodes SET state='error',err='端口冲突：10001' WHERE id=?", (self.entry,))
+        self.assertEqual(self.get(lid)['sync']['state'], 'failed')
+        # Reading the presentation must not change the switch or claimed active path.
+        self.assertEqual(self.get(lid)['state'], before['state'])
+        self.assertEqual(self.get(lid)['selected'], before['selected'])
+        config = self.h.api_configs(self.db,{})['chains'][0]
+        self.assertEqual(config['link_sync']['state'], 'failed')
+
     def test_prepare_commit_and_stable_entry(self):
         lid=self.link()
         self.assertIsNone(self.get(lid)['connection'])

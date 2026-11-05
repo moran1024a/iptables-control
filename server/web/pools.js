@@ -1,30 +1,65 @@
 // Templates provide membership; every link owns its selection and preferences.
-const LINK_STATES = {draft:'草稿', active:'已应用', pending:'等待应用', preparing:'准备下游', switching:'切换入口', waiting:'等待确认', error:'异常', deleting:'删除中'};
+const LINK_STATES = {draft:'草稿', active:'已应用', pending:'等待应用', preparing:'准备下游', switching:'切换入口', waiting:'等待确认', error:'异常', deleting:'删除中', manual:'等待手动同步', timeout:'确认超时', failed:'应用失败', offline:'节点离线'};
 let poolView = null, linkEditor = null, templateEditor = null, instanceEditor = null, quickSwitch = null;
 const resourceName = (items, id, fallback='已删除') => items.find(x => x.id === id)?.name || fallback;
 const memberName = (id) => id === 0 ? 'direct' : resourceName(poolView.nodes, id);
-const linkState = l => `<span class="badge ${['error','waiting'].includes(l.state) ? 'removing' : l.state === 'active' ? 'applied' : 'applying'}">${LINK_STATES[l.state] || esc(l.state)}</span>`;
+const linkStatus = l => l.sync?.state || l.state;
+const linkState = l => {
+  const state=linkStatus(l), problem=['error','timeout','failed','offline'].includes(state);
+  return `<span class="badge ${problem?'removing':state==='active'?'applied':'applying'}">${LINK_STATES[state] || esc(state)}</span>`;
+};
 const poolHead = (title, button='') => `<div class="page-head"><h1>${title}</h1><div class="head-actions">${button}</div></div>`;
+
+const collectionFilters = {pools:{q:'',state:''}, links:{q:'',state:''}, configs:{q:'',state:''}};
+let drawCollection = null;
+const matchesSearch = (kind, text) => text.toLowerCase().includes(collectionFilters[kind].q.trim().toLowerCase());
+const statusGroup = l => {
+  const state=linkStatus(l);
+  return ['error','timeout','failed','offline'].includes(state)?'error':['preparing','switching','pending','waiting','manual'].includes(state)?'pending':state;
+};
+function collectionTools(kind, count, total, statuses) {
+  const f=collectionFilters[kind];
+  return `<div class="collection-tools" data-collection="${kind}"><input type="search" data-collection-query value="${esc(f.q)}" placeholder="搜索名称或地址" aria-label="搜索列表"><select data-collection-state aria-label="筛选状态"><option value="">全部状态</option>${statuses.map(([key,label])=>`<option value="${key}" ${f.state===key?'selected':''}>${label}</option>`).join('')}</select><span class="count">${count} / ${total}</span></div>`;
+}
+document.addEventListener('input',e=>{
+  const box=e.target.closest('[data-collection]');if(!box || !e.target.hasAttribute('data-collection-query'))return;
+  collectionFilters[box.dataset.collection].q=e.target.value;drawCollection?.();
+});
+document.addEventListener('change',e=>{
+  const box=e.target.closest('[data-collection]');if(!box || !e.target.hasAttribute('data-collection-state'))return;
+  collectionFilters[box.dataset.collection].state=e.target.value;drawCollection?.();
+});
 
 async function poolList(request) {
   const d = await api('GET','pools'); if (request !== viewRequest) return; poolView = d;
-  render(poolHead('池', '<button class="primary" data-action="pool-new">新增池</button>') +
-    (d.pools.map(p => `<div class="card" data-key="pool-${p.id}"><div class="card-head"><div class="title">${esc(p.name)}</div><div class="actions"><button class="small" data-action="pool-edit" data-id="${p.id}">编辑</button><button class="small danger" data-action="pool-delete" data-id="${p.id}" ${p.references.length ? 'disabled title="请先解除链路引用"' : ''}>删除</button></div></div><div class="path">${p.members.map((n,i) => `<span>${i+1}. ${esc(memberName(n))}</span>`).join('<span class="arrow">→</span>') || '暂无成员'}</div><div class="sub">${p.references.length ? '引用链路：'+p.references.map(esc).join('、') : '尚未被引用'}</div></div>`).join('') || emptyState('◉','先创建一个池，再将它添加到链路。')));
+  drawCollection=()=>{
+    const rows=d.pools.filter(p=>matchesSearch('pools',p.name+' '+p.members.map(n=>memberName(n)+' '+(d.nodes.find(x=>x.id===n)?.addr||'')).join(' ')) && (!collectionFilters.pools.state || (p.references.length?'used':'free')===collectionFilters.pools.state));
+    render(poolHead('池','<button class="primary" data-action="pool-new">新增池</button>')+
+      collectionTools('pools',rows.length,d.pools.length,[['used','已引用'],['free','未引用']])+
+      `<div class="collection">${rows.map(p=>`<div class="collection-row" data-key="pool-${p.id}"><div class="collection-main"><button class="plain-title" data-action="pool-edit" data-id="${p.id}">${esc(p.name)}</button><div class="member-tags">${p.members.map(n=>`<span>${esc(memberName(n))}</span>`).join('')||'<span>暂无成员</span>'}</div></div><span class="muted collection-meta" title="${esc(p.references.join('、'))}">${p.references.length?`${p.references.length} 条链路`:'未引用'}</span><div class="row-actions"><button class="small" data-action="pool-edit" data-id="${p.id}">编辑</button><button class="small danger" data-action="pool-delete" data-id="${p.id}" ${p.references.length?'disabled title="请先解除链路引用"':''}>删除</button></div></div>`).join('')||emptyState('◉',d.pools.length?'没有匹配的池':'暂无池')}</div>`);
+  };drawCollection();
 }
 
+const dragHandle = '<span class="drag-handle" title="拖动排序" aria-hidden="true">⠿</span>';
+const orderButtons = (prefix,i,length) => `<button type="button" class="small" data-action="${prefix}-up" data-index="${i}" ${i?'':'disabled'} aria-label="上移">↑</button><button type="button" class="small" data-action="${prefix}-down" data-index="${i}" ${i<length-1?'':'disabled'} aria-label="下移">↓</button>`;
 function poolForm(p) {
   templateEditor = {id:p?.id, name:p?.name || '', members:[...(p?.members || [])]}; drawPoolForm();
 }
-function drawPoolForm() {
-  const p = templateEditor;
-  openModal(`<form data-form="pool-save"><h2>${p.id ? '编辑池' : '新增池'}</h2><label><span>名称</span><input name="name" value="${esc(p.name)}" required maxlength="100"></label><div class="member-list">${p.members.map((n,i) => `<div class="member-row"><span>${i+1}. ${esc(memberName(n))}</span><button type="button" class="small" data-action="pool-up" data-index="${i}" ${i ? '' : 'disabled'}>上移</button><button type="button" class="small danger" data-action="pool-remove" data-index="${i}">移除</button></div>`).join('')}</div><div class="inline-fields"><select id="pool-add-node"><option value="">选择主动节点</option>${poolView.nodes.filter(n => n.eligible && !p.members.includes(n.id)).map(n => `<option value="${n.id}">${esc(n.name)}</option>`).join('')}</select><button type="button" data-action="pool-add">添加成员</button></div><div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
+function drawPoolForm(preserve=false) {
+  const p = templateEditor, available=poolView.nodes.filter(n=>n.eligible&&!p.members.includes(n.id));
+  openModal(`<form data-form="pool-save"><h2>${p.id ? '编辑池' : '新增池'}</h2><label><span>名称</span><input name="name" value="${esc(p.name)}" required maxlength="100"></label><div class="member-list" data-reorder="pool">${p.members.map((n,i)=>`<div class="member-row sort-item" data-order="${n}">${dragHandle}<span class="member-label">${i+1}. ${esc(memberName(n))}</span>${orderButtons('pool',i,p.members.length)}<button type="button" class="small danger" data-action="pool-remove" data-index="${i}">移除</button></div>`).join('')}</div><details class="member-picker"><summary>添加成员 <span class="count">${available.length}</span></summary><div class="resource-menu"><input type="search" data-resource-search data-ignore-dirty placeholder="搜索名称或地址" aria-label="搜索成员"><div class="member-options">${available.map(n=>`<label data-search="${esc((n.name+' '+n.addr).toLowerCase())}"><input type="checkbox" value="${n.id}" data-member-choice data-ignore-dirty><span>${esc(n.name)}<small>${esc(n.addr||'')}</small></span></label>`).join('')}<span class="resource-empty" ${available.length?'hidden':''}>没有匹配项</span></div><button type="button" class="small" data-action="pool-add">添加所选成员</button></div></details><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`,preserve);
 }
 function rememberPool() { templateEditor.name = $('#modal [name=name]').value; }
 
 async function linkList(request) {
   const d = await api('GET','links'); if (request !== viewRequest) return; poolView = d;
-  render(poolHead('链路', '<button class="primary" data-action="link-new">新增链路</button>') +
-    (d.links.map(l => `<a href="#/routes/${l.id}" class="card link-card" data-key="link-${l.id}"><div class="card-head"><div class="title">${esc(l.name)}</div>${linkState(l)}</div><div class="sub">${l.plan.entry ? esc(resourceName(d.nodes,l.plan.entry)) : '直达目标'} → ${esc(resourceName(d.targets,l.plan.target,'未选择目标'))}</div><div class="path">${l.hops.length ? l.hops.map(h => esc(h.name)).join(' → ') + ' → ' : ''}${esc(resourceName(d.targets,l.plan.target,'草稿'))}</div>${l.error ? `<div class="hint t-red">${esc(l.error)}</div>` : ''}${l.cleanup.length ? `<div class="hint">${l.cleanup.length} 项旧规则等待清理</div>` : ''}</a>`).join('') || emptyState('⇄','创建链路，选择入口、池和目标。')));
+  drawCollection=()=>{
+    const route=l=>[l.plan.entry?resourceName(d.nodes,l.plan.entry):null,...l.plan.stages.map(st=>st.kind==='pool'?resourceName(d.pools,st.pool_id):memberName(st.node_id)),resourceName(d.targets,l.plan.target,'未选择目标')].filter(Boolean).join(' → ');
+    const rows=d.links.filter(l=>matchesSearch('links',l.name+' '+route(l)+' '+(l.connection?l.connection.host+':'+l.connection.port:''))&&(!collectionFilters.links.state || statusGroup(l)===collectionFilters.links.state));
+    render(poolHead('链路','<button class="primary" data-action="link-new">新增链路</button>')+
+      collectionTools('links',rows.length,d.links.length,[['active','已应用'],['pending','等待同步'],['error','异常'],['draft','草稿'],['deleting','删除中']])+
+      `<div class="collection">${rows.map(l=>`<a href="#/routes/${l.id}" class="collection-row link-card" data-key="link-${l.id}"><div class="collection-main"><div class="title">${esc(l.name)}</div><div class="sub">${esc(route(l))}</div>${l.error?`<div class="row-error">${esc(l.error)}</div>`:''}</div>${l.cleanup.length?`<span class="muted collection-meta">${l.cleanup.length} 项待清理</span>`:''}${linkState(l)}<span class="muted">›</span></a>`).join('')||emptyState('⇄',d.links.length?'没有匹配的链路':'暂无链路')}</div>`);
+  };drawCollection();
 }
 
 function switchBlocked(l, stage, member) {
@@ -71,7 +106,7 @@ function topology(l) {
   const healthy=currentIds.every(id=>!['offline','error','skew','deleting','new'].includes(d.nodes.find(n=>n.id===id)?.status));
   const flowing=matches && healthy && (l.state==='active' || l.state==='preparing');
   const pending=l.job ? columns.map(col=>picked(col,l.job.selected)) : [];
-  const cables=[], active=[], waiting=[];
+  const cables=[], active=[], waiting=[], hits=[];
   const pathBetween=(a,b)=>{
     const x=a.x+a.width,bend=Math.min(32,(b.x-x)/4);
     return `M ${x} ${a.y} C ${x+bend} ${a.y} ${b.x-bend} ${b.y} ${b.x} ${b.y}`;
@@ -81,20 +116,23 @@ function topology(l) {
     for(const a of left.points) for(const b of right.points) {
       if(a.member && a.member===b.member && right.kind!=='target') continue;
       cables.push(`<path class="topology-candidate" data-from="${a.key}" data-to="${b.key}" d="${pathBetween(a,b)}"/>`);
+      if(right.kind!=='target' && a.member && b.member && [a.member,b.member].every(id=>d.nodes.find(n=>n.id===id)?.mode==='active')) {
+        hits.push(`<path class="topology-hit" data-action="edge-quality" data-source="${a.member}" data-target="${b.member}" d="${pathBetween(a,b)}" role="button" tabindex="0" aria-label="${esc(memberName(a.member)+' → '+memberName(b.member)+' 网络质量')}"><title>${esc(memberName(a.member)+' → '+memberName(b.member))} · 网络质量</title></path>`);
+      }
     }
     if(matches) {
       const path=pathBetween(current[i],current[i+1]);
-      active.push(`<path class="topology-confirmed${flowing?' flowing':''}" d="${path}"/>`);
-      if(flowing) active.push(`<path class="topology-flow" d="${path}"/>`);
+      active.push(`<path class="topology-confirmed${flowing?' flowing':''}" data-from="${current[i].key}" data-to="${current[i+1].key}" d="${path}"/>`);
+      if(flowing) active.push(`<path class="topology-flow" data-from="${current[i].key}" data-to="${current[i+1].key}" d="${path}"/>`);
     }
-    if(pending[i] && pending[i+1]) waiting.push(`<path class="topology-pending" d="${pathBetween(pending[i],pending[i+1])}"/>`);
+    if(pending[i] && pending[i+1]) waiting.push(`<path class="topology-pending" data-from="${pending[i].key}" data-to="${pending[i+1].key}" d="${pathBetween(pending[i],pending[i+1])}"/>`);
   }
   const cards=columns.map((col,index)=>{
     if(col.kind!=='pool') {
       const node=d.nodes.find(n=>n.id===col.id),target=d.targets.find(t=>t.id===col.id);
       const name=col.kind==='target'?(target?.name||'未选择目标'):(node?.name||'已删除节点');
       const subtitle=col.kind==='entry'?`${node?.addr||''}:${plan.port||'自动端口'}`:col.kind==='target'?'':node?.addr||'';
-      return `<div class="topology-fixed${flowing?' on-route':''}" data-key="fixed-${index}-${col.id}" style="left:${col.x}px;top:${col.y}px;width:${col.width}px"><small>${col.label}${col.kind!=='target'?` · ${node?.mode==='passive'?'被动':'主动'}`:''}</small>${col.kind==='target'?`<strong title="${esc(name)}">${esc(name)}</strong>`:`<a href="#/nodes/${col.id}" title="${esc(name)}">${esc(name)}</a>`}<span class="topology-address" title="${esc(subtitle)}">${esc(subtitle)}</span></div>`;
+      return `<div class="topology-fixed${flowing?' on-route':''}" data-key="fixed-${index}-${col.id}" data-point="${col.points[0].key}" ${matches?'data-current':''} style="left:${col.x}px;top:${col.y}px;width:${col.width}px"><small>${col.label}${col.kind!=='target'?` · ${node?.mode==='passive'?'被动':'主动'}`:''}</small>${col.kind==='target'?`<strong title="${esc(name)}">${esc(name)}</strong>`:`<a href="#/nodes/${col.id}" title="${esc(name)}">${esc(name)}</a>`}<span class="topology-address" title="${esc(subtitle)}">${esc(subtitle)}</span></div>`;
     }
     const st=col.stage;
     return `<section class="topology-pool" data-key="stage-${esc(st.id)}" aria-label="${esc(resourceName(d.pools,st.pool_id))}" style="left:${col.x}px;top:${col.y}px;width:${col.width}px;height:${col.height}px"><div class="topology-pool-head"><div><small>池 · ${st.order.length} 个候选${st.locked!=null?' · 已锁定':''}</small><strong title="${esc(resourceName(d.pools,st.pool_id))}">${esc(resourceName(d.pools,st.pool_id))}</strong></div><button class="small" data-action="instance-edit" data-stage="${esc(st.id)}" ${l.job||l.state==='deleting'?'disabled':''}>设置</button></div><div class="topology-members">${col.points.map((p,i)=>{
@@ -102,10 +140,10 @@ function topology(l) {
       const reason=switchBlocked(l,st,p.member),disabled=st.disabled.includes(p.member);
       const status=p.member===0?'':({synced:'在线',offline:'离线',syncing:'等待同步',new:'未连接',error:'异常',skew:'时间异常',deleting:'删除中'}[node?.status]||'未就绪');
       const label=isPending?'待确认':isCurrent?(flowing?'生效':'上次确认'):disabled?'禁用':'';
-      return `<button class="topology-choice${isCurrent?' is-current':''}${isCurrent&&flowing?' on-route':''}${isPending?' is-pending':''}${disabled?' is-disabled':''}" data-key="member-${p.member}" data-point="${p.key}" data-action="topology-switch" data-stage="${esc(st.id)}" data-member="${p.member}" title="${esc(reason||'切换到 '+memberName(p.member))}" ${reason?'disabled':''}><span class="topology-choice-title"><span class="topology-rank">${i+1}</span><strong title="${esc(memberName(p.member))}">${esc(p.member===0?'direct':node?.name||'已删除节点')}</strong>${st.default===p.member?'<small class="topology-default">默认</small>':''}</span><span class="topology-choice-meta"><span class="${p.member===0?'':'topology-node-status'} ${node?.status==='synced'||p.member===0?'ready':''}">${esc(status)}</span><span class="topology-state">${esc(label)}${st.locked===p.member?' · 锁定':''}</span></span></button>`;
+      return `<button class="topology-choice${isCurrent?' is-current':''}${isCurrent&&flowing?' on-route':''}${isPending?' is-pending':''}${disabled?' is-disabled':''}" data-key="member-${p.member}" ${isCurrent?'data-current':''} data-point="${p.key}" data-action="topology-switch" data-stage="${esc(st.id)}" data-member="${p.member}" title="${esc(reason||'切换到 '+memberName(p.member))}" ${reason?'disabled':''}><span class="topology-choice-title"><span class="topology-rank">${i+1}</span><strong title="${esc(memberName(p.member))}">${esc(p.member===0?'direct':node?.name||'已删除节点')}</strong>${st.default===p.member?'<small class="topology-default">默认</small>':''}</span><span class="topology-choice-meta"><span class="${p.member===0?'':'topology-node-status'} ${node?.status==='synced'||p.member===0?'ready':''}">${esc(status)}</span><span class="topology-state">${esc(label)}${st.locked===p.member?' · 锁定':''}</span></span></button>`;
     }).join('')||'<p class="hint">暂无成员，请打开设置</p>'}</div></section>`;
   }).join('');
-  return `<div class="topology-toolbar"><div class="topology-legend"><span class="legend-active">生效</span><span class="legend-pending">待确认</span></div><div class="topology-tools"><button class="small" data-action="canvas-out" title="缩小" aria-label="缩小">−</button><span data-zoom-value>100%</span><button class="small" data-action="canvas-in" title="放大" aria-label="放大">+</button><button class="small" data-action="canvas-fit">适应画布</button></div></div><div class="topology" data-key="canvas-${l.id}" tabindex="0" role="region" aria-label="链路画布，拖动平移，滚轮缩放"><div class="topology-canvas" style="width:${width}px;height:${height}px">${cards}<svg class="topology-cables" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-hidden="true">${cables.join('')}${active.join('')}${waiting.join('')}</svg></div></div>`;
+  return `<div class="topology-toolbar"><div class="topology-legend"><span class="legend-active">生效</span><span class="legend-pending">待确认</span></div><div class="topology-tools"><button class="small" data-action="canvas-out" title="缩小" aria-label="缩小">−</button><span data-zoom-value>100%</span><button class="small" data-action="canvas-in" title="放大" aria-label="放大">+</button><button class="small" data-action="canvas-fit">适应</button><button class="small" data-action="canvas-current" ${matches?'':'disabled'}>当前路径</button><button class="small" data-action="canvas-fullscreen">${topologyViews.get(l.id)?.fullscreen?'退出全屏':'全屏'}</button></div></div><div class="topology" data-key="canvas-${l.id}" tabindex="0" role="region" aria-label="链路画布，拖动平移，滚轮缩放"><div class="topology-canvas" style="width:${width}px;height:${height}px">${cards}<svg class="topology-cables" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-label="节点连线">${cables.join('')}${active.join('')}${waiting.join('')}${hits.join('')}</svg></div></div>`;
 }
 
 function quickSwitchForm(l, sid, member) {
@@ -118,11 +156,12 @@ function quickSwitchForm(l, sid, member) {
 }
 
 function focusTopology(event) {
-  const member=event.target.closest?.('.topology-choice');
+  const member=event.target.closest?.('[data-point]');
   if(!member || member.contains(event.relatedTarget)) return;
-  const enabled=event.type==='mouseover'||event.type==='focusin';
-  member.closest('.topology-canvas').querySelectorAll('.topology-candidate').forEach(path=>{
-    if(path.dataset.from===member.dataset.point || path.dataset.to===member.dataset.point) path.classList.toggle('is-focused',enabled);
+  const enabled=event.type==='mouseover'||event.type==='focusin', canvas=member.closest('.topology-canvas');
+  canvas.classList.toggle('has-highlight',enabled);
+  canvas.querySelectorAll('path[data-from]').forEach(path=>{
+    path.classList.toggle('is-focused',enabled && (path.dataset.from===member.dataset.point || path.dataset.to===member.dataset.point));
   });
 }
 for(const event of ['mouseover','mouseout','focusin','focusout']) document.addEventListener(event,focusTopology);
@@ -132,6 +171,8 @@ let topologyBinding = null;
 
 function releaseTopology() {
   topologyBinding?.observer.disconnect();
+  if (topologyBinding) topologyBinding.view.fullscreen = false;
+  document.body.classList.remove('canvas-fullscreen');
   topologyBinding = null;
 }
 
@@ -158,6 +199,25 @@ function mountTopology(id) {
     view.x = x-(x-view.x)*ratio; view.y = y-(y-view.y)*ratio;
     view.scale = scale; view.auto = false; apply();
   };
+  const focusCurrent = () => {
+    const cards=[...canvas.querySelectorAll('[data-current]')]; if(!cards.length)return;
+    const origin=canvas.getBoundingClientRect(), rects=cards.map(el=>el.getBoundingClientRect());
+    const x=(Math.min(...rects.map(r=>r.left))-origin.left)/view.scale;
+    const y=(Math.min(...rects.map(r=>r.top))-origin.top)/view.scale;
+    const width=(Math.max(...rects.map(r=>r.right))-origin.left)/view.scale-x;
+    const height=(Math.max(...rects.map(r=>r.bottom))-origin.top)/view.scale-y;
+    view.scale=Math.min(1.5,(viewport.clientWidth-48)/width,(viewport.clientHeight-48)/height);
+    view.x=(viewport.clientWidth-width*view.scale)/2-x*view.scale;
+    view.y=(viewport.clientHeight-height*view.scale)/2-y*view.scale;
+    view.auto=false;apply();
+  };
+  const fullscreen = () => {
+    view.fullscreen=!view.fullscreen;
+    viewport.closest('.topology-panel').classList.toggle('is-fullscreen',view.fullscreen);
+    document.body.classList.toggle('canvas-fullscreen',view.fullscreen);
+    app.querySelector('[data-action=canvas-fullscreen]').textContent=view.fullscreen?'退出全屏':'全屏';
+    fit();
+  };
   if (topologyBinding?.viewport !== viewport) {
     releaseTopology();
     const points = new Map();
@@ -166,7 +226,7 @@ function mountTopology(id) {
     const distance = values => Math.hypot(values[0].x-values[1].x,values[0].y-values[1].y);
     viewport.addEventListener('wheel',e=>{e.preventDefault();const p=position(e);zoom(Math.exp(-Math.max(-300,Math.min(300,e.deltaY))*.002),p.x,p.y);},{passive:false});
     viewport.onpointerdown = e => {
-      if (e.button!==0 || e.target.closest('button,a,input,select') || points.size>=2) return;
+      if (e.button!==0 || e.target.closest('button,a,input,select,[data-action]') || points.size>=2) return;
       e.preventDefault(); viewport.focus({preventScroll:true});
       points.set(e.pointerId,position(e)); viewport.setPointerCapture(e.pointerId);
       viewport.classList.add('is-dragging');
@@ -194,15 +254,49 @@ function mountTopology(id) {
     };
     const observer=new ResizeObserver(()=>view.auto?fit():apply());
     observer.observe(viewport);
-    topologyBinding={viewport,observer,fit,zoom};
+    topologyBinding={viewport,observer,fit,zoom,focusCurrent,fullscreen,view};
   }
   if(view.auto) fit(); else apply();
+}
+
+function syncFeedback(l) {
+  const pending=l.sync?.nodes||[];
+  if(!pending.length && !l.error && !l.job)return '';
+  return `<div class="sync-feedback" role="status">${l.error?`<p class="row-error">${esc(l.error)}</p>`:''}${pending.length?`<div class="sync-nodes">${pending.map(n=>`<a href="#/nodes/${n.id}" title="${esc(n.error)}">${esc(n.name)} <span>${LINK_STATES[n.reason]||'等待确认'}</span></a>`).join('')}</div>`:l.job?'<span class="muted">等待节点确认</span>':''}${pending.some(n=>n.reason==='manual'||n.mode==='passive'&&['failed','timeout'].includes(n.reason))?'<span class="manual-sync">在对应节点执行 <code>sudo ictl --sync</code><button class="small" data-action="copy" data-text="sudo ictl --sync">复制</button></span>':''}${l.sync?.retry || !l.sync&&l.error?'<button class="small" data-action="link-retry">重试同步</button>':''}</div>`;
+}
+
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape' && $('#modal').hidden && topologyBinding?.view.fullscreen)topologyBinding.fullscreen();
+  if((e.key==='Enter'||e.key===' ') && e.target.matches?.('.topology-hit')) {e.preventDefault();e.target.dispatchEvent(new MouseEvent('click',{bubbles:true}));}
+});
+
+async function edgeQuality(source,target) {
+  const id=poolView.link.id;
+  openModal(`<h2>${esc(memberName(source))} → ${esc(memberName(target))}</h2><div class="edge-quality"><div class="quality-heading"><span class="quality-key" style="--series-color:var(--blue)">UDP</span><span class="quality-key" style="--series-color:var(--green)">ICMP</span><select aria-label="时间范围" data-edge-range><option value="900">15 分钟</option><option value="3600">1 小时</option><option value="86400">24 小时</option></select></div><div data-edge-chart>正在加载…</div></div><div class="form-actions"><button data-action="modal-close">关闭</button></div>`);
+  $('#modal .modal-box').classList.add('quality-dialog');
+  const state=modalState;let timer,sequence=0;
+  state.cleanup=()=>clearTimeout(timer);
+  const update=async()=>{
+    clearTimeout(timer);const request=++sequence,range=Number($('#modal [data-edge-range]').value);
+    try {
+      const data=await api('POST','quality',{scope:'links',id,source,target,range});
+      if(modalState!==state || request!==sequence)return;
+      const content=qualityChart(data.series,data.now,range)+`<div class="edge-stats">${data.series.map(s=>`<div><strong>${QUALITY_PROTOCOLS[s.protocol][0]}</strong><span>5 分钟平均 ${qualityNumber(s.summary.mean)}</span><span>P95 ${qualityNumber(s.summary.p95)}</span><span>波动 ${qualityNumber(s.summary.jitter)}</span><span>丢包 ${qualityNumber(s.summary.loss,'%')}</span><span class="muted">${esc(QUALITY_STATES[s.state]||s.state)}</span>${s.note?`<small>${esc(s.note)}</small>`:''}</div>`).join('')}</div>`;
+      $('#modal [data-edge-chart]').innerHTML=content;
+    } catch(err) {
+      if(modalState!==state || request!==sequence)return;
+      $('#modal [data-edge-chart]').innerHTML=`<p class="t-red">${esc(err.message)}</p>`;
+    }
+    timer=setTimeout(update,10000);
+  };
+  $('#modal [data-edge-range]').onchange=update;
+  await update();
 }
 
 async function linkDetail(id, request) {
   const d = await api('GET',`links/${id}`); if (request !== viewRequest) return; poolView=d; const l=d.link;
   render(`<a class="back" href="#/routes">← 链路</a>` + poolHead(esc(l.name), `${linkState(l)}<button data-action="link-edit" ${l.job || l.state === 'deleting' ? 'disabled' : ''}>编辑链路</button><button class="danger" data-action="link-delete" ${l.job || l.state === 'deleting' ? 'disabled' : ''}>删除</button>`) +
-    `<div class="panel">${topology(l)}${l.error ? `<p class="t-red">${esc(l.error)}</p><button data-action="link-retry">重试同步</button>` : ''}${l.cleanup.length ? `<p class="hint">旧规则待清理：${l.cleanup.map(r=>`${esc(memberName(r.node_id))}:${r.port}`).join('、')}</p>` : ''}</div>` +
+    `<div class="panel topology-panel${topologyViews.get(l.id)?.fullscreen?' is-fullscreen':''}">${topology(l)}${syncFeedback(l)}${l.cleanup.length ? `<p class="hint">旧规则待清理：${l.cleanup.map(r=>`${esc(memberName(r.node_id))}:${r.port}`).join('、')}</p>` : ''}</div>` +
     `<div class="panel"><h2>当前连接</h2>${l.connection ? `<div class="entry"><code>${esc(l.connection.host)}:${l.connection.port}</code><button class="small" data-action="copy" data-text="${esc(l.connection.uri)}">复制${l.connection.protocol==='endpoint' ? '地址' : '导入链接'}</button></div>` : '<p class="muted">尚未确认生效</p>'}<a href="#/quality/links/${l.id}">网络质量 →</a></div>` +
     `<div class="panel"><h2>切换记录</h2>${l.events.length ? `<table><tbody>${l.events.map(e=>`<tr><td>${esc(fmtTime(e.ts))}</td><td>${esc(e.message)}</td></tr>`).join('')}</tbody></table>` : '<p class="muted">暂无记录</p>'}</div>`);
   mountTopology(id);
@@ -217,20 +311,23 @@ function rememberLink() {
   linkEditor.name=f.elements.name.value; linkEditor.plan.entry=Number(f.elements.entry.value)||null;
   linkEditor.plan.target=Number(f.elements.target.value)||null; linkEditor.plan.port=Number(f.elements.port.value)||null;
 }
-function drawLinkForm() {
+function drawLinkForm(preserve=false) {
   const p=linkEditor.plan;
-  const options=(items,selected)=>items.map(x=>`<option value="${x.id}" ${x.id===selected?'selected':''}>${esc(x.name)}</option>`).join('');
-  openModal(`<form data-form="link-save"><h2>${linkEditor.id?'编辑链路':'新增链路'}</h2><label><span>名称</span><input name="name" value="${esc(linkEditor.name)}" required></label><div class="inline-fields"><label><span>入口节点</span><select name="entry"><option value="">无入口（直达目标）</option>${options(poolView.nodes,p.entry)}</select></label><label><span>入口端口</span><input name="port" type="number" min="1" max="65535" value="${p.port||''}" placeholder="自动分配"></label></div><h3>中间路径</h3><div class="member-list">${p.stages.map((st,i)=>`<div class="member-row"><span>${i+1}. ${st.kind==='pool'?'池 · '+esc(resourceName(poolView.pools,st.pool_id)):esc(memberName(st.node_id))}</span><button type="button" class="small" data-action="stage-up" data-index="${i}" ${i?'':'disabled'}>上移</button><button type="button" class="small danger" data-action="stage-remove" data-index="${i}">移除</button></div>`).join('') || '<p class="muted">入口直接连接目标</p>'}</div><div class="inline-fields"><select id="stage-add"><option value="">选择池或固定节点</option><optgroup label="池">${poolView.pools.map(x=>`<option value="p:${x.id}">${esc(x.name)}</option>`).join('')}</optgroup><optgroup label="固定节点">${poolView.nodes.map(x=>`<option value="n:${x.id}">${esc(x.name)}</option>`).join('')}</optgroup></select><button type="button" data-action="stage-add">添加阶段</button></div><label><span>目标</span><select name="target"><option value="">未选择</option>${options(poolView.targets,p.target)}</select></label><div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button>${!linkEditor.id || poolView.link?.state==='draft'?'<button name="draft" value="1">保存草稿</button>':''}<button class="primary">保存并应用</button></div></form>`);
+  const stages=[...poolView.pools.map(x=>({id:'p:'+x.id,name:'池 · '+x.name})),...poolView.nodes.map(x=>({...x,id:'n:'+x.id}))];
+  openModal(`<form data-form="link-save"><h2>${linkEditor.id?'编辑链路':'新增链路'}</h2><label><span>名称</span><input name="name" value="${esc(linkEditor.name)}" required></label><div class="inline-fields"><label><span>入口节点</span>${resourceSelect('entry',poolView.nodes,p.entry,'无入口（直达目标）')}</label><label><span>入口端口</span><input name="port" type="number" min="1" max="65535" value="${p.port||''}" placeholder="自动分配"></label></div><h3>中间路径</h3><div class="member-list" data-reorder="stage">${p.stages.map((st,i)=>`<div class="member-row sort-item" data-order="${esc(st.id)}">${dragHandle}<span class="member-label">${i+1}. ${st.kind==='pool'?'池 · '+esc(resourceName(poolView.pools,st.pool_id)):esc(memberName(st.node_id))}</span>${orderButtons('stage',i,p.stages.length)}<button type="button" class="small danger" data-action="stage-remove" data-index="${i}">移除</button></div>`).join('')||'<p class="muted">入口直接连接目标</p>'}</div><div class="inline-fields">${resourceSelect('stage-add',stages,'','选择池或固定节点',true)}<button type="button" data-action="stage-add">添加阶段</button></div><label><span>目标</span>${resourceSelect('target',poolView.targets,p.target,'未选择')}</label><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button>${!linkEditor.id || poolView.link?.state==='draft'?'<button name="draft" value="1">保存草稿</button>':''}<button class="primary">保存并应用</button></div></form>`,preserve);
+  $('#stage-add').setAttribute('data-ignore-dirty','');
+  if(!preserve)modalState.initial=modalValues();
 }
 
 function instanceForm(sid) {
   const l=poolView.link; instanceEditor={link:structuredClone(l),source:structuredClone(l),stage:sid}; drawInstance();
 }
 function instance() { return instanceEditor.link.plan.stages.find(s=>s.id===instanceEditor.stage); }
-function drawInstance() {
-  const s=instance(),l=instanceEditor.link;
-  openModal(`<form data-form="instance-save"><h2>${esc(resourceName(poolView.pools,s.pool_id))}</h2><div class="member-list">${s.order.map((n,i)=>`<div class="member-row"><span>${i+1}. ${esc(memberName(n))}${l.selected[s.id]===n?' <b class="t-green">生效</b>':''}${s.default===n?' <small>默认</small>':''}</span><button type="button" class="small" data-action="instance-up" data-index="${i}" ${i?'':'disabled'} aria-label="提高优先级">↑</button><button type="button" class="small" data-action="instance-down" data-index="${i}" ${i<s.order.length-1?'':'disabled'} aria-label="降低优先级">↓</button><button type="button" class="small" data-action="instance-disable" data-member="${n}" ${l.selected[s.id]===n?'disabled':''}>${s.disabled.includes(n)?'启用':'禁用'}</button></div>`).join('')}</div><label><span>默认节点</span><select id="instance-default">${s.order.map(n=>`<option value="${n}" ${s.default===n?'selected':''}>${esc(memberName(n))}</option>`).join('')}</select></label><label><span>锁定</span><select id="instance-lock"><option value="">不锁定</option>${s.order.filter(n=>!s.disabled.includes(n)).map(n=>`<option value="${n}" ${s.locked===n?'selected':''}>${esc(memberName(n))}</option>`).join('')}</select></label><button type="button" data-action="instance-direct" ${l.selected[s.id]===0 || s.locked===0 ? 'disabled' : ''}>${s.direct?'移除 direct':'添加 direct'}</button><div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
+function drawInstance(preserve=false) {
+  const s=instance(),l=instanceEditor.link, members=s.order.map(n=>({id:n,name:memberName(n)}));
+  openModal(`<form data-form="instance-save"><h2>${esc(resourceName(poolView.pools,s.pool_id))}</h2><div class="member-list" data-reorder="instance">${s.order.map((n,i)=>`<div class="member-row sort-item" data-order="${n}">${dragHandle}<span class="member-label">${i+1}. ${esc(memberName(n))}${l.selected[s.id]===n?' <b class="t-green">生效</b>':''}${s.default===n?' <small>默认</small>':''}</span>${orderButtons('instance',i,s.order.length)}<button type="button" class="small" data-action="instance-disable" data-member="${n}" ${l.selected[s.id]===n?'disabled':''}>${s.disabled.includes(n)?'启用':'禁用'}</button></div>`).join('')}</div><label><span>默认节点</span>${resourceSelect('instance-default',members,s.default,'请选择',true)}</label><label><span>锁定</span>${resourceSelect('instance-lock',members.filter(n=>!s.disabled.includes(n.id)),s.locked,'不锁定',true)}</label><button type="button" data-action="instance-direct" ${l.selected[s.id]===0 || s.locked===0 ? 'disabled' : ''}>${s.direct?'移除 direct':'添加 direct'}</button><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`,preserve);
 }
+
 function rememberInstance() {
   const v=$('#instance-lock').value; instance().locked=v===''?null:Number(v);
   const d=$('#instance-default').value; instance().default=d===''?null:Number(d);
@@ -238,8 +335,24 @@ function rememberInstance() {
 
 async function configSummary(request) {
   const d=await api('GET','configs'); if(request!==viewRequest)return;
-  render(poolHead('配置','<a class="button" href="#/routes">管理链路 →</a>')+ (d.chains.length?`<div class="panel table-scroll"><table><thead><tr><th>名称</th><th>入口地址</th><th>状态</th><th>连接信息</th></tr></thead><tbody>${d.chains.map(c=>`<tr data-key="summary-${c.id}"><td><a href="#/routes/${c.link_id||''}">${esc(c.remark)}</a></td><td><code>${c.connection?esc(c.connection.host)+':'+c.connection.port:'等待入口确认'}</code></td><td>${c.link_state?linkState({state:c.link_state}):esc(c.status)}${c.link_error?`<small class="t-red">${esc(c.link_error)}</small>`:''}</td><td>${c.connection?`<button class="small" data-action="copy" data-text="${esc(c.connection.uri)}">复制${c.connection.protocol==='endpoint'?'地址':'导入链接'}</button>`:''}</td></tr>`).join('')}</tbody></table></div>`:emptyState('⇄','尚无配置，请先创建链路。')));
+  drawCollection=()=>{
+    const view=c=>({state:c.link_state||c.status,sync:c.link_sync});
+    const rows=d.chains.filter(c=>matchesSearch('configs',c.remark+' '+(c.connection?c.connection.host+':'+c.connection.port:''))&&(!collectionFilters.configs.state || statusGroup(view(c))===collectionFilters.configs.state));
+    render(poolHead('配置','<a class="button" href="#/routes">管理链路 →</a>')+
+      collectionTools('configs',rows.length,d.chains.length,[['active','已应用'],['pending','等待同步'],['error','异常'],['deleting','删除中']])+
+      `<div class="collection">${rows.map(c=>`<div class="collection-row" data-key="summary-${c.id}"><div class="collection-main"><a class="title" href="#/routes/${c.link_id||''}">${esc(c.remark)}</a><div class="sub"><code>${c.connection?esc(c.connection.host)+':'+c.connection.port:'等待入口确认'}</code></div>${c.link_error?`<div class="row-error">${esc(c.link_error)}</div>`:''}</div>${linkState(view(c))}<div class="row-actions">${c.connection?`<button class="small" data-action="copy" data-text="${esc(c.connection.uri)}">复制${c.connection.protocol==='endpoint'?'地址':'导入链接'}</button>`:''}</div></div>`).join('')||emptyState('⇄',d.chains.length?'没有匹配的配置':'暂无配置')}</div>`);
+  };drawCollection();
 }
+
+document.addEventListener('reordered',e=>{
+  const kind=e.target.dataset.reorder;if(!kind)return;
+  const order=[...e.target.querySelectorAll('[data-order]')].map(el=>el.dataset.order);
+  const before=kind==='pool'?templateEditor.members:kind==='stage'?linkEditor.plan.stages.map(s=>s.id):instance().order;
+  if(order.join(',')===before.join(','))return;
+  if(kind==='pool'){rememberPool();templateEditor.members=order.map(Number);markModalDirty();drawPoolForm(true);}
+  if(kind==='stage'){rememberLink();linkEditor.plan.stages=order.map(id=>linkEditor.plan.stages.find(s=>s.id===id));markModalDirty();drawLinkForm(true);}
+  if(kind==='instance'){rememberInstance();instance().order=order.map(Number);markModalDirty();drawInstance(true);}
+});
 
 Object.assign(FORMS, {
   async 'quick-switch'() { const choice={...quickSwitch}; await api('POST',`links/${choice.id}/action`,{action:'switch',revision:choice.revision,stage:choice.stage,member:choice.member});closeModal();toast('等待节点确认');await refresh(); },
@@ -252,22 +365,27 @@ Object.assign(ACTIONS, {
   'canvas-in':()=>topologyBinding?.zoom(1.2),
   'canvas-out':()=>topologyBinding?.zoom(1/1.2),
   'canvas-fit':()=>topologyBinding?.fit(),
+  'canvas-current':()=>topologyBinding?.focusCurrent(),
+  'canvas-fullscreen':()=>topologyBinding?.fullscreen(),
+  'edge-quality':el=>edgeQuality(Number(el.dataset.source),Number(el.dataset.target)),
   'pool-new':()=>poolForm(), 'pool-edit':el=>poolForm(poolView.pools.find(p=>p.id===Number(el.dataset.id))),
-  async 'pool-delete'(el){if(!confirm('删除此池？'))return;await api('DELETE',`pools/${el.dataset.id}`);refresh();},
-  'pool-up'(el){rememberPool();const i=Number(el.dataset.index),a=templateEditor.members;[a[i-1],a[i]]=[a[i],a[i-1]];drawPoolForm();},
-  'pool-remove'(el){rememberPool();templateEditor.members.splice(Number(el.dataset.index),1);drawPoolForm();},
-  'pool-add'(){rememberPool();const n=Number($('#pool-add-node').value);if(n)templateEditor.members.push(n);drawPoolForm();},
+  async 'pool-delete'(el){if(!(await confirmBox('删除池','删除 <b>'+esc(poolView.pools.find(p=>p.id===Number(el.dataset.id)).name)+'</b>？','删除',true)))return;await api('DELETE',`pools/${el.dataset.id}`);refresh();},
+  'pool-down'(el){rememberPool();const i=Number(el.dataset.index),a=templateEditor.members;[a[i],a[i+1]]=[a[i+1],a[i]];markModalDirty();drawPoolForm(true);},
+  'pool-up'(el){rememberPool();const i=Number(el.dataset.index),a=templateEditor.members;[a[i-1],a[i]]=[a[i],a[i-1]];markModalDirty();drawPoolForm(true);},
+  'pool-remove'(el){rememberPool();templateEditor.members.splice(Number(el.dataset.index),1);markModalDirty();drawPoolForm(true);},
+  'pool-add'(){rememberPool();const ids=[...document.querySelectorAll('[data-member-choice]:checked')].map(el=>Number(el.value));if(!ids.length)return;templateEditor.members.push(...ids);markModalDirty();drawPoolForm(true);},
   'link-new':()=>linkForm(), 'link-edit':()=>linkForm(poolView.link),
-  async 'link-delete'(){if(!confirm('删除链路并清理其转发规则？'))return;await api('DELETE',`links/${poolView.link.id}`);location.hash='#/routes';},
+  async 'link-delete'(){if(!(await confirmBox('删除链路','删除 <b>'+esc(poolView.link.name)+'</b> 并清理其转发规则？','删除',true)))return;await api('DELETE',`links/${poolView.link.id}`);location.hash='#/routes';},
   async 'link-retry'(){const l=poolView.link;await api('POST',`links/${l.id}/action`,{action:'retry',revision:l.revision});refresh();},
-  'stage-add'(){rememberLink();const [kind,id]=$('#stage-add').value.split(':');if(!id)return;linkEditor.plan.stages.push({id:crypto.randomUUID?.()||String(Date.now()),kind:kind==='p'?'pool':'node',...(kind==='p'?{pool_id:Number(id)}:{node_id:Number(id)})});drawLinkForm();},
-  'stage-up'(el){rememberLink();const i=Number(el.dataset.index),a=linkEditor.plan.stages;[a[i-1],a[i]]=[a[i],a[i-1]];drawLinkForm();},
-  'stage-remove'(el){rememberLink();linkEditor.plan.stages.splice(Number(el.dataset.index),1);drawLinkForm();},
+  'stage-add'(){rememberLink();const [kind,id]=$('#stage-add').value.split(':');if(!id)return;linkEditor.plan.stages.push({id:crypto.randomUUID?.()||String(Date.now()),kind:kind==='p'?'pool':'node',...(kind==='p'?{pool_id:Number(id)}:{node_id:Number(id)})});markModalDirty();drawLinkForm(true);},
+  'stage-down'(el){rememberLink();const i=Number(el.dataset.index),a=linkEditor.plan.stages;[a[i],a[i+1]]=[a[i+1],a[i]];markModalDirty();drawLinkForm(true);},
+  'stage-up'(el){rememberLink();const i=Number(el.dataset.index),a=linkEditor.plan.stages;[a[i-1],a[i]]=[a[i],a[i-1]];markModalDirty();drawLinkForm(true);},
+  'stage-remove'(el){rememberLink();linkEditor.plan.stages.splice(Number(el.dataset.index),1);markModalDirty();drawLinkForm(true);},
   'instance-edit':el=>instanceForm(el.dataset.stage),
   'topology-switch':el=>quickSwitchForm(poolView.link,el.dataset.stage,Number(el.dataset.member)),
-  'instance-up'(el){rememberInstance();const i=Number(el.dataset.index),a=instance().order;[a[i-1],a[i]]=[a[i],a[i-1]];drawInstance();},
-  'instance-down'(el){rememberInstance();const i=Number(el.dataset.index),a=instance().order;[a[i],a[i+1]]=[a[i+1],a[i]];drawInstance();},
-  'instance-disable'(el){rememberInstance();const n=Number(el.dataset.member),s=instance();s.disabled=s.disabled.includes(n)?s.disabled.filter(x=>x!==n):[...s.disabled,n];if(s.locked===n)s.locked=null;drawInstance();},
-  'instance-direct'(){rememberInstance();const s=instance();s.direct=!s.direct;s.order=s.direct?[...s.order,0]:s.order.filter(n=>n!==0);s.disabled=s.disabled.filter(n=>n!==0);if(!s.direct && s.default===0)s.default=s.order[0]??null;drawInstance();},
+  'instance-up'(el){rememberInstance();const i=Number(el.dataset.index),a=instance().order;[a[i-1],a[i]]=[a[i],a[i-1]];markModalDirty();drawInstance(true);},
+  'instance-down'(el){rememberInstance();const i=Number(el.dataset.index),a=instance().order;[a[i],a[i+1]]=[a[i+1],a[i]];markModalDirty();drawInstance(true);},
+  'instance-disable'(el){rememberInstance();const n=Number(el.dataset.member),s=instance();s.disabled=s.disabled.includes(n)?s.disabled.filter(x=>x!==n):[...s.disabled,n];if(s.locked===n)s.locked=null;markModalDirty();drawInstance(true);},
+  'instance-direct'(){rememberInstance();const s=instance();s.direct=!s.direct;s.order=s.direct?[...s.order,0]:s.order.filter(n=>n!==0);s.disabled=s.disabled.filter(n=>n!==0);if(!s.direct && s.default===0)s.default=s.order[0]??null;markModalDirty();drawInstance(true);},
   'instance-switch':el=>quickSwitchForm(instanceEditor.source,instanceEditor.stage,Number(el.dataset.member))
 });
