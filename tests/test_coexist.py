@@ -54,6 +54,30 @@ class CoexistTests(AgentHarness,unittest.TestCase):
         self.assertFalse((self.lib/'config').exists())
         with self.assertRaisesRegex(self.ipt.Failure,'配置冲突'):self.add(proto='tcp')
 
+    def test_empty_nft_backend_includes_virtual_default_chains(self):
+        def query(args):
+            table=args[args.index('-t')+1] if '-t' in args else None
+            text='' if args[0]=='iptables-save' else ('-P PREROUTING ACCEPT\n-P POSTROUTING ACCEPT\n' if table=='nat' else '-P FORWARD ACCEPT\n')
+            return types.SimpleNamespace(stdout=text)
+        with patch.object(self.ipt,'command',side_effect=query):
+            snap=self.ipt.snapshot()
+        self.assertIn(('nat','PREROUTING'),snap['chains'])
+        self.assertIn(('filter','FORWARD'),snap['chains'])
+        self.assertEqual(self.ipt.snapshot(snap['text']),snap)
+
+    def test_update_and_delete_clear_only_old_connection_tuples(self):
+        self.add(proto='udp')
+        row=self.row()
+        self.ipt.clear_old_connections([row],[dict(row,comment='renamed')])
+        log=self.root/'commands'
+        self.assertNotIn('conntrack -D',log.read_text())
+        self.ipt.clear_old_connections([row],[dict(row,ip='198.51.100.3')])
+        self.ipt.clear_old_connections([dict(row,ip='198.51.100.3')],[])
+        calls=[line for line in log.read_text().splitlines() if line.startswith('conntrack -D')]
+        self.assertEqual(len(calls),2)
+        self.assertIn('--orig-port-dst 10001 --reply-src 198.51.100.2 --reply-port-src 443 --dst-nat',calls[0])
+        self.assertIn('--reply-src 198.51.100.3',calls[1])
+
     def test_agent_without_standalone_and_both_managers_on_distinct_ports(self):
         self.agent_apply();self.add(10002)
         self.assertShell('with_lock local_apply; [ "$R_STATE" = ok ]')

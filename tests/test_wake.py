@@ -168,3 +168,37 @@ main --wake-sync {token}
         self.assertEqual(wake.summary(self.db, node)['state'], 'confirmed')
         self.assertFalse((self.lib/'wake-ack').exists())
         self.assertIn('10001', (self.lib/'config').read_text())
+
+
+class WakeLocalSettingsTests(unittest.TestCase):
+    def test_failed_start_restores_previous_config_and_service(self):
+        import os
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from test_server import ROOT
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name in ('pkg','conf','lib','bin'):(root/name).mkdir()
+            (root/'lib/agent-kind').write_text('passive\n')
+            previous='ENABLED=1\nPORT=61023\nALLOW=192.0.2.1\n'
+            (root/'conf/wake.conf').write_text(previous); (root/'unit').write_text('old service')
+            (root/'pkg/passive.sh').write_text('CONFIG="$CASE_ROOT/missing"; check_port_conflicts() { return 0; }')
+            (root/'pkg/wake').write_text('''#!/bin/bash
+if [ "$1" = --make-config ]; then printf 'ENABLED=1\\nPORT=%s\\nALLOW=%s\\n' "$2" "$3"; fi
+'''); (root/'pkg/wake').chmod(0o755)
+            (root/'bin/systemctl').write_text('''#!/bin/bash
+echo "$*" >> "$CASE_ROOT/services"
+if [ "$1" = enable ] && [ "${2:-}" = --now ]; then exit 1; fi
+'''); (root/'bin/systemctl').chmod(0o755)
+            source=(ROOT/'agent/wake.sh').read_text()
+            for path,target in (('/usr/local/lib/ictl','pkg'),('/etc/ictl','conf'),('/var/lib/ictl','lib'),('/etc/systemd/system/ictl-wake.service','unit'),('/run/ictl.lock','lock')):
+                source=source.replace(path,str(root/target))
+            script=root/'wake.sh'; script.write_text(source)
+            code='ICTL_LIBRARY=1 source "$CASE_ROOT/wake.sh"; policy_apply() { :; }; policy_remove() { :; }; configure 61024 192.0.2.1'
+            result=subprocess.run(['bash','-c',code],env={**os.environ,'CASE_ROOT':directory,'PATH':str(root/'bin')+':'+os.environ['PATH']},capture_output=True,text=True,timeout=10)
+            self.assertNotEqual(result.returncode,0)
+            self.assertEqual((root/'conf/wake.conf').read_text(),previous)
+            self.assertEqual((root/'unit').read_text(),'old service')
+            self.assertIn('start ictl-wake',(root/'services').read_text())
+            self.assertFalse(list((root/'conf').glob('wake-backup.*')))

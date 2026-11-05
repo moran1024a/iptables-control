@@ -249,7 +249,7 @@ def manage(s, conn, node, data):
         path, _ = artifact(s, data.get('name'))
         return path.read_bytes()
     if action == 'info':
-        return f"proto=2\nmode={node['desired_mode']}\ninstalled={node['installed_agent']}\n"
+        return f"proto=2\nmode={node['desired_mode']}\ninstalled={node['installed_agent']}\ninstallation_id={node['installation_id'] or ''}\n"
     if action == 'wake-assets':
         arch = data.get('arch')
         if arch not in ('amd64', 'arm64'):
@@ -269,8 +269,6 @@ def manage(s, conn, node, data):
         _, digest = artifact(s, name)
         _, manager_digest = artifact(s, 'manage.sh')
         _, passive_digest = artifact(s, 'passive.sh')
-        if node['installed_agent'] != target:
-            conn.execute('UPDATE nodes SET manual_required=1 WHERE id=?',(node['id'],))
         op = secrets.token_hex(16)
         result = packet(s, conn, node, 'manual', op)
         config = 'v=' + result['hash'] + '\n' + '\n'.join(s.node_rules(conn, node)) + '\n'
@@ -284,6 +282,17 @@ def manage(s, conn, node, data):
                           (node['id'], data.get('op', ''))).fetchone()
     if not record:
         raise s.UserError('找不到切换事务')
+    if action == 'abort':
+        if record['result'] == 'confirmed':
+            raise s.UserError('已确认的同步不能取消')
+        conn.execute('DELETE FROM sync_ops WHERE node_id=? AND op=?', (node['id'], record['op']))
+        conn.execute("UPDATE agent_switches SET result='aborted',updated=? WHERE node_id=?", (now, node['id']))
+        if (node['state'] == 'init' and node['applied_generation'] == node['desired_generation']
+                and node['reported_v'] == s.rules_version(s.node_rules(conn, node))):
+            conn.execute("UPDATE nodes SET state='ok' WHERE id=?", (node['id'],))
+        return 'proto=2\nresult=aborted\n'
+    if record['result'] == 'aborted':
+        raise s.UserError('同步已取消，请重新准备')
     if action == 'status':
         return f"proto=2\nresult={record['result'] or 'pending'}\nmode={record['target']}\n"
     if action not in ('commit', 'failed') or data.get('target') != record['target']:

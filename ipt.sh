@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-VERSION=3.2
+VERSION=3.2.1
 SELF_PATH="$(readlink -f -- "$0")"
 
 error() { printf '错误：%s\n' "$*" >&2; }
@@ -23,7 +23,7 @@ prompt() {
 
 check_dependencies() {
   local tool manager='' package missing=() packages=()
-  for tool in python3 iptables iptables-save iptables-restore ss; do
+  for tool in python3 iptables iptables-save iptables-restore ss conntrack; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
   if ((${#missing[@]})); then
@@ -37,6 +37,7 @@ check_dependencies() {
         python3) package=python3; [[ "$manager" == pacman ]] && package=python ;;
         iptables*) package=iptables ;;
         ss) package=iproute2; [[ "$manager" == dnf || "$manager" == yum ]] && package=iproute ;;
+        conntrack) package=conntrack; [[ "$manager" == dnf || "$manager" == yum || "$manager" == zypper ]] && package=conntrack-tools ;;
       esac
       [[ " ${packages[*]} " == *" $package "* ]] || packages+=("$package")
     done
@@ -50,7 +51,7 @@ check_dependencies() {
       zypper) zypper --non-interactive install "${packages[@]}" || return 1 ;;
     esac
   fi
-  for tool in python3 iptables iptables-save iptables-restore ss systemctl; do
+  for tool in python3 iptables iptables-save iptables-restore ss conntrack systemctl; do
     command -v "$tool" >/dev/null 2>&1 || { error "依赖仍不可用：$tool"; return 1; }
   done
   python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || { error '需要 Python 3.8 或更新版本。'; return 1; }
@@ -229,10 +230,19 @@ def snapshot(text=None):
             rules.append(dict(table=table, chain=chain, spec=words[2:], pos=counts[key]))
     if ('nat', 'PREROUTING') not in chains or ('filter', 'FORWARD') not in chains:
         if live:
-            # 空白机器可能尚未加载 NAT/filter 表；显式查询后重新读取一次。
-            for name in ('nat', 'filter'):
-                command(['iptables', '-w', '30', '-t', name, '-S'])
-            return snapshot(command(['iptables-save']).stdout)
+            # iptables-nft does not materialize empty tables on a read. Include
+            # its virtual built-in chains without touching the host firewall.
+            for name, parent in (('nat', 'PREROUTING'), ('filter', 'FORWARD')):
+                if (name, parent) in chains:
+                    continue
+                listing = command(['iptables', '-w', '30', '-t', name, '-S']).stdout.splitlines()
+                if any(not line.startswith('-P ') for line in listing):
+                    raise Failure('iptables-save 与规则查询结果不一致，请重试。')
+                defaults = [shlex.split(line)[1:] for line in listing]
+                if not any(chain == parent for chain, policy in defaults):
+                    raise Failure('无法读取默认防火墙链。')
+                text += '\n*' + name + '\n' + ''.join(f':{chain} {policy} [0:0]\n' for chain, policy in defaults) + 'COMMIT\n'
+            return snapshot(text)
         raise Failure('无法读取完整的 IPv4 NAT/FORWARD 表，已停止操作。')
     return dict(text=text, rules=rules, chains=chains)
 
@@ -701,6 +711,16 @@ def restore_scheduler(state):
         command(['systemctl', 'enable' if state[unit] else 'disable', unit], check=state[unit])
     command(['systemctl', 'start' if state['active'] else 'stop', TIMER], check=state['active'])
 
+def clear_old_connections(old_rows, rows):
+    def tuples(items):
+        return {(proto, r['incoming'], r['ip'], r['target']) for r in items if r['ip'] for proto in protocols(r)}
+    for proto, incoming, ip, target in sorted(tuples(old_rows) - tuples(rows)):
+        result = command(['conntrack', '-D', '-f', 'ipv4', '-p', proto,
+                          '--orig-port-dst', str(incoming), '--reply-src', ip,
+                          '--reply-port-src', str(target), '--dst-nat'], check=False)
+        if result.returncode and not (result.returncode == 1 and '0 flow entries' in result.stderr):
+            raise Failure('清理旧转发连接失败：' + result.stderr.strip())
+
 def transact(old_rows, rows, snap, script, refresh=False):
     owned = owned_rules(snap, old_rows)
     desired = make_rules(rows)
@@ -749,6 +769,7 @@ def transact(old_rows, rows, snap, script, refresh=False):
         atomic_write(PERSIST, owned_snapshot(snapshot(), rows))
         if not refresh:
             scheduler(rows, script)
+        clear_old_connections(old_rows, rows)
         log(f'change committed: forwards={len(rows)} backup={saved}')
     except Exception as exc:
         for sig in signals:

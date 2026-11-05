@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.4.2"
+VERSION="0.4.3"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/lib/ictl/passive.sh"
@@ -428,7 +428,7 @@ check_port_conflicts() {
       if [ "${#columns[@]}" -le "$p" ]; then error='端口检查失败：本机端口输出格式无效'; break; fi
       address="${columns[$p]}"; port="${address##*:}"; ip="${address%:*}"
       ip="${ip#\[}"; ip="${ip%\]}"; ip="${ip%%%*}"
-      [[ "$ip" != *:* || "$ip" = :: || "$ip" = ::ffff:* ]] || continue
+      [[ "${ICTL_WAKE_IPV6:-0}" = 1 || "$ip" != *:* || "$ip" = :: || "$ip" = ::ffff:* ]] || continue
       if [[ ! "$port" =~ ^[0-9]+$ ]]; then error='端口检查失败：本机端口输出格式无效'; break; fi
       if [ -n "${requested[$proto:$port]:-}" ]; then error="端口冲突：${proto^^} $port 已被本机服务占用"; break; fi
     done < "$d/sockets"
@@ -547,6 +547,9 @@ restore_owned() {
       while iptables -t "$table" -C "$parent" -j "$chain" 2>/dev/null; do
         iptables -w -t "$table" -D "$parent" -j "$chain" || return 1
       done
+    elif [ "$flag" = 1 ]; then
+      iptables -w -t "$table" -C "$parent" -j "$chain" 2>/dev/null ||
+        iptables -w -t "$table" -I "$parent" 1 -j "$chain" || return 1
     fi
     if [[ "$snapshot" != *":$chain "* ]]; then
       iptables -w -t "$table" -F "$chain" && iptables -w -t "$table" -X "$chain" || return 1
@@ -1351,7 +1354,7 @@ main() {
     --snapshot-owned) need_root && owned_snapshot; return $? ;;
     --restore-owned)
       need_root || return 1
-      with_lock restore_owned "$(cat "$2")" $'1\n1\n1'; return $? ;;
+      with_lock restore_owned "$(cat "$2")" $'1\n1\n1' && jumps_ok; return $? ;;
   esac
   if [ "${1:-}" = --daemon ]; then
     need_root || return 1

@@ -48,13 +48,12 @@ class MigrationTests(Fixture, unittest.TestCase):
         old,before=self.legacy();secret=old.execute('SELECT params FROM tunnels WHERE id=8').fetchone()[0]
         old.close();self.db=s.init_db()
         self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],403)
-        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,10)),before[3:])
+        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,10)),[])
         self.assertEqual(s.get_target(self.db,8)['params'],secret)
-        self.assertEqual([r[0] for r in self.db.execute('SELECT id FROM chains ORDER BY id')],[8,9,11,12])
-        self.assertEqual([r[0] for r in self.db.execute('SELECT id FROM hops ORDER BY id')],[8,9,11,12])
-        self.assertEqual({r[0] for r in self.db.execute('SELECT port FROM retired_ports WHERE node_id=10')},{10001,10002,10003,10019})
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM chains').fetchone()[0],0)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM hops').fetchone()[0],0)
+        self.assertEqual({r[0] for r in self.db.execute('SELECT port FROM retired_ports WHERE node_id=10')},{10001,10002,10003,10008,10009,10011,10012,10019})
         self.assertEqual(s.get_node(self.db,10)['desired_mode'],'active')
-        self.assertNotEqual(s.get_chain(self.db,11)['target_id'],s.get_chain(self.db,12)['target_id'])
         self.assertFalse(self.db.execute("SELECT name FROM sqlite_master WHERE name IN ('tunnels','tunnel_nodes','tunnel_presence','all_nodes')").fetchall())
         self.assertFalse(self.db.execute('PRAGMA foreign_key_check').fetchall())
         backup=Path(s.DB_PATH+'.pre-0.3.0.bak');data=backup.read_bytes();self.assertEqual(backup.stat().st_mode&0o777,0o600)
@@ -66,7 +65,7 @@ class MigrationTests(Fixture, unittest.TestCase):
         self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],403)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM targets').fetchone()[0],2)
 
-    def test_200_preserves_unchanged_applied_forwarding_and_removes_tunnel_nodes(self):
+    def test_200_keeps_resources_and_retires_old_forwarding(self):
         self.db.close();os.unlink(s.DB_PATH)
         c=sqlite3.connect(s.DB_PATH);c.row_factory=sqlite3.Row;c.executescript(s.SCHEMA)
         for kind in ('nodes','chains'):
@@ -80,9 +79,11 @@ class MigrationTests(Fixture, unittest.TestCase):
         s.migrate_v020(c);c.execute("UPDATE nodes SET kind='tunnel' WHERE id=20")
         c.execute("INSERT INTO tunnels(id,name,node_id,protocol,port,params) VALUES (6,'managed',20,'shadowsocks',12346,'{}')");c.commit();c.close()
         self.db=s.init_db();n=s.get_node(self.db,10)
-        self.assertEqual(s.node_rules(self.db,n),before)
-        self.assertEqual(n['desired_generation'],n['applied_generation'])
-        self.assertEqual(s.get_chain(self.db,9)['remark'],'kept')
+        self.assertEqual(s.node_rules(self.db,n),[])
+        self.assertGreater(n['desired_generation'],n['applied_generation'])
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM chains').fetchone()[0],0)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM targets').fetchone()[0],1)
+        self.assertEqual(self.db.execute('SELECT port FROM retired_ports WHERE node_id=10').fetchone()[0],12345)
         self.assertFalse(self.db.execute('SELECT 1 FROM nodes WHERE id=20').fetchone())
         self.assertGreater(self.node('new'),20)
 

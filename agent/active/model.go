@@ -18,11 +18,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
-const version = "0.4.2"
+const version = "0.4.3"
 const tableName = "ictl_active"
 
 type M = map[string]any
@@ -43,6 +44,7 @@ type Config struct {
 	Epoch      string `json:"epoch"`
 }
 type Agent struct {
+	stateMu        *sync.Mutex // Shared by control and local maintenance; snapshots are read-only.
 	root           string
 	url            string
 	key            string

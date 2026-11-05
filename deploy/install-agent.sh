@@ -2,7 +2,7 @@
 # Install the explicitly selected release. RC releases never follow /latest.
 set -euo pipefail
 umask 077
-VERSION="0.4.2"
+VERSION="0.4.3"
 BASE="https://github.com/moran1024a/iptables-control/releases/download/v$VERSION"
 TRUSTED_BASE="$BASE"
 URL='' KEY='' KIND=active
@@ -42,17 +42,51 @@ for file in manage.sh control.sh; do
   bash -n "$work/$file"
 done
 mkdir -p /etc/ictl /usr/local/lib/ictl /var/lib/ictl
+exec 8>/run/ictl-manager.lock
+flock -n 8 || { echo '另一个安装或同步操作正在运行' >&2; exit 1; }
 auto_update=1
 if [ -f /etc/ictl/agent.conf ]; then
   old_key="$(sed -n 's/^KEY=//p' /etc/ictl/agent.conf)"
-  [ "$old_key" = "$KEY" ] || { echo '已安装不同身份的 Agent；请先明确卸载旧身份' >&2; exit 1; }
+  [ "$old_key" = "$KEY" ] || { echo '已安装不同身份的 Agent；重置本节点密钥请运行 sudo ictl --credentials，迁移到另一节点请先卸载旧身份' >&2; exit 1; }
   auto_update="$(sed -n 's/^AUTO_UPDATE=//p' /etc/ictl/agent.conf)"
   [ "$auto_update" = 0 ] || auto_update=1
 fi
+backup="$(mktemp -d /var/lib/ictl/install-backup.XXXXXX)"
+was_active=0
+systemctl is-active --quiet ictl-agent && was_active=1
+[ ! -f /var/lib/ictl/switch-work/transaction ] || cp /var/lib/ictl/switch-work/transaction "$backup/transaction"
+files=(/etc/ictl/agent.conf /usr/local/lib/ictl/manage.sh /usr/local/lib/ictl/control.sh)
+for i in "${!files[@]}"; do
+  [ ! -e "${files[$i]}" ] || cp -p "${files[$i]}" "$backup/$i"
+done
+install_cleanup() {
+  local result=$? phase=''
+  if [ "$result" != 0 ]; then
+    phase="$(sed -n 's/^PHASE=//p' /var/lib/ictl/switch-work/transaction 2>/dev/null || true)"
+    if [ -f "$backup/transaction" ] && cmp -s "$backup/transaction" /var/lib/ictl/switch-work/transaction; then phase=''; fi
+    case "$phase" in
+      handover|installed|confirmed|failed)
+        echo "交接尚待恢复或确认；安装前文件保留在 $backup，请使用 sudo ictl --sync 或 --recover 处理。" >&2 ;;
+      *)
+        for i in "${!files[@]}"; do
+          if [ -f "$backup/$i" ]; then cp -p "$backup/$i" "${files[$i]}"
+          else rm -f "${files[$i]}"; fi
+        done
+        # An early-failure cleanup may have restarted the service while the new
+        # URL was still on disk. Reload the restored identity as well.
+        if [ "$was_active" = 1 ]; then systemctl try-restart ictl-agent; fi
+        rm -rf "$backup"
+        echo '安装未进入交接，已恢复安装前的接入信息和管理脚本。' >&2 ;;
+    esac
+  else rm -rf "$backup"; fi
+  rm -rf "$work"
+  return "$result"
+}
+trap install_cleanup EXIT
 printf 'URL=%s\nKEY=%s\nAUTO_UPDATE=%s\n' "$URL" "$KEY" "$auto_update" > /etc/ictl/agent.conf.new
 mv /etc/ictl/agent.conf.new /etc/ictl/agent.conf
 for file in manage.sh control.sh; do
   install -m 755 "$work/$file" "/usr/local/lib/ictl/$file.new"
   mv "/usr/local/lib/ictl/$file.new" "/usr/local/lib/ictl/$file"
 done
-bash /usr/local/lib/ictl/manage.sh --switch "$KIND"
+ICTL_MANAGER_LOCK_HELD=1 bash /usr/local/lib/ictl/manage.sh --switch "$KIND"

@@ -11,6 +11,20 @@ class PassiveTests(AgentHarness,unittest.TestCase):
 
     def tearDown(self):self.temp.cleanup()
 
+    def test_restore_reconnects_parent_chains_after_handover_cleanup(self):
+        self.assertShell('''printf 'v=abc\n1 both 10001 192.0.2.1 443\n' > "$CONFIG"
+local_apply
+[ "$R_STATE" = ok ] || exit 1
+snapshot="$(owned_snapshot)"
+remove_rules
+restore_owned "$snapshot" $'1\n1\n1' && jumps_ok
+''')
+
+    def test_ipv6_wake_listener_conflict(self):
+        (self.root/'udp.sockets').write_text('UNCONN 0 0 [::1]:61024 [::]:*\n')
+        self.assertShell("ICTL_WAKE_CHECK=1; check_port_conflicts $'v=check\\n1 udp 61024 127.0.0.1 1'")
+        self.assertShell("ICTL_WAKE_CHECK=1; ICTL_WAKE_IPV6=1; ! check_port_conflicts $'v=check\\n1 udp 61024 127.0.0.1 1'")
+
     def test_reboot_restores_rules_without_dns_or_control_requests(self):
         self.assertShell('printf "v=abc\\n1 both 10001 192.0.2.1 443\\n" > "$CONFIG"\nlocal_apply\n[ "$R_STATE" = ok ]')
         r=self.assertShell('''curl() { echo forbidden >&2; return 1; }

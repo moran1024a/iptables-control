@@ -583,6 +583,7 @@ async function nodeDetail(id, request) {
     </div>
     ${n.note ? `<div class="panel note-full"><h2>备注</h2><div>${esc(n.note)}</div></div>` : ""}
     <div class="panel">${bar(n.bar)}
+      ${n.installed_agent === "legacy" || !n.installed_agent ? `<p class="t-yellow">此节点尚未迁移。请在节点执行下方一键接入命令；新版主动 Agent 确认安装后才能加入池并显示采集信息。</p>` : ""}
       ${n.desired_mode === "passive" || n.manual_required ? `<p class="hint">本机运行 <code>sudo ictl --sync</code> 或菜单「同步更新」。等待状态会持续到当前变更确认成功。白条上的绿色表示手动同步活动或远程同步成功，执行结果见下方事件。</p>` : ""}
       ${n.desired_mode === "passive" ? `<p class="hint">已同步表示最近一次确认结果，不表示实时在线；被动模式不自动轮询。</p>` : ""}
       ${n.desired_mode === "passive" ? `<p class="hint">远程唤醒：${n.wake_enabled ? `已开启，UDP ${n.wake_port}。${n.wake?.state === 'waiting' ? '正在等待同步确认，超过 30 秒转为等待手动同步。' : n.wake?.state === 'confirmed' ? '最近一次同步已确认。' : '请确保节点本地已配置白名单和相同端口。'}` : '未开启，配置变更需要本机手动同步。'}</p>` : ""}
@@ -890,7 +891,7 @@ function confirmBox(title, text, okLabel = "确定", danger = false) {
 function keyModal(title, key, extra = "") {
   openModal(`
     <h2>${esc(title)}</h2>
-    <p>节点需要在 <code>sudo ictl</code> 菜单 1 中填入新密钥，在此之前会显示认证失败，规则保持不变。</p>
+    <p>${currentNode?.installed_agent === "legacy" ? "旧版节点在 sudo ictl 菜单 1 中更新接入密钥。" : "在节点运行 <code>sudo ictl --credentials</code> 更新接入密钥（需要 0.4.3 或更新的管理器）。"}</p>
     <div class="key-box"><code>${esc(key)}</code><button class="small" data-action="copy" data-text="${esc(key)}">复制</button></div>
     ${extra}
     <div class="form-actions"><button type="button" class="primary" data-action="modal-close">完成</button></div>`);
@@ -1156,7 +1157,7 @@ const ACTIONS = {
   },
 
   async "node-rekey"() {
-    const ok = await confirmBox("重置密钥", `重置后旧密钥立即失效，节点 <b>${esc(currentNode.name)}</b> 需要填入新密钥才能继续同步。`, "重置");
+    const ok = await confirmBox("重置密钥", `重置后旧密钥立即失效，节点 <b>${esc(currentNode.name)}</b> 需要填入新密钥才能继续同步。${currentNode.installed_agent !== "legacy" ? "请先将节点管理器更新到 0.4.3，再执行此操作。" : ""}`, "重置");
     if (!ok) return;
     const r = await api("POST", `nodes/${currentNode.id}/rekey`);
     keyModal("密钥已重置", r.key);

@@ -92,10 +92,45 @@ class InstallerTests(unittest.TestCase):
     def test_success_removes_only_old_container_and_keeps_backup(self):
         r=self.run_install();self.assertEqual(r.returncode,0,r.stderr)
         containers=json.loads((self.root/'containers').read_text());self.assertEqual(list(containers),['ictl-server'])
-        self.assertTrue(containers['ictl-server']['image'].endswith('0.4.2'))
+        self.assertTrue(containers['ictl-server']['image'].endswith('0.4.3'))
         backup=next((self.root/'data').glob('*.bak'));c=sqlite3.connect(backup)
         self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],202);c.close()
 
     def test_missing_port_value_rejected(self):
         r=subprocess.run(['bash',str(ROOT/'deploy/install-server.sh'),'--port'],env=self.env,capture_output=True,text=True)
         self.assertNotEqual(r.returncode,0);self.assertIn('缺少参数',r.stderr)
+
+
+class AgentInstallerTests(unittest.TestCase):
+    def test_failed_preparation_restores_identity_and_entry_scripts(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name in ('bin','etc','pkg','lib','run','assets'):(root/name).mkdir()
+            key='ab'*32
+            original={root/'etc/agent.conf':f'URL=https://old.invalid/sync\nKEY={key}\nAUTO_UPDATE=0\n',
+                      root/'pkg/manage.sh':'old manager',root/'pkg/control.sh':'old control'}
+            for path,text in original.items():path.write_text(text)
+            for name in ('manage.sh','control.sh'):
+                (root/'assets'/name).write_text('#!/bin/bash\nexit 42\n')
+            (root/'assets/SHA256SUMS').write_text(''.join(hashlib.sha256((root/'assets'/name).read_bytes()).hexdigest()+'  '+name+'\n' for name in ('manage.sh','control.sh')))
+            for name in ('systemctl','nft','ss','conntrack'):
+                (root/'bin'/name).write_text('#!/bin/sh\nexit 0\n'); (root/'bin'/name).chmod(0o755)
+            (root/'bin/id').write_text('#!/bin/sh\necho 0\n'); (root/'bin/id').chmod(0o755)
+            (root/'bin/curl').write_text('''#!/bin/bash
+for arg in "$@"; do
+  if [[ "$arg" == https://* ]]; then file="${arg##*/}"; fi
+  if [ "${prev:-}" = -o ]; then output="$arg"; fi
+  prev="$arg"
+done
+cp "$CASE_ROOT/assets/$file" "$output"
+'''); (root/'bin/curl').chmod(0o755)
+            source=(ROOT/'deploy/install-agent.sh').read_text()
+            for path,target in (('/etc/ictl','etc'),('/usr/local/lib/ictl','pkg'),('/var/lib/ictl','lib'),('/run/ictl-manager.lock','run/manager.lock')):
+                source=source.replace(path,str(root/target))
+            script=root/'install'; script.write_text(source)
+            result=subprocess.run(['bash',str(script),'--url','https://new.invalid/sync','--key',key],
+                                  env={**os.environ,'CASE_ROOT':directory,'PATH':str(root/'bin')+':'+os.environ['PATH']},capture_output=True,text=True)
+            self.assertEqual(result.returncode,42,result.stderr)
+            for path,text in original.items():self.assertEqual(path.read_text(),text)
+            self.assertFalse(list((root/'lib').glob('install-backup.*')))

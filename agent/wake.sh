@@ -90,43 +90,72 @@ EOF
   systemctl daemon-reload
 }
 
-configure() {
-  local new old
+configure() (
+  local new old saved was_active=0 was_enabled=0 changed=0 ipv6=0
   [ "$(cat "$LIB/agent-kind" 2>/dev/null)" = passive ] || { echo '只有被动 Agent 可以启用远程唤醒' >&2; return 1; }
   [ ! -f "$LIB/switch-work/transaction" ] || { echo '请先完成本机同步或模式切换' >&2; return 1; }
-  new="$(mktemp /etc/ictl/wake-new.XXXXXX)"
-  if ! "$PKG/wake" --make-config "$1" "$2" > "$new"; then rm -f "$new"; return 1; fi
-  old="$(mktemp /etc/ictl/wake-old.XXXXXX)"
-  [ ! -f "$CONF" ] || cp "$CONF" "$old"
-  if [ -f "$UNIT" ]; then systemctl stop ictl-wake; fi
+  saved="$(mktemp -d /etc/ictl/wake-backup.XXXXXX)"
+  new="$saved/new" old="$saved/conf"
+  [ ! -f "$CONF" ] || cp -p "$CONF" "$old"
+  [ ! -f "$UNIT" ] || cp -p "$UNIT" "$saved/unit"
+  systemctl is-active --quiet ictl-wake && was_active=1
+  systemctl is-enabled --quiet ictl-wake && was_enabled=1
+  configure_cleanup() {
+    local result=$? restore_ok=1
+    trap - EXIT
+    if [ "$result" != 0 ] && [ "$changed" = 1 ]; then
+      systemctl stop ictl-wake || true
+      exec 9>/run/ictl.lock
+      if flock -w 60 9; then
+        if [ -f "$old" ]; then cp -p "$old" "$CONF" && policy_apply || restore_ok=0
+        else rm -f "$CONF"; policy_remove || restore_ok=0; fi
+        if [ -f "$saved/unit" ]; then cp -p "$saved/unit" "$UNIT" || restore_ok=0
+        else rm -f "$UNIT"; fi
+        flock -u 9
+      else restore_ok=0; fi
+      exec 9>&-
+      systemctl daemon-reload || restore_ok=0
+      if [ "$was_enabled" = 1 ]; then systemctl enable ictl-wake || restore_ok=0
+      else systemctl disable ictl-wake 2>/dev/null || true; fi
+      if [ "$was_active" = 1 ]; then systemctl start ictl-wake || restore_ok=0; fi
+      if [ "$restore_ok" = 0 ]; then
+        echo "恢复旧唤醒设置失败，备份保留在 $saved" >&2
+        return "$result"
+      fi
+      echo '启用失败，已恢复原来的唤醒设置。' >&2
+    fi
+    rm -rf "$saved"
+    return "$result"
+  }
+  trap configure_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  "$PKG/wake" --make-config "$1" "$2" > "$new" || return 1
+  [[ "$2" != *:* ]] || ipv6=1
+  changed=1
+  if [ -f "$UNIT" ]; then systemctl stop ictl-wake || return 1; fi
   exec 9>/run/ictl.lock
-  flock -w 60 9
+  flock -w 60 9 || return 1
   # The old reservation is intentionally excluded only for this local check.
-  if ! ICTL_LIBRARY=1 ICTL_WAKE_CHECK=1 bash -c 'source "$1/passive.sh"; ERRS=()
+  if ! ICTL_LIBRARY=1 ICTL_WAKE_CHECK=1 ICTL_WAKE_IPV6="$ipv6" bash -c 'source "$1/passive.sh"; ERRS=()
 if [ -f "$CONFIG" ] && awk -v port="$2" '\''$1 !~ /^v=/ && ($2=="udp" || $2=="both") && $3==port {found=1} END {exit !found}'\'' "$CONFIG"; then
   echo "端口冲突：UDP $2 已被 Agent 保存的转发配置占用" >&2; exit 1
 fi
 check_port_conflicts "v=check
 1 udp $2 127.0.0.1 1" || { printf "%s\n" "${ERRS[@]}" >&2; exit 1; }' _ "$PKG" "$1"; then
-    rm -f "$new" "$old"
     flock -u 9; exec 9>&-
-    if [ -s "$CONF" ] && grep -qx 'ENABLED=1' "$CONF"; then systemctl start ictl-wake; fi
     return 1
   fi
-  mv "$new" "$CONF"
-  if ! policy_apply; then
-    if [ -s "$old" ]; then mv "$old" "$CONF"; policy_apply || true
-    else rm -f "$CONF" "$old"; policy_remove || true; fi
-    flock -u 9; exec 9>&-
-    if [ -f "$CONF" ]; then systemctl start ictl-wake || true; fi
-    return 1
-  fi
-  rm -f "$old"
-  install_unit
+  "$PKG/wake" --check-listen "$new" || return 1
+  mv "$new" "$CONF" || return 1
+  policy_apply || return 1
+  install_unit || return 1
   flock -u 9; exec 9>&-
-  systemctl enable --now ictl-wake
+  systemctl enable --now ictl-wake || return 1
+  sleep 1
+  systemctl is-active --quiet ictl-wake || return 1
   printf '本机远程唤醒已启用：UDP %s；请在面板填写同一端口并开启远程唤醒。\n' "$PORT"
-}
+)
 
 main() {
   [ "$(id -u)" = 0 ] || { echo '请使用 sudo ictl' >&2; return 1; }

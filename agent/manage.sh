@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.4.2"
+VERSION="0.4.3"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -135,7 +135,32 @@ rollback() {
   [ "$result" = 0 ] || die '自动恢复未完成；备份和事务已保留，请勿删除 switch-work'
   return 1
 }
-perform_sync() {
+sync_cleanup() {
+  local result="$1"
+  if [ "$result" != 0 ] && [ "$SYNC_PREPARED" = 1 ] && [ "$SYNC_HANDOVER" = 0 ]; then
+    # No rules have been handed over yet. Release the server reservation and
+    # restore the old service even when upload, checkpoint or backup failed.
+    flock -u 9 2>/dev/null || true
+    exec 9>&-
+    rpc abort || true
+    if [ "$SYNC_JOURNALED" = 1 ]; then rm -f "$WORK/transaction"; fi
+    if [ "$SYNC_STOPPED" = 1 ] && [ "$FROM" != none ]; then
+      if [ "$FROM" = passive ] || [ "$TARGET" = active ]; then
+        systemctl start ictl-agent || die '旧服务恢复启动失败，请检查 journalctl -u ictl-agent'
+      fi
+    fi
+    if [ "$SYNC_WAKE_STOPPED" = 1 ]; then systemctl start ictl-wake || true; fi
+  fi
+  return "$result"
+}
+perform_sync() (
+  SYNC_PREPARED=0 SYNC_HANDOVER=0 SYNC_STOPPED=0 SYNC_WAKE_STOPPED=0 SYNC_JOURNALED=0
+  trap 'sync_cleanup "$?"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  sync_transaction "$@"
+)
+sync_transaction() {
   local wanted="${1:-}" artifact digest manager_digest helper_digest old_kind item
   local failed_active=0
   mkdir -p "$WORK" "$PKG"
@@ -170,6 +195,7 @@ perform_sync() {
   [ "${UPDATE_ONLY:-0}" != 1 ] || [ "$FROM" = "$TARGET" ] || { die '更新不能转换 Agent 类型；请使用 --sync 确认切换'; return 1; }
   rpc prepare || return 1
   OP="$(field op)" GEN="$(field generation)" HASH="$(field v)" NEW_VERSION="$(field version)"
+  SYNC_PREPARED=1
   artifact="$(field artifact)" digest="$(field sha256)" manager_digest="$(field manager_sha256)" helper_digest="$(field passive_sha256)"
   [[ "$OP" =~ ^[0-9a-f]{32}$ && "$GEN" =~ ^[0-9]+$ && "$HASH" =~ ^[0-9a-f]{12}$ ]] || { die '服务端切换快照无效'; return 1; }
   field config_b64 | base64 -d > "$WORK/config" || return 1
@@ -193,8 +219,11 @@ perform_sync() {
     for item in iptables iptables-save iptables-restore getent conntrack; do command -v "$item" >/dev/null || { die "缺少依赖：$item"; return 1; }; done
   fi
   PHASE=prepared; journal || return 1
+  SYNC_JOURNALED=1
+  SYNC_STOPPED=1
   systemctl stop ictl-agent 2>/dev/null || { [ ! -f "$UNIT" ] || return 1; }
   if [ -f /etc/systemd/system/ictl-wake.service ]; then
+    SYNC_WAKE_STOPPED=1
     systemctl stop ictl-wake || return 1
   fi
   if [ "$FROM" = active ]; then "$PKG/active" --flush-traffic || return 1; fi
@@ -206,14 +235,15 @@ perform_sync() {
   done
   if [ "$FROM" = active ]; then
     ICTL_LOCK_HELD=1 "$PKG/active" --checkpoint || return 1
-    cp "$LIB/config" "$WORK/old-config"
-    "$PKG/active" --generation-only > "$WORK/old-generation"
+    cp "$LIB/config" "$WORK/old-config" || return 1
+    "$PKG/active" --generation-only > "$WORK/old-generation" || return 1
   elif [ "$FROM" != none ]; then
     ICTL_LOCK_HELD=1 bash "$WORK/passive-helper.sh" --snapshot-owned > "$WORK/old-rules" || return 1
   fi
   tar -cf "$WORK/backup.tar" -C / "${files[@]}" || return 1
-  rm -f "$LIB/active/enabled"
   PHASE=handover; journal || return 1
+  SYNC_HANDOVER=1
+  rm -f "$LIB/active/enabled"
   if [ "$FROM" != "$TARGET" ] && [ "$FROM" != none ]; then
     if [ "$FROM" = active ]; then
       ICTL_LOCK_HELD=1 "$PKG/active" --clear || { rollback; return 1; }
@@ -300,6 +330,26 @@ wake_settings() {
     2) [ ! -f "$PKG/wake.sh" ] || bash "$PKG/wake.sh" --disable ;;
   esac
 }
+credentials() {
+  local previous_url="$URL" previous_key="$KEY" new_url new_key expected
+  read -r -p "同步地址（留空保留当前地址）：" new_url
+  read -r -s -p '新节点密钥：' new_key; printf '\n'
+  URL="${new_url:-$previous_url}" KEY="$new_key"
+  if ! [[ "$URL" =~ ^https?://[^[:space:]\"\\]+$ && "$KEY" =~ ^[0-9a-f]{64}$ ]]; then
+    URL="$previous_url" KEY="$previous_key"; die '地址或密钥格式无效'; return 1
+  fi
+  derive_keys
+  if ! rpc info; then URL="$previous_url" KEY="$previous_key"; derive_keys; return 1; fi
+  if [ "$(field mode)" = active ] && [[ "$URL" != https://* ]]; then die '主动 Agent 需要 HTTPS'; return 1; fi
+  expected="$(field installation_id)"
+  if [ -n "$expected" ] && [ "$expected" != "$(cat "$LIB/installation-id" 2>/dev/null)" ]; then
+    die '新密钥属于另一安装身份，未替换当前配置'; return 1
+  fi
+  printf 'URL=%s\nKEY=%s\nAUTO_UPDATE=%s\n' "$URL" "$KEY" "$AUTO_UPDATE" > "$CONF.new" &&
+    chmod 600 "$CONF.new" && mv "$CONF.new" "$CONF" || return 1
+  printf '接入凭据已验证并保存，正在同步确认。\n'
+  perform_sync
+}
 main() {
   [ "$(id -u)" = 0 ] || { die '请使用 sudo ictl'; return 1; }
   [ -f "$PKG/control.sh" ] || { die '管理组件不完整，请重新运行本版本安装脚本'; return 1; }
@@ -307,15 +357,18 @@ main() {
   ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; esac
   read_identity || return 1
   mkdir -p "$WORK"
-  exec 8>/run/ictl-manager.lock
-  flock -n 8 || { die '另一项安装或同步正在执行'; return 1; }
+  if [ "${ICTL_MANAGER_LOCK_HELD:-0}" != 1 ]; then
+    exec 8>/run/ictl-manager.lock
+    flock -n 8 || { die '另一项安装或同步正在执行'; return 1; }
+  fi
   local action="${1:-}" choice
   if [ -z "$action" ]; then
-    printf 'ictl %s\n1) 同步更新／确认切换\n2) 本地状态\n3) 更新当前 Agent\n4) 卸载\n5) 被动节点远程唤醒设置\n0) 退出\n' "$VERSION"
+    printf 'ictl %s\n1) 同步更新／确认切换\n2) 本地状态\n3) 更新当前 Agent\n4) 卸载\n5) 被动节点远程唤醒设置\n6) 修改接入地址／密钥\n0) 退出\n' "$VERSION"
     read -r -p '请选择：' choice
-    case "$choice" in 1) action=--sync ;; 2) action=--status ;; 3) action=--update ;; 4) action=--uninstall ;; 5) action=--wake-settings ;; *) return 0 ;; esac
+    case "$choice" in 1) action=--sync ;; 2) action=--status ;; 3) action=--update ;; 4) action=--uninstall ;; 5) action=--wake-settings ;; 6) action=--credentials ;; *) return 0 ;; esac
   fi
   case "$action" in
+    --credentials) credentials ;;
     --wake-settings) wake_settings ;;
     --wake-sync) bash "$PKG/passive.sh" --wake-sync "${2:-}" ;;
     --sync|--install) perform_sync ;;
@@ -355,7 +408,7 @@ main() {
         if [ -L "$old" ] && [ "$(readlink "$old")" = /usr/local/bin/ictl ]; then rm -f "$old"; fi
       done
       systemctl daemon-reload ;;
-    *) die '用法：ictl [--sync|--switch active/passive|--update|--status|--wake-settings|--recover|--uninstall [-y]]'; return 1 ;;
+    *) die '用法：ictl [--sync|--switch active/passive|--update|--status|--credentials|--wake-settings|--recover|--uninstall [-y]]'; return 1 ;;
   esac
 }
 if [ "${ICTL_LIBRARY:-0}" != 1 ]; then main "$@"; fi

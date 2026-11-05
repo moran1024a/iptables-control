@@ -321,7 +321,7 @@ def rows(c, lid):
     return [dict(r) for r in c.execute("SELECT * FROM link_rules WHERE link_id=? AND phase='live' ORDER BY id", (lid,))]
 
 
-def begin(s, c, link, plan, selected, path, reason):
+def begin(s, c, link, plan, selected, path, reason, previous=None):
     if link['job']:
         raise s.UserError('链路已有未完成的切换，请先等待确认或重试同步', status=409)
     if plan['target'] is None:
@@ -379,6 +379,9 @@ def begin(s, c, link, plan, selected, path, reason):
     job = dict(phase='prepare', at=int(time.time()), new=new, old=old, selected=selected,
                nodes=sorted({r['node_id'] for r in old + new}), target=target['id'], reason=reason,
                wait=sorted({r['node_id'] for r in new[1:]}))
+    previous = previous or link
+    job['previous'] = dict(plan=json.loads(previous['plan']), name=previous['name'],
+                           selected=json.loads(previous['selected']))
     c.execute("UPDATE links SET job=?,state='preparing',error='' WHERE id=?", (dump(job), link['id']))
     event(c, link['id'], reason + '：准备新路径')
 
@@ -407,7 +410,7 @@ def link_save(s, c, body, ident=None):
                             and x['id'] in old_stages and x['pool_id'] == old_stages[x['id']]['pool_id']
                             and x['default'] != default_member(old_stages[x['id']])}
         selected, path = choose(s, c, link, plan, prefer_current=bool(old), forced=changed_defaults)
-        begin(s, c, link, plan, selected, path, '手动应用')
+        begin(s, c, link, plan, selected, path, '手动应用', previous=old)
     elif old and old['chain_id'] is not None:
         raise s.UserError('已经运行的链路请使用保存并应用')
     return dict(id=ident)
@@ -419,7 +422,30 @@ def action(s, c, body, ident):
         raise s.UserError('链路已变化，请刷新后重试', status=409)
     if link['state'] == 'deleting':
         raise s.UserError('链路正在删除，暂不能切换', status=409)
-    if body.get('action') == 'retry':
+    if body.get('action') == 'cancel':
+        if not link['job']:
+            raise s.UserError('没有待取消的切换')
+        job = json.loads(link['job'])
+        if job['phase'] == 'rollback':
+            raise s.UserError('正在恢复旧路径，请等待确认或重试同步')
+        if job['phase'] == 'prepare':
+            cancel_complete(s, c, link, job)
+        else:
+            # The entry might already have switched even if its receipt was lost.
+            # Restore it before removing any of the new downstream rules.
+            entry = job['new'][:1]
+            for r in entry:
+                c.execute('DELETE FROM link_rules WHERE id=?', (r['id'],))
+            for r in job['old']:
+                c.execute("INSERT OR IGNORE INTO link_rules VALUES (?,?, 'live',?,?,?,?)",
+                          (r['id'], ident, r['node_id'], r['port'], r['host'], r['tport']))
+            old_ports = {(r['node_id'], r['port']) for r in job['old']}
+            retire(s, c, ident, [r for r in entry if (r['node_id'], r['port']) not in old_ports])
+            job.update(phase='rollback', at=int(time.time()),
+                       wait=sorted({r['node_id'] for r in entry + [r for r in job['old'] if c.execute('SELECT 1 FROM hops WHERE id=? AND seq=0', (r['id'],)).fetchone()]}))
+            c.execute("UPDATE links SET job=?,state='switching',error='' WHERE id=?", (dump(job), ident))
+            event(c, ident, '取消切换：等待入口恢复旧路径')
+    elif body.get('action') == 'retry':
         if not link['job']:
             c.execute("UPDATE links SET failures='[]',error='' WHERE id=?", (ident,))
             plan = json.loads(link['plan'])
@@ -455,6 +481,28 @@ def retire(s, c, lid, rules):
         s.reserve_removed(c, r['node_id'], r['port'])
         if s.get_node(c, r['node_id'])['first_seen']:
             c.execute('INSERT OR IGNORE INTO link_retired VALUES (?,?,?)', (lid, r['node_id'], r['port']))
+
+
+def cancel_complete(s, c, link, job):
+    staged = [dict(r) for r in c.execute("SELECT * FROM link_rules WHERE link_id=? AND phase='stage'", (link['id'],))]
+    retire(s, c, link['id'], staged)
+    c.execute("DELETE FROM link_rules WHERE link_id=? AND phase='stage'", (link['id'],))
+    previous = job.get('previous')
+    if previous is None:
+        # Compatibility with a switch started before cancellation was supported.
+        hops = list(c.execute('SELECT * FROM hops WHERE chain_id=? ORDER BY seq', (link['chain_id'],)))
+        target = c.execute('SELECT target_id FROM chains WHERE id=?', (link['chain_id'],)).fetchone()[0]
+        previous = dict(plan=fixed_plan(hops, target), name=link['name'], selected={})
+    retained = json.loads(link['retained'])
+    for stage in json.loads(link['plan'])['stages']:
+        if stage['kind'] == 'pool' and stage not in retained:
+            retained.append(stage)
+    c.execute("UPDATE links SET plan=?,name=?,selected=?,job=NULL,state=?,error='',failures='[]',retained=? WHERE id=?",
+              (dump(previous['plan']), previous['name'], dump(previous['selected']),
+               'active' if job['old'] else 'draft', dump(retained), link['id']))
+    if not job['old']:
+        c.execute('DELETE FROM chains WHERE id=?', (link['chain_id'],))
+    event(c, link['id'], '切换已取消，新路径规则开始清理')
 
 
 def delete_link(s, c, ident):
@@ -513,6 +561,10 @@ def progress(s, c, link, now):
         c.execute("UPDATE links SET job=?,state='switching',error='' WHERE id=?", (dump(job), link['id']))
         event(c, link['id'], '下游已确认，切换入口')
         return
+    if job['phase'] == 'rollback':
+        cancel_complete(s, c, link, job)
+        c.execute('UPDATE links SET revision=revision+1 WHERE id=?', (link['id'],))
+        return
     new_ids = {r['id'] for r in job['new']}
     old = [r for r in job['old'] if r['id'] not in new_ids]
     # The stable entry port is still owned by the new rule and must not be retired.
@@ -548,7 +600,7 @@ def tick(s, c, now=None, allow_failover=True):
         if link['job']:
             progress(s, c, link, now)
             continue
-        if link['state'] == 'active' and not c.execute('SELECT 1 FROM link_retired WHERE link_id=?', (link['id'],)).fetchone():
+        if link['state'] in ('active', 'draft') and not c.execute('SELECT 1 FROM link_retired WHERE link_id=?', (link['id'],)).fetchone():
             c.execute("UPDATE links SET retained='[]' WHERE id=?", (link['id'],))
         if link['chain_id'] is None or not allow_failover:
             continue

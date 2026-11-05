@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const version = "0.4.0"
+const version = "0.4.3"
 const configPath = "/etc/ictl/wake.conf"
 const replayPath = "/var/lib/ictl/wake-replay.json"
 
@@ -315,9 +315,19 @@ func main() {
 		fmt.Println(version)
 		return
 	}
-	if len(args) == 2 && args[0] == "--check-config" {
-		if _, err := loadConfig(args[1]); err != nil {
+	if len(args) == 2 && (args[0] == "--check-config" || args[0] == "--check-listen") {
+		c, err := loadConfig(args[1])
+		if err != nil {
 			log.Fatal(err)
+		}
+		if args[0] == "--check-listen" {
+			conns, err := listen(c)
+			if err != nil {
+				log.Fatal(err)
+			}
+			for _, conn := range conns {
+				conn.Close()
+			}
 		}
 		return
 	}
@@ -334,7 +344,7 @@ func main() {
 		return
 	}
 	if len(args) != 1 || args[0] != "--daemon" {
-		log.Fatal("usage: wake --daemon|--version|--check-config path|--make-config port ip,ip")
+		log.Fatal("usage: wake --daemon|--version|--check-config path|--check-listen path|--make-config port ip,ip")
 	}
 	if err := run(); err != nil {
 		log.Fatal(err)

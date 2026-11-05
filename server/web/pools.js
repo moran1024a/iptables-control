@@ -47,7 +47,7 @@ function poolForm(p) {
 }
 function drawPoolForm(preserve=false) {
   const p = templateEditor, available=poolView.nodes.filter(n=>n.eligible&&!p.members.includes(n.id));
-  openModal(`<form data-form="pool-save"><h2>${p.id ? '编辑池' : '新增池'}</h2><label><span>名称</span><input name="name" value="${esc(p.name)}" required maxlength="100"></label><div class="member-list" data-reorder="pool">${p.members.map((n,i)=>`<div class="member-row sort-item" data-order="${n}">${dragHandle}<span class="member-label">${i+1}. ${esc(memberName(n))}</span>${orderButtons('pool',i,p.members.length)}<button type="button" class="small danger" data-action="pool-remove" data-index="${i}">移除</button></div>`).join('')}</div><details class="member-picker"><summary>添加成员 <span class="count">${available.length}</span></summary><div class="resource-menu"><input type="search" data-resource-search data-ignore-dirty placeholder="搜索名称或地址" aria-label="搜索成员"><div class="member-options">${available.map(n=>`<label data-search="${esc((n.name+' '+n.addr).toLowerCase())}"><input type="checkbox" value="${n.id}" data-member-choice data-ignore-dirty><span>${esc(n.name)}<small>${esc(n.addr||'')}</small></span></label>`).join('')}<span class="resource-empty" ${available.length?'hidden':''}>没有匹配项</span></div><button type="button" class="small" data-action="pool-add">添加所选成员</button></div></details><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`,preserve);
+  openModal(`<form data-form="pool-save"><h2>${p.id ? '编辑池' : '新增池'}</h2><label><span>名称</span><input name="name" value="${esc(p.name)}" required maxlength="100"></label><div class="member-list" data-reorder="pool">${p.members.map((n,i)=>`<div class="member-row sort-item" data-order="${n}">${dragHandle}<span class="member-label">${i+1}. ${esc(memberName(n))}</span>${orderButtons('pool',i,p.members.length)}<button type="button" class="small danger" data-action="pool-remove" data-index="${i}">移除</button></div>`).join('')}</div><p class="hint">仅已完成迁移并确认安装的主动节点可加入池；旧节点请先在节点详情中复制一键接入命令完成升级。</p><details class="member-picker"><summary>添加成员 <span class="count">${available.length}</span></summary><div class="resource-menu"><input type="search" data-resource-search data-ignore-dirty placeholder="搜索名称或地址" aria-label="搜索成员"><div class="member-options">${available.map(n=>`<label data-search="${esc((n.name+' '+n.addr).toLowerCase())}"><input type="checkbox" value="${n.id}" data-member-choice data-ignore-dirty><span>${esc(n.name)}<small>${esc(n.addr||'')}</small></span></label>`).join('')}<span class="resource-empty" ${available.length?'hidden':''}>没有匹配项</span></div><button type="button" class="small" data-action="pool-add">添加所选成员</button></div></details><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`,preserve);
 }
 function rememberPool() { templateEditor.name = $('#modal [name=name]').value; }
 
@@ -105,7 +105,7 @@ function topology(l) {
     && plan.target===l.applied_target_id && (!plan.entry || plan.port===l.hops[0]?.port);
   const healthy=currentIds.every(id=>!['offline','error','skew','deleting','new'].includes(d.nodes.find(n=>n.id===id)?.status));
   const flowing=matches && healthy && (l.state==='active' || l.state==='preparing');
-  const pending=l.job ? columns.map(col=>picked(col,l.job.selected)) : [];
+  const pending=l.job ? columns.map(col=>picked(col,l.job.phase==='rollback' ? l.selected : l.job.selected)) : [];
   const cables=[], active=[], waiting=[], hits=[];
   const pathBetween=(a,b)=>{
     const x=a.x+a.width,bend=Math.min(32,(b.x-x)/4);
@@ -262,7 +262,7 @@ function mountTopology(id) {
 function syncFeedback(l) {
   const pending=l.sync?.nodes||[];
   if(!pending.length && !l.error && !l.job)return '';
-  return `<div class="sync-feedback" role="status">${l.error?`<p class="row-error">${esc(l.error)}</p>`:''}${pending.length?`<div class="sync-nodes">${pending.map(n=>`<a href="#/nodes/${n.id}" title="${esc(n.error)}">${esc(n.name)} <span>${LINK_STATES[n.reason]||'等待确认'}</span></a>`).join('')}</div>`:l.job?'<span class="muted">等待节点确认</span>':''}${pending.some(n=>n.reason==='manual'||n.mode==='passive'&&['failed','timeout'].includes(n.reason))?'<span class="manual-sync">在对应节点执行 <code>sudo ictl --sync</code><button class="small" data-action="copy" data-text="sudo ictl --sync">复制</button></span>':''}${l.sync?.retry || !l.sync&&l.error?'<button class="small" data-action="link-retry">重试同步</button>':''}</div>`;
+  return `<div class="sync-feedback" role="status">${l.error?`<p class="row-error">${esc(l.error)}</p>`:''}${pending.length?`<div class="sync-nodes">${pending.map(n=>`<a href="#/nodes/${n.id}" title="${esc(n.error)}">${esc(n.name)} <span>${LINK_STATES[n.reason]||'等待确认'}</span></a>`).join('')}</div>`:l.job?'<span class="muted">等待节点确认</span>':''}${pending.some(n=>n.reason==='manual'||n.mode==='passive'&&['failed','timeout'].includes(n.reason))?'<span class="manual-sync">在对应节点执行 <code>sudo ictl --sync</code><button class="small" data-action="copy" data-text="sudo ictl --sync">复制</button></span>':''}${l.job?.phase==='rollback'?'<span class="muted">正在恢复旧路径</span>':l.job?'<button class="small" data-action="link-cancel">取消切换</button>':''}${l.sync?.retry || !l.sync&&l.error?'<button class="small" data-action="link-retry">重试同步</button>':''}</div>`;
 }
 
 document.addEventListener('keydown',e=>{
@@ -376,6 +376,7 @@ Object.assign(ACTIONS, {
   'pool-add'(){rememberPool();const ids=[...document.querySelectorAll('[data-member-choice]:checked')].map(el=>Number(el.value));if(!ids.length)return;templateEditor.members.push(...ids);markModalDirty();drawPoolForm(true);},
   'link-new':()=>linkForm(), 'link-edit':()=>linkForm(poolView.link),
   async 'link-delete'(){if(!(await confirmBox('删除链路','删除 <b>'+esc(poolView.link.name)+'</b> 并清理其转发规则？','删除',true)))return;await api('DELETE',`links/${poolView.link.id}`);location.hash='#/routes';},
+  async 'link-cancel'(){const l=poolView.link;if(!(await confirmBox('取消切换',l.job.phase==='prepare'?'撤销新路径准备，保留当前路径？':'恢复旧路径，确认入口恢复后清理新路径？','确认')))return;await api('POST',`links/${l.id}/action`,{action:'cancel',revision:l.revision});refresh();},
   async 'link-retry'(){const l=poolView.link;await api('POST',`links/${l.id}/action`,{action:'retry',revision:l.revision});refresh();},
   'stage-add'(){rememberLink();const [kind,id]=$('#stage-add').value.split(':');if(!id)return;linkEditor.plan.stages.push({id:crypto.randomUUID?.()||String(Date.now()),kind:kind==='p'?'pool':'node',...(kind==='p'?{pool_id:Number(id)}:{node_id:Number(id)})});markModalDirty();drawLinkForm(true);},
   'stage-down'(el){rememberLink();const i=Number(el.dataset.index),a=linkEditor.plan.stages;[a[i],a[i+1]]=[a[i+1],a[i]];markModalDirty();drawLinkForm(true);},

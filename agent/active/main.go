@@ -22,6 +22,9 @@ import (
 )
 
 func (a *Agent) session(ctx context.Context) error {
+	if a.stateMu == nil {
+		a.stateMu = &sync.Mutex{}
+	}
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+a.key)
 	ws, _, e := websocket.Dial(ctx, "wss"+strings.TrimPrefix(a.url, "https")+"/v3/ws", &websocket.DialOptions{HTTPHeader: headers})
@@ -44,7 +47,10 @@ func (a *Agent) session(ctx context.Context) error {
 		defer cancel()
 		return ws.Write(writeCtx, websocket.MessageText, b)
 	}
-	if e = send(M{"type": "hello", "protocol": 3, "version": version, "installation_id": a.installation, "boot_id": a.boot, "generation": a.config.Generation, "hash": a.config.Hash, "capabilities": []string{"nftables", "traffic", "metrics", "ports", "queries", "network_quality", "network_quality_icmp"}}); e != nil {
+	a.stateMu.Lock()
+	current := a.config
+	a.stateMu.Unlock()
+	if e = send(M{"type": "hello", "protocol": 3, "version": version, "installation_id": a.installation, "boot_id": a.boot, "generation": current.Generation, "hash": current.Hash, "capabilities": []string{"nftables", "traffic", "metrics", "ports", "queries", "network_quality", "network_quality_icmp"}}); e != nil {
 		return e
 	}
 	helloCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -100,150 +106,193 @@ func (a *Agent) session(ctx context.Context) error {
 	// Reconcile authorization/configuration first; periodic collection begins after the first control response.
 	ready := false
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case e := <-fail:
-			return e
-		case msg := <-receive:
-			if msg["session"] != session {
-				return errors.New("会话标识不匹配")
-			}
-			switch msg["type"] {
-			case "traffic_ack":
-				for _, item := range array(msg["data"]) {
-					row, _ := item.(map[string]any)
-					key := fmt.Sprintf("%d/%s/%s", number(row["rule_id"]), row["protocol"], row["epoch"])
-					if u := a.usage[key]; u != nil && !u.Active && row["up"] == u.Up && row["down"] == u.Down && row["up_packets"] == u.UpPackets && row["down_packets"] == u.DownPackets {
-						delete(a.usage, key)
+		paused := false
+		e = func() error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case e := <-fail:
+				return e
+			case msg := <-receive:
+				a.stateMu.Lock()
+				defer a.stateMu.Unlock()
+				if msg["session"] != session {
+					return errors.New("会话标识不匹配")
+				}
+				switch msg["type"] {
+				case "traffic_ack":
+					for _, item := range array(msg["data"]) {
+						row, _ := item.(map[string]any)
+						key := fmt.Sprintf("%d/%s/%s", number(row["rule_id"]), row["protocol"], row["epoch"])
+						if u := a.usage[key]; u != nil && !u.Active && row["up"] == u.Up && row["down"] == u.Down && row["up_packets"] == u.UpPackets && row["down_packets"] == u.DownPackets {
+							delete(a.usage, key)
+						}
 					}
-				}
-				if e = atomicJSON(a.path("active/traffic.json"), a.usage); e != nil {
-					return e
-				}
-			case "update":
-				if a.autoUpdate && time.Since(lastUpdate) > time.Hour {
-					lastUpdate = time.Now()
-					cmd := exec.Command("systemd-run", "--quiet", "--collect", "--unit=ictl-agent-update", "--", "/usr/local/bin/ictl", "--auto-update")
-					if err := cmd.Run(); err != nil {
-						log.Printf("自动更新未启动: %v", err)
+					if e = atomicJSON(a.path("active/traffic.json"), a.usage); e != nil {
+						return e
 					}
-				}
-			case "quiesce":
-				stopQuality()
-				stopQueries()
-				if e = atomicBytes(a.path("paused"), []byte("manual confirmation required\n"), 0600); e != nil {
-					return e
-				}
-				_ = a.locked(a.sample)
-				_ = send(M{"type": "quiesced"})
-				_ = ws.Close(websocket.StatusNormalClosure, "paused")
-				return nil
-			case "config":
-				ready = true
-				raw, _ := json.Marshal(msg)
-				var c Config
-				if e = json.Unmarshal(raw, &c); e != nil {
-					return e
-				}
-				for i := range c.Rules {
-					if c.Rules[i].Protocol == "" {
-						c.Rules[i].Protocol = "both"
+				case "update":
+					if a.autoUpdate && time.Since(lastUpdate) > time.Hour {
+						lastUpdate = time.Now()
+						cmd := exec.Command("systemd-run", "--quiet", "--collect", "--unit=ictl-agent-update", "--", "/usr/local/bin/ictl", "--auto-update")
+						if err := cmd.Run(); err != nil {
+							log.Printf("自动更新未启动: %v", err)
+						}
 					}
+				case "quiesce":
+					stopQuality()
+					stopQueries()
+					if e = atomicBytes(a.path("paused"), []byte("manual confirmation required\n"), 0600); e != nil {
+						return e
+					}
+					_ = a.locked(a.sample)
+					_ = send(M{"type": "quiesced"})
+					_ = ws.Close(websocket.StatusNormalClosure, "paused")
+					paused = true
+					return nil
+				case "config":
+					ready = true
+					raw, _ := json.Marshal(msg)
+					var c Config
+					if e = json.Unmarshal(raw, &c); e != nil {
+						return e
+					}
+					for i := range c.Rules {
+						if c.Rules[i].Protocol == "" {
+							c.Rules[i].Protocol = "both"
+						}
+					}
+					a.stateError = ""
+					e = monitor.applyConfig(a, c)
+					text := ""
+					if e != nil {
+						text = e.Error()
+						a.stateError = text
+					}
+					// Seal observations before a deletion receipt removes the online identity.
+					rows := a.traffic()
+					for start := 0; start < len(rows); start += 1000 {
+						if e = send(M{"type": "traffic", "id": randomID(), "data": rows[start:min(start+1000, len(rows))]}); e != nil {
+							return e
+						}
+					}
+					if e = send(M{"type": "apply_result", "op": msg["op"], "generation": c.Generation, "hash": c.Hash, "mode": "active", "ok": text == "", "error": text, "version": version, "held_ports": a.heldPorts()}); e != nil {
+						return e
+					}
+				case "apply_ack", "ready":
+					ready = true
+				case "blocked":
+					ready = true
+					a.stateError = fmt.Sprint(msg["error"])
+				case "quality_setup":
+					monitor.setup(a, msg)
+				case "quality_probe":
+					monitor.probe(msg)
+				case "query":
+					select {
+					case queries <- struct{}{}:
+						snapshot := *a
+						body, _ := msg["query"].(map[string]any)
+						id := msg["id"]
+						go func() {
+							defer func() { <-queries }()
+							result := snapshot.queryContext(queryCtx, body)
+							if child.Err() == nil {
+								_ = send(M{"type": "query_result", "id": id, "data": result})
+							}
+						}()
+					default:
+						_ = send(M{"type": "query_result", "id": msg["id"], "error": "查询并发已满"})
+					}
+				case "error":
+					return fmt.Errorf("服务端: %v", msg["error"])
 				}
-				a.stateError = ""
-				e = monitor.applyConfig(a, c)
-				text := ""
+			case <-ticker.C:
+				a.stateMu.Lock()
+				defer a.stateMu.Unlock()
+				if !ready {
+					_ = send(M{"type": "status", "generation": a.config.Generation, "hash": a.config.Hash, "state": "ok"})
+					return nil
+				}
+				pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				e = ws.Ping(pingCtx)
+				cancel()
 				if e != nil {
-					text = e.Error()
-					a.stateError = text
+					return e
 				}
-				// Seal observations before a deletion receipt removes the online identity.
+				count++
+				state := "ok"
+				if a.stateError != "" {
+					state = "error"
+				}
+				for _, message := range []M{{"type": "status", "generation": a.config.Generation, "hash": a.config.Hash, "state": state, "error": a.stateError, "auto_update": a.autoUpdate, "held_ports": a.heldPorts()}, {"type": "metrics", "data": a.metrics()}} {
+					if e = send(message); e != nil {
+						return e
+					}
+				}
 				rows := a.traffic()
 				for start := 0; start < len(rows); start += 1000 {
 					if e = send(M{"type": "traffic", "id": randomID(), "data": rows[start:min(start+1000, len(rows))]}); e != nil {
 						return e
 					}
 				}
-				if e = send(M{"type": "apply_result", "op": msg["op"], "generation": c.Generation, "hash": c.Hash, "mode": "active", "ok": text == "", "error": text, "version": version, "held_ports": a.heldPorts()}); e != nil {
-					return e
+				if count == 1 || count%6 == 0 {
+					if e = send(M{"type": "inventory", "data": a.inventory()}); e != nil {
+						return e
+					}
 				}
-			case "apply_ack", "ready":
-				ready = true
-			case "blocked":
-				ready = true
-				a.stateError = fmt.Sprint(msg["error"])
-			case "quality_setup":
-				monitor.setup(a, msg)
-			case "quality_probe":
-				monitor.probe(msg)
-			case "query":
-				select {
-				case queries <- struct{}{}:
-					snapshot := *a
-					body, _ := msg["query"].(map[string]any)
-					id := msg["id"]
-					go func() {
-						defer func() { <-queries }()
-						result := snapshot.queryContext(queryCtx, body)
-						if child.Err() == nil {
-							_ = send(M{"type": "query_result", "id": id, "data": result})
-						}
-					}()
-				default:
-					_ = send(M{"type": "query_result", "id": msg["id"], "error": "查询并发已满"})
-				}
-			case "error":
-				return fmt.Errorf("服务端: %v", msg["error"])
-			}
-		case <-ticker.C:
-			if !ready {
-				_ = send(M{"type": "status", "generation": a.config.Generation, "hash": a.config.Hash, "state": "ok"})
-				continue
-			}
-			pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			e = ws.Ping(pingCtx)
-			cancel()
-			if e != nil {
-				return e
-			}
-			count++
-			if e = a.locked(a.sample); e != nil {
-				a.stateError = "统计持久化失败: " + e.Error()
-			}
-			state := "ok"
-			if a.stateError != "" {
-				state = "error"
-			}
-			for _, message := range []M{{"type": "status", "generation": a.config.Generation, "hash": a.config.Hash, "state": state, "error": a.stateError, "auto_update": a.autoUpdate, "held_ports": a.heldPorts()}, {"type": "metrics", "data": a.metrics()}} {
-				if e = send(message); e != nil {
-					return e
-				}
-			}
-			rows := a.traffic()
-			for start := 0; start < len(rows); start += 1000 {
-				if e = send(M{"type": "traffic", "id": randomID(), "data": rows[start:min(start+1000, len(rows))]}); e != nil {
-					return e
-				}
-			}
-			if count == 1 || count%6 == 0 {
-				if e = send(M{"type": "inventory", "data": a.inventory()}); e != nil {
-					return e
-				}
-				if a.config.Hash != "" {
-					if err := a.apply(a.config); err != nil {
-						a.stateError = err.Error()
+				if count == 1 || count%3 == 0 {
+					qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					ports := a.portSnapshot(qctx, false)
+					cancel()
+					if e = send(M{"type": "ports", "data": ports}); e != nil {
+						return e
 					}
 				}
 			}
-			if count == 1 || count%3 == 0 {
-				qctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				ports := a.portSnapshot(qctx, false)
-				cancel()
-				if e = send(M{"type": "ports", "data": ports}); e != nil {
-					return e
+			return nil
+		}()
+		if e != nil || paused {
+			return e
+		}
+	}
+}
+
+// Local counters and DNS/rule maintenance must continue during a control outage.
+func (a *Agent) maintain(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	count := 0
+	lastError := ""
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.stateMu.Lock()
+			if ctx.Err() != nil || readText(a.path("paused")) != "" {
+				a.stateMu.Unlock()
+				return
+			}
+			if _, err := os.Stat(a.path("active/enabled")); err != nil {
+				a.stateMu.Unlock()
+				return
+			}
+			count++
+			err := a.locked(a.sample)
+			if (count == 1 || count%6 == 0) && a.config.Hash != "" {
+				if applyErr := a.apply(a.config); applyErr != nil {
+					err = applyErr
 				}
 			}
+			if err != nil {
+				lastError = "本地维护失败: " + err.Error()
+				a.stateError = lastError
+			} else if a.stateError == lastError {
+				a.stateError = ""
+				lastError = ""
+			}
+			a.stateMu.Unlock()
 		}
 	}
 }
@@ -261,12 +310,20 @@ func (a *Agent) daemon(ctx context.Context) error {
 	if _, e = os.Stat(a.path("active/enabled")); e != nil {
 		return nil
 	}
+	if _, e = os.Stat(a.path("paused")); e == nil {
+		return nil
+	}
 	if a.config.Hash != "" {
 		if e = a.restore(); e != nil {
 			a.stateError = e.Error()
 			log.Print(e)
 		}
 	}
+	a.stateMu = &sync.Mutex{}
+	localCtx, stopLocal := context.WithCancel(ctx)
+	localDone := make(chan struct{})
+	go func() { defer close(localDone); a.maintain(localCtx, 10*time.Second) }()
+	defer func() { stopLocal(); <-localDone }()
 	backoff := []time.Duration{1, 2, 5, 10, 30}
 	attempt := 0
 	for {

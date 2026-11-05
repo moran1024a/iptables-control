@@ -33,7 +33,7 @@ import types
 def _module():
     return types.SimpleNamespace(**globals())
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 DATABASE_VERSION = 403
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
@@ -380,7 +380,7 @@ def init_db():
             return conn
         conn.close()
     conn = init_db_v030()
-    agent_v3.migrate(_module(), conn, reset_legacy=version == 300)
+    agent_v3.migrate(_module(), conn, reset_legacy=version is not None and version < 400)
     network_quality.migrate(_module(), conn)
     wake.migrate(_module(), conn)
     pools.migrate(_module(), conn)

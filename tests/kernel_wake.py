@@ -19,6 +19,11 @@ def main():
         work = Path(temp)
         (work/'wake').symlink_to(binary)
         (work/'wake.conf').write_text('ENABLED=1\nPORT=39001\nALLOW=127.0.0.2,::1\n')
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as occupied:
+            occupied.bind(('::1',39001))
+            check=subprocess.run([str(binary),'--check-listen',str(work/'wake.conf')],capture_output=True,text=True)
+            assert check.returncode != 0 and 'address already in use' in check.stderr, check.stderr
+        subprocess.run([str(binary),'--check-listen',str(work/'wake.conf')],check=True)
         setup = f'ICTL_LIBRARY=1 source {shlex.quote(str(ROOT / "agent/wake.sh"))}\n'
         setup += f'PKG={shlex.quote(temp)}\nCONF="$PKG/wake.conf"\n'
 

@@ -52,6 +52,45 @@ class PoolTests(Fixture, unittest.TestCase):
             if self.get(lid)['job'] is None:return
         self.fail('switch did not finish')
 
+    def test_cancel_prepare_releases_link_and_restores_default(self):
+        lid=self.link(); self.finish(lid)
+        before=self.get(lid)
+        self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=before['revision']),lid)
+        self.tick(int(time.time())+31)
+        waiting=self.get(lid); self.assertEqual(waiting['state'],'waiting')
+        self.call('api_link_action',dict(action='cancel',revision=waiting['revision']),lid)
+        after=self.get(lid)
+        self.assertIsNone(after['job']); self.assertEqual(after['plan'],before['plan'])
+        self.assertEqual(after['selected'],before['selected'])
+        self.assertFalse(s.node_rules(self.db,s.get_node(self.db,self.b)))
+        self.assertTrue(after['cleanup'])
+        self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.a,revision=after['revision']),lid)
+
+    def test_cancel_commit_keeps_downstream_until_entry_restored(self):
+        lid=self.link(); self.finish(lid)
+        before=self.get(lid)
+        old_rules=s.node_rules(self.db,s.get_node(self.db,self.entry))
+        self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=before['revision']),lid)
+        self.ack(self.b); self.tick()
+        switching=self.get(lid); self.assertEqual(switching['job']['phase'],'commit')
+        self.call('api_link_action',dict(action='cancel',revision=switching['revision']),lid)
+        self.assertEqual(self.get(lid)['job']['phase'],'rollback')
+        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,self.entry)),old_rules)
+        self.assertTrue(s.node_rules(self.db,s.get_node(self.db,self.b)))
+        self.tick(); self.assertIsNotNone(self.get(lid)['job'])
+        self.ack(self.entry); self.tick()
+        self.assertIsNone(self.get(lid)['job'])
+        self.assertFalse(s.node_rules(self.db,s.get_node(self.db,self.b)))
+        self.assertEqual(self.get(lid)['plan'],before['plan'])
+
+    def test_cancel_new_link_returns_to_editable_draft(self):
+        lid=self.link(); self.ack(self.a); self.tick()
+        self.call('api_link_action',dict(action='cancel',revision=self.get(lid)['revision']),lid)
+        self.ack(self.entry); self.tick()
+        link=self.get(lid)
+        self.assertEqual(link['state'],'draft'); self.assertIsNone(link['chain_id'])
+        self.assertIsNone(link['job'])
+
     def test_receipt_summary_distinguishes_manual_timeout_and_failure(self):
         with self.db:
             self.db.execute("UPDATE nodes SET desired_mode='passive',installed_agent='passive',agent='0.4.0-rc.4' WHERE id=?", (self.entry,))

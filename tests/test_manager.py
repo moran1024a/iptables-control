@@ -46,6 +46,7 @@ rpc() {
    [ ! -e "$CASE_ROOT/fail-commit" ] || return 1
    REPLY=$'proto=2\\nresult=confirmed\\n' ;;
   failed) echo "$2" > "$CASE_ROOT/reported-error" ;;
+  abort) echo abort >> "$CASE_ROOT/backend.log" ;;
  esac
 }
 fetch_component() { if [ "$1" = manage.sh ]; then cp "$CASE_ROOT/manager" "$3"; else cp "$CASE_ROOT/target" "$3"; fi; }
@@ -78,6 +79,37 @@ fetch_component() { if [ "$1" = manage.sh ]; then cp "$CASE_ROOT/manager" "$3"; 
         self.assertNotEqual(self.run_manager().returncode,0)
         self.assertFalse((self.root/'tools.log').exists())
         self.assertEqual((self.root/'lib/config').read_text(),'old config')
+
+    def test_early_update_failure_restarts_service_and_allows_retry(self):
+        self.existing(); (self.root/'mode').write_text('active')
+        (self.root/'fail-flush').touch()
+        self.assertNotEqual(self.run_manager('UPDATE_ONLY=1 perform_sync').returncode, 0)
+        self.assertIn('start ictl-agent', (self.root/'tools.log').read_text())
+        self.assertIn('abort', (self.root/'backend.log').read_text())
+        self.assertFalse((self.root/'lib/switch-work/transaction').exists())
+        (self.root/'fail-flush').unlink()
+        result = self.run_manager('UPDATE_ONLY=1 perform_sync')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_download_failure_releases_server_operation(self):
+        self.existing(); (self.root/'mode').write_text('active')
+        result = self.run_manager('fetch_component() { return 1; }; perform_sync')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('abort', (self.root/'backend.log').read_text())
+        self.assertFalse((self.root/'tools.log').exists())
+
+    def test_credentials_validated_before_save(self):
+        old = 'URL=https://old.invalid/sync\nKEY=' + 'ab'*32 + '\nAUTO_UPDATE=1\n'
+        conf = self.root/'etc/agent.conf'; conf.write_text(old)
+        code = "derive_keys() { :; }; rpc() { return 1; }; credentials"
+        result = subprocess.run(['bash', '-c', self.setup + '\n' + code], env=self.env,
+                                input='https://new.invalid/sync\n'+'cd'*32+'\n', text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0); self.assertEqual(conf.read_text(), old)
+        code = "derive_keys() { :; }; perform_sync() { echo sync >> \"$CASE_ROOT/backend.log\"; }; credentials"
+        result = subprocess.run(['bash', '-c', self.setup + '\n' + code], env=self.env,
+                                input='https://new.invalid/sync\n'+'cd'*32+'\n', text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('KEY='+'cd'*32, conf.read_text()); self.assertIn('sync', (self.root/'backend.log').read_text())
 
     def test_lost_receipt_does_not_enable_active_before_retry(self):
         (self.root/'mode').write_text('active');(self.root/'fail-commit').touch()

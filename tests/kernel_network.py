@@ -47,6 +47,11 @@ def tcp():
     if not b:break
     c.sendall(b)
 threading.Thread(target=tcp,daemon=True).start()
+def udp_new():
+ s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('0.0.0.0',30444))
+ while True:
+  b,a=s.recvfrom(65535);s.sendto(b'new'+b,a)
+threading.Thread(target=udp_new,daemon=True).start()
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('0.0.0.0',30443))
 while True:
  b,a=s.recvfrom(65535);s.sendto(b,a)
@@ -55,6 +60,41 @@ echo=subprocess.Popen(['ip','netns','exec','target',sys.executable,'-c',server])
 try:
     with tempfile.TemporaryDirectory() as directory:
         root=Path(directory)
+        repo=Path(__file__).resolve().parents[1]
+        standalone=types.ModuleType('standalone')
+        source=(repo/'ipt.sh').read_text().split("<<'IPT_PYTHON'\n",1)[1].split('\nIPT_PYTHON',1)[0]
+        exec(compile(source,'ipt.sh:backend','exec'),standalone.__dict__)
+        for name in ('CONF','PERSIST','SYSCTL','LEGACY_PERSIST','AGENT_CONF','WAKE_CONF','LOG','UNIT_DIR','BACKUPS'):
+            setattr(standalone,name,root/name)
+        standalone.scheduler=lambda *args:None
+        standalone.scheduler_state=lambda:{}
+        standalone.restore_scheduler=lambda state:None
+        # This is still a pristine iptables-nft namespace, with virtual tables.
+        first=dict(id='a'*32,incoming='30233',host='198.51.100.2',ip='198.51.100.2',target='30443',proto='udp',comment='test',legacy=False)
+        other=dict(first,id='b'*32,incoming='30234')
+        original=[first,other]
+        standalone.transact([],original,standalone.snapshot(),str(repo/'ipt.sh'))
+        probe=subprocess.Popen(['ip','netns','exec','client',sys.executable,'-u','-c','''
+import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(.5)
+s.connect(('192.0.2.1',30233))
+for _ in sys.stdin:
+ try:
+  s.send(b'old');print(s.recv(32).decode(),flush=True)
+ except (TimeoutError,ConnectionRefusedError): print('closed',flush=True)
+'''],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+        try:
+            def response():
+                probe.stdin.write('send\n');probe.stdin.flush();return probe.stdout.readline().strip()
+            assert response()=='old'
+            changed=[dict(first,target='30444'),other]
+            standalone.transact(original,changed,standalone.snapshot(),str(repo/'ipt.sh'))
+            assert response()=='newold', 'old conntrack survived target edit'
+            standalone.transact(changed,[other],standalone.snapshot(),str(repo/'ipt.sh'))
+            assert response()=='closed', 'deleted forward remained reachable'
+            standalone.transact([other],[],standalone.snapshot(),str(repo/'ipt.sh'))
+        finally:
+            probe.terminate();probe.wait(timeout=5);probe.stdin.close();probe.stdout.close()
         conf=root/'identity';conf.write_text('URL=https://example.invalid/sync\nKEY='+'ab'*32+'\n')
         binary=str(Path(sys.argv[1]).resolve())
         def agent(*args,**kw):return run(binary,'--state-root',str(root),'--conf',str(conf),*args,**kw)
@@ -114,10 +154,6 @@ s.close()
         assert '30124' in run('nft','list','table','ip','unrelated')
         # Feed the passive/wake checker actual iptables-nft output produced by
         # the standalone backend, including its ct status dnat ACCEPT rules.
-        repo=Path(__file__).resolve().parents[1]
-        standalone=types.ModuleType('standalone')
-        source=(repo/'ipt.sh').read_text().split("<<'IPT_PYTHON'\n",1)[1].split('\nIPT_PYTHON',1)[0]
-        exec(compile(source,'ipt.sh:backend','exec'),standalone.__dict__)
         row=dict(id='a'*32,incoming='10001',host='198.51.100.2',ip='198.51.100.2',target='443',proto='udp',comment='coexist')
         for rule in standalone.make_rules([row]):
             run('iptables','-w','-t',rule['table'],'-A',rule['chain'],*rule['spec'])
@@ -137,6 +173,6 @@ check_port_conflicts "$3" || { printf '%s\\n' "${ERRS[@]}" >&2; exit 1; }
         except subprocess.CalledProcessError as exc:assert '端口冲突' in exc.stderr, exc.stderr
         else:raise AssertionError('standalone DNAT port accepted as a wake port')
         assert run('nft','-j','list','ruleset')==before, 'port checks changed firewall rules'
-        print('PASS: TCP/UDP forwarding, exact counters, update continuity, native conflicts, scoped cleanup and passive wake checks with real ipt.sh rules')
+        print('PASS: pristine standalone install, live UDP edit/deletion, TCP/UDP forwarding, exact counters, native conflicts and passive wake coexistence')
 finally:
     echo.terminate();echo.wait(timeout=5)

@@ -66,7 +66,7 @@ class ServerTests(Fixture, unittest.TestCase):
         self.assertEqual(s.agent_update('0.2.1', 1), 'same')
         self.assertEqual(s.agent_update('0.2.0', 1), 'pending')
         self.assertEqual(s.agent_update('0.1.7', 1), 'pending')
-        self.assertEqual(s.VERSION, '0.4.2')
+        self.assertEqual(s.VERSION, '0.4.3')
 
     def test_route_allocates_no_ports(self):
         a, b = self.node(), self.node('B')
@@ -121,7 +121,7 @@ class ServerTests(Fixture, unittest.TestCase):
 
 
 
-    def test_migration_preserves_rules_pending_and_backup(self):
+    def test_migration_preserves_resources_and_backup_clears_topology(self):
         self.db.close()
         os.unlink(s.DB_PATH)
         old=sqlite3.connect(s.DB_PATH);old.row_factory=sqlite3.Row
@@ -136,15 +136,16 @@ class ServerTests(Fixture, unittest.TestCase):
         s.set_setting(old,'window','60');s.set_setting(old,'sync_path','/oldsync');s.set_setting(old,'panel_path','/oldpanel')
         old.commit();before=s.legacy_node_rules(old,old.execute('SELECT * FROM nodes WHERE id=7').fetchone());old.close()
         self.db=s.init_db()
-        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,7)),before)
+        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,7)),[])
         self.assertEqual(s.get_node(self.db,7)['key'],'ab'*32)
         self.assertEqual(s.setting(self.db,'sync_path'),'/oldsync')
-        self.assertEqual(tuple(self.db.execute('SELECT * FROM chain_pending').fetchone()),(9,8))
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM links').fetchone()[0],1)
+        self.assertFalse(self.db.execute('SELECT * FROM chain_pending').fetchone())
+        self.assertEqual(self.db.execute('SELECT port FROM retired_ports WHERE node_id=7').fetchone()[0],12345)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM links').fetchone()[0],0)
         backup=sqlite3.connect(s.DB_PATH+'.pre-0.2.0.bak')
         self.assertEqual(backup.execute('SELECT port FROM hops WHERE id=81').fetchone()[0],12345);backup.close()
         self.db.close();self.db=s.init_db()
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM links').fetchone()[0],1)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM links').fetchone()[0],0)
 
     def test_failed_migration_is_atomic(self):
         self.db.close();os.unlink(s.DB_PATH)

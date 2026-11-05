@@ -14,6 +14,22 @@ import transport
 
 
 class V3Tests(Fixture, unittest.TestCase):
+    def test_aborted_download_releases_manual_sync_without_confirming_mode(self):
+        nid=self.node()
+        component=Path(self.temp.name)/'asset'; component.write_text('test')
+        def manage(**kw):
+            with self.db:
+                return agent_v3.fields(agent_v3.manage(s,self.db,s.get_node(self.db,nid),{'t':str(int(time.time())), **kw}))
+        with patch.object(agent_v3,'artifact',return_value=(component,'f'*64)):
+            prepared=manage(manage='prepare',target='active',arch='amd64')
+        self.assertTrue(self.db.execute("SELECT 1 FROM sync_ops WHERE source='manual'").fetchone())
+        self.assertEqual(manage(manage='abort',op=prepared['op'])['result'],'aborted')
+        self.assertFalse(self.db.execute("SELECT 1 FROM sync_ops WHERE source='manual'").fetchone())
+        self.assertEqual(s.get_node(self.db,nid)['installed_agent'],'legacy')
+        self.assertFalse(s.get_node(self.db,nid)['manual_required'])
+        with self.assertRaises(s.UserError):
+            manage(manage='commit',op=prepared['op'],target='active')
+
     def test_cumulative_uint64_deduplicates_reorders_and_adds_epochs(self):
         nid = self.node()
         row = dict(rule_id=1, protocol='tcp', epoch='a'*32, up=str(2**63+17), down='30', up_packets='5', down_packets='3')
