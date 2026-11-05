@@ -50,7 +50,7 @@ func (a *Agent) session(ctx context.Context) error {
 	a.stateMu.Lock()
 	current := a.config
 	a.stateMu.Unlock()
-	if e = send(M{"type": "hello", "protocol": 3, "version": version, "installation_id": a.installation, "boot_id": a.boot, "generation": current.Generation, "hash": current.Hash, "capabilities": []string{"nftables", "traffic", "metrics", "ports", "queries", "network_quality", "network_quality_icmp"}}); e != nil {
+	if e = send(M{"type": "hello", "protocol": 3, "version": version, "installation_id": a.installation, "boot_id": a.boot, "generation": current.Generation, "hash": current.Hash, "capabilities": []string{"nftables", "traffic", "metrics", "ports", "queries", "network_quality", "network_quality_icmp", "network_quality_tcp"}}); e != nil {
 		return e
 	}
 	helloCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -187,7 +187,7 @@ func (a *Agent) session(ctx context.Context) error {
 				case "quality_setup":
 					monitor.setup(a, msg)
 				case "quality_probe":
-					monitor.probe(msg)
+					monitor.probeWithAgent(a, msg)
 				case "query":
 					select {
 					case queries <- struct{}{}:

@@ -57,7 +57,10 @@ const responses={me:{username:"owner",version:"0.3.1"},nodes:{nodes:[node],group
 const requests=[];
 const pool={id:1,name:'香港池',members:[1,2],references:['主链路']};
 const link={id:1,chain_id:1,applied_target_id:1,name:'主链路',revision:1,state:'active',error:'',job:null,cleanup:[],events:[],hops:[{node_id:3,name:'入口',port:10001},{node_id:1,name:'A',port:10002}],connection:chain.connection,selected:{p1:1},plan:{entry:3,port:10001,target:1,stages:[{id:'p1',kind:'pool',pool_id:1,default:1,order:[1,2],disabled:[],locked:null,direct:false}]}};
-const resources={links:[link],pools:[pool],targets:[target],nodes:[{id:1,name:'A',eligible:true,status:'synced',mode:'active'},{id:2,name:'B',eligible:true,status:'synced',mode:'active'},{id:3,name:'入口',eligible:true,status:'synced',mode:'active'}]};
+link.group_id=1;
+const resources={groups:[group,{id:2,name:'第二组',builtin:0}],links:[link],pools:[pool],targets:[target],nodes:[{id:1,name:'A',eligible:true,status:'synced',mode:'active'},{id:2,name:'B',eligible:true,status:'synced',mode:'active'},{id:3,name:'入口',eligible:true,status:'synced',mode:'active'}]};
+responses.configs.groups=resources.groups;
+responses.subscriptions={public_url:'https://example.com',groups:[group],configs:[{id:1,name:'SS 配置',group_id:1,error:'',clash_error:''},{id:2,name:'普通地址',group_id:1,error:'缺少代理协议',clash_error:'缺少代理协议'}],subscriptions:[{id:1,name:'我的订阅',enabled:true,link_ids:[1],path:'/sub/test-token',counts:{clash:1,v2ray:1}}]};
 responses.pools=resources;responses.links=resources;responses['links/1']={...resources,link};chain.link_id=1;chain.link_state='active';
 window.fetch=async (url,options={})=>{
  const path=String(url).split("api/")[1]?.split("?")[0];
@@ -65,6 +68,7 @@ window.fetch=async (url,options={})=>{
  if(path==="quality") {
   const data={nodes:[{id:1,name:"A",mode:"active"},{id:2,name:"B",mode:"active"}],pair:{source:1,target:2,target_addr:"192.0.2.2",port:33445},now:1200,step:10,state:"collecting",adjacent:true,summary:{mean:20,peak:30,p95:30,jitter:10,samples:3,lost:1,loss:100/3},latest:{slot:1190,status:"timeout",error:"探测超时"},points:[{time:1180,mean:20,peak:30,loss:0,samples:1,lost:0,status:"ok",resolved_ip:"192.0.2.2"},{time:1190,mean:null,peak:null,loss:100,samples:1,lost:1,status:"timeout"},{time:1200,mean:null,peak:null,loss:null,samples:0,lost:0,status:"missing"}]};
   data.series = [{protocol:"udp-echo-v1",...data},{protocol:"icmp-echo-v1",...data,latest:{slot:1190,status:"ok",rtt:18},points:data.points.map(p=>({...p,mean:p.mean == null ? null : p.mean-2,peak:p.peak == null ? null : p.peak-2}))}];
+  if(JSON.parse(options.body||'{}').scope==='links') {data.name='主链路';data.series.unshift({...data.series[0],protocol:'tcp-connect-v1'});data.sections=['B → C → 目标','B → C','C → 目标'].map((label,i)=>({id:String(i),kind:i?'子段':'全段',label,series:data.series}));}
   return {ok:true,status:200,json:async()=>data};
  }
  if(options.method && options.method!=="GET") {requests.push({path,body:JSON.parse(options.body||"{}")});return {ok:true,status:200,json:async()=>({id:1,assigned:[],affected:0,key:null})};}
@@ -128,6 +132,8 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(app.querySelector('[name="quality-range"]').options.length===3,"time ranges missing");
   const gaps=qualityChart([{protocol:"udp-echo-v1",points:[{time:1180,mean:10,peak:10,status:"ok",resolved_ip:"a"},{time:1190,mean:null,status:"missing"},{time:1200,mean:20,peak:20,status:"ok",resolved_ip:"a"}]}],1200,900);
   assert(!gaps.includes('stroke-width="2"'),"chart joins missing samples");
+  const changedPathChart=qualityChart([{protocol:'tcp-connect-v1',points:[{time:1190,mean:10,peak:10,status:'ok',resolved_ip:'a',path_key:'old'},{time:1200,mean:20,peak:20,status:'ok',resolved_ip:'a',path_key:'new'}]}],1200,900);
+  assert(!changedPathChart.includes('stroke-width="2"')&&changedPathChart.includes('路径切换'),'chart joined different paths');
   leaveView();await show(poolList,false);assert(app.textContent.includes('香港池'),'pool list missing');
   poolForm(pool);await ACTIONS['pool-up']({dataset:{index:'1'}});
   assert(templateEditor.members[0]===2,'template reorder failed');closeModal();
@@ -215,8 +221,20 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   const hover=app.querySelector('.topology-choice[data-member="2"]');
   hover.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));
   assert(app.querySelector('.has-highlight') && app.querySelector('.is-focused'),'hover focus missing');
-  await ACTIONS['edge-quality'](app.querySelector('.topology-hit'));
-  assert(document.querySelector('#modal .quality-chart'),'connection chart missing');closeModal();
+  leaveView();await show(r=>linkQualityPage(1,r),false);
+  assert(app.querySelectorAll('.quality-chart').length===3,'automatic segment charts missing');
+  assert(!app.querySelector('[name=quality-source]'),'segment page still asks for source');
+  assert(app.textContent.includes('B → C → 目标'),'full path label missing');
+  await show(configSummary,false);assert(!app.querySelector('[data-action=group-rename]'),'config groups must be read-only');
+  await show(linkList,false);await ACTIONS['sort-start']({dataset:{kind:'links'}});
+  assert(app.querySelector('.sort-card'),'link sort mode missing');await ACTIONS['sort-save']({dataset:{kind:'links'}});
+  assert(requests.at(-1).path==='links/order','link order saved to wrong endpoint');
+  await show(subscriptionList,false);assert(app.textContent.includes('我的订阅'),'subscription list missing');
+  subscriptionForm(responses.subscriptions.subscriptions[0]);
+  assert(document.querySelector('[name=link_id][value="1"]').checked,'bound config missing');
+  assert(document.querySelector('[name=link_id][value="2"]').disabled,'plain endpoint should not be selectable');
+  const subForm=document.querySelector('#modal form');await FORMS.subscription(subForm,Object.fromEntries(new FormData(subForm)));
+  assert(requests.at(-1).path==='subscriptions/1' && requests.at(-1).body.link_ids[0]===1,'subscription selection lost');
   assert(!document.body.classList.contains('canvas-fullscreen'),'fullscreen body state leaked');
   leaveView();await show(settingsPage,false);assert(!app.textContent.includes('sing-box'),"obsolete core settings");
   assert(!document.querySelector('a[href="#/tunnels"]'),"obsolete nav");
@@ -225,8 +243,8 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
 })();
 '''
             html=(ROOT/'server/web/index.html').read_text().replace('<script src="app.js"></script>',
-                '<pre id="result">RUNNING</pre><script>'+setup+'</script><script>'+(ROOT/'server/web/app.js').read_text()+'</script><script>'+(ROOT/'server/web/pools.js').read_text()+'</script><script>'+exercise+'</script>')
-            html=html.replace('<script src="pools.js"></script>','')
+                '<pre id="result">RUNNING</pre><script>'+setup+'</script><script>'+(ROOT/'server/web/app.js').read_text()+'</script><script>'+(ROOT/'server/web/pools.js').read_text()+'</script><script>'+(ROOT/'server/web/subscriptions.js').read_text()+'</script><script>'+exercise+'</script>')
+            html=html.replace('<script src="pools.js"></script>','').replace('<script src="subscriptions.js"></script>','')
             html=html.replace('<link rel="stylesheet" href="style.css">','<style>'+(ROOT/'server/web/style.css').read_text()+'</style>')
             (root/'index.html').write_text(html)
             r=subprocess.run([chrome,'--headless','--no-sandbox','--disable-gpu','--disable-background-networking',

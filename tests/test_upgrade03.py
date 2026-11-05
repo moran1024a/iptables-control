@@ -36,7 +36,7 @@ class Upgrade03Tests(Fixture, unittest.TestCase):
 
     def test_resources_survive_empty_snapshot_clears_old_rules_after_ack(self):
         self.db.close(); self.db = s.init_db()
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 403)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], s.DATABASE_VERSION)
         node = dict(s.get_node(self.db, self.nid))
         for key in ('id','name','note','addr','key','ports','desired_mode','group_id','sort','auto_update'):
             self.assertEqual(node[key], self.node_before[key])
@@ -106,9 +106,9 @@ class Upgrade03Tests(Fixture, unittest.TestCase):
                 with patch.object(s.Handler,'panel_path','/unavailable'):
                     with self.assertRaisesRegex(s.UserError,'HTTP 服务尚未就绪'):
                         s.cmd_health(None)
-            with self.db:self.db.execute('PRAGMA user_version=404')
+            with self.db:self.db.execute(f'PRAGMA user_version={s.DATABASE_VERSION + 1}')
             with self.assertRaisesRegex(s.UserError,'数据库尚未就绪'):
                 s.cmd_health(None)
-            self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],404)
+            self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],s.DATABASE_VERSION + 1)
         finally:
             server.shutdown();server.server_close();thread.join()

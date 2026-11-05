@@ -28,13 +28,15 @@ import agent_v3
 import network_quality
 import wake
 import pools
+import subscriptions
+import link_quality
 import types
 
 def _module():
     return types.SimpleNamespace(**globals())
 
-VERSION = "0.4.3"
-DATABASE_VERSION = 403
+VERSION = "0.4.4"
+DATABASE_VERSION = 404
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -68,10 +70,11 @@ STATIC = {
     "index.html": "text/html; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
     "pools.js": "text/javascript; charset=utf-8",
+    "subscriptions.js": "text/javascript; charset=utf-8",
     "style.css": "text/css; charset=utf-8",
 }
 HEALTH = {"ok": "正常", "error": "故障", "skew": "时间不一致"}
-KINDS = ("nodes", "routes", "targets", "chains")
+KINDS = ("nodes", "routes", "targets", "chains", "links")
 DEFAULT_GROUP = "默认分组"
 
 SCHEMA = """
@@ -375,6 +378,7 @@ def init_db():
             network_quality.migrate(_module(), conn)
             wake.migrate(_module(), conn)
             pools.migrate(_module(), conn)
+            migrate_v044(conn)
             with conn:
                 ensure_active_windows(conn)
             return conn
@@ -384,7 +388,25 @@ def init_db():
     network_quality.migrate(_module(), conn)
     wake.migrate(_module(), conn)
     pools.migrate(_module(), conn)
+    migrate_v044(conn)
     return conn
+
+
+def migrate_v044(conn):
+    if conn.execute('PRAGMA user_version').fetchone()[0] >= 404:
+        return
+    backup_database(conn, DB_PATH + '.pre-0.4.4.bak')
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute("SELECT 1 FROM item_groups WHERE kind='links' AND builtin=1").fetchone():
+            conn.execute("INSERT INTO item_groups(kind,name,builtin) VALUES ('links',?,1)", (DEFAULT_GROUP,))
+        conn.execute('ALTER TABLE links ADD COLUMN group_id INTEGER NOT NULL DEFAULT 0')
+        conn.execute('ALTER TABLE links ADD COLUMN sort INTEGER NOT NULL DEFAULT 0')
+        conn.execute('UPDATE links SET group_id=?,sort=id', (default_group(conn, 'links'),))
+        for stmt in (subscriptions.SCHEMA + link_quality.SCHEMA).split(';'):
+            if stmt.strip():
+                conn.execute(stmt)
+        conn.execute('PRAGMA user_version=404')
 
 
 def migrate_v030(conn):
@@ -1449,6 +1471,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             path, _, query = self.path.partition("?")
             if path == self.sync_path:
                 return self.sync() if method == "POST" else self.not_found()
+            if method == 'GET' and re.fullmatch(r'/sub/[0-9a-f]{64}', path):
+                fmt = parse_qs(query).get('format', ['v2ray'])
+                if len(fmt) != 1 or fmt[0] not in ('clash', 'v2ray'):
+                    return self.not_found()
+                conn = db()
+                try:
+                    # One snapshot prevents a concurrent cutover mixing entry and credentials.
+                    conn.execute('BEGIN')
+                    result = subscriptions.export(_module(), conn, path.rsplit('/', 1)[1], fmt[0])
+                finally:
+                    conn.close()
+                if result is None:
+                    return self.not_found()
+                return self.reply(200, result[0], result[1], [('Cache-Control', 'no-store'),
+                                  ('X-Content-Type-Options', 'nosniff')])
             if path == self.panel_path and method == "GET":
                 return self.reply(302, "", headers=[("Location", self.panel_path + "/")])
             prefix = self.panel_path + "/"
@@ -1599,6 +1636,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 handler = {"PATCH": self.api_route_save, "DELETE": self.api_route_del}.get(method)
             elif parts == ["targets"]:
                 handler = {"GET": self.api_targets, "POST": self.api_target_save}.get(method)
+            elif parts == ['subscriptions']:
+                handler = {'GET': self.api_subscriptions, 'POST': self.api_subscription_save}.get(method)
+            elif len(parts) == 2 and parts[0] == 'subscriptions' and parts[1].isdigit():
+                handler = {'PATCH': self.api_subscription_save, 'DELETE': self.api_subscription_delete}.get(method)
             elif len(parts) == 2 and parts[0] == "targets" and parts[1].isdigit():
                 handler = {"PATCH": self.api_target_save, "DELETE": self.api_target_del}.get(method)
             elif len(parts) == 2 and parts[0] in KINDS and parts[1] == "order":
@@ -1974,6 +2015,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # 排序
 
+    def api_subscriptions(self, conn, body):
+        return subscriptions.listing(_module(), conn)
+
+    def api_subscription_save(self, conn, body, ident=None):
+        return subscriptions.save(_module(), conn, body, ident)
+
+    def api_subscription_delete(self, conn, body, ident):
+        pools.get(_module(), conn, 'subscriptions', ident)
+        conn.execute('DELETE FROM subscriptions WHERE id=?', (ident,))
+        return {'deleted': True}
+
     def api_order(self, conn, body, kind):
         """保存顺序：groups 为分组顺序，ids 为全部对象按显示顺序排列（只能在组内调整，不改变所属分组）。"""
         groups, ids = body.get("groups"), body.get("ids")
@@ -2120,11 +2172,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 link = dict(link)
                 link['state'], link['error'] = pools.display_state(_module(), conn, link)
                 c.update(link_id=link['id'], link_state=link['state'], link_error=link['error'],
+                         group_id=link['group_id'],
                          link_sync=pools.sync_status(_module(), conn, link))
                 if link['state'] in ('preparing', 'switching', 'pending', 'waiting', 'error'):
                     c['status'] = 'error' if link['state'] in ('waiting','error') else 'applying'
                 if not c['hops'] and link['state'] in ('preparing', 'switching', 'waiting'):
                     c['connection'] = None
+        order = {r['id']: i for i, r in enumerate(conn.execute(ordered('links')))}
+        data['chains'].sort(key=lambda c: order.get(c.get('link_id'), len(order)))
+        data['groups'] = get_groups(conn, 'links')
         return data
 
     @track_mutation

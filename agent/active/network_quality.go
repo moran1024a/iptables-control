@@ -110,6 +110,22 @@ func probeNetworkQuality(ctx context.Context, host string, port int, key []byte,
 		return result
 	}
 	result["resolved_ip"] = ips[0].String()
+	if protocol == "tcp-connect-v1" {
+		probeCtx, stop := context.WithTimeout(ctx, 3*time.Second)
+		defer stop()
+		start := time.Now()
+		conn, err := (&net.Dialer{}).DialContext(probeCtx, "tcp4", net.JoinHostPort(ips[0].String(), strconv.Itoa(port)))
+		if err != nil {
+			result["error"] = "TCP 建连失败: " + err.Error()
+			if timeout, ok := err.(net.Error); ok && timeout.Timeout() && ctx.Err() == nil {
+				result["status"] = "timeout"
+			}
+			return result
+		}
+		result["status"], result["rtt"] = "ok", float64(time.Since(start).Microseconds())/1000
+		conn.Close() // No application payload is sent to the target service.
+		return result
+	}
 	network, address := "udp4", net.JoinHostPort(ips[0].String(), strconv.Itoa(port))
 	if protocol == "icmp-echo-v1" {
 		network, address = "ip4:icmp", ips[0].String()
@@ -296,6 +312,32 @@ func (q *qualityMonitor) run() {
 }
 
 func (q *qualityMonitor) probe(body M) {
+	q.probeWithAgent(nil, body)
+}
+
+func (q *qualityMonitor) probeWithAgent(a *Agent, body M) {
+	// Bind route probes to an installed rule before starting asynchronous I/O.
+	// The session owns the state mutex while processing this message.
+	if id := int64(number(body["rule_id"])); id != 0 {
+		valid := false
+		if a != nil && readText(a.path("paused")) == "" {
+			for _, rule := range a.config.Rules {
+				if rule.ID == id && rule.Host == body["host"] && rule.TargetPort == int(number(body["port"])) {
+					valid = true
+					if net.ParseIP(rule.IP) != nil {
+						body["host"] = rule.IP
+					}
+					break
+				}
+			}
+		}
+		if !valid {
+			_ = q.send(M{"type": "quality_result", "id": body["id"], "status": "error", "error": "探测路径与已安装规则不一致"})
+			return
+		}
+	} else if body["protocol"] == "tcp-connect-v1" {
+		return
+	}
 	q.mu.Lock()
 	if time.Since(q.last) < 900*time.Millisecond {
 		q.mu.Unlock()
@@ -314,10 +356,13 @@ func (q *qualityMonitor) probe(body M) {
 			if protocol == "" {
 				protocol = "udp-echo-v1"
 			}
-			if host == "" || (protocol != "icmp-echo-v1" && protocol != "udp-echo-v1") {
+			if host == "" || (protocol != "icmp-echo-v1" && protocol != "udp-echo-v1" && protocol != "tcp-connect-v1") {
 				return
 			}
 			if protocol == "udp-echo-v1" && (port < 1 || port > 65535 || err != nil || len(key) != 32) {
+				return
+			}
+			if protocol == "tcp-connect-v1" && (port < 1 || port > 65535) {
 				return
 			}
 			result := probeNetworkQuality(q.ctx, host, port, key, protocol)

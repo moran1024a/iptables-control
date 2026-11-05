@@ -81,7 +81,9 @@ def sync_legacy(c):
             c.execute('UPDATE links SET name=?,plan=?,state=? WHERE id=?',
                       (chain['remark'], dump(plan), 'deleting' if chain['deleting'] else 'active', link['id']))
         else:
-            c.execute("INSERT INTO links(name,chain_id,plan,state) VALUES (?,?,?,'active')", (chain['remark'], chain['id'], dump(plan)))
+            group = c.execute("SELECT id FROM item_groups WHERE kind='links' AND builtin=1").fetchone()[0]
+            c.execute("INSERT INTO links(name,chain_id,plan,state,group_id,sort) VALUES (?,?,?,'active',?,(SELECT COALESCE(MAX(sort),0)+1 FROM links))",
+                      (chain['remark'], chain['id'], dump(plan), group))
 
 
 def refresh_links(s, c, node=None, target=None):
@@ -393,6 +395,7 @@ def link_save(s, c, body, ident=None):
     if old and old['job']:
         raise s.UserError('链路正在切换或等待确认，暂不能编辑', status=409)
     name = s.check_remark(body.get('name', old['name'] if old else ''), 'name', '名称')
+    group = s.check_group(c, 'links', body.get('group_id', old['group_id'] if old else None))
     plan = validate_plan(s, c, body.get('plan'), old)
     if old:
         retained = json.loads(old['retained'])
@@ -401,8 +404,11 @@ def link_save(s, c, body, ident=None):
                 retained.append(st)
         c.execute('UPDATE links SET retained=? WHERE id=?', (dump(retained), ident))
         c.execute('UPDATE links SET name=?,plan=?,failures=\'[]\',revision=revision+1 WHERE id=?', (name, dump(plan), ident))
+        if group != old['group_id']:
+            s.move_group(c, 'links', ident, group)
     else:
-        ident = c.execute('INSERT INTO links(name,plan) VALUES (?,?)', (name, dump(plan))).lastrowid
+        ident = c.execute('INSERT INTO links(name,plan,group_id,sort) VALUES (?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM links))',
+                          (name, dump(plan), group)).lastrowid
     link = get(s, c, 'links', ident)
     if body.get('apply', True):
         old_stages = {x['id']: x for x in json.loads(old['plan'])['stages'] if x['kind'] == 'pool'} if old else {}
@@ -713,7 +719,7 @@ def detail(s, c, link):
 
 
 def listing(s, c):
-    return dict(links=[detail(s, c, r) for r in c.execute('SELECT * FROM links ORDER BY id')],
+    return dict(links=[detail(s, c, r) for r in c.execute(s.ordered('links'))], groups=s.get_groups(c, 'links'),
                 pools=[dict(id=p['id'], name=p['name'], members=json.loads(p['members']),
                             references=list(dict.fromkeys(l['name'] for l, _ in references(c, p['id'])))) for p in c.execute('SELECT * FROM pools ORDER BY id')],
                 nodes=[dict(id=n['id'], name=n['name'], addr=n['addr'], mode=n['desired_mode'],

@@ -4,10 +4,10 @@
     2,
     3
   ],
-  "server": "0.4.3",
+  "server": "0.4.4",
   "forward_agent": "0.2.1",
   "legacy_agent": "0.2.1",
-  "active_agent": "0.4.3",
+  "active_agent": "0.4.4",
   "passive_agent": "0.4.3",
   "wake_agent": "0.4.3",
   "manager": "0.4.3",

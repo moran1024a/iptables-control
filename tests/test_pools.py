@@ -338,7 +338,7 @@ class PoolTests(Fixture, unittest.TestCase):
                 self.db.execute('DROP TABLE '+table)
             self.db.execute('PRAGMA user_version=402')
         self.db.close();self.db=s.init_db()
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],403)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],s.DATABASE_VERSION)
         self.assertEqual(before,{n:s.node_rules(self.db,s.get_node(self.db,n)) for n in before})
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM links WHERE state='draft'").fetchone()[0],1)
         self.assertEqual(self.db.execute('SELECT chain_id FROM links WHERE chain_id IS NOT NULL').fetchone()[0],cid)

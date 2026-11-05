@@ -10,24 +10,26 @@ const linkState = l => {
 };
 const poolHead = (title, button='') => `<div class="page-head"><h1>${title}</h1><div class="head-actions">${button}</div></div>`;
 
-const collectionFilters = {pools:{q:'',state:''}, links:{q:'',state:''}, configs:{q:'',state:''}};
+const collectionFilters = {pools:{q:'',state:''}, links:{q:'',state:'',group:''}, configs:{q:'',state:'',group:''}};
+filters.links=collectionFilters.links; filters.configs=collectionFilters.configs;
 let drawCollection = null;
 const matchesSearch = (kind, text) => text.toLowerCase().includes(collectionFilters[kind].q.trim().toLowerCase());
 const statusGroup = l => {
   const state=linkStatus(l);
   return ['error','timeout','failed','offline'].includes(state)?'error':['preparing','switching','pending','waiting','manual'].includes(state)?'pending':state;
 };
-function collectionTools(kind, count, total, statuses) {
+function collectionTools(kind, count, total, statuses, groups=[]) {
   const f=collectionFilters[kind];
-  return `<div class="collection-tools" data-collection="${kind}"><input type="search" data-collection-query value="${esc(f.q)}" placeholder="搜索名称或地址" aria-label="搜索列表"><select data-collection-state aria-label="筛选状态"><option value="">全部状态</option>${statuses.map(([key,label])=>`<option value="${key}" ${f.state===key?'selected':''}>${label}</option>`).join('')}</select><span class="count">${count} / ${total}</span></div>`;
+  return `<div class="collection-tools" data-collection="${kind}"><input type="search" data-collection-query value="${esc(f.q)}" placeholder="搜索名称或地址" aria-label="搜索列表"><select data-collection-state aria-label="筛选状态"><option value="">全部状态</option>${statuses.map(([key,label])=>`<option value="${key}" ${f.state===key?'selected':''}>${label}</option>`).join('')}</select>${groups.length>1?`<select data-collection-group aria-label="筛选分组"><option value="">全部分组</option>${groups.map(g=>`<option value="${g.id}" ${String(g.id)===f.group?'selected':''}>${esc(g.name)}</option>`).join('')}</select>`:''}<span class="count">${count} / ${total}</span></div>`;
 }
 document.addEventListener('input',e=>{
   const box=e.target.closest('[data-collection]');if(!box || !e.target.hasAttribute('data-collection-query'))return;
   collectionFilters[box.dataset.collection].q=e.target.value;drawCollection?.();
 });
 document.addEventListener('change',e=>{
-  const box=e.target.closest('[data-collection]');if(!box || !e.target.hasAttribute('data-collection-state'))return;
-  collectionFilters[box.dataset.collection].state=e.target.value;drawCollection?.();
+  const box=e.target.closest('[data-collection]');if(!box)return;
+  const field=e.target.hasAttribute('data-collection-state')?'state':e.target.hasAttribute('data-collection-group')?'group':null;
+  if(!field)return;collectionFilters[box.dataset.collection][field]=e.target.value;drawCollection?.();
 });
 
 async function poolList(request) {
@@ -53,12 +55,16 @@ function rememberPool() { templateEditor.name = $('#modal [name=name]').value; }
 
 async function linkList(request) {
   const d = await api('GET','links'); if (request !== viewRequest) return; poolView = d;
+  list={kind:'links',data:d,draw:()=>drawCollection()};
   drawCollection=()=>{
     const route=l=>[l.plan.entry?resourceName(d.nodes,l.plan.entry):null,...l.plan.stages.map(st=>st.kind==='pool'?resourceName(d.pools,st.pool_id):memberName(st.node_id)),resourceName(d.targets,l.plan.target,'未选择目标')].filter(Boolean).join(' → ');
-    const rows=d.links.filter(l=>matchesSearch('links',l.name+' '+route(l)+' '+(l.connection?l.connection.host+':'+l.connection.port:''))&&(!collectionFilters.links.state || statusGroup(l)===collectionFilters.links.state));
-    render(poolHead('链路','<button class="primary" data-action="link-new">新增链路</button>')+
-      collectionTools('links',rows.length,d.links.length,[['active','已应用'],['pending','等待同步'],['error','异常'],['draft','草稿'],['deleting','删除中']])+
-      `<div class="collection">${rows.map(l=>`<a href="#/routes/${l.id}" class="collection-row link-card" data-key="link-${l.id}"><div class="collection-main"><div class="title">${esc(l.name)}</div><div class="sub">${esc(route(l))}</div>${l.error?`<div class="row-error">${esc(l.error)}</div>`:''}</div>${l.cleanup.length?`<span class="muted collection-meta">${l.cleanup.length} 项待清理</span>`:''}${linkState(l)}<span class="muted">›</span></a>`).join('')||emptyState('⇄',d.links.length?'没有匹配的链路':'暂无链路')}</div>`);
+    if(sortMode==='links')return render(listHead('links',d.links.length,d.links.length)+sortList('links',d.links,l=>`<div class="title">${esc(l.name)}</div><div class="sub">${esc(route(l))}</div>`));
+    const f=collectionFilters.links;
+    const rows=d.links.filter(l=>matchesSearch('links',l.name+' '+route(l)+' '+(l.connection?l.connection.host+':'+l.connection.port:''))&&(!f.state || statusGroup(l)===f.state)&&(!f.group || l.group_id===Number(f.group)));
+    const card=l=>`<a href="#/routes/${l.id}" class="collection-row link-card" data-key="link-${l.id}"><div class="collection-main"><div class="title">${esc(l.name)}</div><div class="sub">${esc(route(l))}</div>${l.error?`<div class="row-error">${esc(l.error)}</div>`:''}</div>${l.cleanup.length?`<span class="muted collection-meta">${l.cleanup.length} 项待清理</span>`:''}${linkState(l)}<span class="muted">›</span></a>`;
+    render(listHead('links',d.links.length,rows.length,'link-new','新增链路')+
+      collectionTools('links',rows.length,d.links.length,[['active','已应用'],['pending','等待同步'],['error','异常'],['draft','草稿'],['deleting','删除中']],d.groups)+
+      `<div class="collection">${groupedList('links',rows,card,()=> '链路')||emptyState('⇄',d.links.length?'没有匹配的链路':'暂无链路')}</div>`);
   };drawCollection();
 }
 
@@ -270,28 +276,24 @@ document.addEventListener('keydown',e=>{
   if((e.key==='Enter'||e.key===' ') && e.target.matches?.('.topology-hit')) {e.preventDefault();e.target.dispatchEvent(new MouseEvent('click',{bubbles:true}));}
 });
 
-async function edgeQuality(source,target) {
-  const id=poolView.link.id;
-  openModal(`<h2>${esc(memberName(source))} → ${esc(memberName(target))}</h2><div class="edge-quality"><div class="quality-heading"><span class="quality-key" style="--series-color:var(--blue)">UDP</span><span class="quality-key" style="--series-color:var(--green)">ICMP</span><select aria-label="时间范围" data-edge-range><option value="900">15 分钟</option><option value="3600">1 小时</option><option value="86400">24 小时</option></select></div><div data-edge-chart>正在加载…</div></div><div class="form-actions"><button data-action="modal-close">关闭</button></div>`);
-  $('#modal .modal-box').classList.add('quality-dialog');
-  const state=modalState;let timer,sequence=0;
-  state.cleanup=()=>clearTimeout(timer);
-  const update=async()=>{
-    clearTimeout(timer);const request=++sequence,range=Number($('#modal [data-edge-range]').value);
-    try {
-      const data=await api('POST','quality',{scope:'links',id,source,target,range});
-      if(modalState!==state || request!==sequence)return;
-      const content=qualityChart(data.series,data.now,range)+`<div class="edge-stats">${data.series.map(s=>`<div><strong>${QUALITY_PROTOCOLS[s.protocol][0]}</strong><span>5 分钟平均 ${qualityNumber(s.summary.mean)}</span><span>P95 ${qualityNumber(s.summary.p95)}</span><span>波动 ${qualityNumber(s.summary.jitter)}</span><span>丢包 ${qualityNumber(s.summary.loss,'%')}</span><span class="muted">${esc(QUALITY_STATES[s.state]||s.state)}</span>${s.note?`<small>${esc(s.note)}</small>`:''}</div>`).join('')}</div>`;
-      $('#modal [data-edge-chart]').innerHTML=content;
-    } catch(err) {
-      if(modalState!==state || request!==sequence)return;
-      $('#modal [data-edge-chart]').innerHTML=`<p class="t-red">${esc(err.message)}</p>`;
-    }
-    timer=setTimeout(update,10000);
-  };
-  $('#modal [data-edge-range]').onchange=update;
-  await update();
+async function linkQualityPage(id, request) {
+  const range=qualityViews.get('links/'+id)?.range||900;
+  const d=await api('POST','quality',{scope:'links',id,range});if(request!==viewRequest)return;
+  const cards=d.sections.map(section=>{
+    const rows=section.series.map(s=>{
+      const [label,color]=QUALITY_PROTOCOLS[s.protocol],stat=s.summary;
+      const latest=s.latest, fresh=latest && latest.path_key===s.path_key && d.now-latest.slot<=25;
+      const state=['collecting','ok'].includes(s.state) && fresh ? latest.status : s.state;
+      return `<tr><td><span class="quality-key" style="--series-color:${color}">${label}</span></td><td>${fresh&&latest.status==='ok'?qualityNumber(latest.rtt):'—'}</td><td>${qualityNumber(stat.mean)}</td><td>${qualityNumber(stat.p95)}</td><td>${qualityNumber(stat.jitter)}</td><td>${qualityNumber(stat.loss,'%')}</td><td title="${esc(s.note||latest?.error||'')}">${esc(QUALITY_STATES[state]||state)}</td></tr>`;
+    }).join('');
+    return `<section class="panel" data-key="quality-${section.id}"><div class="quality-heading"><h2><span class="muted">${esc(section.kind)}</span> ${esc(section.label)}</h2></div>${qualityChart(section.series,d.now,range)}<div class="quality-table"><table><thead><tr><th>探测</th><th>最新</th><th>5 分钟平均</th><th>P95</th><th>波动</th><th>超时率</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+  }).join('');
+  render(`<a class="back" href="#/routes/${id}">← ${esc(d.name)}</a>`+poolHead('网络质量',`<select data-link-quality-range="${id}" aria-label="时间范围">${[[900,'15 分钟'],[3600,'1 小时'],[86400,'24 小时']].map(([n,label])=>`<option value="${n}" ${n===range?'selected':''}>${label}</option>`).join('')}</select>`)+cards);
 }
+document.addEventListener('change',e=>{
+  if(!e.target.hasAttribute('data-link-quality-range'))return;
+  qualityViews.set('links/'+e.target.dataset.linkQualityRange,{range:Number(e.target.value)});refresh();
+});
 
 async function linkDetail(id, request) {
   const d = await api('GET',`links/${id}`); if (request !== viewRequest) return; poolView=d; const l=d.link;
@@ -303,18 +305,18 @@ async function linkDetail(id, request) {
 }
 
 function linkForm(l) {
-  linkEditor = {id:l?.id, revision:l?.revision, name:l?.name || '', plan:structuredClone(l?.plan || {entry:null,port:null,target:null,stages:[]})};
+  linkEditor = {id:l?.id, revision:l?.revision, group_id:l?.group_id, name:l?.name || '', plan:structuredClone(l?.plan || {entry:null,port:null,target:null,stages:[]})};
   drawLinkForm();
 }
 function rememberLink() {
   const f=$('#modal form'); if(!f || f.dataset.form!=='link-save') return;
-  linkEditor.name=f.elements.name.value; linkEditor.plan.entry=Number(f.elements.entry.value)||null;
+  linkEditor.group_id=Number(f.elements.group_id?.value)||linkEditor.group_id; linkEditor.name=f.elements.name.value; linkEditor.plan.entry=Number(f.elements.entry.value)||null;
   linkEditor.plan.target=Number(f.elements.target.value)||null; linkEditor.plan.port=Number(f.elements.port.value)||null;
 }
 function drawLinkForm(preserve=false) {
   const p=linkEditor.plan;
   const stages=[...poolView.pools.map(x=>({id:'p:'+x.id,name:'池 · '+x.name})),...poolView.nodes.map(x=>({...x,id:'n:'+x.id}))];
-  openModal(`<form data-form="link-save"><h2>${linkEditor.id?'编辑链路':'新增链路'}</h2><label><span>名称</span><input name="name" value="${esc(linkEditor.name)}" required></label><div class="inline-fields"><label><span>入口节点</span>${resourceSelect('entry',poolView.nodes,p.entry,'无入口（直达目标）')}</label><label><span>入口端口</span><input name="port" type="number" min="1" max="65535" value="${p.port||''}" placeholder="自动分配"></label></div><h3>中间路径</h3><div class="member-list" data-reorder="stage">${p.stages.map((st,i)=>`<div class="member-row sort-item" data-order="${esc(st.id)}">${dragHandle}<span class="member-label">${i+1}. ${st.kind==='pool'?'池 · '+esc(resourceName(poolView.pools,st.pool_id)):esc(memberName(st.node_id))}</span>${orderButtons('stage',i,p.stages.length)}<button type="button" class="small danger" data-action="stage-remove" data-index="${i}">移除</button></div>`).join('')||'<p class="muted">入口直接连接目标</p>'}</div><div class="inline-fields">${resourceSelect('stage-add',stages,'','选择池或固定节点',true)}<button type="button" data-action="stage-add">添加阶段</button></div><label><span>目标</span>${resourceSelect('target',poolView.targets,p.target,'未选择')}</label><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button>${!linkEditor.id || poolView.link?.state==='draft'?'<button name="draft" value="1">保存草稿</button>':''}<button class="primary">保存并应用</button></div></form>`,preserve);
+  openModal(`<form data-form="link-save"><h2>${linkEditor.id?'编辑链路':'新增链路'}</h2><label><span>名称</span><input name="name" value="${esc(linkEditor.name)}" required></label>${groupSelect(poolView.groups,linkEditor.group_id)}<div class="inline-fields"><label><span>入口节点</span>${resourceSelect('entry',poolView.nodes,p.entry,'无入口（直达目标）')}</label><label><span>入口端口</span><input name="port" type="number" min="1" max="65535" value="${p.port||''}" placeholder="自动分配"></label></div><h3>中间路径</h3><div class="member-list" data-reorder="stage">${p.stages.map((st,i)=>`<div class="member-row sort-item" data-order="${esc(st.id)}">${dragHandle}<span class="member-label">${i+1}. ${st.kind==='pool'?'池 · '+esc(resourceName(poolView.pools,st.pool_id)):esc(memberName(st.node_id))}</span>${orderButtons('stage',i,p.stages.length)}<button type="button" class="small danger" data-action="stage-remove" data-index="${i}">移除</button></div>`).join('')||'<p class="muted">入口直接连接目标</p>'}</div><div class="inline-fields">${resourceSelect('stage-add',stages,'','选择池或固定节点',true)}<button type="button" data-action="stage-add">添加阶段</button></div><label><span>目标</span>${resourceSelect('target',poolView.targets,p.target,'未选择')}</label><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button>${!linkEditor.id || poolView.link?.state==='draft'?'<button name="draft" value="1">保存草稿</button>':''}<button class="primary">保存并应用</button></div></form>`,preserve);
   $('#stage-add').setAttribute('data-ignore-dirty','');
   if(!preserve)modalState.initial=modalValues();
 }
@@ -335,12 +337,14 @@ function rememberInstance() {
 
 async function configSummary(request) {
   const d=await api('GET','configs'); if(request!==viewRequest)return;
+  list={kind:'configs',data:{...d,configs:d.chains},draw:()=>drawCollection()};
   drawCollection=()=>{
-    const view=c=>({state:c.link_state||c.status,sync:c.link_sync});
-    const rows=d.chains.filter(c=>matchesSearch('configs',c.remark+' '+(c.connection?c.connection.host+':'+c.connection.port:''))&&(!collectionFilters.configs.state || statusGroup(view(c))===collectionFilters.configs.state));
+    const view=c=>({state:c.link_state||c.status,sync:c.link_sync}),f=collectionFilters.configs;
+    const rows=d.chains.filter(c=>matchesSearch('configs',c.remark+' '+(c.connection?c.connection.host+':'+c.connection.port:''))&&(!f.state || statusGroup(view(c))===f.state)&&(!f.group || c.group_id===Number(f.group)));
+    const card=c=>`<div class="collection-row" data-key="summary-${c.id}"><div class="collection-main"><a class="title" href="#/routes/${c.link_id||''}">${esc(c.remark)}</a><div class="sub"><code>${c.connection?esc(c.connection.host)+':'+c.connection.port:'等待入口确认'}</code></div>${c.link_error?`<div class="row-error">${esc(c.link_error)}</div>`:''}</div>${linkState(view(c))}<div class="row-actions">${c.connection?`<button class="small" data-action="copy" data-text="${esc(c.connection.uri)}">复制${c.connection.protocol==='endpoint'?'地址':'导入链接'}</button>`:''}</div></div>`;
     render(poolHead('配置','<a class="button" href="#/routes">管理链路 →</a>')+
-      collectionTools('configs',rows.length,d.chains.length,[['active','已应用'],['pending','等待同步'],['error','异常'],['deleting','删除中']])+
-      `<div class="collection">${rows.map(c=>`<div class="collection-row" data-key="summary-${c.id}"><div class="collection-main"><a class="title" href="#/routes/${c.link_id||''}">${esc(c.remark)}</a><div class="sub"><code>${c.connection?esc(c.connection.host)+':'+c.connection.port:'等待入口确认'}</code></div>${c.link_error?`<div class="row-error">${esc(c.link_error)}</div>`:''}</div>${linkState(view(c))}<div class="row-actions">${c.connection?`<button class="small" data-action="copy" data-text="${esc(c.connection.uri)}">复制${c.connection.protocol==='endpoint'?'地址':'导入链接'}</button>`:''}</div></div>`).join('')||emptyState('⇄',d.chains.length?'没有匹配的配置':'暂无配置')}</div>`);
+      collectionTools('configs',rows.length,d.chains.length,[['active','已应用'],['pending','等待同步'],['error','异常'],['deleting','删除中']],d.groups)+
+      `<div class="collection">${groupedList('configs',rows,card,()=> '配置',false)||emptyState('⇄',d.chains.length?'没有匹配的配置':'暂无配置')}</div>`);
   };drawCollection();
 }
 
@@ -367,7 +371,7 @@ Object.assign(ACTIONS, {
   'canvas-fit':()=>topologyBinding?.fit(),
   'canvas-current':()=>topologyBinding?.focusCurrent(),
   'canvas-fullscreen':()=>topologyBinding?.fullscreen(),
-  'edge-quality':el=>edgeQuality(Number(el.dataset.source),Number(el.dataset.target)),
+  'edge-quality':()=>{location.hash=`#/quality/links/${poolView.link.id}`;},
   'pool-new':()=>poolForm(), 'pool-edit':el=>poolForm(poolView.pools.find(p=>p.id===Number(el.dataset.id))),
   async 'pool-delete'(el){if(!(await confirmBox('删除池','删除 <b>'+esc(poolView.pools.find(p=>p.id===Number(el.dataset.id)).name)+'</b>？','删除',true)))return;await api('DELETE',`pools/${el.dataset.id}`);refresh();},
   'pool-down'(el){rememberPool();const i=Number(el.dataset.index),a=templateEditor.members;[a[i],a[i+1]]=[a[i+1],a[i]];markModalDirty();drawPoolForm(true);},

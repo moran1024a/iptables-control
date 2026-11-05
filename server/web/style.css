@@ -741,6 +741,12 @@ body.canvas-fullscreen { overflow:hidden; }
 .sync-nodes span { color:var(--muted); margin-left:6px; }
 .manual-sync { display:flex; flex-wrap:wrap; align-items:center; gap:5px; }
 .quality-dialog { max-width:900px; }
+.subscription-choices { max-height:50vh; overflow:auto; border:1px solid var(--border); border-radius:8px; padding:12px; }
+.subscription-group > strong { display:block; margin:8px 0; }
+.subscription-group label { display:flex; gap:10px; align-items:center; margin:8px 0; }
+.subscription-group input { width:auto; flex:none; }
+.subscription-group small { display:block; }
+.collection > .group .group-body { padding:0; }
 .edge-quality .quality-heading select { width:auto; margin-left:auto; }
 .edge-stats { display:flex; gap:12px; }
 .edge-stats > div { display:flex; flex:1; flex-wrap:wrap; gap:7px 14px; border:1px solid var(--border); border-radius:8px; padding:12px; font-size:12px; }

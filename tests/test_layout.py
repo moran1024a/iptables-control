@@ -47,7 +47,7 @@ class MigrationTests(Fixture, unittest.TestCase):
     def test_202_mixed_migration_exact_scope_and_idempotence(self):
         old,before=self.legacy();secret=old.execute('SELECT params FROM tunnels WHERE id=8').fetchone()[0]
         old.close();self.db=s.init_db()
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],403)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],s.DATABASE_VERSION)
         self.assertEqual(s.node_rules(self.db,s.get_node(self.db,10)),[])
         self.assertEqual(s.get_target(self.db,8)['params'],secret)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM chains').fetchone()[0],0)
@@ -62,7 +62,7 @@ class MigrationTests(Fixture, unittest.TestCase):
 
     def test_201_migration_path(self):
         c,_=self.legacy(201);c.close();self.db=s.init_db()
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],403)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],s.DATABASE_VERSION)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM targets').fetchone()[0],2)
 
     def test_200_keeps_resources_and_retires_old_forwarding(self):

@@ -7,6 +7,7 @@ import math
 import secrets
 import time
 import pools
+import link_quality
 
 INTERVAL = 10
 PORT = 33445
@@ -82,7 +83,7 @@ def aggregate(rows):
     sent = len(good) + lost
     changes = [abs(b['rtt'] - a['rtt']) for a, b in zip(rows, rows[1:])
                if a['status'] == b['status'] == 'ok' and b['slot'] - a['slot'] <= INTERVAL * 2
-               and a['resolved_ip'] == b['resolved_ip']]
+               and a['resolved_ip'] == b['resolved_ip'] and a.get('path_key') == b.get('path_key')]
     ordered = sorted(good)
     return dict(samples=sent, lost=lost, loss=lost * 100 / sent if sent else None,
                 mean=sum(good) / len(good) if good else None, peak=max(good) if good else None,
@@ -91,9 +92,13 @@ def aggregate(rows):
 
 
 def history(conn, pair_id, seconds, now):
-    step = {900: 10, 3600: 60, 86400: 300}[seconds]
     rows = [dict(r) for r in conn.execute('SELECT * FROM quality_samples WHERE pair_id=? AND slot>=? ORDER BY slot',
-                                         (pair_id, now - seconds - step))]
+                                         (pair_id, now - max(seconds, 300) - 300))]
+    return summarize(rows, seconds, now)
+
+
+def summarize(rows, seconds, now):
+    step = {900: 10, 3600: 60, 86400: 300}[seconds]
     buckets = defaultdict(list)
     for row in rows:
         buckets[row['slot'] // step * step].append(row)
@@ -105,12 +110,13 @@ def history(conn, pair_id, seconds, now):
                            error=batch[-1]['error'] if batch else '',
                            resolved_ip=batch[-1]['resolved_ip'] if batch else '',
                            gap=any(r['status'] != 'ok' for r in batch) or len(batch) < step // INTERVAL,
-                           endpoint_change=len({r['resolved_ip'] for r in batch if r['resolved_ip']}) > 1))
-    recent = [dict(r) for r in conn.execute('SELECT * FROM quality_samples WHERE pair_id=? AND slot>=? ORDER BY slot',
-                                          (pair_id, now - 300))]
-    latest = conn.execute('SELECT * FROM quality_samples WHERE pair_id=? AND slot>=? ORDER BY slot DESC LIMIT 1',
-                          (pair_id, now - 86400)).fetchone()
-    return dict(points=points, step=step, summary=aggregate(recent), latest=dict(latest) if latest else None)
+                           path_key=batch[-1].get('path_key') if batch else None,
+                           path_label=batch[-1].get('path_label', '') if batch else '',
+                           endpoint_change=len({(r['resolved_ip'], r.get('path_key')) for r in batch}) > 1))
+    recent = [r for r in rows if r['slot'] >= now - 300]
+    latest = rows[-1] if rows else None
+    return dict(points=points, step=step, summary=aggregate(recent), latest=latest)
+
 
 
 class Monitor:
@@ -122,6 +128,7 @@ class Monitor:
         self.budget = {}
         self.task = None
         self.cleanup_at = 0
+        self.links = link_quality.Monitor(self)
 
     def unavailable(self, nodes, pair):
         reason = stopped(nodes, pair)
@@ -147,6 +154,8 @@ class Monitor:
         if scope not in ('routes', 'configs', 'links') or type(ident) is not int or seconds not in (900, 3600, 86400):
             raise self.hub.s.UserError('无效的链路或时间范围')
         now = int(time.time())
+        if scope == 'links' and 'source' not in body and 'target' not in body:
+            return await self.links.view(body, now)
 
         def read(conn):
             ids = paths(conn).get((scope, ident))
@@ -178,13 +187,15 @@ class Monitor:
         now = int(time.time())
         self.extra = {k: v for k, v in self.extra.items() if v > now}
 
+        link_needed = await self.links.prepare(now)
         extra = tuple(self.extra)
 
         def plan(conn):
             routes = paths(conn)
             nodes = {r['id']: dict(r) for r in conn.execute('SELECT * FROM nodes')}
-            edges = {edge for (scope, _), ids in routes.items() if scope != 'links' for edge in zip(ids, ids[1:]) if edge[0] != edge[1]}
-            edges.update(pools.quality_paths(conn)[1])
+            linked = {r[0] for r in conn.execute('SELECT chain_id FROM links WHERE chain_id IS NOT NULL')}
+            edges = {edge for (scope, ident), ids in routes.items() if scope == 'routes' or (scope == 'configs' and ident not in linked)
+                     for edge in zip(ids, ids[1:]) if edge[0] != edge[1]}
             for scope, ident, a, b in extra:
                 ids = routes.get((scope, ident), [])
                 if a in ids and b in ids:
@@ -202,6 +213,7 @@ class Monitor:
         active_ids = {p['id'] for p in pairs}
         self.last = {k: v for k, v in self.last.items() if k in active_ids}
         needed = {n for p in pairs if p['protocol'] == 'udp-echo-v1' and not stopped(nodes, p) for n in (p['source'], p['target'])}
+        needed.update(link_needed)
         for nid, session in list(self.hub.sessions.items()):
             if not session.get('quality_capable') or session.get('paused'):
                 continue
@@ -246,7 +258,11 @@ class Monitor:
             await asyncio.wait_for(source['send'](dict(type='quality_probe', id=op, host=pair['target_addr'],
                                                        port=pair['port'], protocol=pair['protocol'], key=target.get('quality_key', ''))), 2)
 
+        await self.links.tick(now)
+
     async def result(self, nid, session, data):
+        if data.get('id') in self.links.pending:
+            return await self.links.result(nid, session, data)
         task = self.pending.get(data.get('id'))
         if not task or task['session'] is not session or task['pair']['source'] != nid:
             return

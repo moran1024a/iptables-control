@@ -3,11 +3,68 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"io"
 	"net"
 	"os"
 	"testing"
 	"time"
 )
+
+func TestTCPQualityConnectsWithoutPayloadAndChecksInstalledRoute(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	payload := make(chan []byte, 1)
+	go func() {
+		c, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(time.Second))
+		body, _ := io.ReadAll(c)
+		payload <- body
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	results := make(chan M, 4)
+	monitor := newQualityMonitor(ctx, func(m M) error { results <- m; return nil })
+	a := &Agent{root: t.TempDir(), config: Config{Rules: []Rule{{ID: 17, Host: "does-not-resolve.invalid", IP: "127.0.0.1", TargetPort: port}}}}
+	monitor.probeWithAgent(a, M{"id": "valid", "rule_id": 17, "protocol": "tcp-connect-v1", "host": "does-not-resolve.invalid", "port": port})
+	select {
+	case result := <-results:
+		if result["status"] != "ok" || result["resolved_ip"] != "127.0.0.1" {
+			t.Fatal(result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("TCP probe did not complete")
+	}
+	if body := <-payload; len(body) != 0 {
+		t.Fatal("sent application data", body)
+	}
+	monitor.probeWithAgent(a, M{"id": "stale", "rule_id": 18, "protocol": "tcp-connect-v1", "host": "127.0.0.1", "port": port})
+	if result := <-results; result["status"] != "error" {
+		t.Fatal("accepted stale route", result)
+	}
+	listener.Close()
+	result := probeNetworkQuality(ctx, "127.0.0.1", port, nil, "tcp-connect-v1")
+	if result["status"] != "error" {
+		t.Fatal("closed port was counted as successful RTT", result)
+	}
+}
+
+func TestTCPQualityKernelPath(t *testing.T) {
+	if os.Getenv("ICTL_QUALITY_KERNEL") != "1" {
+		t.Skip("requires disposable network namespace")
+	}
+	result := probeNetworkQuality(context.Background(), "192.0.2.1", 30123, nil, "tcp-connect-v1")
+	if result["status"] != "ok" || result["rtt"].(float64) < 60 {
+		t.Fatal("probe did not include the delayed downstream path", result)
+	}
+}
 
 func TestICMPReplyValidation(t *testing.T) {
 	if icmpChecksum([]byte{0, 1, 2, 3, 4, 5}) != 0xf9f6 || icmpChecksum([]byte{0, 1, 2}) != 0xfdfe {

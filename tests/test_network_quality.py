@@ -28,7 +28,7 @@ class QualityTests(Fixture, unittest.TestCase):
             self.db.execute('PRAGMA user_version=400')
         Path(s.DB_PATH + '.pre-0.4.0-rc.2.bak').unlink()
         upgraded = s.init_db()
-        self.assertEqual(upgraded.execute('PRAGMA user_version').fetchone()[0], 403)
+        self.assertEqual(upgraded.execute('PRAGMA user_version').fetchone()[0], s.DATABASE_VERSION)
         self.assertEqual(s.node_rules(upgraded, s.get_node(upgraded, a)), before)
         self.assertEqual(s.get_node(upgraded, a)['quality_port'], q.PORT)
         self.assertTrue(Path(s.DB_PATH + '.pre-0.4.0-rc.2.bak').is_file())

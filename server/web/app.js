@@ -38,7 +38,7 @@ let list = null;                  // 当前列表页：{kind, data, draw}，搜�
 let sortMode = null;              // 正在排序的列表："nodes" / "chains"
 const openDetails = new Set();    // 已展开的折叠区，刷新后保持
 const revealedKeys = new Set();   // 已显示密钥的节点
-const filters = { nodes: {}, routes: {}, targets: {}, chains: {} };   // 搜索和筛选条件，刷新页面后清空
+const filters = { nodes: {}, routes: {}, targets: {}, chains: {}, links: {}, configs: {} };   // 搜索和筛选条件，刷新页面后清空
 const collapsed = new Set(JSON.parse(localStorage.getItem("ictl-collapsed") || "[]"));   // 已折叠的分组
 
 function esc(s) {
@@ -305,6 +305,7 @@ async function route() {
   if (page === "routes") return show(linkList, true);
   if (page === "pools") return show(poolList, true);
   if (page === "targets") return show(targetList, true);
+  if (page === "subscriptions") return show(subscriptionList, true);
   if (page === "settings") return show(settingsPage, false);
   location.hash = "#/nodes";
 }
@@ -362,7 +363,7 @@ function showChangeAccount() {
 
 // ------------------------------------------------------------ 节点列表
 
-const KIND_LABEL = { nodes: "节点", routes: "链路", targets: "目标", chains: "配置" };
+const KIND_LABEL = { nodes: "节点", routes: "链路", targets: "目标", chains: "配置", links: "链路", configs: "配置" };
 
 // 列表页标题栏：排序模式下显示「取消 / 完成」；搜索或筛选时不能排序
 function listHead(kind, total, shown, newAction, newLabel, extraActions = "") {
@@ -389,7 +390,7 @@ function saveCollapsed() {
 
 // 按分组显示：items 已按分组和组内顺序排列。只有默认分组时不显示组头。
 // 搜索或筛选时隐藏没有匹配项的分组，有匹配项的分组临时展开
-function groupedList(kind, items, card, summary) {
+function groupedList(kind, items, card, summary, editable = true) {
   const groups = list.data.groups;
   if (groups.length === 1) return items.map(card).join("");
   const filtering = isFiltering(kind);
@@ -398,16 +399,16 @@ function groupedList(kind, items, card, summary) {
     if (filtering && !members.length) return "";
     const key = `${kind}-${g.id}`;
     return `<section class="group${!filtering && collapsed.has(key) ? " closed" : ""}" data-key="group-${key}">
-      ${groupHead(kind, g, `${members.length} 个${summary(members)}`)}
+      ${groupHead(kind, g, `${members.length} 个${summary(members)}`, "", editable)}
       <div class="group-body">${members.map(card).join("") || `<div class="group-empty">空分组</div>`}</div>
     </section>`;
   }).join("");
 }
 
-function groupHead(kind, g, sum, handle = "") {
+function groupHead(kind, g, sum, handle = "", editable = true) {
   return `<div class="group-head" data-action="group-toggle" data-group="${kind}-${g.id}">
     ${handle}<span class="chevron"></span><span class="group-name">${esc(g.name)}</span><span class="group-sum">${sum}</span>
-    ${handle ? "" : `<span class="group-actions">
+    ${handle || !editable ? "" : `<span class="group-actions">
       <button class="small" data-action="group-rename" data-id="${g.id}">改名</button>
       ${g.builtin ? "" : `<button class="small danger" data-action="group-delete" data-id="${g.id}">删除</button>`}
     </span>`}
@@ -1403,10 +1404,10 @@ function drawRoutes() {
 }
 
 const qualityViews = new Map();
-const QUALITY_STATES = {ok: "成功", timeout: "探测超时", error: "探测异常", offline: "节点离线", stopped: "探测已停止", unsupported: "需要升级 Agent", disabled: "探测已关闭", waiting: "等待探测就绪", missing: "未采样", collecting: "持续采集中"};
+const QUALITY_STATES = {unknown: "未知", ok: "成功", timeout: "探测超时", error: "探测异常", offline: "节点离线", stopped: "探测已停止", unsupported: "需要升级 Agent", disabled: "探测已关闭", waiting: "等待探测就绪", missing: "未采样", collecting: "持续采集中"};
 const qualityNumber = (n, unit = " ms") => n == null ? "—" : Number(n).toFixed(1) + unit;
 
-const QUALITY_PROTOCOLS = {"udp-echo-v1": ["UDP", "var(--blue)"], "icmp-echo-v1": ["ICMP", "var(--green)"]};
+const QUALITY_PROTOCOLS = {"tcp-connect-v1": ["TCP", "var(--yellow)"], "udp-echo-v1": ["UDP", "var(--blue)"], "icmp-echo-v1": ["ICMP", "var(--green)"]};
 
 function qualityChart(series, now, seconds) {
   const width = 900, height = 250, left = 55, right = 16, top = 18, bottom = 40;
@@ -1415,11 +1416,16 @@ function qualityChart(series, now, seconds) {
   const y = n => top + (height - top - bottom) * (1 - n / maximum);
   const grid = [0, .5, 1].map(f => `<line x1="${left}" x2="${width-right}" y1="${y(maximum*f)}" y2="${y(maximum*f)}" stroke="var(--border)"/><text x="${left-8}" y="${y(maximum*f)+4}" text-anchor="end">${(maximum*f).toFixed(1)}</text>`).join("");
   const ticks = [0, .5, 1].map(f => { const time = now-seconds+seconds*f; return `<text x="${x(time)}" y="${height-5}" text-anchor="${f === 0 ? "start" : f === 1 ? "end" : "middle"}">${esc(clock(time))}</text>`; }).join("");
+  const changes = new Set();
   const curves = series.map((s, index) => {
     const [name, color] = QUALITY_PROTOCOLS[s.protocol];
-    let previous = null, elements = "";
+    let previous = null, pathKey = null, elements = "";
     for (const p of s.points.filter(p => p.time >= now - seconds)) {
-      const title = `<title>${name} · ${esc(fmtTime(p.time))} · ${esc(QUALITY_STATES[p.status] || p.status)} · 平均 ${qualityNumber(p.mean)} · 峰值 ${qualityNumber(p.peak)} · 探测丢包 ${qualityNumber(p.loss, "%")}（${p.lost}/${p.samples}）${p.resolved_ip ? " · " + esc(p.resolved_ip) : ""}${p.error ? " · " + esc(p.error) : ""}</title>`;
+      if(p.path_key && pathKey && pathKey!==p.path_key && !changes.has(p.time)) {
+        changes.add(p.time);elements+=`<line x1="${x(p.time)}" x2="${x(p.time)}" y1="${top}" y2="${height-bottom}" stroke="var(--muted)" stroke-dasharray="3 4"><title>路径切换 · ${esc(p.path_label||'')}</title></line>`;
+      }
+      if(p.path_key)pathKey=p.path_key;
+      const title = `<title>${name} · ${esc(fmtTime(p.time))} · ${esc(QUALITY_STATES[p.status] || p.status)} · 平均 ${qualityNumber(p.mean)} · 峰值 ${qualityNumber(p.peak)} · 探测超时 ${qualityNumber(p.loss, "%")}（${p.lost}/${p.samples}）${p.resolved_ip ? " · " + esc(p.resolved_ip) : ""}${p.error ? " · " + esc(p.error) : ""}</title>`;
       const px = x(p.time).toFixed(1);
       if (p.mean == null) {
         previous = null;
@@ -1429,7 +1435,7 @@ function qualityChart(series, now, seconds) {
         }
         continue;
       }
-      if (previous && !previous.gap && !p.gap && !previous.endpoint_change && !p.endpoint_change && previous.resolved_ip === p.resolved_ip) {
+      if (previous && !previous.gap && !p.gap && !previous.endpoint_change && !p.endpoint_change && previous.resolved_ip === p.resolved_ip && previous.path_key === p.path_key) {
         elements += `<line x1="${x(previous.time).toFixed(1)}" y1="${y(previous.mean).toFixed(1)}" x2="${px}" y2="${y(p.mean).toFixed(1)}" stroke="${color}" stroke-width="2"/>`;
       }
       if (p.peak != null && p.peak !== p.mean) elements += `<line x1="${px}" x2="${px}" y1="${y(p.mean).toFixed(1)}" y2="${y(p.peak).toFixed(1)}" stroke="${color}" opacity=".3">${title}</line>`;
@@ -1438,10 +1444,11 @@ function qualityChart(series, now, seconds) {
     }
     return `<g data-protocol="${s.protocol}">${elements}</g>`;
   }).join("");
-  return `<svg class="quality-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="UDP 与 ICMP 往返延迟对比">${grid}${curves}${ticks}</svg>`;
+  return `<svg class="quality-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="网络延迟趋势">${grid}${curves}${ticks}</svg>`;
 }
 
 async function qualityPage(scope, id, request) {
+  if(scope==='links')return linkQualityPage(id,request);
   const key = `${scope}/${id}`, selection = qualityViews.get(key) || {range: 900};
   let d;
   try { d = await api("POST", "quality", {scope, id, ...selection}); }
