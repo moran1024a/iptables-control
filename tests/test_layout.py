@@ -113,6 +113,12 @@ class LayoutTests(Fixture, unittest.TestCase):
             self.call(method,{'group_id':gid},ids[0])
             self.call('api_order',dict(groups=[gid,default],ids=ids[::-1]),kind)
             self.assertEqual(s.get_groups(self.db,kind)[0]['id'],gid)
+            if kind in ('nodes', 'targets'):
+                choices = self.call('api_pool_list')[kind]
+                panel = self.call('api_' + kind)[kind]
+                self.assertEqual([x['id'] for x in choices], [x['id'] for x in panel])
+                self.call('api_order',dict(groups=[default,gid],ids=ids[::-1]),kind)
+                self.assertEqual([x['id'] for x in self.call('api_pool_list')[kind]], ids[::-1])
             with self.assertRaises(s.UserError):self.call('api_order',dict(groups=[gid,default],ids=[ids[0],ids[0]]),kind)
             self.call('api_group_del',{},gid)
         after=s.mutation_snapshot(self.db)

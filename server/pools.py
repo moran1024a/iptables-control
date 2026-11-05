@@ -714,7 +714,8 @@ def detail(s, c, link):
         chain = s.get_chain(c, link['chain_id']); target = s.get_target(c, chain['target_id'])
         result['applied_target_id'] = target['id']
         first = result['hops'][0] if result['hops'] else dict(addr=target['host'], port=target['port'])
-        result['connection'] = s.target_config.connection(target, first['addr'], first['port'], link['name'])
+        result['connection'] = s.target_config.connection(target, first['addr'], first['port'],
+                                                         s.config_name(c, link['name'], link['group_id']))
     return result
 
 
@@ -724,8 +725,8 @@ def listing(s, c):
                             references=list(dict.fromkeys(l['name'] for l, _ in references(c, p['id'])))) for p in c.execute('SELECT * FROM pools ORDER BY id')],
                 nodes=[dict(id=n['id'], name=n['name'], addr=n['addr'], mode=n['desired_mode'],
                             eligible=n['installed_agent'] == 'active' and n['desired_mode'] == 'active' and not n['manual_required'] and not n['deleting'],
-                            status=s.node_status(c, n, int(time.time()))) for n in c.execute('SELECT * FROM nodes')],
-                targets=[dict(id=t['id'], name=t['name']) for t in c.execute('SELECT * FROM targets')])
+                            status=s.node_status(c, n, int(time.time()))) for n in c.execute(s.ordered('nodes'))],
+                targets=[dict(id=t['id'], name=t['name']) for t in c.execute(s.ordered('targets'))])
 
 
 def quality_paths(c, only=None):

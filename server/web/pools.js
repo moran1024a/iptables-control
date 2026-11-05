@@ -280,15 +280,9 @@ async function linkQualityPage(id, request) {
   const range=qualityViews.get('links/'+id)?.range||900;
   const d=await api('POST','quality',{scope:'links',id,range});if(request!==viewRequest)return;
   const cards=d.sections.map(section=>{
-    const rows=section.series.map(s=>{
-      const [label,color]=QUALITY_PROTOCOLS[s.protocol],stat=s.summary;
-      const latest=s.latest, fresh=latest && latest.path_key===s.path_key && d.now-latest.slot<=25;
-      const state=['collecting','ok'].includes(s.state) && fresh ? latest.status : s.state;
-      return `<tr><td><span class="quality-key" style="--series-color:${color}">${label}</span></td><td>${fresh&&latest.status==='ok'?qualityNumber(latest.rtt):'—'}</td><td>${qualityNumber(stat.mean)}</td><td>${qualityNumber(stat.p95)}</td><td>${qualityNumber(stat.jitter)}</td><td>${qualityNumber(stat.loss,'%')}</td><td title="${esc(s.note||latest?.error||'')}">${esc(QUALITY_STATES[state]||state)}</td></tr>`;
-    }).join('');
-    return `<section class="panel" data-key="quality-${section.id}"><div class="quality-heading"><h2><span class="muted">${esc(section.kind)}</span> ${esc(section.label)}</h2></div>${qualityChart(section.series,d.now,range)}<div class="quality-table"><table><thead><tr><th>探测</th><th>最新</th><th>5 分钟平均</th><th>P95</th><th>波动</th><th>超时率</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+    return `<section class="panel quality-card" data-key="quality-${section.id}"><div class="quality-heading"><h2><span class="quality-kind">${esc(section.kind)}</span> ${esc(section.label)}</h2>${qualityLegend(section.series)}</div>${qualityChart(section.series,d.now,range)}${qualityTable(section.series,d.now)}</section>`;
   }).join('');
-  render(`<a class="back" href="#/routes/${id}">← ${esc(d.name)}</a>`+poolHead('网络质量',`<select data-link-quality-range="${id}" aria-label="时间范围">${[[900,'15 分钟'],[3600,'1 小时'],[86400,'24 小时']].map(([n,label])=>`<option value="${n}" ${n===range?'selected':''}>${label}</option>`).join('')}</select>`)+cards);
+  renderQuality(`<a class="back" href="#/routes/${id}">← ${esc(d.name)}</a>`+poolHead('网络质量',`<select data-link-quality-range="${id}" aria-label="时间范围">${[[900,'15 分钟'],[3600,'1 小时'],[86400,'24 小时']].map(([n,label])=>`<option value="${n}" ${n===range?'selected':''}>${label}</option>`).join('')}</select>`)+cards,d.sections.map(section=>({series:section.series,now:d.now,seconds:range})));
 }
 document.addEventListener('change',e=>{
   if(!e.target.hasAttribute('data-link-quality-range'))return;
@@ -326,7 +320,9 @@ function instanceForm(sid) {
 }
 function instance() { return instanceEditor.link.plan.stages.find(s=>s.id===instanceEditor.stage); }
 function drawInstance(preserve=false) {
-  const s=instance(),l=instanceEditor.link, members=s.order.map(n=>({id:n,name:memberName(n)}));
+  const s=instance(),l=instanceEditor.link;
+  const nodeOrder=new Map(poolView.nodes.map((n,i)=>[n.id,i]));
+  const members=s.order.map(n=>({id:n,name:memberName(n)})).sort((a,b)=>(nodeOrder.get(a.id)??nodeOrder.size)-(nodeOrder.get(b.id)??nodeOrder.size));
   openModal(`<form data-form="instance-save"><h2>${esc(resourceName(poolView.pools,s.pool_id))}</h2><div class="member-list" data-reorder="instance">${s.order.map((n,i)=>`<div class="member-row sort-item" data-order="${n}">${dragHandle}<span class="member-label">${i+1}. ${esc(memberName(n))}${l.selected[s.id]===n?' <b class="t-green">生效</b>':''}${s.default===n?' <small>默认</small>':''}</span>${orderButtons('instance',i,s.order.length)}<button type="button" class="small" data-action="instance-disable" data-member="${n}" ${l.selected[s.id]===n?'disabled':''}>${s.disabled.includes(n)?'启用':'禁用'}</button></div>`).join('')}</div><label><span>默认节点</span>${resourceSelect('instance-default',members,s.default,'请选择',true)}</label><label><span>锁定</span>${resourceSelect('instance-lock',members.filter(n=>!s.disabled.includes(n.id)),s.locked,'不锁定',true)}</label><button type="button" data-action="instance-direct" ${l.selected[s.id]===0 || s.locked===0 ? 'disabled' : ''}>${s.direct?'移除 direct':'添加 direct'}</button><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`,preserve);
 }
 

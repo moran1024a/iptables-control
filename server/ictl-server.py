@@ -35,7 +35,7 @@ import types
 def _module():
     return types.SimpleNamespace(**globals())
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 DATABASE_VERSION = 404
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
@@ -535,6 +535,11 @@ def default_group(conn, kind):
 def get_groups(conn, kind):
     return [dict(r) for r in conn.execute(
         "SELECT id, name, builtin FROM item_groups WHERE kind = ? ORDER BY sort, id", (kind,))]
+
+
+def config_name(conn, name, group_id):
+    group = conn.execute('SELECT name,builtin FROM item_groups WHERE id=?', (group_id,)).fetchone()
+    return f"{group['name']}#{name}" if group and not group['builtin'] else name
 
 
 def check_group(conn, kind, group_id):
@@ -2160,14 +2165,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for c in data["chains"]:
             row = get_chain(conn, c["id"])
             t = get_target(conn, row["target_id"])
+            link = conn.execute('SELECT * FROM links WHERE chain_id=?', (c['id'],)).fetchone()
             c.update(route_id=row["route_id"], route_name=get_route(conn, row["route_id"])["name"] if row["route_id"] else None,
                      target_id=t["id"], target_name=t["name"], connection=None)
             if not c["deleting"]:
                 first = c["hops"][0] if c["hops"] else {"addr": t["host"], "port": t["port"]}
-                c["connection"] = target_config.connection(t, first["addr"], first["port"], c["remark"])
+                name = config_name(conn, link['name'] if link else c['remark'], link['group_id'] if link else c['group_id'])
+                c["connection"] = target_config.connection(t, first["addr"], first["port"], name)
             c["status"] = ("deleting" if c["deleting"] else "error" if any(n['status']=='error' for n in c['hops']+c['pending']) else "applying" if c["pending"] else
                            "saved" if not c["hops"] else "applied")
-            link = conn.execute('SELECT * FROM links WHERE chain_id=?', (c['id'],)).fetchone()
             if link:
                 link = dict(link)
                 link['state'], link['error'] = pools.display_state(_module(), conn, link)

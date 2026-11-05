@@ -131,6 +131,11 @@ class SchedulerTests(Fixture, unittest.IsolatedAsyncioTestCase):
         monitor = self.hub.quality
         view = await monitor.view(dict(scope='routes', id=self.route_id, source=self.a, target=self.c))
         self.assertFalse(view['adjacent'])
+        self.call('api_order', dict(groups=[s.default_group(self.db, 'nodes')], ids=[self.c, self.b, self.a]), 'nodes')
+        default_view = await monitor.view(dict(scope='routes', id=self.route_id))
+        self.assertEqual([n['id'] for n in default_view['nodes']], [self.c, self.b, self.a])
+        self.assertEqual((default_view['pair']['source'], default_view['pair']['target']), (self.a, self.b))
+        self.assertTrue(default_view['adjacent'])
         await monitor.tick()
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM quality_pairs').fetchone()[0], 6)
         with self.assertRaises(s.UserError):

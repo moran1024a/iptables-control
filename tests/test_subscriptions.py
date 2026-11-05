@@ -70,6 +70,9 @@ class SubscriptionTests(Fixture, unittest.TestCase):
                '&pbk='+key+'&sid=0123&type=ws&path='+quote('/a?b=1')+'&host=host.example&fp=chrome')
         self.call('api_target_save', {'uri': uri}, self.target_id)
         self.call('api_config_save', dict(remark='name: "quoted" # value'), self.cid)
+        group = self.call('api_group_add', dict(kind='links', name='香港'))['id']
+        with self.db:
+            s.move_group(self.db, 'links', self.lid, group)
         row = self.create()
         body, _ = subscriptions.export(s._module(), self.db, row['token'], 'clash')
         proxy = json.loads(body.split('  - ', 1)[1].splitlines()[0])
@@ -77,7 +80,11 @@ class SubscriptionTests(Fixture, unittest.TestCase):
         self.assertEqual(proxy['servername'], 'sni.example')
         self.assertEqual(proxy['reality-opts'], {'public-key': key, 'short-id': '0123'})
         self.assertEqual(proxy['ws-opts'], {'path': '/a?b=1', 'headers': {'Host': 'host.example'}})
-        self.assertEqual(proxy['name'], 'name: "quoted" # value')
+        self.assertEqual(proxy['name'], '香港#name: "quoted" # value')
+        body, _ = subscriptions.export(s._module(), self.db, row['token'], 'v2ray')
+        parsed = s.target_config.import_uri(base64.b64decode(body).decode())
+        self.assertEqual(parsed['name'], proxy['name'])
+        self.assertEqual(s.target_config.import_uri(self.call('api_configs')['chains'][0]['connection']['uri'])['name'], proxy['name'])
 
     def test_public_route_without_panel_auth_and_revocation(self):
         row = self.create()
@@ -112,8 +119,16 @@ class SubscriptionTests(Fixture, unittest.TestCase):
         self.assertEqual([c['link_id'] for c in data['chains']], [lid2, self.lid])
         self.assertEqual(data['chains'][0]['group_id'], group)
         body, _ = subscriptions.export(s._module(), self.db, row['token'], 'v2ray')
-        self.assertTrue(base64.b64decode(body).decode().splitlines()[0].endswith('#second'))
+        uri = base64.b64decode(body).decode().splitlines()[0]
+        self.assertEqual(s.target_config.import_uri(uri)['name'], 'first group#second')
+        self.assertEqual(data['chains'][0]['connection']['uri'], uri)
+        self.assertEqual(self.call('api_link_get', {}, lid2)['link']['connection']['uri'], uri)
+        self.call('api_group_edit', dict(name='香港 # A'), group)
+        body, _ = subscriptions.export(s._module(), self.db, row['token'], 'clash')
+        self.assertEqual(json.loads(body.split('  - ', 1)[1].splitlines()[0])['name'], '香港 # A#second')
         self.call('api_group_del', {}, group)
+        config = next(c for c in self.call('api_configs')['chains'] if c['link_id'] == lid2)
+        self.assertEqual(s.target_config.import_uri(config['connection']['uri'])['name'], 'second')
         self.assertEqual(s.node_rules(self.db, s.get_node(self.db, self.a)), before)
         self.call('api_chain_del', {}, cid2)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM subscription_links WHERE link_id=?', (lid2,)).fetchone()[0], 0)

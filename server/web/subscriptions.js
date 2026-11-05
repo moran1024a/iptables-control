@@ -17,13 +17,29 @@ function subscriptionForm(row) {
   openModal(`<form data-form="subscription" data-id="${row?.id||''}"><h2>${row?'编辑订阅':'新增订阅'}</h2>
     <label><span>名称</span><input name="name" value="${esc(row?.name||'')}" maxlength="64" required></label>
     <label><span>状态</span><select name="enabled"><option value="1">启用</option><option value="0" ${row&&!row.enabled?'selected':''}>禁用</option></select></label>
-    <h3>绑定配置</h3><div class="subscription-choices">${d.groups.map(g=>{
+    <div class="subscription-heading"><h3>绑定配置</h3><label><input type="checkbox" data-subscription-all data-ignore-dirty>全选</label></div><div class="subscription-choices">${d.groups.map(g=>{
       const items=d.configs.filter(c=>c.group_id===g.id);if(!items.length)return '';
       return `<div class="subscription-group">${d.groups.length>1?`<strong>${esc(g.name)}</strong>`:''}${items.map(c=>`<label><input type="checkbox" name="link_id" value="${c.id}" ${ids.includes(c.id)?'checked':''} ${c.error&&!ids.includes(c.id)?'disabled':''}><span>${esc(c.name)}${c.error||c.clash_error?`<small class="muted">${esc(c.error||c.clash_error+'；可用于 v2rayN')}</small>`:''}</span></label>`).join('')}</div>`;
     }).join('')||'<p class="muted">暂无配置，请先创建链路。</p>'}</div>
     <p class="hint">绑定配置随链路更新。VLESS Reality 请使用 Mihomo 内核客户端。</p><div class="form-error"></div>
     <div class="form-actions">${row?`<button type="button" class="danger" data-action="subscription-delete" data-id="${row.id}">删除</button><button type="button" data-action="subscription-reset" data-id="${row.id}">重置链接</button>`:''}<button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
+  updateSubscriptionSelection($('#modal form'));
 }
+
+function updateSubscriptionSelection(form) {
+  const all=form.querySelector('[data-subscription-all]'),items=[...form.querySelectorAll('[name=link_id]:not(:disabled)')];
+  const selected=items.filter(x=>x.checked).length;
+  all.disabled=!items.length;
+  all.checked=items.length>0 && selected===items.length;
+  all.indeterminate=selected>0 && selected<items.length;
+}
+
+document.addEventListener('change',e=>{
+  const form=e.target.closest('[data-form="subscription"]');
+  if(!form || !e.target.matches('[data-subscription-all],[name=link_id]'))return;
+  if(e.target.hasAttribute('data-subscription-all'))form.querySelectorAll('[name=link_id]:not(:disabled)').forEach(x=>x.checked=e.target.checked);
+  updateSubscriptionSelection(form);
+});
 
 FORMS.subscription=async(form,data)=>{
   const id=form.dataset.id;

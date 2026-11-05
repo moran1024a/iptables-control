@@ -161,9 +161,9 @@ class Monitor:
             ids = paths(conn).get((scope, ident))
             if ids is None:
                 raise self.hub.s.UserError('链路不存在', status=404)
-            nodes = {r['id']: dict(r) for r in conn.execute('SELECT * FROM nodes')}
+            nodes = {r['id']: dict(r) for r in conn.execute(self.hub.s.ordered('nodes'))}
             ids = list(dict.fromkeys(ids))
-            options = [dict(id=n, name=nodes[n]['name'], mode=nodes[n]['desired_mode']) for n in ids]
+            options = [dict(id=n['id'], name=n['name'], mode=n['desired_mode']) for n in nodes.values() if n['id'] in ids]
             if len(ids) < 2:
                 return dict(nodes=options, pair=None, now=now)
             a, b = body.get('source', ids[0]), body.get('target', ids[1])

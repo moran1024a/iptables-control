@@ -1408,13 +1408,38 @@ const QUALITY_STATES = {unknown: "未知", ok: "成功", timeout: "探测超时"
 const qualityNumber = (n, unit = " ms") => n == null ? "—" : Number(n).toFixed(1) + unit;
 
 const QUALITY_PROTOCOLS = {"tcp-connect-v1": ["TCP", "var(--yellow)"], "udp-echo-v1": ["UDP", "var(--blue)"], "icmp-echo-v1": ["ICMP", "var(--green)"]};
+const QUALITY_PLOT = {width:900, height:250, left:55, right:16, top:18, bottom:40};
+
+function qualityLegend(series) {
+  return `<div class="quality-legend">${series.map(s=>{
+    const [name,color]=QUALITY_PROTOCOLS[s.protocol];
+    return `<button type="button" class="quality-key" data-quality-focus="${s.protocol}" style="--series-color:${color}" aria-label="高亮 ${name} 曲线">${name}</button>`;
+  }).join('')}</div>`;
+}
+
+function qualityTable(series, now) {
+  const rows=series.map(s=>{
+    const [name,color]=QUALITY_PROTOCOLS[s.protocol], stat=s.summary, latest=s.latest;
+    const fresh=latest && now-latest.slot<=25 && (s.path_key == null || latest.path_key===s.path_key);
+    const state=['collecting','ok'].includes(s.state) && fresh ? latest.status : s.state;
+    const tone=state==='ok'?'green':['error','offline'].includes(state)?'red':state==='timeout'?'yellow':state==='collecting'?'blue':'grey';
+    const value=(key,text,cls='')=>`<span class="${cls}" data-quality-value="${s.protocol}:${key}">${text}</span>`;
+    return `<tr data-quality-focus="${s.protocol}"><td><span class="quality-key" style="--series-color:${color}">${name}</span></td>
+      <td>${value('latest',fresh&&latest.status==='ok'?qualityNumber(latest.rtt):'—','quality-latest')}</td>
+      <td>${value('mean',qualityNumber(stat.mean))}</td><td>${value('p95',qualityNumber(stat.p95))}</td><td>${value('jitter',qualityNumber(stat.jitter))}</td>
+      <td>${value('loss',qualityNumber(stat.loss,'%'),stat.loss>0?'t-yellow':'')}<small class="quality-time">${stat.samples?`${stat.lost} / ${stat.samples} 个样本`:''}</small></td>
+      <td title="${esc(s.note||latest?.error||'')}"><span class="pill t-${tone}" data-quality-value="${s.protocol}:state">${esc(QUALITY_STATES[state]||state)}</span><small class="quality-time">${latest?esc(clock(latest.slot)):''}</small></td></tr>`;
+  }).join('');
+  return `<div class="quality-table"><table><thead><tr><th>探测</th><th>最新延迟</th><th>5 分钟平均</th><th>P95</th><th>波动</th><th>超时率</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
 
 function qualityChart(series, now, seconds) {
-  const width = 900, height = 250, left = 55, right = 16, top = 18, bottom = 40;
+  const {height,left,right,top,bottom}=QUALITY_PLOT;
+  const width=Math.max(300,Math.min(QUALITY_PLOT.width,app.clientWidth-42));
   const maximum = Math.max(1, ...series.flatMap(s => s.points.map(p => p.peak || 0))) * 1.1;
   const x = t => left + (t - (now - seconds)) / seconds * (width - left - right);
   const y = n => top + (height - top - bottom) * (1 - n / maximum);
-  const grid = [0, .5, 1].map(f => `<line x1="${left}" x2="${width-right}" y1="${y(maximum*f)}" y2="${y(maximum*f)}" stroke="var(--border)"/><text x="${left-8}" y="${y(maximum*f)+4}" text-anchor="end">${(maximum*f).toFixed(1)}</text>`).join("");
+  const grid = [0, .25, .5, .75, 1].map(f => `<line x1="${left}" x2="${width-right}" y1="${y(maximum*f)}" y2="${y(maximum*f)}" stroke="var(--border)" stroke-dasharray="3 5"/><text x="${left-8}" y="${y(maximum*f)+4}" text-anchor="end">${(maximum*f).toFixed(1)}</text>`).join("");
   const ticks = [0, .5, 1].map(f => { const time = now-seconds+seconds*f; return `<text x="${x(time)}" y="${height-5}" text-anchor="${f === 0 ? "start" : f === 1 ? "end" : "middle"}">${esc(clock(time))}</text>`; }).join("");
   const changes = new Set();
   const curves = series.map((s, index) => {
@@ -1442,9 +1467,68 @@ function qualityChart(series, now, seconds) {
       elements += `<circle cx="${px}" cy="${y(p.mean).toFixed(1)}" r="2.5" fill="${color}">${title}</circle>`;
       previous = p;
     }
-    return `<g data-protocol="${s.protocol}">${elements}</g>`;
+    return `<g class="quality-series" data-protocol="${s.protocol}">${elements}</g>`;
   }).join("");
-  return `<svg class="quality-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="网络延迟趋势">${grid}${curves}${ticks}</svg>`;
+  const version=esc(JSON.stringify([seconds,series.map(s=>s.latest||s.points.at(-1))]));
+  return `<div class="quality-plot" data-version="${version}"><svg class="quality-chart" viewBox="0 0 ${width} ${height}" tabindex="0" role="img" aria-label="网络延迟趋势，使用左右方向键查看数据">${grid}${curves}${ticks}<line class="quality-cursor" y1="${top}" y2="${height-bottom}" hidden/></svg><div class="quality-tooltip" role="status" hidden></div></div>`;
+}
+
+function hideQualityPoint(plot) {
+  delete plot.qualityTime;
+  plot.querySelector('.quality-cursor').setAttribute('hidden','');
+  plot.querySelector('.quality-tooltip').hidden=true;
+}
+
+function showQualityPoint(plot, time) {
+  const {series,now,seconds,times}=plot.qualityData;
+  if(!times.length)return;
+  time=times.reduce((a,b)=>Math.abs(b-time)<Math.abs(a-time)?b:a);
+  plot.qualityTime=time;
+  const line=plot.querySelector('.quality-cursor'), tip=plot.querySelector('.quality-tooltip'), svg=plot.querySelector('svg');
+  const {left,right}=QUALITY_PLOT, width=svg.viewBox.baseVal.width, x=left+(time-now+seconds)/seconds*(width-left-right);
+  line.setAttribute('x1',x);line.setAttribute('x2',x);line.removeAttribute('hidden');
+  tip.innerHTML=`<strong>${esc(fmtTime(time))}</strong>${series.map(s=>{
+    const p=s.points.find(p=>p.time===time),[name,color]=QUALITY_PROTOCOLS[s.protocol];
+    return `<div><span class="quality-key" style="--series-color:${color}">${name}</span><b>${qualityNumber(p?.mean)}</b></div><small>${esc(QUALITY_STATES[p?.status||'missing']||p?.status)}${p?.mean!=null?` · 峰值 ${qualityNumber(p.peak)}`:''}${p?.loss!=null?` · 超时 ${qualityNumber(p.loss,'%')}`:''}</small>`;
+  }).join('')}`;
+  tip.hidden=false;
+  const matrix=svg.getScreenCTM(), offset=matrix.a*x+matrix.e-plot.getBoundingClientRect().left;
+  tip.style.left=`${Math.max(8,Math.min(offset+14,plot.clientWidth-tip.offsetWidth-8))}px`;
+}
+
+function renderQuality(html, charts) {
+  const key=el=>el.closest('.quality-card').dataset.key+'/'+(el.dataset.qualityValue||'plot');
+  const before=new Map([...app.querySelectorAll('.quality-card [data-quality-value],.quality-card .quality-plot')].map(el=>[key(el),el.dataset.version||el.textContent]));
+  render(html);
+  if(!matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    app.querySelectorAll('.quality-card [data-quality-value],.quality-card .quality-plot').forEach(el=>{
+      if(before.has(key(el)) && before.get(key(el))!==(el.dataset.version||el.textContent))
+        el.animate([{opacity:.45},{opacity:1}],{duration:240,easing:'ease-out'});
+    });
+  }
+  app.querySelectorAll('.quality-plot').forEach((plot,i)=>{
+    const data=charts[i], svg=plot.querySelector('svg');
+    plot.qualityData={...data,times:[...new Set(data.series.flatMap(s=>s.points.filter(p=>p.time>=data.now-data.seconds && p.time<=data.now).map(p=>p.time)))].sort((a,b)=>a-b)};
+    const point=e=>{
+      const cursor=svg.createSVGPoint();cursor.x=e.clientX;cursor.y=e.clientY;
+      const x=cursor.matrixTransform(svg.getScreenCTM().inverse()).x;
+      const {left,right}=QUALITY_PLOT,width=svg.viewBox.baseVal.width;
+      if(x<left || x>width-right)return hideQualityPoint(plot);
+      showQualityPoint(plot,data.now-data.seconds+(x-left)/(width-left-right)*data.seconds);
+    };
+    svg.onpointermove=point;svg.onpointerdown=point;
+    svg.onpointerleave=()=>hideQualityPoint(plot);svg.onblur=()=>hideQualityPoint(plot);
+    svg.onkeydown=e=>{
+      if(e.key==='Escape')return hideQualityPoint(plot);
+      if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;
+      e.preventDefault();
+      const times=plot.qualityData.times;if(!times.length)return;
+      const current=plot.qualityTime==null?times.length-1:times.indexOf(plot.qualityTime);
+      const index=e.key==='Home'?0:e.key==='End'?times.length-1:Math.max(0,Math.min(times.length-1,current+(e.key==='ArrowLeft'?-1:1)));
+      showQualityPoint(plot,times[index]);
+    };
+    if(plot.qualityTime!=null)showQualityPoint(plot,plot.qualityTime);
+  });
 }
 
 async function qualityPage(scope, id, request) {
@@ -1465,30 +1549,19 @@ async function qualityPage(scope, id, request) {
   if (!d.pair) return render(`<h1>网络质量</h1><p>至少需要两个节点。</p><a href="#/${scope === "links" ? "routes/" + id : scope}">返回列表</a>`);
   qualityViews.set(key, {range: selection.range, source: d.pair.source, target: d.pair.target});
   const options = value => d.nodes.map(n => `<option value="${n.id}" ${n.id === value ? "selected" : ""}>${esc(n.name)}${n.mode === "passive" ? "（被动）" : ""}</option>`).join("");
-  const rows = d.series.map(s => {
-    const [name, color] = QUALITY_PROTOCOLS[s.protocol], latest = s.latest, stat = s.summary;
-    const fresh = latest && d.now - latest.slot <= 25 && s.state === "collecting";
-    const state = s.state === "collecting" ? (latest?.status || "missing") : s.state;
-    return `<tr><td><span class="quality-key" style="--series-color:${color}">${name}</span></td>
-      <td>${latest?.status === "ok" ? qualityNumber(latest.rtt) : "—"}${!fresh && latest ? "（历史）" : ""}</td>
-      <td>${qualityNumber(stat.mean)}</td><td>${qualityNumber(stat.p95)}</td><td>${qualityNumber(stat.jitter)}</td>
-      <td>${qualityNumber(stat.loss,"%")}${stat.samples ? `<small class="muted">（${stat.lost} / ${stat.samples} 个样本）</small>` : ""}</td>
-      <td title="${esc(s.note || latest?.error || "")}">${esc(QUALITY_STATES[state] || state)}<small class="quality-time">${latest ? fmtTime(latest.slot) : ""}</small></td></tr>`;
-  }).join("");
   const notes = d.series.filter(s => s.note || s.latest?.error).map(s => `${QUALITY_PROTOCOLS[s.protocol][0]}：${esc(s.note || s.latest.error)}`);
-  render(`<div class="list-head"><h1>网络质量</h1><a href="#/${scope === "links" ? "routes/" + id : scope}">返回列表</a></div>
+  renderQuality(`<div class="list-head"><h1>网络质量</h1><a href="#/${scope === "links" ? "routes/" + id : scope}">返回列表</a></div>
     <div class="panel quality-controls" data-quality="${key}">
       <label><span>发起节点</span><select name="quality-source">${options(d.pair.source)}</select></label>
       <span class="quality-arrow">→</span><label><span>接收节点</span><select name="quality-target">${options(d.pair.target)}</select></label>
       <label><span>时间范围</span><select name="quality-range">${[[900,"最近 15 分钟"],[3600,"最近 1 小时"],[86400,"最近 24 小时"]].map(([n,label]) => `<option value="${n}" ${n === selection.range ? "selected" : ""}>${label}</option>`).join("")}</select></label>
     </div>
-    <div class="panel"><div class="quality-heading"><h2>往返延迟 <span class="count">ms</span></h2><span class="quality-key" style="--series-color:var(--blue)">UDP</span><span class="quality-key" style="--series-color:var(--green)">ICMP</span></div>
+    <div class="panel quality-card" data-key="quality-${scope}-${id}"><div class="quality-heading"><h2>往返延迟 <span class="count">ms</span></h2>${qualityLegend(d.series)}</div>
       ${qualityChart(d.series,d.now,selection.range)}
-      <p class="hint">曲线显示平均值，浅色细线保留峰值；底部 × 为超时或异常，不代表 0 ms。悬停查看详情。</p>
-      <div class="quality-table"><table><thead><tr><th>探测</th><th>最新 RTT</th><th>5 分钟平均</th><th>P95</th><th>波动</th><th>探测丢包率</th><th>最近状态</th></tr></thead><tbody>${rows}</tbody></table></div>
+      ${qualityTable(d.series,d.now)}
       ${notes.length ? `<p class="hint">${notes.join("；")}</p>` : ""}
     </div>
-    <p class="hint">${d.adjacent ? "后台持续采集" : "查看期间采集非相邻节点的直达网络"}，每种协议默认 10 秒一次，共享节点限速。历史保留 24 小时。ICMP 无响应可能是禁 Ping 或限速；探测异常不改变转发状态。</p>`);
+    <p class="hint">${d.adjacent ? "后台持续采集" : "查看期间采集非相邻节点的直达网络"}，每种协议默认 10 秒一次，共享节点限速。历史保留 24 小时。底部 × 表示异常或未知。</p>`,[{series:d.series,now:d.now,seconds:selection.range}]);
 
 }
 

@@ -153,7 +153,7 @@ def export(s, c, token, fmt):
     names = {'DIRECT', 'REJECT', 'GLOBAL', '订阅节点'}
     links, proxies = [], []
     for item in items:
-        name = item['name']
+        name = s.config_name(c, item['name'], item['group_id'])
         while name in names:
             name += ' [' + str(item['id']) + ']'
         names.add(name)
