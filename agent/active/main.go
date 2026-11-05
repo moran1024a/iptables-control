@@ -44,7 +44,7 @@ func (a *Agent) session(ctx context.Context) error {
 		defer cancel()
 		return ws.Write(writeCtx, websocket.MessageText, b)
 	}
-	if e = send(M{"type": "hello", "protocol": 3, "version": version, "installation_id": a.installation, "boot_id": a.boot, "generation": a.config.Generation, "hash": a.config.Hash, "capabilities": []string{"nftables", "traffic", "metrics", "ports", "queries"}}); e != nil {
+	if e = send(M{"type": "hello", "protocol": 3, "version": version, "installation_id": a.installation, "boot_id": a.boot, "generation": a.config.Generation, "hash": a.config.Hash, "capabilities": []string{"nftables", "traffic", "metrics", "ports", "queries", "network_quality", "network_quality_icmp"}}); e != nil {
 		return e
 	}
 	helloCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -64,6 +64,9 @@ func (a *Agent) session(ctx context.Context) error {
 	defer stop()
 	queryCtx, stopQueries := context.WithCancel(child)
 	defer stopQueries()
+	qualityCtx, stopQuality := context.WithCancel(child)
+	defer stopQuality()
+	monitor := newQualityMonitor(qualityCtx, send)
 	go func() {
 		for {
 			_, b, e := ws.Read(child)
@@ -127,6 +130,7 @@ func (a *Agent) session(ctx context.Context) error {
 					}
 				}
 			case "quiesce":
+				stopQuality()
 				stopQueries()
 				if e = atomicBytes(a.path("paused"), []byte("manual confirmation required\n"), 0600); e != nil {
 					return e
@@ -148,7 +152,7 @@ func (a *Agent) session(ctx context.Context) error {
 					}
 				}
 				a.stateError = ""
-				e = a.apply(c)
+				e = monitor.applyConfig(a, c)
 				text := ""
 				if e != nil {
 					text = e.Error()
@@ -169,6 +173,10 @@ func (a *Agent) session(ctx context.Context) error {
 			case "blocked":
 				ready = true
 				a.stateError = fmt.Sprint(msg["error"])
+			case "quality_setup":
+				monitor.setup(a, msg)
+			case "quality_probe":
+				monitor.probe(msg)
 			case "query":
 				select {
 				case queries <- struct{}{}:

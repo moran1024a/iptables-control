@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"github.com/coder/websocket"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +23,18 @@ func TestTLSControlAndDurablePause(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bin, "nft"), []byte("#!/bin/sh\necho '{\"nftables\":[]}'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
+	for _, tool := range []string{"ss", "iptables-save"} {
+		if err := os.WriteFile(filepath.Join(bin, tool), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := socket.LocalAddr().(*net.UDPAddr).Port
+	socket.Close()
+	probeKey := []byte("0123456789abcdef0123456789abcdef")
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
 	a := &Agent{root: root, key: "test-key", installation: randomID(), usage: map[string]*Usage{}}
 	done := make(chan string, 1)
@@ -49,12 +63,42 @@ func TestTLSControlAndDurablePause(t *testing.T) {
 			done <- "missing hello"
 			return
 		}
-		for _, kind := range []string{"welcome", "ready", "quiesce"} {
+		for _, kind := range []string{"welcome", "ready"} {
 			data, _ := json.Marshal(M{"type": kind, "session": "test-session"})
 			if err = ws.Write(ctx, websocket.MessageText, data); err != nil {
 				done <- err.Error()
 				return
 			}
+		}
+		for _, step := range []struct {
+			command  M
+			response string
+		}{
+			{M{"type": "quality_setup", "id": "setup", "port": port, "key": hex.EncodeToString(probeKey)}, "quality_listener"},
+			{M{"type": "quality_probe", "id": "probe", "host": "127.0.0.1", "port": port, "key": hex.EncodeToString(probeKey)}, "quality_result"},
+		} {
+			step.command["session"] = "test-session"
+			data, _ := json.Marshal(step.command)
+			if err := ws.Write(ctx, websocket.MessageText, data); err != nil {
+				done <- err.Error()
+				return
+			}
+			_, data, err = ws.Read(ctx)
+			if err != nil {
+				done <- err.Error()
+				return
+			}
+			var result M
+			_ = json.Unmarshal(data, &result)
+			if result["type"] != step.response || (result["error"] != nil && result["error"] != "") || (step.response == "quality_result" && result["status"] != "ok") {
+				done <- string(data)
+				return
+			}
+		}
+		data, _ := json.Marshal(M{"type": "quiesce", "session": "test-session"})
+		if err = ws.Write(ctx, websocket.MessageText, data); err != nil {
+			done <- err.Error()
+			return
 		}
 		_, raw, err = ws.Read(ctx)
 		if err != nil {

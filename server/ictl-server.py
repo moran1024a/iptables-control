@@ -25,12 +25,13 @@ import time
 from urllib.parse import parse_qs
 import target_config
 import agent_v3
+import network_quality
 import types
 
 def _module():
     return types.SimpleNamespace(**globals())
 
-VERSION = "0.4.0-rc.1"
+VERSION = "0.4.0-rc.2"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -362,16 +363,18 @@ def init_db():
     conn = db() if os.path.isfile(DB_PATH) else None
     if conn is not None:
         version = conn.execute('PRAGMA user_version').fetchone()[0]
-        if version > 400:
+        if version > 401:
             conn.close()
             raise UserError('数据库版本高于本服务端')
-        if version == 400:
+        if version >= 400:
+            network_quality.migrate(_module(), conn)
             with conn:
                 ensure_active_windows(conn)
             return conn
         conn.close()
     conn = init_db_v030()
     agent_v3.migrate(_module(), conn)
+    network_quality.migrate(_module(), conn)
     return conn
 
 
@@ -996,6 +999,8 @@ def parse_hops(conn, hops, chain_id=None):
     for i, (node, port) in enumerate(result, 1):
         if port is None:
             continue
+        if node["desired_mode"] == "active" and port == node["quality_port"] and not conn.execute("SELECT 1 FROM hops WHERE node_id=? AND port=? AND chain_id=?", (node["id"], port, chain_id)).fetchone():
+            raise UserError(f"第 {i} 跳：端口 {port} 已预留为质量探测端口，请修改节点探测端口或转发端口", "hops")
         if (node["id"], port) in seen:
             raise UserError(f"第 {i} 跳：重复使用了节点 {node['name']} 的端口 {port}", "hops")
         seen.add((node["id"], port))
@@ -1020,6 +1025,8 @@ def parse_hops(conn, hops, chain_id=None):
             "SELECT port FROM hops WHERE node_id = ? AND chain_id IS NOT ?", (node["id"], chain_id))}
         used |= {r[0] for r in conn.execute("SELECT port FROM retired_ports WHERE node_id = ?", (node["id"],))}
         used |= {p for n, p in result if n["id"] == node["id"] and p is not None}
+        if node["desired_mode"] == "active":
+            used.add(node["quality_port"])
         item[1] = pick_port(parse_ports(node["ports"]), used)
         if item[1] is None:
             raise UserError(f"第 {i} 跳：节点 {node['name']} 允许的端口 {node['ports']} 已全部被占用", "hops")
@@ -1680,7 +1687,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "manual_required": bool(n["manual_required"]), "protocol_version": n["protocol_version"],
                 "desired_generation": n["desired_generation"], "applied_generation": n["applied_generation"],
                 "err": n["err"], "installed_agent": n["installed_agent"], "backend": n["backend"],
-                "connection_state": n["connection_state"]}
+                "connection_state": n["connection_state"], "quality_port": n["quality_port"]}
 
     def api_nodes(self, conn, body):
         now = int(time.time())
@@ -1713,6 +1720,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise UserError("模式必须为主动或被动", "desired_mode")
         if mode == "passive":
             conn.execute("UPDATE nodes SET desired_mode='passive',manual_required=1 WHERE id=?", (cur.lastrowid,))
+        quality_port = check_port(body.get("quality_port", network_quality.PORT), "quality_port") if body.get("quality_port", network_quality.PORT) != 0 else 0
+        conn.execute("UPDATE nodes SET quality_port=? WHERE id=?", (quality_port, cur.lastrowid))
         return {"id": cur.lastrowid}
 
     def api_node_get(self, conn, body, node_id):
@@ -1776,6 +1785,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise UserError("模式必须为主动或被动", "desired_mode")
         if mode != n["desired_mode"] and n["first_seen"] and n["protocol_version"] < 2:
             raise UserError("请先升级节点 Agent 并完成一次同步，再切换模式", "desired_mode")
+        quality_port = body.get("quality_port", n["quality_port"])
+        quality_port = check_port(quality_port, "quality_port") if quality_port != 0 else 0
+        conn.execute("UPDATE nodes SET quality_port=? WHERE id=?", (quality_port, node_id))
         key = None
         if mode != n["desired_mode"]:
             conn.execute("UPDATE nodes SET desired_mode=?,manual_required=1 WHERE id=?", (mode, node_id))
@@ -2130,7 +2142,7 @@ def cmd_info(args):
 def cmd_health(args):
     conn = read_db()
     try:
-        if conn.execute('PRAGMA user_version').fetchone()[0] != 400:
+        if conn.execute('PRAGMA user_version').fetchone()[0] != 401:
             raise UserError('数据库尚未就绪')
         path = setting(conn, 'panel_path') + '/'
     finally:

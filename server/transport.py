@@ -8,6 +8,7 @@ import time
 
 from aiohttp import web, WSMsgType
 import agent_v3
+import network_quality
 
 
 def captured(s, method, path, headers, body, peer):
@@ -31,6 +32,7 @@ class Hub:
         self.s = s
         self.sessions = {}
         self.queries = {}
+        self.quality = network_quality.Monitor(self)
 
     async def database(self, fn):
         def run():
@@ -94,7 +96,8 @@ class Hub:
             return ws
         nid = node['id']
         lock = asyncio.Lock()
-        session = {'id': secrets.token_hex(16), 'wake': asyncio.Event(), 'ws': ws, 'paused': False}
+        session = {'id': secrets.token_hex(16), 'wake': asyncio.Event(), 'ws': ws, 'paused': False,
+                   'quality_capable': 'network_quality' in hello.get('capabilities', [])}
 
         async def send(message):
             async with lock:
@@ -194,6 +197,11 @@ class Hub:
                 elif kind == 'traffic':
                     result = await self.database(lambda c: agent_v3.accept_traffic(self.s, c, nid, data.get('data')))
                     await send({'type': 'traffic_ack', 'id': data.get('id'), 'data': result})
+                elif kind == 'quality_listener':
+                    if data.get('id') == session.get('quality_setup_id'):
+                        session['quality_listener'] = data
+                elif kind == 'quality_result':
+                    await self.quality.result(nid, session, data)
                 elif kind == 'query_result':
                     pending = self.queries.get((nid, data.get('id')))
                     if pending and pending[0] == session['id'] and not pending[1].done():
@@ -242,6 +250,23 @@ def create_app(s):
     async def dispatch(request):
         body = await request.read()
         h = captured(s, request.method, request.raw_path, request.headers.items(), body, request.remote or '')
+        if request.path == s.Handler.panel_path + '/api/quality':
+            if request.method != 'POST' or request.content_type != 'application/json':
+                raise web.HTTPBadRequest()
+            if not await hub.database(lambda c: h.auth(c) and s.setting(c, 'must_change') != '1'):
+                return web.json_response({'error': '未登录或需要修改默认密码'}, status=401)
+            try:
+                payload = json.loads(body)
+                if not isinstance(payload, dict):
+                    raise ValueError()
+                response = web.json_response(await hub.quality.view(payload))
+                for cookie in h.cookies:
+                    response.headers.add('Set-Cookie', cookie)
+                return response
+            except s.UserError as exc:
+                return web.json_response({'error': str(exc)}, status=exc.status)
+            except (ValueError, TypeError):
+                raise web.HTTPBadRequest()
         parts = request.path.removeprefix(s.Handler.panel_path + '/api/').split('/')
         if (request.path.startswith(s.Handler.panel_path + '/api/') and len(parts) == 3
                 and parts[0] == 'nodes' and parts[1].isdigit() and parts[2] == 'query'):
@@ -270,13 +295,20 @@ def create_app(s):
             hub.notify()
         return response
 
+    async def start(_app):
+        hub.quality.task = asyncio.create_task(hub.quality.run())
+
     async def shutdown(_app):
+        if hub.quality.task:
+            hub.quality.task.cancel()
+            await asyncio.gather(hub.quality.task, return_exceptions=True)
         await asyncio.gather(*(x['ws'].close(code=1001, message=b'server shutdown') for x in list(hub.sessions.values())))
 
     app.router.add_get(prefix + '/ws', hub.websocket)
     app.router.add_get(prefix + '/artifacts/{name}', asset)
     app.router.add_post(prefix + '/traffic', final_traffic)
     app.router.add_route('*', '/{path:.*}', dispatch)
+    app.on_startup.append(start)
     app.on_shutdown.append(shutdown)
     return app
 

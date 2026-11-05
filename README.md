@@ -4,7 +4,7 @@
 
 支持多跳链路、SS／SS2022／VLESS Reality 目标、主动与被动同步，以及 Agent 与单机脚本共存。
 
-**当前开发版：0.4.0-rc.1（测试版）**。主动节点改用 Go + nftables 和长连接；被动节点保留 Bash + iptables。正式版仍为 0.3.1，RC 不更新 `latest`。转发节点无需安装代理核心，目标服务需自行准备。
+**当前开发版：0.4.0-rc.2（测试版）**。主动节点改用 Go + nftables 和长连接；被动节点保留 Bash + iptables。RC2 增加主动节点间的网络质量监测与 24 小时趋势。正式版仍为 0.3.1，RC 不更新 `latest`。转发节点无需安装代理核心，目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -15,6 +15,7 @@
 - [切换主动与被动](#切换主动与被动)
 - [卸载与删除](#卸载与删除)
 - [使用指南](#使用指南)
+- [网络质量监测](#网络质量监测)
 - [单机脚本与共存](#单机脚本与共存)
 - [常用命令](#常用命令)
 - [常见问题](#常见问题)
@@ -31,7 +32,7 @@
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.1/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.2/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -39,7 +40,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.1/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.2/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
 新主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口（默认 `8730`），并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址，再接入节点。
@@ -63,7 +64,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.1/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.2/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -117,7 +118,7 @@ sudo ictl --sync    # 同步配置，或确认面板要求的类型切换
 删除容器和镜像，保留数据卷，之后可重新安装恢复使用：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.1/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.2/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；若要完整停用，请先处理节点。
@@ -191,6 +192,20 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 本次仍使用手动链路，不包含池、自动择路或自动灾备。
 
+## 网络质量监测
+
+服务端和主动 Agent 升级到 **0.4.0-rc.2** 后，在“链路”或“配置”卡片点击 **网络质量与趋势**。
+
+1. 在两个主动节点的防火墙／云安全组中，允许参与探测的节点访问 **UDP 33445**，并按需允许 **ICMP Echo（Ping）**。ICMP 不占用 TCP／UDP 端口，Agent 内置实现，不需要安装 ping 命令。程序不会自动修改防火墙。
+2. 默认使用节点的入站地址。端口冲突时，在“编辑节点 → 质量探测 UDP 端口”修改；填写 `0` 可停止该节点的全部质量探测。已有转发规则保持原样。
+3. 在同一张延迟图中对比 **蓝色 UDP** 与 **绿色 ICMP** 曲线；下方摘要表分别显示 RTT、最近 5 分钟平均值、P95、波动和探测丢包率。支持 **15 分钟、1 小时、24 小时**切换；悬停数据点查看详情。
+
+相邻主动节点的 UDP 和 ICMP 各默认每 **10 秒**探测一次，错开调度，关闭网页后仍持续采集。同一节点对在多个链路中共享结果；每个节点最多参与一次新探测／秒，任务多时自动分批。也可在图表中选择链路内非相邻节点，查看期间按需探测，离开页面后约一分钟停止。全部历史保留 24 小时。
+
+超时、离线、探测异常和未采样分别展示，缺失数据不当作 `0 ms`。丢包率同时显示失败次数与样本数，仅代表探测包，不等于业务流量丢包；短窗口样本少，宜结合趋势判断。UDP 使用独立认证小包，ICMP 使用系统 Echo 应答，分别统计；不做带宽测速，不会触发自动切换或修改转发规则。切为被动后停止参与探测，历史记录继续保留至到期。
+
+> 图表测量节点间直达网络，不代表经过其他节点的整段业务链路。UDP 端口未放行、ICMP 被禁用或限速时可能显示相应协议超时；一种探测异常不阻止另一种，转发仍按原配置工作。旧版及 RC1 Agent 不参与质量探测，升级前会显示提示。
+
 ## 单机脚本与共存
 
 ### 使用单机脚本
@@ -260,7 +275,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 **升级后需要回退怎么办？**
 
-Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-deploy-*.bak`，0.4.0 迁移还会在数据库旁保留 `ictl.db.pre-0.4.0.bak`。人工回退需停止服务，恢复升级前数据库及对应旧镜像，移除新数据库的 `-wal`／`-shm` 文件后再启动；回退会丢弃升级后的数据。源码部署或自定义数据库路径需自行备份和恢复。
+Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-deploy-*.bak`，0.4.0 迁移还会在数据库旁保留 `ictl.db.pre-0.4.0.bak`，RC1 → RC2 升级另外保留 `ictl.db.pre-0.4.0-rc.2.bak`。人工回退需停止服务，恢复升级前数据库及对应旧镜像，移除新数据库的 `-wal`／`-shm` 文件后再启动；回退会丢弃升级后的数据。源码部署或自定义数据库路径需自行备份和恢复。
 
 ## 开发与贡献
 
@@ -307,7 +322,8 @@ sudo unshare -nm env ICTL_KERNEL_TEST=1 python3 tests/kernel_network.py /tmp/ict
 
 | 组件 | 当前版本 |
 | --- | --- |
-| 服务端／主动 Agent／被动 Agent／管理器 | 0.4.0-rc.1 |
+| 服务端／主动 Agent | 0.4.0-rc.2 |
+| 被动 Agent／管理器 | 0.4.0-rc.1 |
 | 旧版兼容 Agent | 0.2.1 |
 | 单机脚本 | 3.2-rc.1 |
 

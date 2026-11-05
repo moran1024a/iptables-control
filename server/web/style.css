@@ -588,3 +588,17 @@ body.auth-page {
 
 /* Passive nodes record manual activity on a white timeline in both themes. */
 .bar .lv-white { background: #fff; border: 1px solid #d1d5db; }
+
+/* Network quality charts share the panel theme and remain usable on mobile. */
+.quality-link { display: inline-block; margin-top: 10px; }
+.quality-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
+.quality-controls label { flex: 1; min-width: 160px; margin: 0; }
+.quality-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 20px; }
+.quality-heading h2 { margin-right: auto; }
+.quality-key { white-space: nowrap; }
+.quality-key::before { content: ""; display: inline-block; width: 18px; height: 3px; margin-right: 7px; vertical-align: middle; background: var(--series-color); }
+.quality-table { overflow-x: auto; }
+.quality-time { display: block; color: var(--muted); white-space: nowrap; }
+.quality-chart { width: 100%; min-height: 160px; display: block; overflow: visible; }
+.quality-chart text { fill: var(--muted); font-size: 12px; }
+.quality-chart circle:hover { r: 5; cursor: crosshair; }

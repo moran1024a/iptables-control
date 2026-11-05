@@ -256,7 +256,7 @@ function schedule() {
   refreshTimer = setTimeout(async () => {
     if ($("#modal").hidden && !document.hidden && !sortMode) await refresh();
     if (page === pageVersion) schedule();
-  }, REFRESH_MS);
+  }, currentView.refreshMS || REFRESH_MS);
 }
 
 function refresh() {
@@ -283,9 +283,14 @@ async function route() {
   document.body.classList.remove("auth-page");
   footer(true);
   $("#nav").hidden = false;
-  const [page, id] = (location.hash || "#/nodes").replace(/^#\/?/, "").split("/");
+  const [page, id, detailId] = (location.hash || "#/nodes").replace(/^#\/?/, "").split("/");
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === page));
 
+  if (page === "quality" && ["routes", "configs"].includes(id) && /^\d+$/.test(detailId || "")) {
+    const view = (request) => qualityPage(id, Number(detailId), request);
+    view.refreshMS = 10000;
+    return show(view, true);
+  }
   if (page === "nodes" && id) return show((request) => nodeDetail(Number(id), request), true);
   if (page === "nodes") return show(nodeList, true);
   if (page === "configs" || page === "chains") return show(chainList, true);
@@ -700,6 +705,7 @@ function drawChains() {
         <div class="sub">${c.route_id ? `链路：${esc(c.route_name)}` : "直连目标"} · 目标：${esc(c.target_name)}</div>
         ${c.connection && c.connection.protocol !== "endpoint" ? `<div class="entry"><span class="muted">连接信息</span><button class="small" data-action="connection" data-id="${c.id}">查看 / 复制</button>${c.connection.tcp_only ? `<span class="hint">SOCKS5 链路仅支持 TCP</span>` : ""}</div>` : ""}
         <div class="path">${path.join(`<span class="arrow">→</span>`)}</div>
+        ${c.hops.length > 1 && !c.deleting ? `<a class="quality-link" href="#/quality/configs/${c.id}">网络质量与趋势 →</a>` : ""}
         ${pendingLine(c)}
       </div>`;
   };
@@ -822,6 +828,8 @@ async function nodeForm(node) {
         <input name="addr" value="${esc(node?.addr)}" class="mono" required></label>
       <label><span>允许的入站端口（端口或范围，多个用逗号分隔，如 10000-20000,30000）</span>
         <input name="ports" value="${esc(node?.ports ?? "10000-65535")}" class="mono" required></label>
+      <label><span>质量探测 UDP 端口（默认 33445，0 停止全部探测；仅主动节点使用）</span><input name="quality_port" type="number" min="0" max="65535" value="${node?.quality_port ?? 33445}" required></label>
+      <p class="hint">请在防火墙／云安全组放行其他探测节点访问此端口。探测异常不影响现有转发。</p>
       <label><span>同步模式</span><select name="desired_mode" ${node?.first_seen && node.protocol_version < 2 ? "disabled" : ""}>
         <option value="active" ${node?.desired_mode !== "passive" ? "selected" : ""}>主动（长连接自动同步）</option>
         <option value="passive" ${node?.desired_mode === "passive" ? "selected" : ""}>被动（仅本机手动同步）</option>
@@ -961,12 +969,12 @@ const FORMS = {
   async node(form, data) {
     const id = form.dataset.id;
     if (!id) {
-      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, group_id: groupId(data) });
+      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), group_id: groupId(data) });
       closeModal();
       location.hash = `#/nodes/${r.id}`;
       return;
     }
-    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, group_id: groupId(data) });
+    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), group_id: groupId(data) });
     closeModal();
     if (r.key) {
       const ups = r.upstream.length ? `<p>以下节点需要同步规则：${r.upstream.map(esc).join("、")}</p>` : "";
@@ -1268,9 +1276,103 @@ function drawRoutes() {
   const d = list.data;
   const card = r => `<div class="card" data-key="route-${r.id}"><div class="card-head"><div class="title">${esc(r.name)}</div><div class="actions"><button class="small" data-action="route-edit" data-id="${r.id}">编辑</button><button class="small danger" data-action="route-delete" data-id="${r.id}">删除</button></div></div>
       <div class="path">${r.nodes.map(n => `<a href="#/nodes/${n.id}">${esc(n.name)}</a>`).join('<span class="arrow">→</span>')}</div>
+      ${r.nodes.length > 1 ? `<a class="quality-link" href="#/quality/routes/${r.id}">网络质量与趋势 →</a>` : ""}
       <div class="sub">${r.configs.length ? `被 ${r.configs.length} 个配置引用：${r.configs.map(c => esc(c.remark)).join("、")}` : "尚未被配置使用"}</div></div>`;
   drawManagedList("routes", d.routes, card, "route-new", "新增链路", "链路保存转发节点顺序，不分配端口。修改后会自动更新所有引用配置。");
 }
+
+const qualityViews = new Map();
+const QUALITY_STATES = {ok: "成功", timeout: "探测超时", error: "探测异常", offline: "节点离线", stopped: "探测已停止", unsupported: "需要升级 Agent", disabled: "探测已关闭", waiting: "等待探测就绪", missing: "未采样", collecting: "持续采集中"};
+const qualityNumber = (n, unit = " ms") => n == null ? "—" : Number(n).toFixed(1) + unit;
+
+const QUALITY_PROTOCOLS = {"udp-echo-v1": ["UDP", "var(--blue)"], "icmp-echo-v1": ["ICMP", "var(--green)"]};
+
+function qualityChart(series, now, seconds) {
+  const width = 900, height = 250, left = 55, right = 16, top = 18, bottom = 40;
+  const maximum = Math.max(1, ...series.flatMap(s => s.points.map(p => p.peak || 0))) * 1.1;
+  const x = t => left + (t - (now - seconds)) / seconds * (width - left - right);
+  const y = n => top + (height - top - bottom) * (1 - n / maximum);
+  const grid = [0, .5, 1].map(f => `<line x1="${left}" x2="${width-right}" y1="${y(maximum*f)}" y2="${y(maximum*f)}" stroke="var(--border)"/><text x="${left-8}" y="${y(maximum*f)+4}" text-anchor="end">${(maximum*f).toFixed(1)}</text>`).join("");
+  const ticks = [0, .5, 1].map(f => { const time = now-seconds+seconds*f; return `<text x="${x(time)}" y="${height-5}" text-anchor="${f === 0 ? "start" : f === 1 ? "end" : "middle"}">${esc(clock(time))}</text>`; }).join("");
+  const curves = series.map((s, index) => {
+    const [name, color] = QUALITY_PROTOCOLS[s.protocol];
+    let previous = null, elements = "";
+    for (const p of s.points.filter(p => p.time >= now - seconds)) {
+      const title = `<title>${name} · ${esc(fmtTime(p.time))} · ${esc(QUALITY_STATES[p.status] || p.status)} · 平均 ${qualityNumber(p.mean)} · 峰值 ${qualityNumber(p.peak)} · 探测丢包 ${qualityNumber(p.loss, "%")}（${p.lost}/${p.samples}）${p.resolved_ip ? " · " + esc(p.resolved_ip) : ""}${p.error ? " · " + esc(p.error) : ""}</title>`;
+      const px = x(p.time).toFixed(1);
+      if (p.mean == null) {
+        previous = null;
+        if (p.status !== "missing") {
+          const py = height - bottom + 8 + index * 8;
+          elements += `<path d="M ${x(p.time)-2},${py-2} l 4,4 m -4,0 l 4,-4" stroke="${color}" stroke-width="1.5">${title}</path>`;
+        }
+        continue;
+      }
+      if (previous && !previous.gap && !p.gap && !previous.endpoint_change && !p.endpoint_change && previous.resolved_ip === p.resolved_ip) {
+        elements += `<line x1="${x(previous.time).toFixed(1)}" y1="${y(previous.mean).toFixed(1)}" x2="${px}" y2="${y(p.mean).toFixed(1)}" stroke="${color}" stroke-width="2"/>`;
+      }
+      if (p.peak != null && p.peak !== p.mean) elements += `<line x1="${px}" x2="${px}" y1="${y(p.mean).toFixed(1)}" y2="${y(p.peak).toFixed(1)}" stroke="${color}" opacity=".3">${title}</line>`;
+      elements += `<circle cx="${px}" cy="${y(p.mean).toFixed(1)}" r="2.5" fill="${color}">${title}</circle>`;
+      previous = p;
+    }
+    return `<g data-protocol="${s.protocol}">${elements}</g>`;
+  }).join("");
+  return `<svg class="quality-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="UDP 与 ICMP 往返延迟对比">${grid}${curves}${ticks}</svg>`;
+}
+
+async function qualityPage(scope, id, request) {
+  const key = `${scope}/${id}`, selection = qualityViews.get(key) || {range: 900};
+  let d;
+  try { d = await api("POST", "quality", {scope, id, ...selection}); }
+  catch (err) {
+    if (request !== viewRequest || err.status === 401 || err.status === 403) return;
+    if (err.status === 400 && selection.source != null) {
+      qualityViews.set(key, {range: selection.range});
+      return qualityPage(scope, id, request);
+    }
+    if (request === viewRequest) render(`<h1>网络质量</h1><p class="t-red">${esc(err.message)}</p><a href="#/${scope}">返回列表</a>`);
+    return;
+  }
+  if (request !== viewRequest) return;
+  if (!d.pair) return render(`<h1>网络质量</h1><p>至少需要两个节点。</p><a href="#/${scope}">返回列表</a>`);
+  qualityViews.set(key, {range: selection.range, source: d.pair.source, target: d.pair.target});
+  const options = value => d.nodes.map(n => `<option value="${n.id}" ${n.id === value ? "selected" : ""}>${esc(n.name)}${n.mode === "passive" ? "（被动）" : ""}</option>`).join("");
+  const rows = d.series.map(s => {
+    const [name, color] = QUALITY_PROTOCOLS[s.protocol], latest = s.latest, stat = s.summary;
+    const fresh = latest && d.now - latest.slot <= 25 && s.state === "collecting";
+    const state = s.state === "collecting" ? (latest?.status || "missing") : s.state;
+    return `<tr><td><span class="quality-key" style="--series-color:${color}">${name}</span></td>
+      <td>${latest?.status === "ok" ? qualityNumber(latest.rtt) : "—"}${!fresh && latest ? "（历史）" : ""}</td>
+      <td>${qualityNumber(stat.mean)}</td><td>${qualityNumber(stat.p95)}</td><td>${qualityNumber(stat.jitter)}</td>
+      <td>${qualityNumber(stat.loss,"%")}${stat.samples ? `<small class="muted">（${stat.lost} / ${stat.samples} 个样本）</small>` : ""}</td>
+      <td title="${esc(s.note || latest?.error || "")}">${esc(QUALITY_STATES[state] || state)}<small class="quality-time">${latest ? fmtTime(latest.slot) : ""}</small></td></tr>`;
+  }).join("");
+  const notes = d.series.filter(s => s.note || s.latest?.error).map(s => `${QUALITY_PROTOCOLS[s.protocol][0]}：${esc(s.note || s.latest.error)}`);
+  render(`<div class="list-head"><h1>网络质量</h1><a href="#/${scope}">返回列表</a></div>
+    <div class="panel quality-controls" data-quality="${key}">
+      <label><span>发起节点</span><select name="quality-source">${options(d.pair.source)}</select></label>
+      <span class="quality-arrow">→</span><label><span>接收节点</span><select name="quality-target">${options(d.pair.target)}</select></label>
+      <label><span>时间范围</span><select name="quality-range">${[[900,"最近 15 分钟"],[3600,"最近 1 小时"],[86400,"最近 24 小时"]].map(([n,label]) => `<option value="${n}" ${n === selection.range ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+    </div>
+    <div class="panel"><div class="quality-heading"><h2>往返延迟 <span class="count">ms</span></h2><span class="quality-key" style="--series-color:var(--blue)">UDP</span><span class="quality-key" style="--series-color:var(--green)">ICMP</span></div>
+      ${qualityChart(d.series,d.now,selection.range)}
+      <p class="hint">曲线显示平均值，浅色细线保留峰值；底部 × 为超时或异常，不代表 0 ms。悬停查看详情。</p>
+      <div class="quality-table"><table><thead><tr><th>探测</th><th>最新 RTT</th><th>5 分钟平均</th><th>P95</th><th>波动</th><th>探测丢包率</th><th>最近状态</th></tr></thead><tbody>${rows}</tbody></table></div>
+      ${notes.length ? `<p class="hint">${notes.join("；")}</p>` : ""}
+    </div>
+    <p class="hint">${d.adjacent ? "后台持续采集" : "查看期间采集非相邻节点的直达网络"}，每种协议默认 10 秒一次，共享节点限速。历史保留 24 小时。ICMP 无响应可能是禁 Ping 或限速；探测异常不改变转发状态。</p>`);
+
+}
+
+document.addEventListener("change", e => {
+  const box = e.target.closest?.("[data-quality]");
+  if (!box) return;
+  const source = Number(box.querySelector('[name="quality-source"]').value);
+  const target = Number(box.querySelector('[name="quality-target"]').value);
+  if (source === target) { toast("请选择两个不同节点", true); return; }
+  qualityViews.set(box.dataset.quality, {source, target, range: Number(box.querySelector('[name="quality-range"]').value)});
+  refresh();
+});
 
 // 各列表共用交互方式，数据、分组 ID、筛选与折叠状态按 kind 分开。
 function drawManagedList(kind, rows, card, newAction, newLabel, hint, extraActions = "") {

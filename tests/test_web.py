@@ -58,6 +58,11 @@ const requests=[];
 window.fetch=async (url,options={})=>{
  const path=String(url).split("api/")[1]?.split("?")[0];
  if(!path)throw Error("unexpected request "+url);
+ if(path==="quality") {
+  const data={nodes:[{id:1,name:"A",mode:"active"},{id:2,name:"B",mode:"active"}],pair:{source:1,target:2,target_addr:"192.0.2.2",port:33445},now:1200,step:10,state:"collecting",adjacent:true,summary:{mean:20,peak:30,p95:30,jitter:10,samples:3,lost:1,loss:100/3},latest:{slot:1190,status:"timeout",error:"探测超时"},points:[{time:1180,mean:20,peak:30,loss:0,samples:1,lost:0,status:"ok",resolved_ip:"192.0.2.2"},{time:1190,mean:null,peak:null,loss:100,samples:1,lost:1,status:"timeout"},{time:1200,mean:null,peak:null,loss:null,samples:0,lost:0,status:"missing"}]};
+  data.series = [{protocol:"udp-echo-v1",...data},{protocol:"icmp-echo-v1",...data,latest:{slot:1190,status:"ok",rtt:18},points:data.points.map(p=>({...p,mean:p.mean == null ? null : p.mean-2,peak:p.peak == null ? null : p.peak-2}))}];
+  return {ok:true,status:200,json:async()=>data};
+ }
  if(options.method && options.method!=="GET") {requests.push({path,body:JSON.parse(options.body||"{}")});return {ok:true,status:200,json:async()=>({id:1,assigned:[],affected:0,key:null})};}
  if(!responses[path])throw Error("missing fixture "+path);
  return {ok:true,status:200,json:async()=>structuredClone(responses[path])};
@@ -110,6 +115,15 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(!form.querySelector('[name=config_port]'),"direct target allocates ports");
   await FORMS.chain(form,Object.fromEntries(new FormData(form)));
   assert(requests.at(-1).body.target_id===1&&requests.at(-1).body.route_id===null,"wrong config payload");
+  leaveView();await show(r=>qualityPage("routes",1,r),false);
+  assert(app.querySelectorAll('svg.quality-chart').length===1,"expected one combined quality chart");
+  assert(app.textContent.includes('1 / 3 个样本'),"loss sample denominator missing");
+  assert(app.textContent.includes('探测超时'),"timeout missing");
+  assert(app.querySelector('svg [data-protocol="udp-echo-v1"] circle').getAttribute('fill') !== app.querySelector('svg [data-protocol="icmp-echo-v1"] circle').getAttribute('fill'),"protocol colours must differ");
+  assert(!app.innerHTML.includes('NaN'),"chart contains NaN");
+  assert(app.querySelector('[name="quality-range"]').options.length===3,"time ranges missing");
+  const gaps=qualityChart([{protocol:"udp-echo-v1",points:[{time:1180,mean:10,peak:10,status:"ok",resolved_ip:"a"},{time:1190,mean:null,status:"missing"},{time:1200,mean:20,peak:20,status:"ok",resolved_ip:"a"}]}],1200,900);
+  assert(!gaps.includes('stroke-width="2"'),"chart joins missing samples");
   leaveView();await show(settingsPage,false);assert(!app.textContent.includes('sing-box'),"obsolete core settings");
   assert(!document.querySelector('a[href="#/tunnels"]'),"obsolete nav");
   document.querySelector('#result').textContent='PASS';

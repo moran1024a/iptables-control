@@ -107,6 +107,29 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
         await ws.close()
         self.assertEqual(s.get_node(self.db,nid)['manual_required'],1)
 
+    async def test_quality_api_authentication_scope_and_cookie_renewal(self):
+        a, b = self.node(), self.node('B')
+        rid = self.route([a, b])
+        path = s.Handler.panel_path + '/api/quality'
+        payload = dict(scope='routes', id=rid)
+        response = await self.client.post(path, json=payload)
+        self.assertEqual(response.status, 401)
+        token = 'quality-session'
+        with self.db:
+            s.set_setting(self.db, 'must_change', '0')
+            self.db.execute('INSERT INTO sessions VALUES (?,?)',
+                            (s.hashlib.sha256(token.encode()).hexdigest(), int(time.time()) + 100))
+        headers = {'Cookie': s.SESSION_COOKIE + '=' + token}
+        response = await self.client.post(path, json=payload, headers=headers)
+        self.assertEqual(response.status, 200)
+        data = await response.json()
+        self.assertEqual(data['pair']['source'], a)
+        self.assertEqual(len(data['series']), 2)
+        self.assertEqual(data['series'][0]['state'], 'unsupported')
+        self.assertIn('Set-Cookie', response.headers)
+        response = await self.client.post(path, json={**payload, 'source': a, 'target': 999}, headers=headers)
+        self.assertEqual(response.status, 400)
+
     async def test_seventy_idle_sessions_do_not_exhaust_http_workers(self):
         nodes=[self.node(str(i)) for i in range(70)]
         with self.db:
