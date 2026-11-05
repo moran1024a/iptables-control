@@ -15,7 +15,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 REGISTRY="ghcr.io"
 MIRROR_REGISTRY="ghcr.nju.edu.cn"
 REPO="moran1024a/ictl-server"
@@ -148,6 +148,8 @@ rollback() {
   echo "升级失败，正在恢复旧容器及升级前数据库。" >&2
   # Never restore a database while the new process could still be writing it.
   if docker container inspect "$NAME" >/dev/null 2>&1; then
+    echo "新容器最近日志：" >&2
+    docker logs --tail 50 "$NAME" >&2 || true
     docker rm -f "$NAME" >/dev/null || die "停止新容器失败；未恢复数据库，备份：$BACKUP"
   fi
   if [ -n "$OLD_NAME" ]; then
@@ -171,7 +173,11 @@ for suffix in ("-wal", "-shm"):
 }
 
 if [ -n "$OLD_NAME" ]; then
-  echo "升级会删除数据库中的隧道节点、受管隧道及其关联配置；远端旧隧道服务请自行卸载。"
+  case "$current" in
+    0.1.*|0.2.*) echo "升级会删除旧隧道记录及旧链路、转发配置；远端旧隧道服务请自行卸载。" ;;
+    0.3.*) echo "升级会保留节点、目标及其分组，清空旧链路、转发配置和运行历史；升级前自动备份数据库。" ;;
+    *) echo "升级前将备份数据库；0.4.x 的现有节点、目标、池和链路会保留。" ;;
+  esac
   docker stop "$NAME" >/dev/null
   if ! docker rename "$NAME" "$OLD_NAME"; then
     docker start "$NAME" >/dev/null
@@ -197,12 +203,15 @@ fi
 docker run -d --name "$NAME" --restart unless-stopped \
   -p "${BIND_IP:+$BIND_IP:}$PORT:8730" -v "$DATA_MOUNT" "$IMAGE" >/dev/null
 
-healthy=0
+healthy=0 health_error=""
 for _ in $(seq 1 40); do
-  if docker exec "$NAME" python3 /app/ictl-server.py health >/dev/null 2>&1; then healthy=1; break; fi
+  if health_error="$(docker exec "$NAME" python3 /app/ictl-server.py health 2>&1)"; then healthy=1; break; fi
   sleep 0.5
 done
-[ "$healthy" -eq 1 ] || rollback
+if [ "$healthy" -ne 1 ]; then
+  printf '新容器健康检查失败：\n%s\n' "${health_error:-未返回错误详情}" >&2
+  rollback
+fi
 trap - ERR INT TERM
 [ -z "$OLD_NAME" ] || docker rm "$OLD_NAME" >/dev/null
 

@@ -33,7 +33,8 @@ import types
 def _module():
     return types.SimpleNamespace(**globals())
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
+DATABASE_VERSION = 403
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -367,7 +368,7 @@ def init_db():
     conn = db() if os.path.isfile(DB_PATH) else None
     if conn is not None:
         version = conn.execute('PRAGMA user_version').fetchone()[0]
-        if version > 403:
+        if version > DATABASE_VERSION:
             conn.close()
             raise UserError('数据库版本高于本服务端')
         if version >= 400:
@@ -2278,8 +2279,9 @@ def cmd_info(args):
 def cmd_health(args):
     conn = read_db()
     try:
-        if conn.execute('PRAGMA user_version').fetchone()[0] != 402:
-            raise UserError('数据库尚未就绪')
+        version = conn.execute('PRAGMA user_version').fetchone()[0]
+        if version != DATABASE_VERSION:
+            raise UserError(f'数据库尚未就绪（当前结构版本 {version}，要求 {DATABASE_VERSION}）')
         path = setting(conn, 'panel_path') + '/'
     finally:
         conn.close()

@@ -40,8 +40,11 @@ if args[0]=='rename':data[args[2]]=data.pop(args[1]);save();sys.exit(0)
 if args[0] in ('stop','start'):
  data[args[1]]['running']=args[0]=='start';save();sys.exit(0)
 if args[0]=='rm':data.pop(args[-1],None);save();sys.exit(0)
+if args[0]=='logs':
+ print('server startup diagnostic');sys.exit(0)
 if args[0]=='exec':
- if args[-1]=='health' and os.environ.get('FAIL_HEALTH'):sys.exit(1)
+ if args[-1]=='health' and os.environ.get('FAIL_HEALTH'):
+  print('错误：数据库尚未就绪',file=sys.stderr);sys.exit(1)
  print('ready');sys.exit(0)
 sys.exit(1)
 '''
@@ -76,6 +79,10 @@ class InstallerTests(unittest.TestCase):
     def test_health_failure_restores_old_database_after_migration(self):
         r=self.run_install(FAIL_HEALTH='1');self.assertNotEqual(r.returncode,0);self.assert_old()
         self.assertNotIn('volume rm',(self.root/'docker.log').read_text())
+        self.assertIn('错误：数据库尚未就绪',r.stderr)
+        self.assertIn('server startup diagnostic',r.stderr)
+        commands=(self.root/'docker.log').read_text()
+        self.assertLess(commands.index('logs --tail 50'),commands.index('rm -f'))
 
     def test_failed_restore_keeps_old_stopped(self):
         r=self.run_install(FAIL_HEALTH='1',FAIL_RESTORE='1');self.assertNotEqual(r.returncode,0)
@@ -85,7 +92,7 @@ class InstallerTests(unittest.TestCase):
     def test_success_removes_only_old_container_and_keeps_backup(self):
         r=self.run_install();self.assertEqual(r.returncode,0,r.stderr)
         containers=json.loads((self.root/'containers').read_text());self.assertEqual(list(containers),['ictl-server'])
-        self.assertTrue(containers['ictl-server']['image'].endswith('0.4.0'))
+        self.assertTrue(containers['ictl-server']['image'].endswith('0.4.1'))
         backup=next((self.root/'data').glob('*.bak'));c=sqlite3.connect(backup)
         self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],202);c.close()
 

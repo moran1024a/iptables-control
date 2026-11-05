@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import sqlite3
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -82,3 +83,32 @@ class Upgrade03Tests(Fixture, unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM chains').fetchone()[0],1)
         self.assertEqual(dict(s.get_node(self.db,self.nid)),self.node_before)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM sync_ops').fetchone()[0],1)
+
+    def test_health_after_migration_checks_real_http_and_does_not_migrate(self):
+        # An old database must stay unchanged until the serving process migrates it.
+        with self.assertRaisesRegex(s.UserError, '数据库尚未就绪'):
+            s.cmd_health(None)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],300)
+        self.db.close();self.db=s.init_db()
+        s.Handler.panel_path=s.setting(self.db,'panel_path')
+        server=s.LimitedHTTPServer(('127.0.0.1',0),s.Handler)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        connection=s.http.client.HTTPConnection
+        def local_connection(host,port,timeout):
+            self.assertEqual((host,port),('127.0.0.1',8730))
+            return connection(host,server.server_port,timeout=timeout)
+        try:
+            before=list(self.db.iterdump())
+            # Redirect only the test port; use the real health check and HTTP response.
+            with patch.object(s.http.client,'HTTPConnection',side_effect=local_connection):
+                s.cmd_health(None)
+                self.assertEqual(list(self.db.iterdump()),before)
+                with patch.object(s.Handler,'panel_path','/unavailable'):
+                    with self.assertRaisesRegex(s.UserError,'HTTP 服务尚未就绪'):
+                        s.cmd_health(None)
+            with self.db:self.db.execute('PRAGMA user_version=404')
+            with self.assertRaisesRegex(s.UserError,'数据库尚未就绪'):
+                s.cmd_health(None)
+            self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],404)
+        finally:
+            server.shutdown();server.server_close();thread.join()
