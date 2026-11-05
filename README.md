@@ -4,7 +4,7 @@
 
 支持多跳链路、SS／SS2022／VLESS Reality 目标、主动与被动同步，以及 Agent 与单机脚本共存。
 
-**当前开发版：0.4.0-rc.4（测试版，未发布）**。支持池模板、可视化链路、手动优先级及节点失联灾备。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，可选择开启认证唤醒。正式版仍为 0.3.1，RC 不更新 `latest`。转发节点无需安装代理核心，目标服务需自行准备。
+**当前开发版：0.4.0-rc.5（测试版，未发布）**。支持池模板、可视化链路、手动优先级及节点失联灾备。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，可选择开启认证唤醒。正式版仍为 0.3.1，RC 不更新 `latest`。转发节点无需安装代理核心，目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -33,7 +33,7 @@
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.4/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.5/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -41,7 +41,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.4/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.5/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
 新主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口（默认 `8730`），并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址，再接入节点。
@@ -65,7 +65,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.4/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.5/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -123,7 +123,7 @@ sudo ictl --sync    # 同步配置，或确认面板要求的类型切换
 删除容器和镜像，保留数据卷，之后可重新安装恢复使用：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.4/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.5/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；若要完整停用，请先处理节点。
@@ -180,7 +180,9 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 ### 池与灾备切换
 
-点击链路中的池，设置当前实例的优先级、默认成员、锁定和禁用。默认成员就是第一优先级；锁定后不自动灾备。支持手动切换，也可以添加“直连下一阶段”候选，仅跳过对应池。
+链路详情会展开每个池的全部成员。绿色线条及动画表示已确认的生效路径，黄色虚线表示待确认的新路径；动画不代表真实流量。点击候选节点并确认，可将它设为本链路的默认节点并切换，优先级及显示顺序不变。画布支持拖动、滚轮或双指缩放，首次打开自动适应全部节点；刷新保留视角。
+
+池右上角的“设置”可调整完整优先级、锁定和禁用，也可以添加“直连下一阶段”候选，仅跳过对应池。新建实例以最高优先级的节点作为默认节点；之后默认节点与灾备优先级独立维护。锁定后不自动灾备。离线、禁用或受锁定限制的成员不能快速切换。切换请求被接受后会保留所选默认节点；实际生效仍以节点回执为准。灾备按其余成员的优先级选择，不修改默认节点，也不因默认节点恢复而自动切回。
 
 模板的排序只影响以后添加的实例。新增模板成员会追加到已有实例末尾；移除成员会同步到实例，但正在使用的成员须先切换并等待清理完成。修改某条链路的设置不会影响其他链路。
 
@@ -359,7 +361,8 @@ sudo unshare -nm python3 tests/kernel_pool_switch.py /tmp/ictl-active
 
 | 组件 | 当前版本 |
 | --- | --- |
-| 服务端／主动 Agent／被动 Agent／管理器 | 0.4.0-rc.4 |
+| 服务端 | 0.4.0-rc.5 |
+| 主动 Agent／被动 Agent／管理器 | 0.4.0-rc.4 |
 | 唤醒组件 | 0.4.0-rc.3 |
 | 旧版兼容 Agent | 0.2.1 |
 | 单机脚本 | 3.2-rc.2 |

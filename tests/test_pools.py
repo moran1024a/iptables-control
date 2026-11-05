@@ -76,13 +76,120 @@ class PoolTests(Fixture, unittest.TestCase):
         self.call('api_link_save',dict(name=l['name'],plan=l['plan'],revision=l['revision']),lid);self.finish(lid)
         self.call('api_pool_save',dict(name='pool',members=[self.c,self.a,self.b]),self.pool)
         self.assertEqual(self.get(lid)['plan']['stages'][0]['order'],[self.b,self.a,self.c])
-        self.assertEqual(self.get(lid)['selected']['pool-a'],self.b)
+        self.assertEqual(self.get(lid)['selected']['pool-a'],self.a)
+        self.assertEqual(self.get(lid)['plan']['stages'][0]['default'],self.a)
         with self.assertRaises(s.UserError):self.call('api_pool_delete',{},self.pool)
-        with self.assertRaises(s.UserError):self.call('api_pool_save',dict(members=[self.a,self.c]),self.pool)
+        with self.assertRaises(s.UserError):self.call('api_pool_save',dict(members=[self.b,self.c]),self.pool)
+        l=self.get(lid)
+        self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
+        self.finish(lid)
         # Confirm old-rule cleanup, then an unused member can be removed.
         self.ack(self.a);self.tick()
         self.call('api_pool_save',dict(members=[self.b,self.c]),self.pool)
         self.assertEqual(self.get(lid)['plan']['stages'][0]['order'],[self.b,self.c])
+
+    def test_quick_switch_changes_only_default_and_waits_for_receipt(self):
+        self.call('api_pool_save',dict(members=[self.a,self.b,self.c]),self.pool)
+        lid=self.link();self.finish(lid)
+        other=self.call('api_link_save',dict(name='other',apply=False,plan=dict(entry=self.entry,
+            target=self.target_id,stages=[dict(id='pool-a',kind='pool',pool_id=self.pool)])))['id']
+        l=self.get(lid)
+        self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.c,revision=l['revision']),lid)
+        l=self.get(lid)
+        self.assertEqual(l['plan']['stages'][0]['order'],[self.a,self.b,self.c])
+        self.assertEqual(l['plan']['stages'][0]['default'],self.c)
+        self.assertEqual(l['selected']['pool-a'],self.a)
+        self.assertEqual(l['job']['selected']['pool-a'],self.c)
+        self.assertEqual(l['applied_target_id'],self.target_id)
+        self.assertEqual(self.get(other)['plan']['stages'][0]['order'],[self.a,self.b,self.c])
+        self.assertEqual(json.loads(self.db.execute('SELECT members FROM pools WHERE id=?',(self.pool,)).fetchone()[0]),[self.a,self.b,self.c])
+        self.finish(lid)
+        self.assertEqual(self.get(lid)['selected']['pool-a'],self.c)
+
+    def test_quick_switch_rejections_do_not_change_priority(self):
+        lid=self.link();self.finish(lid)
+        l=self.get(lid);l['plan']['stages'][0]['locked']=self.a
+        self.call('api_link_save',dict(plan=l['plan'],revision=l['revision']),lid)
+        l=self.get(lid)
+        with self.assertRaises(s.UserError):
+            self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
+        self.assertEqual(self.get(lid)['plan'],l['plan'])
+        l['plan']['stages'][0]['locked']=None
+        self.call('api_link_save',dict(plan=l['plan'],revision=l['revision']),lid)
+        l=self.get(lid)
+        with self.db:self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?',(int(time.time())-120,self.b))
+        with self.assertRaises(s.UserError):
+            self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
+        self.assertEqual(self.get(lid)['plan'],l['plan'])
+        self.assertIsNone(self.get(lid)['job'])
+        self.ack(self.b)
+        with self.assertRaises(s.UserError):
+            self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']-1),lid)
+        self.assertEqual(self.get(lid)['plan'],l['plan'])
+
+    def test_setting_current_default_does_not_reapply_and_direct_keeps_priority(self):
+        lid=self.link();self.finish(lid)
+        l=self.get(lid)
+        # A recovered first-priority node need not be the currently selected one.
+        l['plan']['stages'][0].update(order=[self.b,self.a,0],direct=True)
+        with self.db:self.db.execute('UPDATE links SET plan=? WHERE id=?',(json.dumps(l['plan']),lid))
+        before=s.node_rules(self.db,s.get_node(self.db,self.entry))
+        self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.a,revision=l['revision']),lid)
+        l=self.get(lid)
+        self.assertIsNone(l['job'])
+        self.assertEqual(l['plan']['stages'][0]['order'],[self.b,self.a,0])
+        self.assertEqual(l['plan']['stages'][0]['default'],self.a)
+        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,self.entry)),before)
+        self.call('api_link_action',dict(action='switch',stage='pool-a',member=0,revision=l['revision']),lid)
+        self.assertEqual(self.get(lid)['plan']['stages'][0]['order'],[self.b,self.a,0])
+        self.assertEqual(self.get(lid)['plan']['stages'][0]['default'],0)
+        self.finish(lid)
+        self.assertEqual(self.get(lid)['selected']['pool-a'],0)
+
+    def test_rejected_apply_retains_preference_and_last_confirmed_path(self):
+        lid=self.link();self.finish(lid);l=self.get(lid)
+        self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
+        self.ack(self.b,False);self.tick()
+        l=self.get(lid)
+        self.assertEqual(l['plan']['stages'][0]['order'],[self.a,self.b])
+        self.assertEqual(l['plan']['stages'][0]['default'],self.b)
+        self.assertEqual(l['selected']['pool-a'],self.a)
+        self.assertEqual(l['state'],'error')
+
+    def test_failover_uses_priority_without_changing_default_or_failing_back(self):
+        self.call('api_pool_save',dict(members=[self.a,self.b,self.c]),self.pool)
+        lid=self.link();self.finish(lid);l=self.get(lid)
+        self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.c,revision=l['revision']),lid)
+        self.finish(lid);self.ack(self.a);self.tick()
+        with self.db:self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?',(int(time.time())-61,self.c))
+        self.tick()
+        self.assertEqual(self.get(lid)['job']['selected']['pool-a'],self.a)
+        self.finish(lid)
+        l=self.get(lid)
+        self.assertEqual(l['selected']['pool-a'],self.a)
+        self.assertEqual(l['plan']['stages'][0]['default'],self.c)
+        self.assertEqual(l['plan']['stages'][0]['order'],[self.a,self.b,self.c])
+        # Recovery and a priority edit both keep the current path and default.
+        self.ack(self.c);self.tick()
+        l['plan']['stages'][0]['order']=[self.b,self.a,self.c]
+        self.call('api_link_save',dict(plan=l['plan'],revision=l['revision']),lid)
+        l=self.get(lid)
+        self.assertIsNone(l['job'])
+        self.assertEqual(l['selected']['pool-a'],self.a)
+        self.assertEqual(l['plan']['stages'][0]['default'],self.c)
+
+    def test_legacy_default_and_membership_changes_preserve_instance_order(self):
+        lid=self.link();self.finish(lid);l=self.get(lid)
+        del l['plan']['stages'][0]['default']
+        with self.db:self.db.execute('UPDATE links SET plan=? WHERE id=?',(json.dumps(l['plan']),lid))
+        self.assertEqual(self.get(lid)['plan']['stages'][0]['default'],self.a)
+        self.call('api_pool_save',dict(members=[self.c,self.b,self.a]),self.pool)
+        stage=self.get(lid)['plan']['stages'][0]
+        self.assertEqual(stage['order'],[self.a,self.b,self.c])
+        self.assertEqual(stage['default'],self.a)
+        self.call('api_pool_save',dict(members=[self.c,self.a]),self.pool)
+        self.assertEqual(self.get(lid)['plan']['stages'][0]['order'],[self.a,self.c])
+        self.assertEqual(self.get(lid)['plan']['stages'][0]['default'],self.a)
 
     def test_timeout_is_unknown_and_late_receipt_finishes(self):
         lid=self.link();self.ack(self.a);self.tick()
@@ -120,7 +227,7 @@ class PoolTests(Fixture, unittest.TestCase):
         with self.assertRaises(s.UserError):self.call('api_node_del',{},self.b)
         l=self.get(lid)
         with self.assertRaises(s.UserError):self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
-        l['plan']['stages'][0].update(locked=None,direct=True,order=[0,self.a,self.b])
+        l['plan']['stages'][0].update(locked=None,direct=True,order=[0,self.a,self.b],default=0)
         self.call('api_link_save',dict(name=l['name'],plan=l['plan'],revision=l['revision']),lid);self.finish(lid)
         self.assertEqual(self.get(lid)['selected']['pool-a'],0)
         self.assertEqual([h['node_id'] for h in self.get(lid)['hops']],[self.entry])

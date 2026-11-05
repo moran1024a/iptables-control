@@ -33,7 +33,7 @@ import types
 def _module():
     return types.SimpleNamespace(**globals())
 
-VERSION = "0.4.0-rc.4"
+VERSION = "0.4.0-rc.5"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)

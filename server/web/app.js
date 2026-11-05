@@ -230,6 +230,7 @@ async function safe(fn) {
 // ------------------------------------------------------------ 页面切换与刷新
 
 function leaveView() {
+  if (typeof releaseTopology === "function") releaseTopology();
   pageVersion++;
   viewRequest++;
   currentView = null;

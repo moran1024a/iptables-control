@@ -17,6 +17,11 @@ def dump(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
 
+def default_member(stage):
+    # Older plans had no separate default; their first priority was the default.
+    return stage.get('default', next(iter(stage['order']), None))
+
+
 def migrate(s, c):
     if c.execute('PRAGMA user_version').fetchone()[0] >= 403:
         return
@@ -164,8 +169,11 @@ def pool_save(s, c, body, ident=None):
                 raise s.UserError(f"链路「{link['name']}」正在切换，请稍后修改成员", status=409)
             plan = affected.setdefault(link['id'], json.loads(link['plan']))
             instance = next(x for x in plan['stages'] if x['id'] == stage['id'])
+            instance['default'] = default_member(instance)
             instance['order'] = [n for n in instance['order'] if n not in removed] + added
             instance['disabled'] = [n for n in instance['disabled'] if n not in removed]
+            if instance['default'] not in instance['order']:
+                instance['default'] = next(iter(instance['order']), None)
         for lid, plan in affected.items():
             c.execute('UPDATE links SET plan=?, revision=revision+1 WHERE id=?', (dump(plan), lid))
         c.execute('UPDATE pools SET name=?,members=? WHERE id=?', (name, dump(members), ident))
@@ -226,6 +234,11 @@ def validate_plan(s, c, raw, old=None):
         if not isinstance(order, list) or any(type(n) is not int for n in order) or len(set(order)) != len(order):
             raise s.UserError('成员优先级无效')
         order = [n for n in order if n in available] + [n for n in available if n not in order]
+        default = value.get('default', default_member(previous) if previous else next(iter(order), None))
+        if default is None and order:
+            default = order[0]
+        if default is not None and (type(default) is not int or default not in order):
+            raise s.UserError('默认节点必须是池中的成员')
         disabled = value.get('disabled', previous['disabled'] if previous else [])
         locked = value.get('locked', previous.get('locked') if previous else None)
         if not isinstance(disabled, list) or any(type(n) is not int or n not in available for n in disabled):
@@ -239,7 +252,7 @@ def validate_plan(s, c, raw, old=None):
             if current is not None and current in disabled and current not in previous['disabled']:
                 raise s.UserError('请先切换当前成员，再将它禁用', status=409)
         result['stages'].append(dict(id=sid, kind=kind, pool_id=pool['id'], order=order,
-                                     disabled=disabled, locked=locked, direct=direct))
+                                     disabled=disabled, locked=locked, direct=direct, default=default))
     if entry is None and result['stages']:
         raise s.UserError('添加中间阶段之前请选择入口')
     return result
@@ -262,8 +275,9 @@ def choose(s, c, link, plan, prefer_current=False, forced=None, now=None):
             continue
         sid = stage['id']
         order = list(stage['order'])
-        if prefer_current and current.get(sid) in order:
-            order.remove(current[sid]); order.insert(0, current[sid])
+        preferred = current[sid] if prefer_current and sid in current else default_member(stage)
+        if preferred in order:
+            order.remove(preferred); order.insert(0, preferred)
         if stage['locked'] is not None:
             order = [stage['locked']]
         if forced and sid in forced:
@@ -388,7 +402,11 @@ def link_save(s, c, body, ident=None):
         ident = c.execute('INSERT INTO links(name,plan) VALUES (?,?)', (name, dump(plan))).lastrowid
     link = get(s, c, 'links', ident)
     if body.get('apply', True):
-        selected, path = choose(s, c, link, plan)
+        old_stages = {x['id']: x for x in json.loads(old['plan'])['stages'] if x['kind'] == 'pool'} if old else {}
+        changed_defaults = {x['id']: x['default'] for x in plan['stages'] if x['kind'] == 'pool'
+                            and x['id'] in old_stages and x['pool_id'] == old_stages[x['id']]['pool_id']
+                            and x['default'] != default_member(old_stages[x['id']])}
+        selected, path = choose(s, c, link, plan, prefer_current=bool(old), forced=changed_defaults)
         begin(s, c, link, plan, selected, path, '手动应用')
     elif old and old['chain_id'] is not None:
         raise s.UserError('已经运行的链路请使用保存并应用')
@@ -399,6 +417,8 @@ def action(s, c, body, ident):
     link = get(s, c, 'links', ident)
     if body.get('revision') != link['revision']:
         raise s.UserError('链路已变化，请刷新后重试', status=409)
+    if link['state'] == 'deleting':
+        raise s.UserError('链路正在删除，暂不能切换', status=409)
     if body.get('action') == 'retry':
         if not link['job']:
             c.execute("UPDATE links SET failures='[]',error='' WHERE id=?", (ident,))
@@ -420,7 +440,10 @@ def action(s, c, body, ident):
             raise s.UserError('请选择池中的成员')
         c.execute("UPDATE links SET failures='[]' WHERE id=?", (ident,)); link['failures'] = '[]'
         selected, path = choose(s, c, link, plan, prefer_current=True, forced={stage_id: member})
-        begin(s, c, link, plan, selected, path, '手动切换')
+        stage = next(x for x in plan['stages'] if x['id'] == stage_id)
+        stage['default'] = member
+        begin(s, c, link, plan, selected, path, '手动切换默认节点')
+        c.execute('UPDATE links SET plan=? WHERE id=?', (dump(plan), ident))
     else:
         raise s.UserError('未知操作')
     c.execute('UPDATE links SET revision=revision+1 WHERE id=?', (ident,))
@@ -578,14 +601,19 @@ def detail(s, c, link):
     result['state'], result['error'] = display_state(s, c, link)
     for key in ('plan', 'selected', 'failures'):
         result[key] = json.loads(result[key])
+    for stage in result['plan']['stages']:
+        if stage['kind'] == 'pool':
+            stage['default'] = default_member(stage)
     result.pop('retained', None)
     result['job'] = json.loads(result['job']) if result['job'] else None
     result['cleanup'] = [dict(r) for r in c.execute('SELECT node_id,port FROM link_retired WHERE link_id=?', (link['id'],))]
     result['events'] = [dict(r) for r in c.execute('SELECT ts,message FROM link_events WHERE link_id=? ORDER BY id DESC LIMIT 30', (link['id'],))]
     result['hops'] = [dict(r) for r in c.execute('SELECT h.*,n.name,n.addr FROM hops h JOIN nodes n ON n.id=h.node_id WHERE chain_id=? ORDER BY seq', (link['chain_id'],))]
     result['connection'] = None
+    result['applied_target_id'] = None
     if link['chain_id'] and (result['hops'] or result['plan']['entry'] is None):
         chain = s.get_chain(c, link['chain_id']); target = s.get_target(c, chain['target_id'])
+        result['applied_target_id'] = target['id']
         first = result['hops'][0] if result['hops'] else dict(addr=target['host'], port=target['port'])
         result['connection'] = s.target_config.connection(target, first['addr'], first['port'], link['name'])
     return result
