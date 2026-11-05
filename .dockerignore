@@ -1,6 +1,8 @@
 *
-!server/ictl-server.py
-!server/target_config.py
-!server/components.json
-!server/web
-!agent/ictl.sh
+!server/
+!server/**
+!agent/
+!agent/**
+**/__pycache__/
+**/*.pyc
+**/*.test

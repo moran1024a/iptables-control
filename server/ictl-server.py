@@ -24,8 +24,13 @@ import threading
 import time
 from urllib.parse import parse_qs
 import target_config
+import agent_v3
+import types
 
-VERSION = "0.3.1"
+def _module():
+    return types.SimpleNamespace(**globals())
+
+VERSION = "0.4.0-rc.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -309,7 +314,7 @@ def backup_database(conn, path):
     os.replace(temporary, path)
 
 
-def init_db():
+def init_db_v030():
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), mode=0o700, exist_ok=True)
     conn = db()
     version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -350,6 +355,23 @@ def init_db():
     except Exception:
         conn.close()
         raise
+    return conn
+
+
+def init_db():
+    conn = db() if os.path.isfile(DB_PATH) else None
+    if conn is not None:
+        version = conn.execute('PRAGMA user_version').fetchone()[0]
+        if version > 400:
+            conn.close()
+            raise UserError('数据库版本高于本服务端')
+        if version == 400:
+            with conn:
+                ensure_active_windows(conn)
+            return conn
+        conn.close()
+    conn = init_db_v030()
+    agent_v3.migrate(_module(), conn)
     return conn
 
 
@@ -509,7 +531,9 @@ def get_chain(conn, chain_id):
 
 
 def delete_node(conn, node_id):
-    table = node_table(get_node(conn, node_id)["kind"])
+    node = get_node(conn, node_id)
+    table = node_table(node["kind"])
+    conn.execute('INSERT OR REPLACE INTO archived_nodes VALUES (?,?,?)', (node_id,node['name'],int(time.time())))
     conn.execute("DELETE FROM retired_ports WHERE node_id = ?", (node_id,))
     conn.execute("DELETE FROM sync_ops WHERE node_id = ?", (node_id,))
     conn.execute(f"DELETE FROM {table} WHERE id = ?", (node_id,))
@@ -517,6 +541,8 @@ def delete_node(conn, node_id):
     conn.execute("DELETE FROM active_windows WHERE node_id = ?", (node_id,))
     conn.execute("DELETE FROM events WHERE node_id = ?", (node_id,))
     conn.execute("DELETE FROM chain_pending WHERE node_id = ?", (node_id,))
+    for table in ('node_snapshots', 'metric_windows', 'metric_hours', 'agent_switches'):
+        conn.execute(f'DELETE FROM {table} WHERE node_id=?', (node_id,))
     finish_deleted_chains(conn)
 
 
@@ -1090,7 +1116,7 @@ def node_status(conn, node, now):
                               or node["state"] != "ok") else "synced"
     if not node["first_seen"]:
         return "new"
-    if now - node["last_seen"] > OFFLINE_AFTER:
+    if now - node["last_seen"] > (30 if node["installed_agent"] == "active" else OFFLINE_AFTER):
         return "offline"
     if node["skew"] is not None and abs(node["skew"]) > MAX_SKEW:
         return "skew"
@@ -1199,6 +1225,8 @@ def sync_report(conn, node, fields, source_ip, now=None):
         return f'time={now}\n'
     proto = fields.get('proto') == '2'
     source, phase = fields.get('source'), fields.get('phase')
+    if fields.get('agent_kind') == 'passive' and node['desired_mode'] == 'active':
+        return 'proto=2\naction=switch\nmode=active\n'
     if proto and phase in ('poll', 'begin') and node['state'] == 'error' and port_error(node['err']):
         health, err = 'error', node['err']
     if proto and (source not in ('manual','auto') or phase not in ('begin','poll','ack','asset')):
@@ -1439,10 +1467,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.execute('BEGIN IMMEDIATE')
                 node = conn.execute('SELECT * FROM nodes WHERE key=?', (candidate['key'],)).fetchone()
                 if node:
-                    out = sync_report(conn, node, fields, self.source_ip())
+                    if fields.get('manage'):
+                        out = agent_v3.manage(_module(), conn, node, fields)
+                    else:
+                        out = sync_report(conn, node, fields, self.source_ip())
                 else:
                     receipt = conn.execute('SELECT * FROM deleted_receipts WHERE key=? AND expires>=?',
                                            (candidate['key'], int(time.time()))).fetchone()
+                    if (receipt and fields.get('manage') == 'commit' and fields.get('op') == receipt['op']
+                            and fields.get('target') == receipt['mode'] and fields.get('t','').isdigit()
+                            and abs(int(fields['t'])-int(time.time())) <= MAX_SKEW):
+                        out = 'proto=2\nresult=deleted\n'
                     if (receipt and fields.get('proto')=='2' and fields.get('phase')=='ack' and fields.get('state')=='ok'
                             and fields.get('op')==receipt['op'] and fields.get('v')==receipt['hash']
                             and fields.get('generation')==str(receipt['generation']) and fields.get('mode')==receipt['mode']
@@ -1644,7 +1679,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "last_seen": n["last_seen"], "desired_mode": n["desired_mode"], "reported_mode": n["reported_mode"],
                 "manual_required": bool(n["manual_required"]), "protocol_version": n["protocol_version"],
                 "desired_generation": n["desired_generation"], "applied_generation": n["applied_generation"],
-                "err": n["err"]}
+                "err": n["err"], "installed_agent": n["installed_agent"], "backend": n["backend"],
+                "connection_state": n["connection_state"]}
 
     def api_nodes(self, conn, body):
         now = int(time.time())
@@ -1697,13 +1733,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "public_url": setting(conn, "public_url", ""),
             "agent_url": AGENT_URL,
             "version": VERSION,
-            "forward_version": FORWARD_VERSION,
+            "forward_version": COMPONENTS.get(n['installed_agent'] + '_agent', FORWARD_VERSION),
+            "installer_url": f"https://github.com/{REPO}/releases/download/v{VERSION}/install-agent.sh",
+            "telemetry": agent_v3.telemetry(conn, node_id),
             "node": {
                 **self.node_brief(conn, n, now), "bar": node_bar(conn, n, now), "key": n["key"],
                 "first_seen": n["first_seen"], "src_ip": n["src_ip"], "skew": n["skew"], "agent": n["agent"],
                 "reported_v": n["reported_v"], "want_v": rules_version(node_rules(conn, n)),
                 "state": n["state"], "err": n["err"], "group": group["name"],
-                "agent_update": agent_update(n["agent"], n["auto_update"]),
+                "agent_update": (agent_update(n["agent"], n["auto_update"]) if n['installed_agent'] == 'legacy' else
+                    'pending' if agent_v3.newer(COMPONENTS[n['installed_agent'] + '_agent'], n['agent']) else 'same'),
             },
             "rules": rules,
             "chains": [{"id": c["id"], "remark": c["remark"]} for c in chains],
@@ -2072,13 +2111,12 @@ def cmd_serve(args):
     Handler.sync_path = setting(conn, "sync_path")
     Handler.panel_path = setting(conn, "panel_path")
     host, _, port = args.listen.rpartition(":")
-    server = LimitedHTTPServer((host or "0.0.0.0", int(port)), Handler)
     print(f"ictl-server {VERSION} 监听 {args.listen}", flush=True)
     print_info(conn, args.listen)
-    sys.stdout.flush()
     conn.close()
-    threading.Thread(target=cleanup_loop, daemon=True).start()
-    server.serve_forever()
+    import transport
+    transport.serve(_module(), host or "0.0.0.0", int(port))
+
 
 
 def cmd_info(args):
@@ -2092,7 +2130,7 @@ def cmd_info(args):
 def cmd_health(args):
     conn = read_db()
     try:
-        if conn.execute('PRAGMA user_version').fetchone()[0] != 300:
+        if conn.execute('PRAGMA user_version').fetchone()[0] != 400:
             raise UserError('数据库尚未就绪')
         path = setting(conn, 'panel_path') + '/'
     finally:

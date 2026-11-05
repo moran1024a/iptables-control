@@ -1,8 +1,10 @@
 # iptables-control（ictl）
 
-轻量的 IPv4 端口转发管理工具，通过 Web 面板统一管理多台服务器的 iptables 转发规则，也可以使用 `ipt.sh` 在单台服务器上独立管理。
+轻量的 IPv4 端口转发管理工具，通过 Web 面板统一管理多台服务器的端口转发规则，也可以使用 `ipt.sh` 在单台服务器上独立管理。
 
-支持多跳链路、SS／SS2022／VLESS Reality 目标、主动与被动同步，以及 Agent 与单机脚本共存。转发节点无需安装代理核心，目标服务需自行准备。
+支持多跳链路、SS／SS2022／VLESS Reality 目标、主动与被动同步，以及 Agent 与单机脚本共存。
+
+**当前开发版：0.4.0-rc.1（测试版）**。主动节点改用 Go + nftables 和长连接；被动节点保留 Bash + iptables。正式版仍为 0.3.1，RC 不更新 `latest`。转发节点无需安装代理核心，目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -10,6 +12,7 @@
 
 - [安装](#安装)
 - [升级](#升级)
+- [切换主动与被动](#切换主动与被动)
 - [卸载与删除](#卸载与删除)
 - [使用指南](#使用指南)
 - [单机脚本与共存](#单机脚本与共存)
@@ -21,14 +24,14 @@
 
 ## 安装
 
-按使用场景选择：管理多台服务器，安装**服务端 + 节点 Agent**；只管理本机转发，安装**单机脚本**即可。以下命令下载最新 Release。
+按使用场景选择：管理多台服务器，安装**服务端 + 节点 Agent**；只管理本机转发，安装**单机脚本**即可。以下命令固定使用本次 RC，需对应 Release 发布后才能下载；稳定版请使用 [0.3.1 文档](https://github.com/moran1024a/iptables-control/tree/v0.3.1)。
 
 ### 服务端
 
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.1/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -36,14 +39,18 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/downlo
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.1/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
-公网访问建议配置 HTTPS 反向代理，转发至服务端的实际端口（默认 `8730`），并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址，再接入节点。
+新主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口（默认 `8730`），并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址，再接入节点。
 
 ### 节点 Agent
 
-节点需要使用 systemd 的 Linux 系统，并以 root 权限安装。依赖 Bash、curl、openssl 1.1.1+、iptables（含 save／restore、addrtype、conntrack）、ss（iproute2）、getent 和 flock；缺少时请通过系统包管理器安装。
+节点需要使用 systemd 的 Linux，并以 root 权限安装。
+
+- **主动**：amd64／arm64，Linux 5.10+、nftables 1.0+、iproute2、conntrack-tools，使用 HTTPS／WSS。
+- **被动**：Bash、iptables（含 save／restore、addrtype、conntrack）、iproute2、getent。
+- 两者都需要 curl、openssl 1.1.1+ 和 flock。安装器可在 Debian／Ubuntu 安装缺少的依赖，其他系统请先自行安装。
 
 1. 在面板“节点 → 新增节点”中填写名称、入站 IPv4／域名、允许的入站端口，首次使用可保留“主动”模式。
 2. 打开节点详情，复制“一键接入”命令，在**对应节点服务器**执行。
@@ -56,7 +63,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/downlo
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.1/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -76,20 +83,32 @@ sudo bash /root/ipt.sh
 
 ### 节点 Agent 升级
 
-主动节点在开启“自动更新”时，会跟随服务端更新 Agent；被动节点需手动同步才会检查更新。也可以在节点直接执行：
+**服务端升级不会把旧 Bash Agent 自动替换为 Go。** 旧节点继续使用 Agent 0.2.1；要迁移到本次 RC，请在节点详情中重新复制“一键接入”命令执行。安装器保留节点身份和配置，并根据面板所选模式安装对应 Agent。
+
+已完成迁移的节点可执行：
 
 ```bash
-sudo ictl --update
-sudo ictl --sync
+sudo ictl --update  # 只更新当前类型
+sudo ictl --sync    # 同步配置，或确认面板要求的类型切换
 ```
 
-下载较慢时可使用 `sudo ictl --update --mirror`。运行 `sudo ictl`，选择菜单 5 可开关自动更新。
+新版主动 Agent 在 `AUTO_UPDATE=1` 时接受同类型更新通知；被动节点仅在本机手动操作时更新。可在 `/etc/ictl/agent.conf` 将 `AUTO_UPDATE` 设为 `0` 关闭主动自动更新，随后重启 `ictl-agent`。手动 `--update` 不受此开关限制。
 
-从旧协议版本升级的节点默认主动模式，升级并成功同步后才能切换；后续升级保留已选模式。Agent 0.2.1 起会整理 `/root/ictl.sh`、`/ictl.sh` 中可识别的旧版脚本，使这些旧入口运行新版，配置和转发规则保留。
+迁移会替换可识别的 `/root/ictl.sh`、`/ictl.sh` 旧入口，使其指向新版 `ictl`。后端交接期间允许短暂断线；已有防火墙若默认拒绝 FORWARD，需要先明确放行自己的转发范围。
 
 ### 单机脚本升级
 
 重新执行[单机脚本安装命令](#单机脚本)。**如果原脚本不在 `/root/ipt.sh`，请将命令中的安装路径改为原路径**，保证开机任务和定时任务运行新版。更新后进入菜单检查转发列表。
+
+## 切换主动与被动
+
+1. 在面板编辑节点，选择目标模式并保存。
+2. 到该节点运行 `sudo ictl --sync`，或在 `sudo ictl` 菜单选择“同步更新／确认切换”。
+3. 等待显示确认成功，再检查面板状态。
+
+主动切被动时，收到通知的 Agent 会停止管理通信和采集，现有规则继续转发；若节点已经失联，停用通知需等重新连接后才能送达。被动切主动完全依靠本机操作。**两种方向都要替换 Agent 程序，不能只修改本地模式文件。**
+
+切换工具先准备组件与配置，再备份、交接规则，最后向服务端确认。下载失败不动旧规则；交接失败尝试恢复。确认响应丢失时，重新运行 `sudo ictl --sync`；提示交接中断时，按提示运行 `sudo ictl --recover` 后重试。首次安装尚未生成 `ictl` 时，可用 `sudo bash /usr/local/lib/ictl/manage.sh --recover`。
 
 ## 卸载与删除
 
@@ -98,7 +117,7 @@ sudo ictl --sync
 删除容器和镜像，保留数据卷，之后可重新安装恢复使用：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/latest/download/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.1/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；若要完整停用，请先处理节点。
@@ -156,15 +175,21 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 | 行为 | 主动模式 | 被动模式 |
 | --- | --- | --- |
-| 配置同步 | 每 5–10 秒自动检查 | 仅本机手动同步 |
+| 配置同步 | WSS 长连接，配置变更即时推送 | 仅本机手动同步 |
 | 面板修改后 | 自动获取并应用 | 保持“等待中”，直到同步成功 |
-| 开机后 | 恢复规则并继续轮询 | 只恢复已应用规则，不联网、不刷新域名 |
+| 开机后 | 离线恢复规则，然后建立管理连接 | 只恢复已应用规则，不联网、不刷新域名 |
 | 状态条 | 每格 20 秒，显示最近 20 分钟 | 每格 60 秒，显示最近 1 小时；白底，手动同步时标绿 |
-| 长时间无上报 | 超过 120 秒显示离线 | 不因时间流逝判离线 |
+| 长时间无上报 | 新主动 30 秒；旧版轮询 120 秒 | 不因时间流逝判离线 |
 
-在面板编辑节点的“同步模式”并保存后，需到节点执行 `sudo ictl --sync`，或运行 `sudo ictl` 选择菜单 3“同步更新”。**两个方向的模式切换都需要本机同步确认。** 主动切被动时，节点收到切换要求后停止后台同步；被动切主动时，手动同步成功后恢复轮询。
+模式切换见[切换主动与被动](#切换主动与被动)。同步先上报，再获取并应用配置，最后上报结果。失败原因见节点详情和事件；被动状态条的绿色只表示发生了同步，是否成功以状态和事件为准。
 
-同步会先上报状态，再获取并应用配置，最后上报结果。失败时查看节点详情中的错误和事件，处理后再次同步。被动状态条的绿色只表示发生了同步，是否成功以状态和事件为准。
+### 主动节点的数据与诊断
+
+节点详情可查看 CPU、内存、磁盘、网卡速率、端口快照和转发流量；每 10 秒采集主要指标，端口每 30 秒更新，基础信息每 60 秒更新。也可以请求系统、端口、网络、规则、最近日志，以及对当前转发的连接查询和目标诊断。断线期间本地累计流量保留，重连后补报；普通配置切换不会清空累计值。
+
+流量按**本节点、每条转发、TCP／UDP、上下行**分别统计 IPv4 字节，包含协议头和重传。它不是应用下载量，也不是全机网卡流量；多跳不要直接相加。数字以整数保存，重复上报不会重复累加。意外掉电、外部清零或 flowtable 卸载可能造成缺口，可识别的缺口会在面板标明，不能当作完整账单。被动模式不新增采集，历史值保留。
+
+本次仍使用手动链路，不包含池、自动择路或自动灾备。
 
 ## 单机脚本与共存
 
@@ -195,7 +220,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 - **Agent**：拒绝本次新配置，保留原规则，并在同步上报后让面板显示“异常”。到“配置 → 编辑”修改冲突节点对应的端口，再等待主动同步或执行手动同步。
 - **单机脚本**：提示冲突并取消本次操作，返回菜单。修改端口后重新操作即可。
 
-服务端不收集本机端口清单，也不会自动换端口。同一份冲突配置不会被 Agent 自动反复应用；如果已通过移除其他占用解决冲突，请运行 `sudo ictl --sync` 重新检查。仅停止另一方服务不会释放它已保存的端口，需删除或修改对应配置。
+新版主动 Agent 会采集端口供查看，但服务端仍照常下发配置，由本机最终检查，不会自动换端口。同一份冲突配置不会被 Agent 自动反复应用；如果已通过移除其他占用解决冲突，请运行 `sudo ictl --sync` 重新检查。仅停止另一方服务不会释放它已保存的端口，需删除或修改对应配置。
 
 ## 常用命令
 
@@ -235,7 +260,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 **升级后需要回退怎么办？**
 
-Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-deploy-*.bak`，0.3.0 迁移还会在数据库旁保留 `ictl.db.pre-0.3.0.bak`。人工回退需停止服务，恢复升级前数据库及对应旧镜像，移除新数据库的 `-wal`／`-shm` 文件后再启动；回退会丢弃升级后的数据。源码部署或自定义数据库路径需自行备份和恢复。
+Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-deploy-*.bak`，0.4.0 迁移还会在数据库旁保留 `ictl.db.pre-0.4.0.bak`。人工回退需停止服务，恢复升级前数据库及对应旧镜像，移除新数据库的 `-wal`／`-shm` 文件后再启动；回退会丢弃升级后的数据。源码部署或自定义数据库路径需自行备份和恢复。
 
 ## 开发与贡献
 
@@ -244,9 +269,14 @@ Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-de
 <details>
 <summary>源码运行与开发检查</summary>
 
-服务端需要 Python 3.10+、SQLite 3.35+ 和 openssl。在仓库根目录运行以下命令，数据库将保存在当前用户目录中：
+服务端需要 Python 3.10+、SQLite 3.35+、openssl 和 `server/requirements.txt` 中的依赖。主动二进制使用 `agent/active/go.mod` 指定的 Go 版本构建。在仓库根目录运行以下命令，数据库将保存在当前用户目录中：
 
 ```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r server/requirements.txt
+mkdir -p dist
+(cd agent/active && CGO_ENABLED=0 go build -o ../../dist/ictl-active-linux-amd64 .)
 ICTL_DB="$HOME/.local/share/ictl/ictl.db" python3 server/ictl-server.py serve --listen 127.0.0.1:8730
 ```
 
@@ -258,10 +288,18 @@ ICTL_DB="$HOME/.local/share/ictl/ictl.db" python3 server/ictl-server.py serve --
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests
 python3 deploy/check-versions.py
 node --check server/web/app.js
-for file in agent/ictl.sh deploy/install-server.sh ipt.sh; do bash -n "$file"; done
+(cd agent/active && go test ./...)
+for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
 ```
 
-测试中的 iptables、systemd 和 Docker 使用模拟命令，涉及实际系统行为的变更仍需在 Linux 环境验证。
+常规测试中的 iptables、systemd 和 Docker 使用模拟命令。Linux 上可额外运行隔离网络测试（需要 root、iproute2、nftables、conntrack）：
+
+```bash
+(cd agent/active && go build -o /tmp/ictl-active .)
+sudo unshare -nm env ICTL_KERNEL_TEST=1 python3 tests/kernel_network.py /tmp/ictl-active
+```
+
+该测试在新的网络和挂载命名空间内执行，检查真实转发、计数、冲突与清理。
 
 </details>
 
@@ -269,9 +307,9 @@ for file in agent/ictl.sh deploy/install-server.sh ipt.sh; do bash -n "$file"; d
 
 | 组件 | 当前版本 |
 | --- | --- |
-| 服务端 | 0.3.1 |
-| 节点 Agent | 0.2.1 |
-| 单机脚本 | 3.1 |
+| 服务端／主动 Agent／被动 Agent／管理器 | 0.4.0-rc.1 |
+| 旧版兼容 Agent | 0.2.1 |
+| 单机脚本 | 3.2-rc.1 |
 
 各组件版本号独立维护，具体变化见 [CHANGELOG.md](CHANGELOG.md)。
 

@@ -47,7 +47,7 @@ class MigrationTests(Fixture, unittest.TestCase):
     def test_202_mixed_migration_exact_scope_and_idempotence(self):
         old,before=self.legacy();secret=old.execute('SELECT params FROM tunnels WHERE id=8').fetchone()[0]
         old.close();self.db=s.init_db()
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],300)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],400)
         self.assertEqual(s.node_rules(self.db,s.get_node(self.db,10)),before[3:])
         self.assertEqual(s.get_target(self.db,8)['params'],secret)
         self.assertEqual([r[0] for r in self.db.execute('SELECT id FROM chains ORDER BY id')],[8,9,11,12])
@@ -63,7 +63,7 @@ class MigrationTests(Fixture, unittest.TestCase):
 
     def test_201_migration_path(self):
         c,_=self.legacy(201);c.close();self.db=s.init_db()
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],300)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],400)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM targets').fetchone()[0],2)
 
     def test_200_preserves_unchanged_applied_forwarding_and_removes_tunnel_nodes(self):

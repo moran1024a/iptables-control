@@ -84,6 +84,13 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(document.querySelector('[name=desired_mode]').value==='passive',"mode selection wrong");closeModal();
   await show(r=>nodeDetail(1,r),false);
   assert(app.textContent.includes('sudo ictl --sync'),"manual action hint missing");
+  node.installed_agent='active';node.backend='nftables';node.desired_mode='active';
+  responses['nodes/1'].telemetry={metrics_at:100,inventory:{kernel:'test-kernel',arch:'amd64'},metrics:{cpu_percent:12.5},traffic:[{rule_id:1,protocol:'tcp',up:'18446744073709551615',down:'10',quality:'ok'}]};
+  await show(r=>nodeDetail(1,r),false);
+  assert(app.textContent.includes('test-kernel') && app.textContent.includes('转发累计流量'),"active telemetry missing");
+  assert(document.querySelector('[title="18446744073709551615 字节"]'),"traffic integer lost precision");
+  assert(document.querySelector('[data-action=node-query]'),"query actions missing");
+  node.desired_mode='passive';
   node.status='error';node.err='端口冲突：TCP 10001 已被本机服务占用';
   await show(r=>nodeDetail(1,r),false);
   assert(app.textContent.includes('异常')&&app.textContent.includes(node.err),"conflict detail missing");

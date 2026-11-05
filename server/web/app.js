@@ -530,7 +530,7 @@ async function nodeDetail(id, request) {
   const url = syncAddress(d.public_url, d.sync_path);
   const shown = revealedKeys.has(id);
   const quote = (value) => "'" + String(value).replaceAll("'", "'\\''") + "'";
-  const install = (key) => `(f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL ${quote(d.agent_url)} -o "$f" && sudo bash "$f" --url ${quote(url)} --key ${quote(key)})`;
+  const install = (key) => `(f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL ${quote(d.installer_url || d.agent_url)} -o "$f" && sudo bash "$f" --url ${quote(url)} --key ${quote(key)}${d.installer_url ? ` --kind ${quote(n.desired_mode)}` : ""})`;
 
   const rules = d.rules.length
     ? `<table><thead><tr><th>入站端口</th><th>转发到</th><th>所属转发</th></tr></thead><tbody>${d.rules.map((r) => `
@@ -545,6 +545,8 @@ async function nodeDetail(id, request) {
     <span>时差</span><span>${skew}</span>
     <span>节点端版本</span><span>${esc(n.agent || "-")}${AGENT_UPDATE[n.agent_update]
       ? `<span class="muted">（目标转发 Agent 为 ${esc(d.forward_version)}，${(n.desired_mode === "passive" && n.agent_update === "pending") ? "等待本机手动同步时更新" : AGENT_UPDATE[n.agent_update]}）</span>` : ""}</span>
+    <span>已安装组件</span><span>${esc(n.installed_agent || "legacy")} / ${esc(n.backend || "iptables")}</span>
+    <span>管理连接</span><span>${esc(n.connection_state || "旧版轮询")}</span>
     <span>确认进度</span><span>${n.applied_generation} / ${n.desired_generation}</span>
     <span>已应用版本</span><span class="mono">${esc(n.reported_v || "-")}</span>
     <span>应有版本</span><span class="mono">${esc(n.want_v)}</span>
@@ -579,9 +581,10 @@ async function nodeDetail(id, request) {
         <button class="small" data-action="copy" data-text="${esc(n.key)}">复制</button></div>
       <div class="kv"><span>一键接入</span><code>${esc(install(shown ? n.key : "••••••"))}</code>
         <button class="small" data-action="copy" data-text="${esc(install(n.key))}">复制</button></div>
-      <p class="hint">在节点上执行一键接入命令即可完成安装和接入；也可以运行 <code>sudo ictl</code>，选择 1 手动填写同步地址和密钥。</p>
+      <p class="hint">在对应节点执行一键接入命令。旧节点升级或切换类型也使用此入口，保留节点身份；新主动 Agent 需要 HTTPS。</p>
     </div>
     <div class="panel"><h2>转发规则<span class="count">允许端口 ${esc(n.ports)}</span></h2>${rules}</div>
+    ${telemetryPanel(d)}
     <div class="actions">
       <button data-action="node-edit">编辑</button>
       <button data-action="node-rekey">重置密钥</button>
@@ -591,6 +594,43 @@ async function nodeDetail(id, request) {
     </div>
     ${detailsBlock(`more-${id}`, "更多信息", more)}
     ${detailsBlock(`events-${id}`, "事件记录", events)}`);
+}
+
+function bytesText(value) {
+  if (value == null || value === "") return "-";
+  try {
+    let n = BigInt(value || 0), unit = 1n;
+    for (const suffix of ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]) {
+      if (n < unit * 1024n || suffix === "PiB") return `${n * 100n / unit / 100n}.${String(n * 100n / unit % 100n).padStart(2, "0")} ${suffix}`;
+      unit *= 1024n;
+    }
+  } catch (_) { return "-"; }
+}
+
+function telemetryPanel(d) {
+  const n = d.node, t = d.telemetry || {}, m = t.metrics || {}, inv = t.inventory || {};
+  if (n.installed_agent !== "active" && !(t.traffic || []).length) return "";
+  const names = new Map(d.rules.map(r => [r.id, r.chain_remark]));
+  const traffic = (t.traffic || []).map(r => `<tr><td>${esc(names.get(r.rule_id) || `历史规则 ${r.rule_id}`)}</td><td>${esc(r.protocol)}</td><td title="${esc(r.up)} 字节">${bytesText(r.up)}</td><td title="${esc(r.down)} 字节">${bytesText(r.down)}</td><td>${esc(r.quality)}</td></tr>`).join("");
+  const mem = m.memory || {};
+  const net = Object.entries(m.interfaces || {}).map(([name,v]) => `<tr><td>${esc(name)}</td><td>${bytesText(v.rx_bytes)}</td><td>${bytesText(v.tx_bytes)}</td><td>${v.rx_bytes_per_second == null ? "-" : bytesText(Math.round(v.rx_bytes_per_second)) + "/s"}</td><td>${v.tx_bytes_per_second == null ? "-" : bytesText(Math.round(v.tx_bytes_per_second)) + "/s"}</td></tr>`).join("");
+  const ports = ((t.ports || {}).rows || []).slice(0,100).map(p => `<tr><td>${esc(p.source)}</td><td>${esc(p.protocol)}</td><td>${esc(p.port)}</td><td>${esc(p.address || p.target || "-")}</td></tr>`).join("");
+  const queries = [["inventory","系统信息"],["ports","端口详情"],["network","网络信息"],["rules","当前规则"],["logs","最近日志"]];
+  const history = (t.history || []).slice(-20).map(r => `<tr><td>${fmtTime(r.time)}</td><td>${r.data.values?.cpu_percent ? Number(r.data.values.cpu_percent.mean).toFixed(1) + "%" : "-"}</td><td>${r.data.values?.memory_used_percent ? Number(r.data.values.memory_used_percent.mean).toFixed(1) + "%" : "-"}</td><td>${r.data.samples}</td></tr>`).join("");
+  const buttons = n.installed_agent === "active" && n.desired_mode === "active" ? queries.map(([kind,label]) => `<button class="small" data-action="node-query" data-kind="${kind}">${label}</button>`).join("") : "";
+  const diagnostics = n.installed_agent === "active" && n.desired_mode === "active" ? d.rules.map(r => `<button class="small" data-action="node-query" data-kind="diagnose" data-rule="${r.id}">诊断 ${esc(r.chain_remark)}</button><button class="small" data-action="node-query" data-kind="connections" data-rule="${r.id}">连接 ${esc(r.chain_remark)}</button>`).join("") : "";
+  return `<div class="panel"><h2>主动 Agent 采集</h2><p class="hint">最近采样 ${fmtTime(t.metrics_at)}；离线或切为被动后保留历史值，不代表实时状态。</p>
+    <div class="kv-grid"><span>内核 / 架构</span><span>${esc(inv.kernel || "-")} / ${esc(inv.arch || "-")}</span>
+    <span>CPU</span><span>${m.cpu_percent == null ? "-" : Number(m.cpu_percent).toFixed(1) + "%"}</span>
+    <span>内存可用 / 总量</span><span>${bytesText(mem.MemAvailable)} / ${bytesText(mem.MemTotal)}</span>
+    <span>磁盘可用 / 总量</span><span>${bytesText(m.disk?.available)} / ${bytesText(m.disk?.total)}</span>
+    <span>连接跟踪</span><span>${esc(m.conntrack_count || "-")} / ${esc(m.conntrack_max || "-")}</span></div>
+    ${m.traffic_quality ? `<p class="t-yellow">${esc(m.traffic_quality)}</p>` : ""}
+    <h3>转发累计流量</h3><p class="hint">按本节点每条规则的 IPv4 转发字节计数，包含协议头及重传；多跳分别计数。上行为入口到目标，下行为目标返回。主机网卡流量见下表。</p>
+    <table><thead><tr><th>规则</th><th>协议</th><th>上行</th><th>下行</th><th>计数状态</th></tr></thead><tbody>${traffic || '<tr><td colspan="5">等待采集</td></tr>'}</tbody></table>
+    ${detailsBlock(`network-${n.id}`, "网卡与端口", `<table><thead><tr><th>网卡</th><th>接收</th><th>发送</th><th>接收速率</th><th>发送速率</th></tr></thead><tbody>${net}</tbody></table><p>端口快照（最多显示 100 条）</p><table><thead><tr><th>来源</th><th>协议</th><th>端口</th><th>地址</th></tr></thead><tbody>${ports}</tbody></table>`)}
+    ${detailsBlock(`history-${n.id}`, "最近 20 分钟（采样均值）", `<table><thead><tr><th>时间</th><th>CPU</th><th>内存使用率</th><th>样本数</th></tr></thead><tbody>${history}</tbody></table><p class="hint">缺失的时间段没有采样，不按零处理。</p>`)}
+    <div class="actions">${buttons}${diagnostics}</div></div>`;
 }
 
 // ------------------------------------------------------------ 转发
@@ -712,7 +752,9 @@ async function settingsPage(request) {
         <span>同步路径</span><span class="mono">${esc(s.sync_path)}</span>
         <span>面板路径</span><span class="mono">${esc(s.panel_path)}/</span>
         <span>服务端</span><span>${esc(s.version)}</span>
-        <span>转发 Agent</span><span>${esc(s.components.forward_agent)}</span>
+        <span>主动 Agent</span><span>${esc(s.components.active_agent || "-")}</span>
+        <span>被动 Agent</span><span>${esc(s.components.passive_agent || "-")}</span>
+        <span>旧版兼容 Agent</span><span>${esc(s.components.forward_agent)}</span>
       </div>
     </div>`);
 }
@@ -781,7 +823,7 @@ async function nodeForm(node) {
       <label><span>允许的入站端口（端口或范围，多个用逗号分隔，如 10000-20000,30000）</span>
         <input name="ports" value="${esc(node?.ports ?? "10000-65535")}" class="mono" required></label>
       <label><span>同步模式</span><select name="desired_mode" ${node?.first_seen && node.protocol_version < 2 ? "disabled" : ""}>
-        <option value="active" ${node?.desired_mode !== "passive" ? "selected" : ""}>主动（自动轮询）</option>
+        <option value="active" ${node?.desired_mode !== "passive" ? "selected" : ""}>主动（长连接自动同步）</option>
         <option value="passive" ${node?.desired_mode === "passive" ? "selected" : ""}>被动（仅本机手动同步）</option>
       </select></label>
       <p class="hint">${node?.first_seen && node.protocol_version < 2 ? "请先升级 Agent 并同步一次，才能切换模式。" : "切换模式后需在本机运行 sudo ictl --sync 确认；被动转主动也需要本机操作。"}</p>
@@ -993,6 +1035,11 @@ const ACTIONS = {
 
   "node-new": () => nodeForm(),
   "node-edit": () => nodeForm(currentNode),
+  async "node-query"(el) {
+    const id = currentNode.id;
+    const result = await api("POST", `nodes/${id}/query`, {kind:el.dataset.kind, rule_id:Number(el.dataset.rule || 0)});
+    openModal(`<h2>节点查询结果</h2><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(JSON.stringify(result.data || result, null, 2))}</pre><button data-action="modal-close">关闭</button>`);
+  },
 
   "key-toggle"() {
     const id = currentNode.id;

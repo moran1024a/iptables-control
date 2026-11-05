@@ -15,7 +15,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="0.3.1"
+VERSION="0.4.0-rc.1"
 REGISTRY="ghcr.io"
 MIRROR_REGISTRY="ghcr.nju.edu.cn"
 REPO="moran1024a/ictl-server"
@@ -73,12 +73,23 @@ if [ "$UNINSTALL" -eq 1 ]; then
   exit 0
 fi
 
+# Stable releases sort after RCs with the same numeric base.
+version_gt() {
+  local left="${1%%-*}" right="${2%%-*}"
+  if [ "$left" != "$right" ]; then
+    [ "$(printf '%s\n%s\n' "$left" "$right" | sort -V | tail -n 1)" = "$left" ]
+  elif [ "$1" = "$2" ]; then return 1
+  elif [[ "$1" != *-* ]]; then return 0
+  elif [[ "$2" != *-* ]]; then return 1
+  else [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]; fi
+}
+
 # 已有容器：读取版本和端口绑定
 BIND_IP=""
 if current_image="$(docker container inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null)"; then
   current="${current_image##*:}"
   if [ "$FORCE" -eq 0 ] && [ "$current" != "$VERSION" ] &&
-    [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n 1)" = "$current" ]; then
+    version_gt "$current" "$VERSION"; then
     die "当前版本 $current 比本脚本的版本 $VERSION 新，未做改动。若通过加速代理下载，可能拿到了缓存的旧脚本，请稍后重试；确需降级请加 --force。"
   fi
   [ "${current_image%%/*}" = "$MIRROR_REGISTRY" ] && REGISTRY="$MIRROR_REGISTRY"

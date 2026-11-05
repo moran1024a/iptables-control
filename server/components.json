@@ -1,6 +1,11 @@
 {
-  "api": 2,
-  "server": "0.3.1",
+  "api": 3,
+  "supported_apis": [2, 3],
+  "server": "0.4.0-rc.1",
   "forward_agent": "0.2.1",
-  "standalone": "3.1"
+  "legacy_agent": "0.2.1",
+  "active_agent": "0.4.0-rc.1",
+  "passive_agent": "0.4.0-rc.1",
+  "manager": "0.4.0-rc.1",
+  "standalone": "3.2-rc.1"
 }

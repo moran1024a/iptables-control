@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-VERSION=3.1
+VERSION=3.2-rc.1
 SELF_PATH="$(readlink -f -- "$0")"
 
 error() { printf '错误：%s\n' "$*" >&2; }
@@ -411,6 +411,95 @@ def rule_conflict(snap, proto, port, owned):
         return None
     return visit('nat', 'PREROUTING', set()) or visit('mangle', 'PREROUTING', set())
 
+def native_snapshot():
+    import shutil
+    if not shutil.which('nft'):
+        return {'nftables': []}
+    try:
+        return json.loads(command(['nft', '-j', 'list', 'ruleset']).stdout)
+    except (ValueError, TypeError) as exc:
+        raise Failure('无法解析原生 nftables 规则') from exc
+
+def native_conflict(doc, proto, port):
+    chains, sets, starts = {}, {}, []
+    port = int(port)
+    def includes(value):
+        if isinstance(value, int):
+            return value == port
+        if isinstance(value, str):
+            if value.startswith('@'):
+                return includes(sets.get((scope[0], scope[1], value[1:])))
+            return not value.isdigit() or int(value) == port
+        if isinstance(value, list):
+            return any(includes(x) for x in value)
+        if isinstance(value, dict):
+            if 'range' in value:
+                lo, hi = value['range']
+                return int(lo) <= port <= int(hi)
+            for key in ('set', 'elem', 'val'):
+                if key in value:
+                    return includes(value[key])
+        return True
+    def proto_match(value):
+        if isinstance(value, dict):
+            return proto_match(value.get('set'))
+        if isinstance(value, list):
+            return any(proto_match(x) for x in value)
+        return str(value) in (proto, '6' if proto == 'tcp' else '17')
+    for entry in doc.get('nftables', []):
+        for kind, obj in entry.items():
+            if not isinstance(obj, dict) or obj.get('family') not in ('ip', 'inet'):
+                continue
+            base = (obj['family'], obj.get('table'))
+            if kind == 'chain' and obj.get('hook') == 'prerouting':
+                starts.append(base + (obj['name'],))
+            elif kind == 'rule':
+                chains.setdefault(base + (obj['chain'],), []).append(obj)
+            elif kind in ('set', 'map'):
+                sets[base + (obj['name'],)] = obj.get('elem')
+    scope = (None, None)
+    def visit(key, seen):
+        nonlocal scope
+        if key in seen:
+            return None
+        seen = seen | {key}
+        for rule in chains.get(key, []):
+            # Our iptables-nft rules are already excluded by the legacy scanner.
+            if str(rule.get('comment', '')).startswith(PREFIX):
+                continue
+            scope = key[:2]
+            possible = True
+            expressions = rule.get('expr', [])
+            for expression in expressions:
+                m = expression.get('match', {})
+                left, right = m.get('left', {}), m.get('right')
+                known = False
+                if isinstance(left, dict) and left.get('meta', {}).get('key') == 'l4proto':
+                    okay, known = proto_match(right), True
+                elif isinstance(left, dict) and left.get('payload', {}).get('field') == 'dport':
+                    p = left['payload'].get('protocol')
+                    if p in ('tcp', 'udp') and p != proto:
+                        possible = False
+                    okay, known = includes(right), True
+                if known and m.get('op') in ('==', 'in', '!='):
+                    possible = possible and (not okay if m['op'] == '!=' else okay)
+            if not possible:
+                continue
+            for expression in expressions:
+                if any(k in expression for k in ('dnat', 'redirect', 'tproxy', 'vmap')):
+                    return '/'.join(key)
+                for jump in ('jump', 'goto'):
+                    if jump in expression:
+                        result = visit(key[:2] + (expression[jump]['target'],), seen)
+                        if result:
+                            return result
+        return None
+    for start in starts:
+        result = visit(start, set())
+        if result:
+            return result
+    return None
+
 def sockets(proto):
     flags = '-lntp' if proto == 'tcp' else '-aunp'
     output = command(['ss', '-H', flags]).stdout
@@ -437,6 +526,7 @@ def check_conflicts(check_rows, all_rows, snap, owned):
     if not check_rows:
         return  # Removing our own entries must remain possible when the peer is damaged.
     reserved = agent_ports()
+    native = native_snapshot()
     used = {p: sockets(p) for p in {p for r in check_rows for p in protocols(r)}}
     for row in check_rows:
         for proto in protocols(row):
@@ -445,6 +535,9 @@ def check_conflicts(check_rows, all_rows, snap, owned):
                 raise Failure(f'端口冲突：{proto.upper()} {port} 已被 Agent 保存的配置占用。')
             if port in used[proto]:
                 raise Failure(f'端口冲突：{proto.upper()} {port} 已被本机进程占用：\n' + '\n'.join(used[proto][port]))
+            overlap = native_conflict(native, proto, port)
+            if overlap:
+                raise Failure(f'端口冲突：{proto.upper()} {port} 与原生 nftables {overlap} 规则重叠。')
             rule = rule_conflict(snap, proto, port, owned)
             if rule:
                 raise Failure(f'端口冲突：现有规则可能覆盖 {proto.upper()} {port}：\n'

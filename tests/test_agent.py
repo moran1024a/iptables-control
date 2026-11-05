@@ -71,6 +71,7 @@ class AgentHarness:
         self.root=Path(self.temp.name);self.bin=self.root/'bin';self.bin.mkdir()
         fake=self.bin/'iptables';fake.write_text(FAKE_IPTABLES);fake.chmod(0o755)
         for name in ('iptables-save','iptables-restore'):(self.bin/name).symlink_to(fake)
+        nft=self.bin/'nft';nft.write_text("#!/bin/sh\nif [ -f \"$MOCK_ROOT/native.json\" ]; then cat \"$MOCK_ROOT/native.json\"; else echo '{\"nftables\":[]}'; fi\n");nft.chmod(0o755)
         systemctl=self.bin/'systemctl';systemctl.write_text('''#!/bin/bash
 printf 'systemctl %s\n' "$*" >> "$MOCK_ROOT/commands"
 [ ! -f "$MOCK_ROOT/fail-service" ]
@@ -81,7 +82,8 @@ case "$*" in *t*) file="$MOCK_ROOT/tcp.sockets" ;; *) file="$MOCK_ROOT/udp.socke
 if [ -f "$file" ]; then cat "$file"; fi
 ''');ss.chmod(0o755)
         self.env={**os.environ,'PATH':str(self.bin)+':'+os.environ['PATH'],'MOCK_ROOT':str(self.root)}
-        source=(ROOT/'agent/ictl.sh').read_text().rsplit('\nmain "$@"',1)[0]
+        source=(ROOT/getattr(self,'source_file','agent/ictl.sh')).read_text().rsplit('\nmain "$@"',1)[0]
+        source=source.split('\nif [ "${ICTL_LIBRARY:-0}" != 1 ]; then main "$@"; fi')[0]
         source=source.replace('/run/ictl.',str(self.root)+'/request.')
         self.lib=self.root/'lib';self.lib.mkdir()
         self.conf=self.root/'conf';self.conf.mkdir()
