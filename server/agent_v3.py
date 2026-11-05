@@ -35,7 +35,28 @@ CREATE TABLE IF NOT EXISTS agent_switches (
 """
 
 
-def migrate(s, conn):
+def reset_v03(s, conn):
+    """Retain node/target resources, but start 0.4 with no legacy topology.
+
+    Port tombstones are cleanup bookkeeping, not retained forwarding configs.
+    They prevent reuse until the old Agent confirms its new empty snapshot.
+    """
+    conn.execute('''INSERT OR IGNORE INTO retired_ports(node_id,port)
+        SELECT h.node_id,h.port FROM hops h JOIN nodes n ON n.id=h.node_id WHERE n.first_seen IS NOT NULL''')
+    for table in ('hops', 'chains', 'routes', 'chain_pending', 'sync_ops', 'deleted_receipts',
+                  'windows', 'active_windows', 'events'):
+        conn.execute(f'DELETE FROM {table}')
+    conn.execute("DELETE FROM item_groups WHERE kind NOT IN ('nodes','targets')")
+    for kind in ('routes', 'chains'):
+        conn.execute('INSERT INTO item_groups(kind,name,builtin) VALUES (?,?,1)', (kind, s.DEFAULT_GROUP))
+    conn.execute('''UPDATE nodes SET desired_generation=desired_generation+1,applied_generation=0,deleting=0,
+        reported_v=NULL,reported_mode=NULL,state='init',err='',health=NULL,skew=NULL,
+        src_ip=NULL,last_seen=NULL,
+        last_manual=NULL,last_success=NULL''')
+    s.set_setting(conn, 'active_window_start', str(int(time.time())))
+
+
+def migrate(s, conn, reset_legacy=False):
     if conn.execute('PRAGMA user_version').fetchone()[0] == 400:
         return
     s.backup_database(conn, s.DB_PATH + '.pre-0.4.0.bak')
@@ -53,6 +74,8 @@ def migrate(s, conn):
         for statement in SCHEMA.split(';'):
             if statement.strip():
                 conn.execute(statement)
+        if reset_legacy:
+            reset_v03(s, conn)
         conn.execute('PRAGMA user_version=400')
 
 

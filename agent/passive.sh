@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.4.0-rc.3"
+VERSION="0.4.0-rc.4"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/lib/ictl/passive.sh"
@@ -45,7 +45,7 @@ need_root() {
     exit 1
   fi
   local c missing=()
-  for c in curl openssl iptables iptables-save iptables-restore getent flock od systemctl; do
+  for c in curl openssl iptables iptables-save iptables-restore getent flock od systemctl conntrack; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -534,6 +534,21 @@ rules_match() {
   [ "$expected" -eq "$count" ]
 }
 
+clear_changed_connections() {
+  local previous="$1" current="$2" line proto port ip target out
+  while IFS= read -r line; do
+    [[ "$line" = '-A ICTL-PRE '* ]] || continue
+    grep -Fxq -- "$line" <<< "$current" && continue
+    if [[ "$line" =~ -p[[:space:]](tcp|udp).*--dport[[:space:]]([0-9]+).*--to-destination[[:space:]]([0-9.]+):([0-9]+) ]]; then
+      proto="${BASH_REMATCH[1]}" port="${BASH_REMATCH[2]}" ip="${BASH_REMATCH[3]}" target="${BASH_REMATCH[4]}"
+      command -v conntrack >/dev/null || { ERRS+=('切换规则需要 conntrack，请安装 conntrack 后重试'); return 1; }
+      if ! out="$(conntrack -D -f ipv4 -p "$proto" --orig-port-dst "$port" --reply-src "$ip" --reply-port-src "$target" --dst-nat 2>&1)"; then
+        [[ "$out" = *'0 flow entries'* ]] || { ERRS+=("清理旧连接失败：$out"); return 1; }
+      fi
+    fi
+  done <<< "$previous"
+}
+
 apply_rules() {
   local out previous flags actual
   render
@@ -554,6 +569,10 @@ apply_rules() {
   fi
   if ! actual="$(owned_snapshot)" || ! rules_match "$RENDERED" "$actual"; then
     ERRS+=("verify rules failed")
+    restore_owned "$previous" "$flags" || ERRS+=("rollback failed")
+    return 1
+  fi
+  if ! clear_changed_connections "$previous" "$actual"; then
     restore_owned "$previous" "$flags" || ERRS+=("rollback failed")
     return 1
   fi

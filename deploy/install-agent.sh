@@ -2,7 +2,7 @@
 # Install the explicitly selected release. RC releases never follow /latest.
 set -euo pipefail
 umask 077
-VERSION="0.4.0-rc.3"
+VERSION="0.4.0-rc.4"
 BASE="https://github.com/moran1024a/iptables-control/releases/download/v$VERSION"
 TRUSTED_BASE="$BASE"
 URL='' KEY='' KIND=active
@@ -21,7 +21,7 @@ done
 [ "$(id -u)" = 0 ] || { echo '请使用 sudo bash 运行安装脚本' >&2; exit 1; }
 tools=(curl openssl flock systemctl tar)
 packages=(curl openssl util-linux)
-if [ "$KIND" = active ]; then tools+=(nft ss conntrack); packages+=(nftables iproute2 conntrack); else tools+=(iptables iptables-save iptables-restore ss); packages+=(iptables iproute2); fi
+if [ "$KIND" = active ]; then tools+=(nft ss conntrack); packages+=(nftables iproute2 conntrack); else tools+=(iptables iptables-save iptables-restore ss conntrack); packages+=(iptables iproute2 conntrack); fi
 missing=0
 for tool in "${tools[@]}"; do command -v "$tool" >/dev/null || missing=1; done
 if [ "$missing" = 1 ]; then

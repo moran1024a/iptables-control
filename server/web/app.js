@@ -286,15 +286,17 @@ async function route() {
   const [page, id, detailId] = (location.hash || "#/nodes").replace(/^#\/?/, "").split("/");
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === page));
 
-  if (page === "quality" && ["routes", "configs"].includes(id) && /^\d+$/.test(detailId || "")) {
+  if (page === "quality" && ["routes", "configs", "links"].includes(id) && /^\d+$/.test(detailId || "")) {
     const view = (request) => qualityPage(id, Number(detailId), request);
     view.refreshMS = 10000;
     return show(view, true);
   }
   if (page === "nodes" && id) return show((request) => nodeDetail(Number(id), request), true);
   if (page === "nodes") return show(nodeList, true);
-  if (page === "configs" || page === "chains") return show(chainList, true);
-  if (page === "routes") return show(routeList, true);
+  if (page === "configs" || page === "chains") return show(configSummary, true);
+  if (page === "routes" && id) return show((request) => linkDetail(Number(id), request), true);
+  if (page === "routes") return show(linkList, true);
+  if (page === "pools") return show(poolList, true);
   if (page === "targets") return show(targetList, true);
   if (page === "settings") return show(settingsPage, false);
   location.hash = "#/nodes";
@@ -489,10 +491,10 @@ function drawNodes() {
   const items = d.nodes.filter((n) =>
     (!f.mode || n.desired_mode === f.mode) && (!f.q || has(n.name, f.q)) && (!f.status || n.status === f.status) && (!f.group || n.group_id === Number(f.group)));
   const card = (n) => `
-    <a class="card" href="#/nodes/${n.id}" data-key="node-${n.id}">
+    <a class="card node-card" href="#/nodes/${n.id}" data-key="node-${n.id}">
       <div class="card-head">
-        <div class="node-head"><div class="title">${esc(n.name)}</div>${nodeSub(n)}</div>
-        <div class="meta"><span class="muted">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${pill(n.status)}<span class="muted">${ago(n.last_seen, d.now)}</span></div>
+        <div class="node-head"><div class="title"><span class="mode-tag ${n.desired_mode}">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${esc(n.name)}</div>${nodeSub(n)}</div>
+        <div class="meta">${pill(n.status)}<span class="muted">${ago(n.last_seen, d.now)}</span></div>
       </div>
       ${bar(n.bar)}
       ${n.wake?.error ? `<p class="hint t-yellow">${esc(n.wake.error)}</p>` : ""}
@@ -1337,11 +1339,11 @@ async function qualityPage(scope, id, request) {
       qualityViews.set(key, {range: selection.range});
       return qualityPage(scope, id, request);
     }
-    if (request === viewRequest) render(`<h1>网络质量</h1><p class="t-red">${esc(err.message)}</p><a href="#/${scope}">返回列表</a>`);
+    if (request === viewRequest) render(`<h1>网络质量</h1><p class="t-red">${esc(err.message)}</p><a href="#/${scope === "links" ? "routes/" + id : scope}">返回列表</a>`);
     return;
   }
   if (request !== viewRequest) return;
-  if (!d.pair) return render(`<h1>网络质量</h1><p>至少需要两个节点。</p><a href="#/${scope}">返回列表</a>`);
+  if (!d.pair) return render(`<h1>网络质量</h1><p>至少需要两个节点。</p><a href="#/${scope === "links" ? "routes/" + id : scope}">返回列表</a>`);
   qualityViews.set(key, {range: selection.range, source: d.pair.source, target: d.pair.target});
   const options = value => d.nodes.map(n => `<option value="${n.id}" ${n.id === value ? "selected" : ""}>${esc(n.name)}${n.mode === "passive" ? "（被动）" : ""}</option>`).join("");
   const rows = d.series.map(s => {
@@ -1355,7 +1357,7 @@ async function qualityPage(scope, id, request) {
       <td title="${esc(s.note || latest?.error || "")}">${esc(QUALITY_STATES[state] || state)}<small class="quality-time">${latest ? fmtTime(latest.slot) : ""}</small></td></tr>`;
   }).join("");
   const notes = d.series.filter(s => s.note || s.latest?.error).map(s => `${QUALITY_PROTOCOLS[s.protocol][0]}：${esc(s.note || s.latest.error)}`);
-  render(`<div class="list-head"><h1>网络质量</h1><a href="#/${scope}">返回列表</a></div>
+  render(`<div class="list-head"><h1>网络质量</h1><a href="#/${scope === "links" ? "routes/" + id : scope}">返回列表</a></div>
     <div class="panel quality-controls" data-quality="${key}">
       <label><span>发起节点</span><select name="quality-source">${options(d.pair.source)}</select></label>
       <span class="quality-arrow">→</span><label><span>接收节点</span><select name="quality-target">${options(d.pair.target)}</select></label>
@@ -1491,4 +1493,5 @@ if (location.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includ
 }
 document.querySelectorAll(".logo").forEach((el) => (el.innerHTML = LOGO));
 window.addEventListener("hashchange", route);
-route();
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', route, {once:true});
+else route();

@@ -38,6 +38,7 @@ jobs:
           python3 -m pip install -r server/requirements.txt
           python3 -m unittest discover -s tests
           node --check server/web/app.js
+          node --check server/web/pools.js
           for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
           mkdir -p dist
           (cd agent/active && go test ./...)
@@ -55,6 +56,7 @@ jobs:
           sudo apt-get install -y nftables iptables iproute2 conntrack
           sudo unshare -nm env ICTL_KERNEL_TEST=1 python3 tests/kernel_network.py "$PWD/dist/ictl-active-linux-amd64"
           sudo unshare -n python3 tests/kernel_wake.py "$PWD/dist/ictl-wake-linux-amd64"
+          sudo unshare -nm python3 tests/kernel_pool_switch.py "$PWD/dist/ictl-active-linux-amd64"
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3

@@ -81,6 +81,7 @@ printf 'systemctl %s\n' "$*" >> "$MOCK_ROOT/commands"
 case "$*" in *t*) file="$MOCK_ROOT/tcp.sockets" ;; *) file="$MOCK_ROOT/udp.sockets" ;; esac
 if [ -f "$file" ]; then cat "$file"; fi
 ''');ss.chmod(0o755)
+        conntrack=self.bin/'conntrack';conntrack.write_text('#!/bin/sh\nprintf \'conntrack %s\\n\' \"$*\" >> \"$MOCK_ROOT/commands\"\n');conntrack.chmod(0o755)
         self.env={**os.environ,'PATH':str(self.bin)+':'+os.environ['PATH'],'MOCK_ROOT':str(self.root)}
         source=(ROOT/getattr(self,'source_file','agent/ictl.sh')).read_text().rsplit('\nmain "$@"',1)[0]
         source=source.split('\nif [ "${ICTL_LIBRARY:-0}" != 1 ]; then main "$@"; fi')[0]

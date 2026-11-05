@@ -6,6 +6,7 @@ import logging
 import math
 import secrets
 import time
+import pools
 
 INTERVAL = 10
 PORT = 33445
@@ -44,6 +45,7 @@ def paths(conn):
     for c in conn.execute('SELECT id FROM chains WHERE deleting=0'):
         result[('configs', c['id'])] = [h[0] for h in conn.execute(
             'SELECT node_id FROM hops WHERE chain_id=? ORDER BY seq', (c['id'],))]
+    result.update(pools.quality_paths(conn)[0])
     return result
 
 
@@ -142,7 +144,7 @@ class Monitor:
     async def view(self, body):
         scope, ident = body.get('scope'), body.get('id')
         seconds = body.get('range', 900)
-        if scope not in ('routes', 'configs') or type(ident) is not int or seconds not in (900, 3600, 86400):
+        if scope not in ('routes', 'configs', 'links') or type(ident) is not int or seconds not in (900, 3600, 86400):
             raise self.hub.s.UserError('无效的链路或时间范围')
         now = int(time.time())
 
@@ -165,7 +167,7 @@ class Monitor:
                 series.append(dict(protocol=protocol, pair=pair, state=why[0] if why else 'collecting',
                                    note=why[1] if why else '', **history(conn, pair['id'], seconds, now)))
             return dict(nodes=options, pair=series[0]['pair'], now=now, interval=INTERVAL,
-                        adjacent=(a, b) in set(zip(ids, ids[1:])), series=series)
+                        adjacent=(a, b) in (pools.quality_paths(conn, ident)[1] if scope == 'links' else set(zip(ids, ids[1:]))), series=series)
         result = await self.hub.database(read)
         if result['pair']:
             p = result['pair']
@@ -181,7 +183,8 @@ class Monitor:
         def plan(conn):
             routes = paths(conn)
             nodes = {r['id']: dict(r) for r in conn.execute('SELECT * FROM nodes')}
-            edges = {edge for ids in routes.values() for edge in zip(ids, ids[1:]) if edge[0] != edge[1]}
+            edges = {edge for (scope, _), ids in routes.items() if scope != 'links' for edge in zip(ids, ids[1:]) if edge[0] != edge[1]}
+            edges.update(pools.quality_paths(conn)[1])
             for scope, ident, a, b in extra:
                 ids = routes.get((scope, ident), [])
                 if a in ids and b in ids:

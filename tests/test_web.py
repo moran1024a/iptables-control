@@ -55,6 +55,10 @@ const routeData={id:1,name:"route",node_ids:[1],nodes:[node],configs:[],group_id
 const chain={id:1,remark:"config",route_id:1,route_name:"route",target_id:1,target_name:"target",target_host:"example.com",target_port:443,group_id:1,hops:[{...node,node_id:1,port:10001}],pending:[{...node,node_id:1}],status:"applying",connection:{protocol:"endpoint",host:"192.0.2.1",port:10001,uri:"192.0.2.1:10001"}};
 const responses={me:{username:"owner",version:"0.3.1"},nodes:{nodes:[node],groups:[group],now:100},"nodes/1":{node,rules:[],chains:[],events:[],sync_path:"/sync",public_url:"https://example.com",agent_url:"https://example.com/ictl.sh",forward_version:"0.2.1",now:100},routes:{routes:[routeData],groups:[group]},targets:{targets:[target,ss],groups:[group]},configs:{chains:[chain],nodes:[node],node_groups:[group],groups:[group]},settings:{components:{forward_agent:"0.2.1"},username:"owner",version:"0.3.1",sync_path:"/sync",panel_path:"/panel",public_url:""}};
 const requests=[];
+const pool={id:1,name:'香港池',members:[1,2],references:['主链路']};
+const link={id:1,name:'主链路',revision:1,state:'active',error:'',job:null,cleanup:[],events:[],hops:[{node_id:1,name:'入口'}],connection:chain.connection,selected:{p1:1},plan:{entry:1,port:10001,target:1,stages:[{id:'p1',kind:'pool',pool_id:1,order:[1,2],disabled:[],locked:null,direct:false}]}};
+const resources={links:[link],pools:[pool],targets:[target],nodes:[{id:1,name:'A',eligible:true},{id:2,name:'B',eligible:true}]};
+responses.pools=resources;responses.links=resources;responses['links/1']={...resources,link};chain.link_id=1;chain.link_state='active';
 window.fetch=async (url,options={})=>{
  const path=String(url).split("api/")[1]?.split("?")[0];
  if(!path)throw Error("unexpected request "+url);
@@ -124,6 +128,19 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(app.querySelector('[name="quality-range"]').options.length===3,"time ranges missing");
   const gaps=qualityChart([{protocol:"udp-echo-v1",points:[{time:1180,mean:10,peak:10,status:"ok",resolved_ip:"a"},{time:1190,mean:null,status:"missing"},{time:1200,mean:20,peak:20,status:"ok",resolved_ip:"a"}]}],1200,900);
   assert(!gaps.includes('stroke-width="2"'),"chart joins missing samples");
+  leaveView();await show(poolList,false);assert(app.textContent.includes('香港池'),'pool list missing');
+  poolForm(pool);await ACTIONS['pool-up']({dataset:{index:'1'}});
+  assert(templateEditor.members[0]===2,'template reorder failed');closeModal();
+  await show(linkList,false);assert(app.querySelector('a[href="#/routes/1"]'),'link detail entry missing');
+  await show(r=>linkDetail(1,r),false);assert(app.querySelector('.topology-pool'),'topology missing');
+  instanceForm('p1');ACTIONS['instance-direct']();
+  assert(instance().order.includes(0),'direct rule missing');
+  ACTIONS['instance-disable']({dataset:{member:'2'}});assert(instance().disabled.includes(2),'local disable missing');
+  const instanceFormElement=document.querySelector('#modal form');await FORMS['instance-save'](instanceFormElement);
+  assert(requests.at(-1).path==='links/1' && requests.at(-1).body.plan.stages[0].direct,'instance save wrong');
+  linkForm(link);assert(document.querySelector('#modal [name=target]').value==='1','link target missing');
+  document.querySelector('[data-action=modal-close]').click();assert(document.querySelector('#modal').hidden,'cancel broken');
+  await show(configSummary,false);assert(app.textContent.includes('192.0.2.1:10001'),'connection summary missing');
   leaveView();await show(settingsPage,false);assert(!app.textContent.includes('sing-box'),"obsolete core settings");
   assert(!document.querySelector('a[href="#/tunnels"]'),"obsolete nav");
   document.querySelector('#result').textContent='PASS';
@@ -131,7 +148,8 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
 })();
 '''
             html=(ROOT/'server/web/index.html').read_text().replace('<script src="app.js"></script>',
-                '<pre id="result">RUNNING</pre><script>'+setup+'</script><script>'+(ROOT/'server/web/app.js').read_text()+'</script><script>'+exercise+'</script>')
+                '<pre id="result">RUNNING</pre><script>'+setup+'</script><script>'+(ROOT/'server/web/app.js').read_text()+'</script><script>'+(ROOT/'server/web/pools.js').read_text()+'</script><script>'+exercise+'</script>')
+            html=html.replace('<script src="pools.js"></script>','')
             html=html.replace('<link rel="stylesheet" href="style.css">','<style>'+(ROOT/'server/web/style.css').read_text()+'</style>')
             (root/'index.html').write_text(html)
             r=subprocess.run([chrome,'--headless','--no-sandbox','--disable-gpu','--disable-background-networking',

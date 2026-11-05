@@ -4,7 +4,7 @@
 
 支持多跳链路、SS／SS2022／VLESS Reality 目标、主动与被动同步，以及 Agent 与单机脚本共存。
 
-**当前开发版：0.4.0-rc.3（测试版）**。主动节点改用 Go + nftables 和长连接；被动节点保留 Bash + iptables。支持主动节点间的网络质量监测与 24 小时趋势；RC3 增加默认关闭的被动节点远程唤醒。正式版仍为 0.3.1，RC 不更新 `latest`。转发节点无需安装代理核心，目标服务需自行准备。
+**当前开发版：0.4.0-rc.4（测试版，未发布）**。支持池模板、可视化链路、手动优先级及节点失联灾备。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，可选择开启认证唤醒。正式版仍为 0.3.1，RC 不更新 `latest`。转发节点无需安装代理核心，目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -33,7 +33,7 @@
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.3/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.4/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -41,7 +41,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.3/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.4/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
 新主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口（默认 `8730`），并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址，再接入节点。
@@ -51,7 +51,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 节点需要使用 systemd 的 Linux，并以 root 权限安装。
 
 - **主动**：amd64／arm64，Linux 5.10+、nftables 1.0+、iproute2、conntrack-tools，使用 HTTPS／WSS。
-- **被动**：Bash、iptables（含 save／restore、addrtype、conntrack）、iproute2、getent。
+- **被动**：Bash、iptables（含 save／restore、addrtype、conntrack）、iproute2、getent、conntrack-tools。
 - 两者都需要 curl、openssl 1.1.1+ 和 flock。安装器可在 Debian／Ubuntu 安装缺少的依赖，其他系统请先自行安装。
 
 1. 在面板“节点 → 新增节点”中填写名称、入站 IPv4／域名、允许的入站端口，首次使用可保留“主动”模式。
@@ -65,7 +65,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.3/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.4/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -81,11 +81,15 @@ sudo bash /root/ipt.sh
 
 重新执行[服务端安装命令](#服务端)即可。安装器沿用现有端口和数据挂载，保留升级前数据库备份；新容器启动或就绪检查失败时尝试恢复旧容器和数据库。相同版本需要重建时，将命令末尾的 `| bash` 改为 `| bash -s -- --force`。
 
+**从 0.3.x 升级到 0.4.x：只保留节点、目标及其分组，旧链路、转发配置和运行历史全部清空，需要重新创建链路。** 节点密钥、目标连接参数以及登录和接入地址等服务端设置保留。旧 Agent 在下一次成功同步时清理原转发规则；被动节点需要本机手动同步。清理确认前，原端口仍标记为占用，不能分配给新链路。升级前数据库备份为 `ictl.db.pre-0.4.0.bak`。
+
 > 从 0.2.x 或更早版本升级：数据库中的全部隧道节点、受管隧道及其关联配置会被删除。对应远端的旧隧道 Agent、sing-box 和配置文件需自行卸载。外部导入的 SS／VLESS 会转为“目标”，其余有效配置和节点信息保留。详情见 [0.3.0 更新记录](CHANGELOG.md)。
 
 ### 节点 Agent 升级
 
 **服务端升级不会把旧 Bash Agent 自动替换为 Go。** 旧节点继续使用 Agent 0.2.1；要迁移到本次 RC，请在节点详情中重新复制“一键接入”命令执行。安装器保留节点身份和配置，并根据面板所选模式安装对应 Agent。
+
+被动节点升级到 RC4 前，需要先安装 `conntrack-tools`。Debian／Ubuntu 可运行 `sudo apt-get install conntrack`；重新运行新版一键接入安装器也会检查依赖。
 
 已完成迁移的节点可执行：
 
@@ -119,14 +123,14 @@ sudo ictl --sync    # 同步配置，或确认面板要求的类型切换
 删除容器和镜像，保留数据卷，之后可重新安装恢复使用：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.3/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.0-rc.4/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；若要完整停用，请先处理节点。
 
 ### 卸载节点 Agent
 
-1. 在面板解除该节点的链路和配置引用，再删除节点。
+1. 在面板切换使用该节点的链路，等待旧规则清理，再解除池和固定节点引用，删除节点。
 2. 等待节点完成清理同步；未启用远程唤醒或唤醒失败的被动节点，需在本机运行 `sudo ictl --sync`。
 3. 清理确认后，在节点卸载 Agent：
 
@@ -148,7 +152,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 ### 删除面板对象
 
-被引用的节点、链路和目标需先解除引用。删除配置后，要等相关节点确认清理才会释放端口；强制删除配置仍会保留未确认的端口。强制删除节点记录不会清理远端规则，需在节点本机卸载。
+被引用的池不能删除。正在使用、锁定、切换中或等待旧规则清理的池成员不能移除；页面会指出相关链路。删除链路后，等待节点确认清理才释放端口。目标和节点需先解除引用；配置页仅汇总连接信息。
 
 ## 使用指南
 
@@ -157,21 +161,36 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 | 对象 | 用途 | 示例 |
 | --- | --- | --- |
 | 节点 | 安装了 Agent 的转发服务器 | 入口服务器 A、中转服务器 B |
-| 链路 | 指定经过哪些节点及其顺序 | A → B，或只经过 A |
 | 目标 | 最终连接的服务 | `192.0.2.10:443` 或导入的 SS 节点 |
-| 配置 | 将链路和目标组合成一条可用转发 | A → B → 目标 |
+| 池 | 可复用的主动节点候选模板 | 香港 A、香港 B |
+| 链路 | 固定入口、池或固定中间节点，以及一个目标 | 入口 → 香港池 → 目标 |
+| 配置 | 自动汇总每条链路的连接信息 | 入口地址、SS／VLESS 导入链接 |
 
 接入节点后，按以下步骤操作：
 
 1. **添加目标**：进入“目标”，点击“添加地址目标”填写实际 IPv4／域名和端口；已有 SS／SS2022／VLESS Reality 分享链接时，选择“导入分享链接”。
-2. **创建链路**：进入“链路 → 新增链路”，按流量经过的顺序选择节点。单跳转发也需要创建一条只含一个节点的链路。
-3. **创建配置**：进入“配置 → 新增配置”，选择链路和目标。各跳端口留空时自动分配，也可在节点允许范围内手动指定。目标必须先在“目标”中保存。
+2. **创建池（可选）**：进入“池”，添加已确认的主动节点，调整初始优先级。一个节点可以属于多个池。
+3. **创建链路**：选择入口、入口端口、中间池或固定节点及目标，点击“保存并应用”。入口端口留空自动分配，内部端口由服务端管理；也可以保存草稿。
 4. **等待生效**：主动节点和已启用远程唤醒的被动节点自动同步；其余被动节点或唤醒超时的节点，运行 `sudo ictl --sync`。配置显示“已应用”后，说明相关节点已确认规则。
-5. **连接使用**：普通地址目标使用配置中展示的入口地址和端口；SS／VLESS 目标可点击“连接信息 → 查看 / 复制”，将分享链接导入客户端。
+5. **连接使用**：在“配置”中复制入口地址或 SS／VLESS 导入链接。编辑路径时，从配置名称进入对应链路。
 
-选择“无链路（直连目标）”会直接使用目标地址，不经过转发节点，状态显示“已保存”。链路模板本身不占用端口，创建配置后才分配端口。
+选择“无入口（直达目标）”且不添加中间阶段时，直接使用目标地址。池模板和链路草稿不占用转发端口。
 
-修改链路或目标会更新所有引用它的配置；更换入口节点或入口端口后，需要更新客户端的连接信息。四个板块均支持分组、排序和筛选。
+节点和目标保留原有分组、排序与筛选。更换入口节点或入口端口后，需要更新客户端的连接信息；池成员切换保持入口不变。
+
+### 池与灾备切换
+
+点击链路中的池，设置当前实例的优先级、默认成员、锁定和禁用。默认成员就是第一优先级；锁定后不自动灾备。支持手动切换，也可以添加“直连下一阶段”候选，仅跳过对应池。
+
+模板的排序只影响以后添加的实例。新增模板成员会追加到已有实例末尾；移除成员会同步到实例，但正在使用的成员须先切换并等待清理完成。修改某条链路的设置不会影响其他链路。
+
+当前主动成员持续失联 **60 秒**后，服务端按优先级尝试可用成员；成员恢复后不自动切回。首版只处理节点失联，不根据延迟或丢包自动择优，也不检测所有业务链路故障。服务端不可用时保留节点现有规则。
+
+切换先准备下游，再修改入口，收到确认后显示生效；可能短暂断线。新旧路径短时共存，内部节点需有空闲转发端口。等待超过 30 秒会显示待人工处理，晚到回执仍可完成切换。旧规则未确认清理时继续保留端口，不能移除相关成员。遇到端口冲突，修改配置或处理占用后再重试，不自动换端口；灾备可继续尝试其他候选节点。
+
+被动节点只能作为固定节点；参与池切换前，手动升级到 RC4 并安装 conntrack-tools。未开启远程唤醒时，需要在每个待同步阶段运行 `sudo ictl --sync`。
+
+已有 0.4.x RC 升级到 RC4 时，会备份数据库，将每条旧配置转换为一个固定路径链路组，保留原入口、端口、目标和规则；未使用的旧链路保留为草稿。0.3.x 升级则按前述规则清空旧链路和配置。两种升级都不会自动增加池。
 
 ### 主动与被动模式
 
@@ -191,7 +210,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 流量按**本节点、每条转发、TCP／UDP、上下行**分别统计 IPv4 字节，包含协议头和重传。它不是应用下载量，也不是全机网卡流量；多跳不要直接相加。数字以整数保存，重复上报不会重复累加。意外掉电、外部清零或 flowtable 卸载可能造成缺口，可识别的缺口会在面板标明，不能当作完整账单。被动模式不新增采集，历史值保留。
 
-本次仍使用手动链路，不包含池、自动择路或自动灾备。
+池切换会归档旧规则的流量记录，历史累计值保留。
 
 ## 被动节点远程唤醒
 
@@ -208,13 +227,13 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 ## 网络质量监测
 
-服务端和主动 Agent 使用 **0.4.0-rc.2 或更新版本** 后，在“链路”或“配置”卡片点击 **网络质量与趋势**。
+服务端升级后，在链路详情点击 **网络质量与趋势**。主动 Agent 需 RC2 或更新版本。
 
 1. 在两个主动节点的防火墙／云安全组中，允许参与探测的节点访问 **UDP 33445**，并按需允许 **ICMP Echo（Ping）**。ICMP 不占用 TCP／UDP 端口，Agent 内置实现，不需要安装 ping 命令。程序不会自动修改防火墙。
 2. 默认使用节点的入站地址。端口冲突时，在“编辑节点 → 质量探测 UDP 端口”修改；填写 `0` 可停止该节点的全部质量探测。已有转发规则保持原样。
 3. 在同一张延迟图中对比 **蓝色 UDP** 与 **绿色 ICMP** 曲线；下方摘要表分别显示 RTT、最近 5 分钟平均值、P95、波动和探测丢包率。支持 **15 分钟、1 小时、24 小时**切换；悬停数据点查看详情。
 
-相邻主动节点的 UDP 和 ICMP 各默认每 **10 秒**探测一次，错开调度，关闭网页后仍持续采集。同一节点对在多个链路中共享结果；每个节点最多参与一次新探测／秒，任务多时自动分批。也可在图表中选择链路内非相邻节点，查看期间按需探测，离开页面后约一分钟停止。全部历史保留 24 小时。
+实际路径及相邻池的候选主动节点之间，UDP 和 ICMP 各默认每 **10 秒**探测一次，错开调度，关闭网页后仍持续采集。同一节点对在多个链路中共享结果；每个节点最多参与一次新探测／秒，候选较多时排队，实际间隔会延长。也可在图表中选择链路内非相邻节点，查看期间按需探测，离开页面后约一分钟停止。全部历史保留 24 小时。
 
 超时、离线、探测异常和未采样分别展示，缺失数据不当作 `0 ms`。丢包率同时显示失败次数与样本数，仅代表探测包，不等于业务流量丢包；短窗口样本少，宜结合趋势判断。UDP 使用独立认证小包，ICMP 使用系统 Echo 应答，分别统计；不做带宽测速，不会触发自动切换或修改转发规则。切为被动后停止参与探测，历史记录继续保留至到期。
 
@@ -273,7 +292,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 **配置一直“等待中”？**
 
-查看配置中尚未确认的节点。未启用唤醒、唤醒超时的被动节点和切换模式后的节点需要本机手动同步；主动节点则检查服务、网络和节点详情中的错误。链路上的节点全部确认后才会显示“已应用”。
+进入对应链路详情，查看当前阶段和节点错误。未启用唤醒、唤醒超时的被动节点和切换模式后的节点需要本机手动同步；主动节点则检查服务、网络和节点详情中的错误。新路径确认后才会显示“已应用”，旧规则清理状态单独展示。
 
 **节点显示“端口冲突”或“端口检查失败”？**
 
@@ -289,7 +308,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 **升级后需要回退怎么办？**
 
-Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-deploy-*.bak`，0.4.0 迁移还会在数据库旁保留 `ictl.db.pre-0.4.0.bak`，RC2／RC3 升级分别保留 `ictl.db.pre-0.4.0-rc.2.bak`／`ictl.db.pre-0.4.0-rc.3.bak`。人工回退需停止服务，恢复升级前数据库及对应旧镜像，移除新数据库的 `-wal`／`-shm` 文件后再启动；回退会丢弃升级后的数据。源码部署或自定义数据库路径需自行备份和恢复。
+Docker 安装器将升级前备份保存在数据卷内的 `/data/ictl.db.pre-deploy-*.bak`，RC4 数据迁移另保留 `ictl.db.pre-0.4.0-rc.4.bak`；此前 RC 的迁移备份也会保留。人工回退需停止服务，恢复升级前数据库及对应旧镜像，移除新数据库的 `-wal`／`-shm` 文件后再启动；回退会丢弃升级后的数据。源码部署或自定义数据库路径需自行备份和恢复。
 
 ## 开发与贡献
 
@@ -317,6 +336,7 @@ ICTL_DB="$HOME/.local/share/ictl/ictl.db" python3 server/ictl-server.py serve --
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests
 python3 deploy/check-versions.py
 node --check server/web/app.js
+node --check server/web/pools.js
 (cd agent/active && go test ./...)
 for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
 ```
@@ -328,6 +348,7 @@ for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
 sudo unshare -nm env ICTL_KERNEL_TEST=1 python3 tests/kernel_network.py /tmp/ictl-active
 (cd agent/wake && go build -o /tmp/ictl-wake .)
 sudo unshare -n python3 tests/kernel_wake.py /tmp/ictl-wake
+sudo unshare -nm python3 tests/kernel_pool_switch.py /tmp/ictl-active
 ```
 
 该测试在新的网络和挂载命名空间内执行，检查真实转发、计数、冲突与清理。
@@ -338,8 +359,8 @@ sudo unshare -n python3 tests/kernel_wake.py /tmp/ictl-wake
 
 | 组件 | 当前版本 |
 | --- | --- |
-| 服务端／被动 Agent／管理器／唤醒组件 | 0.4.0-rc.3 |
-| 主动 Agent | 0.4.0-rc.2 |
+| 服务端／主动 Agent／被动 Agent／管理器 | 0.4.0-rc.4 |
+| 唤醒组件 | 0.4.0-rc.3 |
 | 旧版兼容 Agent | 0.2.1 |
 | 单机脚本 | 3.2-rc.2 |
 

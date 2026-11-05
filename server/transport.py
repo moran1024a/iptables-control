@@ -10,6 +10,7 @@ from aiohttp import web, WSMsgType
 import agent_v3
 import network_quality
 import wake
+import pools
 
 
 def captured(s, method, path, headers, body, peer):
@@ -35,6 +36,7 @@ class Hub:
         self.queries = {}
         self.quality = network_quality.Monitor(self)
         self.passive_wake = wake.Monitor(self)
+        self.pools = pools.Monitor(self)
 
     async def database(self, fn):
         def run():
@@ -301,8 +303,12 @@ def create_app(s):
     async def start(_app):
         hub.quality.task = asyncio.create_task(hub.quality.run())
         hub.passive_wake.task = asyncio.create_task(hub.passive_wake.run())
+        hub.pools.task = asyncio.create_task(hub.pools.run())
 
     async def shutdown(_app):
+        if hub.pools.task:
+            hub.pools.task.cancel()
+            await asyncio.gather(hub.pools.task, return_exceptions=True)
         if hub.passive_wake.task:
             hub.passive_wake.task.cancel()
             await asyncio.gather(hub.passive_wake.task, return_exceptions=True)

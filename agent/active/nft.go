@@ -380,7 +380,7 @@ func hasConnections(r Rule) (bool, error) {
 }
 func deleteConnections(r Rule) error {
 	for _, p := range protocols(r) {
-		_, e := run(nil, "conntrack", "-D", "-f", "ipv4", "-p", p, "--orig-port-dst", strconv.Itoa(r.Port), "--reply-src", r.IP, "--reply-port-src", strconv.Itoa(r.TargetPort))
+		_, e := run(nil, "conntrack", "-D", "-f", "ipv4", "-p", p, "--orig-port-dst", strconv.Itoa(r.Port), "--reply-src", r.IP, "--reply-port-src", strconv.Itoa(r.TargetPort), "--dst-nat")
 		if e != nil && !strings.Contains(e.Error(), "0 flow entries") {
 			return e
 		}

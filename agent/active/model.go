@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const version = "0.4.0-rc.2"
+const version = "0.4.0-rc.4"
 const tableName = "ictl_active"
 
 type M = map[string]any

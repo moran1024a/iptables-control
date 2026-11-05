@@ -27,12 +27,13 @@ import target_config
 import agent_v3
 import network_quality
 import wake
+import pools
 import types
 
 def _module():
     return types.SimpleNamespace(**globals())
 
-VERSION = "0.4.0-rc.3"
+VERSION = "0.4.0-rc.4"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -65,6 +66,7 @@ NOT_FOUND = "404 page not found\n"
 STATIC = {
     "index.html": "text/html; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
+    "pools.js": "text/javascript; charset=utf-8",
     "style.css": "text/css; charset=utf-8",
 }
 HEALTH = {"ok": "正常", "error": "故障", "skew": "时间不一致"}
@@ -361,23 +363,26 @@ def init_db_v030():
 
 
 def init_db():
+    version = None
     conn = db() if os.path.isfile(DB_PATH) else None
     if conn is not None:
         version = conn.execute('PRAGMA user_version').fetchone()[0]
-        if version > 402:
+        if version > 403:
             conn.close()
             raise UserError('数据库版本高于本服务端')
         if version >= 400:
             network_quality.migrate(_module(), conn)
             wake.migrate(_module(), conn)
+            pools.migrate(_module(), conn)
             with conn:
                 ensure_active_windows(conn)
             return conn
         conn.close()
     conn = init_db_v030()
-    agent_v3.migrate(_module(), conn)
+    agent_v3.migrate(_module(), conn, reset_legacy=version == 300)
     network_quality.migrate(_module(), conn)
     wake.migrate(_module(), conn)
+    pools.migrate(_module(), conn)
     return conn
 
 
@@ -460,23 +465,28 @@ def track_mutation(method):
                 conn.execute('BEGIN IMMEDIATE')
             before = mutation_snapshot(conn)
             result = method(self, conn, *args, **kwargs)
-            after = mutation_snapshot(conn)
-            for nid, (n, rows, retired) in after.items():
-                old, old_rows, old_retired = before.get(nid, ({}, [], set()))
-                # Remarks are display-only; compare the actual wire rules per configuration.
-                key = lambda r: (r['id'], r['port'], r['host'], r['tport'])
-                changed = ([key(r) for r in rows] != [key(r) for r in old_rows] or retired != old_retired or
-                           any(n[k] != old.get(k, n[k]) for k in ('key','desired_mode','deleting')))
-                if changed:
-                    conn.execute('UPDATE nodes SET desired_generation=desired_generation+1 WHERE id=?', (nid,))
-                if changed or any(n[k] != old.get(k, n[k]) for k in ('wake_enabled', 'wake_port')):
-                    wake.queue(_module(), conn, get_node(conn, nid))
-                for cid in {r['chain_id'] for r in old_rows + rows}:
-                    if [key(r) for r in old_rows if r['chain_id']==cid] != [key(r) for r in rows if r['chain_id']==cid]:
-                        if conn.execute('SELECT 1 FROM chains WHERE id=?', (cid,)).fetchone():
-                            mark_pending(conn, cid, [nid])
+            finish_mutation(conn, before)
             return result
     return wrapped
+
+
+def finish_mutation(conn, before):
+    notified = False
+    for nid, (n, rows, retired) in mutation_snapshot(conn).items():
+        old, old_rows, old_retired = before.get(nid, ({}, [], set()))
+        key = lambda r: (r['id'], r['port'], r['host'], r['tport'])
+        changed = ([key(r) for r in rows] != [key(r) for r in old_rows] or retired != old_retired or
+                   any(n[k] != old.get(k, n[k]) for k in ('key','desired_mode','deleting')))
+        if changed:
+            conn.execute('UPDATE nodes SET desired_generation=desired_generation+1 WHERE id=?', (nid,))
+            notified = True
+        if changed or any(n[k] != old.get(k, n[k]) for k in ('wake_enabled', 'wake_port')):
+            wake.queue(_module(), conn, get_node(conn, nid))
+        for cid in {r['chain_id'] for r in old_rows + rows}:
+            if [key(r) for r in old_rows if r['chain_id']==cid] != [key(r) for r in rows if r['chain_id']==cid]:
+                if conn.execute('SELECT 1 FROM chains WHERE id=?', (cid,)).fetchone():
+                    mark_pending(conn, cid, [nid])
+    return notified
 
 
 def setting(conn, k, default=None):
@@ -555,6 +565,8 @@ def delete_node(conn, node_id):
 
 
 def delete_chain(conn, chain_id):
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='links'").fetchone():
+        conn.execute('DELETE FROM links WHERE chain_id=? AND managed=0', (chain_id,))
     conn.execute("DELETE FROM hops WHERE chain_id = ?", (chain_id,))
     conn.execute("DELETE FROM chain_pending WHERE chain_id = ?", (chain_id,))
     conn.execute("DELETE FROM chains WHERE id = ?", (chain_id,))
@@ -1011,6 +1023,8 @@ def parse_hops(conn, hops, chain_id=None):
         if (node["id"], port) in seen:
             raise UserError(f"第 {i} 跳：重复使用了节点 {node['name']} 的端口 {port}", "hops")
         seen.add((node["id"], port))
+        if port in pools.reserved(conn, node['id']):
+            raise UserError(f"第 {i} 跳：端口 {port} 已被链路占用或等待清理", 'ports')
         row = conn.execute(
             """SELECT c.remark || CASE c.deleting WHEN 1 THEN '（删除中）' ELSE '' END AS remark
                FROM hops h JOIN chains c ON c.id = h.chain_id
@@ -1031,6 +1045,7 @@ def parse_hops(conn, hops, chain_id=None):
         used = {r[0] for r in conn.execute(
             "SELECT port FROM hops WHERE node_id = ? AND chain_id IS NOT ?", (node["id"], chain_id))}
         used |= {r[0] for r in conn.execute("SELECT port FROM retired_ports WHERE node_id = ?", (node["id"],))}
+        used |= pools.reserved(conn, node['id'])
         used |= {p for n, p in result if n["id"] == node["id"] and p is not None}
         if node["desired_mode"] == "active":
             used.add(node["quality_port"])
@@ -1097,15 +1112,21 @@ def node_rule_rows(conn, node):
         """,
         (node["id"],),
     )
+    has_links = conn.execute("SELECT 1 FROM sqlite_master WHERE name='links'").fetchone()
+    managed = {r[0] for r in conn.execute('SELECT chain_id FROM links WHERE managed=1')} if has_links else set()
     out = []
     for r in rows:
+        if r['chain_id'] in managed:
+            continue
         if r["next_port"] is None:
             host, port = r["target_host"], r["target_port"]
         else:
             host, port = r["next_addr"], r["next_port"]
         out.append({"id": r["id"], "port": r["port"], "host": host, "tport": port,
                     "chain_id": r["chain_id"], "chain_remark": r["chain_remark"]})
-    return out
+    if has_links:
+        out.extend(pools.rule_rows(conn, node['id']))
+    return sorted(out, key=lambda r: r['id'])
 
 
 def node_rules(conn, node):
@@ -1139,7 +1160,7 @@ def node_status(conn, node, now):
                               or node["state"] != "ok") else "synced"
     if not node["first_seen"]:
         return "new"
-    if now - node["last_seen"] > (30 if node["installed_agent"] == "active" else OFFLINE_AFTER):
+    if node['last_seen'] is None or now - node["last_seen"] > (30 if node["installed_agent"] == "active" else OFFLINE_AFTER):
         return "offline"
     if node["skew"] is not None and abs(node["skew"]) > MAX_SKEW:
         return "skew"
@@ -1192,7 +1213,7 @@ def record_report(conn, node, now, health, err, skew):
     """记录一次上报：状态窗口 + 状态变化事件。"""
     if not node["first_seen"]:
         add_event(conn, node["id"], "首次连接", now)
-    elif node["desired_mode"] == "active" and now - node["last_seen"] > OFFLINE_AFTER:
+    elif node["desired_mode"] == "active" and node['last_seen'] is not None and now - node["last_seen"] > OFFLINE_AFTER:
         add_event(conn, node["id"], f"失联 {duration(now - node['last_seen'])} 后恢复", now)
 
     prev = node["health"] or "ok"
@@ -1566,6 +1587,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 handler = {"PATCH": self.api_config_save, "DELETE": self.api_chain_del}.get(method)
             elif parts == ["routes"]:
                 handler = {"GET": self.api_routes, "POST": self.api_route_save}.get(method)
+            elif parts in (["pools"], ["links"]):
+                handler = {"GET": self.api_pool_list, "POST": self.api_pool_save if parts[0] == 'pools' else self.api_link_save}.get(method)
+            elif len(parts) == 2 and parts[0] in ('pools', 'links') and parts[1].isdigit():
+                handler = ({"PATCH": self.api_pool_save, "DELETE": self.api_pool_delete} if parts[0] == 'pools' else
+                           {"GET": self.api_link_get, "PATCH": self.api_link_save, "DELETE": self.api_link_delete}).get(method)
+            elif len(parts) == 3 and parts[0] == 'links' and parts[1].isdigit() and parts[2] == 'action':
+                handler = {"POST": self.api_link_action}.get(method)
             elif len(parts) == 2 and parts[0] == "routes" and parts[1].isdigit():
                 handler = {"PATCH": self.api_route_save, "DELETE": self.api_route_del}.get(method)
             elif parts == ["targets"]:
@@ -1760,6 +1788,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if enabled:
             if not port:
                 raise UserError('启用远程唤醒需要填写端口', 'wake_port')
+            if port in pools.reserved(conn, node['id']):
+                raise UserError('唤醒端口已被链路占用或等待清理', 'wake_port')
             if conn.execute('SELECT 1 FROM hops WHERE node_id=? AND port=? UNION ALL SELECT 1 FROM retired_ports WHERE node_id=? AND port=?',
                             (node['id'], port, node['id'], port)).fetchone():
                 raise UserError('唤醒端口已被转发配置占用或正在等待释放', 'wake_port')
@@ -1822,12 +1852,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             used = "、".join(f"「{r['remark']}」{r['port']}" for r in outside)
             raise UserError(f"以下转发使用的端口不在新的允许范围内：{used}。请先修改这些转发。", "ports")
         mode = body.get("desired_mode", n["desired_mode"])
+        extra_ports = [p for p in pools.reserved(conn, node_id) if not in_ports(p, ranges)]
+        if extra_ports:
+            raise UserError('链路使用或待清理的端口不在新范围内：' + ','.join(map(str, extra_ports)), 'ports')
         if mode not in ("active", "passive"):
             raise UserError("模式必须为主动或被动", "desired_mode")
+        if mode != n['desired_mode'] and mode == 'passive':
+            refs = [p['name'] for p in conn.execute('SELECT * FROM pools') if node_id in json.loads(p['members'])]
+            if refs:
+                raise UserError('请先将节点从池中移除：' + '、'.join(refs), 'desired_mode')
         if mode != n["desired_mode"] and n["first_seen"] and n["protocol_version"] < 2:
             raise UserError("请先升级节点 Agent 并完成一次同步，再切换模式", "desired_mode")
         quality_port = body.get("quality_port", n["quality_port"])
         quality_port = check_port(quality_port, "quality_port") if quality_port != 0 else 0
+        if quality_port and quality_port != n['quality_port'] and quality_port in pools.reserved(conn, node_id):
+            raise UserError('探测端口已被链路占用或等待清理', 'quality_port')
         conn.execute("UPDATE nodes SET quality_port=? WHERE id=?", (quality_port, node_id))
         self.set_wake(conn, body, n, mode)
         key = None
@@ -1847,6 +1886,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1
                        WHERE h2.node_id = ?""", (node_id,)).fetchall():
                 mark_pending(conn, r["chain_id"], [r["node_id"]])
+            pools.refresh_links(_module(), conn, node=node_id)
         return {"key": key, "upstream": upstream_nodes(conn, node_id) if key else []}
 
     @track_mutation
@@ -1861,6 +1901,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def api_node_del(self, conn, body, node_id):
         n = get_node(conn, node_id)
         table = node_table(n["kind"])
+        pool_refs = pools.node_references(conn, node_id)
+        if pool_refs:
+            raise UserError('节点仍被引用：' + '、'.join(pool_refs), status=409)
         used = [r[0] for r in conn.execute(
             """SELECT DISTINCT c.remark FROM hops h JOIN chains c ON c.id = h.chain_id
                WHERE h.node_id = ? ORDER BY c.id""", (node_id,))]
@@ -1907,6 +1950,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     @track_mutation
     def api_chain_del(self, conn, body, chain_id):
         chain = get_chain(conn, chain_id)
+        link = conn.execute('SELECT id FROM links WHERE chain_id=? AND managed=1', (chain_id,)).fetchone()
+        if link:
+            return pools.delete_link(_module(), conn, link['id'])
         force = self.query.get("force") == ["1"]
         if force:
             for h in conn.execute("SELECT node_id, port FROM hops WHERE chain_id = ?", (chain_id,)).fetchall():
@@ -1984,6 +2030,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # 链路模板、目标对象与组合配置。
 
+    def api_pool_list(self, conn, body):
+        return pools.listing(_module(), conn)
+
+    def api_link_get(self, conn, body, ident):
+        result = pools.listing(_module(), conn)
+        result['link'] = pools.detail(_module(), conn, pools.get(_module(), conn, 'links', ident))
+        return result
+
+    @track_mutation
+    def api_pool_save(self, conn, body, ident=None):
+        return pools.pool_save(_module(), conn, body, ident)
+
+    @track_mutation
+    def api_pool_delete(self, conn, body, ident):
+        return pools.pool_delete(_module(), conn, ident)
+
+    @track_mutation
+    def api_link_save(self, conn, body, ident=None):
+        return pools.link_save(_module(), conn, body, ident)
+
+    @track_mutation
+    def api_link_delete(self, conn, body, ident):
+        return pools.delete_link(_module(), conn, ident)
+
+    @track_mutation
+    def api_link_action(self, conn, body, ident):
+        return pools.action(_module(), conn, body, ident)
+
     def api_routes(self, conn, body):
         result = []
         for r in conn.execute(ordered("routes")):
@@ -2017,6 +2091,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 before = [r[0] for r in conn.execute("SELECT node_id FROM hops WHERE chain_id = ?", (c["id"],))]
                 pairs, _ = route_hops(conn, get_route(conn, route_id), c["id"])
                 apply_config_hops(conn, c["id"], pairs)
+            pools.sync_legacy(conn)
         return {"id": route_id, "affected": len(refs)}
 
     @track_mutation
@@ -2039,11 +2114,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 c["connection"] = target_config.connection(t, first["addr"], first["port"], c["remark"])
             c["status"] = ("deleting" if c["deleting"] else "error" if any(n['status']=='error' for n in c['hops']+c['pending']) else "applying" if c["pending"] else
                            "saved" if not c["hops"] else "applied")
+            link = conn.execute('SELECT * FROM links WHERE chain_id=?', (c['id'],)).fetchone()
+            if link:
+                link = dict(link)
+                link['state'], link['error'] = pools.display_state(_module(), conn, link)
+                c.update(link_id=link['id'], link_state=link['state'], link_error=link['error'])
+                if link['state'] in ('preparing', 'switching', 'pending', 'waiting', 'error'):
+                    c['status'] = 'error' if link['state'] in ('waiting','error') else 'applying'
+                if not c['hops'] and link['state'] in ('preparing', 'switching', 'waiting'):
+                    c['connection'] = None
         return data
 
     @track_mutation
     def api_config_save(self, conn, body, chain_id=None):
         old = get_chain(conn, chain_id) if chain_id is not None else None
+        if old and conn.execute('SELECT 1 FROM links WHERE chain_id=? AND managed=1', (chain_id,)).fetchone():
+            raise UserError('请在链路详情中编辑此配置', status=409)
         if old and old["deleting"]:
             raise UserError("配置正在删除，不能修改")
         if any(k in body for k in ("target_host", "target_port", "tunnel_id", "target_type")):
@@ -2066,6 +2152,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 VALUES (?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM chains))""",
                 (remark, route_id, target["id"], group_id)).lastrowid
         apply_config_hops(conn, chain_id, pairs)
+        pools.sync_legacy(conn)
         return {"id": chain_id, "assigned": assigned}
 
     def api_targets(self, conn, body):
@@ -2106,6 +2193,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          (name, host, port, kind, params, target_id))
             if group_id != old["group_id"]:
                 move_group(conn, "targets", target_id, group_id)
+            if host != old['host'] or port != old['port']:
+                pools.refresh_links(_module(), conn, target=target_id)
         else:
             target_id = conn.execute("""INSERT INTO targets(name,host,port,type,params,group_id,sort)
                 VALUES (?,?,?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM targets))""",
@@ -2115,6 +2204,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     @track_mutation
     def api_target_del(self, conn, body, target_id):
         get_target(conn, target_id)
+        if any(json.loads(l['plan'])['target'] == target_id for l in conn.execute('SELECT plan FROM links')):
+            raise UserError('目标仍被链路引用，请先解除引用')
         if conn.execute("SELECT 1 FROM chains WHERE target_id=?", (target_id,)).fetchone():
             raise UserError("目标仍被配置引用，请先解除引用")
         conn.execute("DELETE FROM targets WHERE id=?", (target_id,))

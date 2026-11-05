@@ -602,3 +602,26 @@ body.auth-page {
 .quality-chart { width: 100%; min-height: 160px; display: block; overflow: visible; }
 .quality-chart text { fill: var(--muted); font-size: 12px; }
 .quality-chart circle:hover { r: 5; cursor: crosshair; }
+/* Compact resources and layered link view. */
+.node-card { padding: 10px 14px; margin-bottom: 7px; }
+.node-card .bar { height: 4px; margin-top: 8px; }
+.node-card .bar span { min-height: 4px; height: 4px; border-radius: 1px; }
+.node-card .bar-axis { font-size: 10px; line-height: 1.1; margin-top: 3px; }
+.node-card .node-sub { font-size: 12px; margin-top: 3px; }
+.mode-tag { display:inline-block; font-size:11px; line-height:1.5; padding:1px 6px; border:1px solid var(--border); border-radius:4px; margin-right:8px; vertical-align:middle; font-weight:500; }
+.mode-tag.active { color:var(--blue); }
+.mode-tag.passive { color:var(--muted); }
+.member-list { margin: 12px 0; }
+.member-row { display:flex; align-items:center; gap:6px; padding:8px 0; border-bottom:1px solid var(--border); flex-wrap:wrap; }
+.member-row > span:first-child { flex:1; min-width:120px; }
+.inline-fields { display:flex; align-items:end; gap:10px; margin:12px 0; }
+.inline-fields > label,.inline-fields > select { flex:1; min-width:0; }
+.topology { display:flex; align-items:center; overflow-x:auto; gap:12px; padding:20px 0; }
+.topology-node { flex:0 0 175px; min-height:115px; display:flex; flex-direction:column; justify-content:center; gap:9px; padding:16px; border:1px solid var(--border); border-radius:8px; text-align:center; background:var(--card); white-space:normal; }
+.topology-node small { color:var(--muted); font-size:12px; }
+.topology-pool { border-color:var(--blue); cursor:pointer; }
+.topology-arrow { flex:0 0 auto; font-size:24px; color:var(--muted); }
+.table-scroll { overflow-x:auto; }
+.table-scroll td small { display:block; max-width:260px; }
+.link-card { display:block; }
+@media(max-width:600px) { .node-card .card-head { gap:8px; } .node-card .meta { font-size:11px; flex-wrap:wrap; } .member-row { gap:4px; } .inline-fields { flex-wrap:wrap; } }

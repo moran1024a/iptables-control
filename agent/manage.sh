@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.4.0-rc.3"
+VERSION="0.4.0-rc.4"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -185,7 +185,7 @@ perform_sync() {
       printf '提示：当前 FORWARD 默认拒绝，请确认已单独放行本节点的转发范围；安装器不会修改该策略。\n' >&2
     fi
   else
-    for item in iptables iptables-save iptables-restore getent; do command -v "$item" >/dev/null || { die "缺少依赖：$item"; return 1; }; done
+    for item in iptables iptables-save iptables-restore getent conntrack; do command -v "$item" >/dev/null || { die "缺少依赖：$item"; return 1; }; done
   fi
   PHASE=prepared; journal || return 1
   systemctl stop ictl-agent 2>/dev/null || { [ ! -f "$UNIT" ] || return 1; }
