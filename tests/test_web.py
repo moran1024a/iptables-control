@@ -1,13 +1,13 @@
 """Exercise real DOM rendering, modes, white activity bars and target-only forms in Chrome."""
 import os
-import asyncio
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
-import aiohttp
 from test_server import ROOT
 import network_quality as q
 
@@ -61,6 +61,14 @@ class BrowserTests(unittest.TestCase):
                                    outage=[sample(3540, 10), sample(3580, 30)]).items():
                 histories[name] = dict(now=3600, seconds=3600, series=[dict(protocol='tcp-connect-v1', **q.summarize(rows, 3600, 3600))])
             setup=r'''
+const reportResult=window.fetch.bind(window);
+const resultObserver=new MutationObserver(()=>{
+ const result=document.querySelector('#result').textContent;
+ if(result==='RUNNING')return;
+ resultObserver.disconnect();
+ reportResult('/result',{method:'POST',body:result});
+});
+resultObserver.observe(document.querySelector('#result'),{childList:true,subtree:true,characterData:true});
 const group={id:1,name:"默认分组",builtin:1};
 const node={id:1,name:"passive node",addr:"192.0.2.1",ports:"10000-10020",kind:"forward",desired_mode:"passive",protocol_version:2,manual_required:true,first_seen:1,last_seen:2,group_id:1,status:"syncing",key:"ab".repeat(32),bar:{start:1,window:60,levels:["white","ok"],counts:[0,2],times:[null,2]},applied_generation:1,desired_generation:2};
 const target={id:1,name:"target",type:"endpoint",host:"example.com",port:443,params:{},configs:[],group_id:1};
@@ -429,33 +437,31 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
                 '<pre id="result">RUNNING</pre><script>'+setup+'</script><script>'+(ROOT/'server/web/app.js').read_text()+'</script><script>'+(ROOT/'server/web/pools.js').read_text()+'</script><script>'+(ROOT/'server/web/subscriptions.js').read_text()+'</script><script>'+exercise+'</script>')
             html=html.replace('<script src="pools.js"></script>','').replace('<script src="subscriptions.js"></script>','')
             html=html.replace('<link rel="stylesheet" href="style.css">','<style>'+(ROOT/'server/web/style.css').read_text()+'</style>')
-            (root/'index.html').write_text(html)
-            async def browser_result():
-                # Real frames are needed for ResizeObserver/requestAnimationFrame;
-                # --virtual-time-budget can finish before those frames are drawn.
-                port_file=root/'profile/DevToolsActivePort'
-                for _ in range(100):
-                    if port_file.exists():break
-                    await asyncio.sleep(.05)
-                port=port_file.read_text().splitlines()[0]
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f'http://127.0.0.1:{port}/json/list') as response:
-                        pages=await response.json()
-                    page=next(p for p in pages if p['type']=='page')
-                    async with session.ws_connect(page['webSocketDebuggerUrl']) as ws:
-                        await ws.send_json(dict(id=1,method='Runtime.evaluate',params=dict(awaitPromise=True,returnByValue=True,
-                            expression="(async()=>{for(;;){const r=document.querySelector('#result')?.textContent;if(r&&r!=='RUNNING')return r;await new Promise(resolve=>setTimeout(resolve,50));}})()")))
-                        reply=await ws.receive_json(timeout=20)
-                        return reply['result']['result']['value']
-            with (root/'chrome.log').open('w') as log:
+            # Let actual frames run and report completion over local HTTP;
+            # this does not depend on a browser debugging port or virtual time.
+            done=threading.Event();results=[]
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *args):pass
+                def do_GET(self):
+                    if self.path!='/':self.send_error(404);return
+                    self.send_response(200)
+                    self.send_header('Content-Type','text/html; charset=utf-8')
+                    self.end_headers();self.wfile.write(html.encode())
+                def do_POST(self):
+                    if self.path!='/result':self.send_error(404);return
+                    results.append(self.rfile.read(int(self.headers['Content-Length'])).decode())
+                    self.send_response(204);self.end_headers();done.set()
+            with ThreadingHTTPServer(('127.0.0.1',0),Handler) as server, (root/'chrome.log').open('w') as log:
+                thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
                 process=subprocess.Popen([chrome,'--headless','--no-sandbox','--disable-gpu','--disable-background-networking',
                     '--no-first-run','--no-default-browser-check','--disable-dev-shm-usage','--window-size=500,900',f'--user-data-dir={root}/profile',
-                    '--remote-debugging-address=127.0.0.1','--remote-debugging-port=0',(root/'index.html').as_uri()],stdout=log,stderr=log)
+                    f'http://127.0.0.1:{server.server_port}/'],stdout=log,stderr=log)
                 try:
-                    result=asyncio.run(browser_result())
+                    self.assertTrue(done.wait(30),'Browser did not report a result:\n'+(root/'chrome.log').read_text()[-4000:])
                 finally:
                     process.terminate()
                     try:process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         process.kill();process.wait()
-            self.assertEqual(result,'PASS',result[-4000:])
+                    server.shutdown();thread.join()
+            self.assertEqual(results[0],'PASS',results[0][-4000:])
