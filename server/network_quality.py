@@ -99,20 +99,39 @@ def history(conn, pair_id, seconds, now):
 
 def summarize(rows, seconds, now):
     step = {900: 10, 3600: 60, 86400: 300}[seconds]
+    start = now - seconds
     buckets = defaultdict(list)
     for row in rows:
-        buckets[row['slot'] // step * step].append(row)
+        if start <= row['slot'] <= now:
+            buckets[row['slot'] // step * step].append(row)
     points = []
-    for slot in range((now - seconds) // step * step, now // step * step + 1, step):
+    for slot in range(start // step * step, now // step * step + 1, step):
         batch = buckets.get(slot, [])
-        stat = aggregate(batch)
-        points.append(dict(time=slot, **stat, status=batch[-1]['status'] if batch else 'missing',
-                           error=batch[-1]['error'] if batch else '',
-                           resolved_ip=batch[-1]['resolved_ip'] if batch else '',
-                           gap=any(r['status'] != 'ok' for r in batch) or len(batch) < step // INTERVAL,
-                           path_key=batch[-1].get('path_key') if batch else None,
-                           path_label=batch[-1].get('path_label', '') if batch else '',
-                           endpoint_change=len({(r['resolved_ip'], r.get('path_key')) for r in batch}) > 1))
+        # Never average different paths/endpoints or bridge a real sampling outage.
+        # Failed probes may have no resolved IP; that alone is not an endpoint change.
+        groups, group, address = [], [], ''
+        for row in batch:
+            if group and (row.get('path_key') != group[-1].get('path_key')
+                          or (address and row['resolved_ip'] and address != row['resolved_ip'])
+                          or row['slot'] - group[-1]['slot'] > INTERVAL * 2):
+                groups.append(group)
+                group, address = [], ''
+            group.append(row)
+            address = row['resolved_ip'] or address
+        groups.append(group)
+        for index, group in enumerate(groups):
+            failures = [r for r in group if r['status'] != 'ok']
+            state = (failures or group)[-1] if group else None
+            points.append(dict(time=max(start, slot) if index == 0 else group[0]['slot'],
+                               end=groups[index + 1][0]['slot'] if index + 1 < len(groups) else min(slot + step, now + 1),
+                               **aggregate(group), status=state['status'] if state else 'missing',
+                               error=state['error'] if state else '', failures=len(failures),
+                               resolved_ip=next((r['resolved_ip'] for r in reversed(group) if r['resolved_ip']), ''),
+                               first_slot=group[0]['slot'] if group else None,
+                               last_slot=group[-1]['slot'] if group else None,
+                               gap=bool(failures),
+                               path_key=group[-1].get('path_key') if group else None,
+                               path_label=group[-1].get('path_label', '') if group else ''))
     recent = [r for r in rows if r['slot'] >= now - 300]
     latest = rows[-1] if rows else None
     return dict(points=points, step=step, summary=aggregate(recent), latest=latest)

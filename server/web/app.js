@@ -36,6 +36,9 @@ let refreshTimer = null;
 let currentNode = null;           // 详情页的节点
 let list = null;                  // 当前列表页：{kind, data, draw}，搜索和筛选时用已有数据重绘
 let sortMode = null;              // 正在排序的列表："nodes" / "chains"
+let sortInitial = null, sortBusy = false;
+const sortValues = () => JSON.stringify(['.sort-group','.sort-card'].map(selector => [...app.querySelectorAll(selector)].map(el => el.dataset.id)));
+const sortChanged = () => sortMode && sortInitial !== null && sortValues() !== sortInitial;
 const openDetails = new Set();    // 已展开的折叠区，刷新后保持
 const revealedKeys = new Set();   // 已显示密钥的节点
 const filters = { nodes: {}, routes: {}, targets: {}, chains: {}, links: {}, configs: {} };   // 搜索和筛选条件，刷新页面后清空
@@ -91,6 +94,10 @@ function footer(withVersion) {
 
 function emptyState(icon, text) {
   return `<div class="empty"><div class="empty-icon">${icon}</div>${text}</div>`;
+}
+
+function moreActions(key, actions) {
+  return `<details class="more-actions" data-key="${key}" ${openDetails.has(key)?'open':''}><summary aria-label="更多操作">更多</summary><div class="more-menu">${actions}</div></details>`;
 }
 
 // 渲染页面：切换页面时整体替换并播放进入动画；刷新时只更新有变化的部分，
@@ -155,20 +162,28 @@ function toast(text, error = false) {
 }
 
 async function copy(text) {
+  let copied = false;
   try {
     await navigator.clipboard.writeText(text);
+    copied = true;
   } catch {
     // HTTP 页面没有剪贴板 API，退回旧方法
     const t = document.createElement("textarea");
     t.value = text;
     t.style.position = "fixed";
     t.style.opacity = "0";
-    document.body.append(t);
-    t.select();
-    document.execCommand("copy");
-    t.remove();
+    const focused = document.activeElement;
+    try {
+      document.body.append(t);
+      t.select();
+      copied = document.execCommand("copy");
+    } catch {} finally {
+      t.remove();
+      if (focused?.isConnected) focused.focus({preventScroll:true});
+    }
   }
-  toast("已复制");
+  toast(copied ? "已复制" : "复制失败，请手动选择内容复制", !copied);
+  return copied;
 }
 
 function syncAddress(publicUrl, syncPath) {
@@ -188,21 +203,25 @@ class ApiError extends Error {
 
 async function api(method, path, body) {
   const request = viewRequest;
-  const opt = { method, headers: {}, credentials: "same-origin" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), path.endsWith('/query') ? 45000 : 20000);
+  const opt = { method, headers: {}, credentials: "same-origin", signal: controller.signal };
   if (method !== "GET") {
     opt.headers["Content-Type"] = "application/json";
     opt.body = JSON.stringify(body || {});
   }
-  let res;
+  let res, data = {};
   try {
     res = await fetch("api/" + path, opt);
-  } catch {
+    try { data = await res.json(); }
+    catch (err) { if (controller.signal.aborted || res.ok) throw err; }
+  } catch (err) {
+    if (controller.signal.aborted) throw new ApiError(0, {error:"请求超时，请刷新核对操作结果后再重试"});
+    if (res) throw new ApiError(0, {error:"服务端响应异常，请刷新核对操作结果"});
     throw new ApiError(0, { error: "无法连接服务端" });
+  } finally {
+    clearTimeout(timer);
   }
-  let data = {};
-  try {
-    data = await res.json();
-  } catch {}
   if (res.ok) return data;
   if (request === viewRequest && res.status === 401 && path !== "login") {
     me = null;
@@ -231,12 +250,14 @@ async function safe(fn) {
 
 function leaveView() {
   if (typeof releaseTopology === "function") releaseTopology();
+  releaseQuality();
   pageVersion++;
   viewRequest++;
   currentView = null;
   currentNode = null;
   list = null;
   sortMode = null;
+  sortInitial = null;
   clearTimeout(refreshTimer);
 }
 
@@ -268,6 +289,14 @@ function refresh() {
 
 let renderedHash = location.hash;
 async function route() {
+  if (sortBusy) {
+    history.replaceState(null, '', location.pathname + location.search + renderedHash);
+    return;
+  }
+  if (sortChanged() && !(await confirmBox("放弃未保存的排序？", "离开后将丢弃此次顺序调整。", "放弃", true))) {
+    history.replaceState(null, '', location.pathname + location.search + renderedHash);
+    return;
+  }
   if ((modalChanged() || modalState?.busy) && !(await requestCloseModal())) {
     history.replaceState(null, '', location.pathname + location.search + renderedHash);
     return;
@@ -373,9 +402,9 @@ function listHead(kind, total, shown, newAction, newLabel, extraActions = "") {
        <button class="primary" data-action="sort-save" data-kind="${kind}">完成</button>`
     : `${total > 1 || list.data.groups.length > 1 ? `<button data-action="sort-start" data-kind="${kind}" ${isFiltering(kind)
         ? `disabled title="搜索或筛选时不能排序"` : ""}>排序</button>` : ""}
-       <button data-action="group-new" data-kind="${kind}">新建分组</button>
        ${extraActions}
-       <button class="primary" data-action="${newAction}">${newLabel}</button>`;
+       <button class="primary" data-action="${newAction}">${newLabel}</button>
+       ${moreActions(`list-actions-${kind}`, `<button data-action="group-new" data-kind="${kind}">新建分组</button>`)}`;
   return `<div class="page-head"><h1>${KIND_LABEL[kind]}<span class="count">${filtering ? `${shown} / ${total}` : total || ""}</span></h1>
     <div class="head-actions">${buttons}</div></div>`;
 }
@@ -392,7 +421,8 @@ function saveCollapsed() {
 // 搜索或筛选时隐藏没有匹配项的分组，有匹配项的分组临时展开
 function groupedList(kind, items, card, summary, editable = true) {
   const groups = list.data.groups;
-  if (groups.length === 1) return items.map(card).join("");
+  const rows = kind === 'nodes' || kind === 'targets';
+  if (groups.length === 1) return rows ? `<div class="resource-rows">${items.map(card).join('')}</div>` : items.map(card).join("");
   const filtering = isFiltering(kind);
   return groups.map((g) => {
     const members = items.filter((x) => x.group_id === g.id);
@@ -400,7 +430,7 @@ function groupedList(kind, items, card, summary, editable = true) {
     const key = `${kind}-${g.id}`;
     return `<section class="group${!filtering && collapsed.has(key) ? " closed" : ""}" data-key="group-${key}">
       ${groupHead(kind, g, `${members.length} 个${summary(members)}`, "", editable)}
-      <div class="group-body">${members.map(card).join("") || `<div class="group-empty">空分组</div>`}</div>
+      <div class="group-body${rows?' resource-rows':''}">${members.map(card).join("") || `<div class="group-empty">空分组</div>`}</div>
     </section>`;
   }).join("");
 }
@@ -501,7 +531,7 @@ function drawNodes() {
   const card = (n) => `
     <a class="card node-card" href="#/nodes/${n.id}" data-key="node-${n.id}">
       <div class="card-head">
-        <div class="node-head"><div class="title"><span class="mode-tag ${n.desired_mode}">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${esc(n.name)}</div>${nodeSub(n)}</div>
+        <div class="node-head"><div class="title" title="${esc(n.name)}"><span class="mode-tag ${n.desired_mode}">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${esc(n.name)}</div>${nodeSub(n)}</div>
         <div class="meta">${pill(n.status)}<span class="muted">${ago(n.last_seen, d.now)}</span></div>
       </div>
       ${bar(n.bar)}
@@ -580,10 +610,10 @@ async function nodeDetail(id, request) {
     <a class="back" href="#/nodes">← 节点列表</a>
     <div class="detail-head">
       <div class="node-head"><h1>${esc(n.name)}</h1><div class="sub mono">${esc(n.addr)}</div></div>
-      <div class="meta"><span class="muted">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${pill(n.status)}<span class="muted">最后上报 ${ago(n.last_seen, d.now)}</span></div>
+      <div class="detail-actions"><div class="meta"><span class="muted">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${pill(n.status)}<span class="muted">最后上报 ${ago(n.last_seen, d.now)}</span></div><button data-action="node-edit">编辑</button>${moreActions(`node-actions-${id}`, `<button data-action="node-rekey">重置密钥</button>${n.status === 'deleting'?'<button class="danger" data-action="node-delete" data-force="1">强制删除</button>':'<button class="danger" data-action="node-delete">删除</button>'}`)}</div>
     </div>
     ${n.note ? `<div class="panel note-full"><h2>备注</h2><div>${esc(n.note)}</div></div>` : ""}
-    <div class="panel">${bar(n.bar)}
+    <div class="detail-grid"><div class="panel">${bar(n.bar)}
       ${n.installed_agent === "legacy" || !n.installed_agent ? `<p class="t-yellow">此节点尚未迁移。请在节点执行下方一键接入命令；新版主动 Agent 确认安装后才能加入池并显示采集信息。</p>` : ""}
       ${n.desired_mode === "passive" || n.manual_required ? `<p class="hint">本机运行 <code>sudo ictl --sync</code> 或菜单「同步更新」。等待状态会持续到当前变更确认成功。白条上的绿色表示手动同步活动或远程同步成功，执行结果见下方事件。</p>` : ""}
       ${n.desired_mode === "passive" ? `<p class="hint">已同步表示最近一次确认结果，不表示实时在线；被动模式不自动轮询。</p>` : ""}
@@ -602,15 +632,8 @@ async function nodeDetail(id, request) {
         <button class="small" data-action="copy" data-text="${esc(install(n.key))}">复制</button></div>
       <p class="hint">在对应节点执行一键接入命令。旧节点升级或切换类型也使用此入口，保留节点身份；新主动 Agent 需要 HTTPS。</p>
     </div>
-    <div class="panel"><h2>转发规则<span class="count">允许端口 ${esc(n.ports)}</span></h2>${rules}</div>
+    </div><div class="panel"><h2>转发规则<span class="count">允许端口 ${esc(n.ports)}</span></h2><div class="table-scroll">${rules}</div></div>
     ${telemetryPanel(d)}
-    <div class="actions">
-      <button data-action="node-edit">编辑</button>
-      <button data-action="node-rekey">重置密钥</button>
-      ${n.status === "deleting"
-        ? `<button class="danger" data-action="node-delete" data-force="1">强制删除</button>`
-        : `<button class="danger" data-action="node-delete">删除</button>`}
-    </div>
     ${detailsBlock(`more-${id}`, "更多信息", more)}
     ${detailsBlock(`events-${id}`, "事件记录", events)}`);
 }
@@ -788,6 +811,7 @@ const modalValues = () => JSON.stringify([...document.querySelectorAll('#modal f
 const modalChanged = () => modalState && (modalState.dirty || modalValues() !== modalState.initial);
 
 function openModal(html, preserve = false) {
+  if (modalState?.busy) return;
   const m = $("#modal");
   if (!preserve || !modalState) {
     const trigger = document.activeElement;
@@ -809,6 +833,7 @@ function openModal(html, preserve = false) {
 
 function closeModal(result = false) {
   const m = $("#modal"), state = modalState;
+  state?.confirm?.finish(false);
   modalState = null;
   m.hidden = true;
   m.innerHTML = "";
@@ -820,6 +845,7 @@ function closeModal(result = false) {
 
 function requestCloseModal() {
   if (modalState?.busy) return Promise.resolve(false);
+  if (modalState?.confirm) { modalState.confirm.finish(false); return Promise.resolve(false); }
   if (!modalChanged()) { closeModal(); return Promise.resolve(true); }
   if (modalState.discardPromise) return modalState.discardPromise;
   const box = $('#modal .modal-box'), previous = document.activeElement;
@@ -841,11 +867,30 @@ function requestCloseModal() {
 
 function markModalDirty() { if (modalState) modalState.dirty = true; }
 
+async function withBusyForm(form, work) {
+  const session = form.closest('#modal') ? modalState : null;
+  if (form.dataset.busy || session?.busy) return;
+  form.dataset.busy = '1';
+  form.inert = true;
+  form.setAttribute('aria-busy', 'true');
+  if (session) session.busy = true;
+  const button = form.querySelector('button.primary'), label = button?.textContent;
+  if (button) { button.disabled = true; button.textContent = '处理中…'; }
+  try { return await work(); }
+  finally {
+    delete form.dataset.busy;
+    form.inert = false;
+    form.removeAttribute('aria-busy');
+    if (session) session.busy = false;
+    if (button) { button.disabled = false; button.textContent = label; }
+  }
+}
+
 // Keep a real select as the form value; searching never changes the selection.
 function resourceSelect(name, items, value = '', placeholder = '请选择', byId = false) {
   const options = [{id:'',name:placeholder}, ...items];
   const selected = options.find(x => String(x.id) === String(value ?? '')) || options[0];
-  return `<details class="resource-picker"><summary>${esc(selected.name)}</summary><div class="resource-menu"><input type="search" data-resource-search data-ignore-dirty placeholder="搜索名称或地址" aria-label="搜索资源"><div class="resource-options">${options.map(x => `<button type="button" data-resource-value="${esc(x.id)}" data-search="${esc((x.name+' '+(x.addr||'')).toLowerCase())}" aria-pressed="${String(x.id)===String(selected.id)}">${esc(x.name)}${x.addr?`<small>${esc(x.addr)}</small>`:''}</button>`).join('')}<span class="resource-empty" hidden>没有匹配项</span></div></div><select hidden ${byId?'id':'name'}="${name}">${options.map(x => `<option value="${esc(x.id)}" ${String(x.id)===String(selected.id)?'selected':''}>${esc(x.name)}</option>`).join('')}</select></details>`;
+  return `<details class="resource-picker"><summary>${esc(selected.name)}</summary><div class="resource-menu"><input type="search" data-resource-search data-ignore-dirty placeholder="搜索名称或地址" aria-label="搜索资源"><div class="resource-options">${options.map(x => `<button type="button" data-resource-value="${esc(x.id)}" data-search="${esc((x.name+' '+(x.addr||'')).toLowerCase())}" aria-pressed="${String(x.id)===String(selected.id)}" ${x.disabled?'disabled':''}>${esc(x.name)}${x.addr||x.note?`<small>${esc([x.addr,x.note].filter(Boolean).join(' · '))}</small>`:''}</button>`).join('')}<span class="resource-empty" hidden>没有匹配项</span></div></div><select hidden ${byId?'id':'name'}="${name}">${options.map(x => `<option value="${esc(x.id)}" ${String(x.id)===String(selected.id)?'selected':''} ${x.disabled?'disabled':''}>${esc(x.name)}</option>`).join('')}</select></details>`;
 }
 
 document.addEventListener('input', e => {
@@ -856,7 +901,14 @@ document.addEventListener('input', e => {
   const empty = menu.querySelector('.resource-empty'); if(empty)empty.hidden = count > 0;
 });
 document.addEventListener('click', e => {
+  document.querySelectorAll('.more-actions[open]').forEach(menu => {
+    if (!menu.contains(e.target) || e.target.closest('[data-action]')) {
+      menu.open = false;
+      openDetails.delete(menu.dataset.key);
+    }
+  });
   const choice = e.target.closest('[data-resource-value]');
+  if (choice && (choice.disabled || choice.closest('[inert]') || modalState?.busy)) return;
   if (choice) {
     const picker = choice.closest('.resource-picker'), select = picker.querySelector('select');
     select.value = choice.dataset.resourceValue;
@@ -870,9 +922,34 @@ document.addEventListener('click', e => {
 document.addEventListener('toggle', e => {
   if(e.target.matches?.('.resource-picker[open]'))e.target.querySelector('input').focus();
 }, true);
-window.addEventListener('beforeunload', e => { if(modalChanged()) {e.preventDefault();e.returnValue='';} });
+window.addEventListener('beforeunload', e => { if(modalChanged() || modalState?.busy || sortChanged() || sortBusy) {e.preventDefault();e.returnValue='';} });
 
 function confirmBox(title, text, okLabel = "确定", danger = false) {
+  if (modalState?.busy) return Promise.resolve(false);
+  if (modalState?.confirm) return modalState.confirm.promise;
+  if (modalState) {
+    const state = modalState, box = $('#modal > .modal-box'), focused = document.activeElement;
+    const shade = document.createElement('div');
+    shade.className = 'discard-shade';
+    shade.innerHTML = `<div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><h2 id="confirm-title">${esc(title)}</h2><p>${text}</p><div class="form-actions"><button type="button" data-confirm="0">取消</button><button type="button" class="primary ${danger?'danger-bg':''}" data-confirm="1">${esc(okLabel)}</button></div></div>`;
+    box.inert = true;
+    $('#modal').append(shade);
+    let resolve;
+    const promise = new Promise(done => resolve = done);
+    const finish = result => {
+      state.confirm = null;
+      shade.remove(); box.inert = false;
+      if (focused?.isConnected) focused.focus({preventScroll:true});
+      resolve(result);
+    };
+    state.confirm = {promise, finish};
+    shade.addEventListener('click', e => {
+      const button = e.target.closest('[data-confirm]');
+      if (button || e.target === shade) finish(button?.dataset.confirm === '1');
+    });
+    shade.querySelector('[data-confirm="0"]').focus();
+    return promise;
+  }
   return new Promise((resolve) => {
     openModal(`
       <h2>${esc(title)}</h2>
@@ -1027,7 +1104,11 @@ function showFormError(form, err) {
     (input.closest('.resource-picker')?.querySelector('summary') || input).focus();
   } else {
     const fe = $(".form-error", form);
-    if (fe) fe.textContent = msg;
+    if (fe) {
+      fe.textContent = msg;
+      if (err.status === 409 && ['link-save','instance-save','quick-switch'].includes(form.dataset.form))
+        fe.insertAdjacentHTML('beforeend', ' <button type="button" class="small" data-action="link-reload">载入最新配置</button>');
+    }
     else toast(msg, true);
   }
 }
@@ -1109,23 +1190,15 @@ document.addEventListener("submit", async (e) => {
   const handler = FORMS[form.dataset.form];
   if (!handler) return;
   e.preventDefault();
-  if (form.dataset.busy) return;
-  form.dataset.busy = '1';
-  const session = form.closest('#modal') ? modalState : null;
-  if (session) session.busy = true;
-  clearFormErrors(form);
-  const button = form.querySelector("button.primary");
-  if (button) button.disabled = true;
+  if (form.closest('[inert]') || form.dataset.busy || (form.closest('#modal') && modalState?.busy)) return;
   try {
-    await handler(form, Object.fromEntries(new FormData(form)));
+    clearFormErrors(form);
+    const data = Object.fromEntries(new FormData(form));
+    await withBusyForm(form, () => handler(form, data));
   } catch (err) {
     if (err instanceof ApiError && (err.status === 401 && form.dataset.form !== "login")) return;
     if (err instanceof ApiError && err.status === 403 && err.data.must_change) return;
-    showFormError(form, err);
-  } finally {
-    delete form.dataset.busy;
-    if (session) session.busy = false;
-    if (button && button.isConnected) button.disabled = false;
+    if (form.isConnected) showFormError(form, err);
   }
 });
 
@@ -1146,9 +1219,17 @@ const ACTIONS = {
   "node-new": () => nodeForm(),
   "node-edit": () => nodeForm(currentNode),
   async "node-query"(el) {
-    const id = currentNode.id;
-    const result = await api("POST", `nodes/${id}/query`, {kind:el.dataset.kind, rule_id:Number(el.dataset.rule || 0)});
-    openModal(`<h2>节点查询结果</h2><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(JSON.stringify(result.data || result, null, 2))}</pre><button data-action="modal-close">关闭</button>`);
+    const id = currentNode.id, page = pageVersion;
+    openModal('<h2>节点查询</h2><p role="status">查询中…</p><button data-action="modal-close">关闭</button>');
+    const session = modalState;
+    try {
+      const result = await api("POST", `nodes/${id}/query`, {kind:el.dataset.kind, rule_id:Number(el.dataset.rule || 0)});
+      if (page !== pageVersion || session !== modalState) return;
+      openModal(`<h2>节点查询结果</h2><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(JSON.stringify(result.data || result, null, 2))}</pre><button data-action="modal-close">关闭</button>`);
+    } catch (err) {
+      if (page !== pageVersion || session !== modalState) return;
+      openModal(`<h2>节点查询失败</h2><p class="t-red">${esc(err.message)}</p><button data-action="modal-close">关闭</button>`);
+    }
   },
 
   "key-toggle"() {
@@ -1217,26 +1298,40 @@ const ACTIONS = {
     list.draw();
   },
 
-  "sort-start"(el) {
+  async "sort-start"(el) {
+    const page = pageVersion;
     sortMode = el.dataset.kind;
+    sortInitial = null;
     clearTimeout(refreshTimer);
-    return refresh();
+    await refresh();
+    if (page === pageVersion && sortMode === el.dataset.kind) sortInitial = sortValues();
   },
-  "sort-cancel"() {
+  async "sort-cancel"() {
+    if (sortBusy || (sortChanged() && !(await confirmBox('放弃未保存的排序？','此次顺序调整将不会保存。','放弃',true)))) return;
     sortMode = null;
+    sortInitial = null;
     refresh();
     schedule();
   },
   async "sort-save"(el) {
+    if (sortBusy) return;
     const ids = [...app.querySelectorAll(".sort-card")].map((c) => Number(c.dataset.id));
     const groups = list.data.groups.length > 1
       ? [...app.querySelectorAll(".sort-group")].map((g) => Number(g.dataset.id))
       : list.data.groups.map((g) => g.id);
-    await api("POST", `${el.dataset.kind}/order`, { groups, ids });
-    sortMode = null;
-    toast("顺序已保存");
-    refresh();
-    schedule();
+    sortBusy = true;
+    app.inert = true;
+    try {
+      await api("POST", `${el.dataset.kind}/order`, { groups, ids });
+      sortMode = null;
+      sortInitial = null;
+      toast("顺序已保存");
+      await refresh();
+    } finally {
+      sortBusy = false;
+      app.inert = false;
+      schedule();
+    }
   },
 
   "chain-new": () => chainForm(),
@@ -1281,19 +1376,24 @@ document.addEventListener("click", (e) => {
   if (e.target.id === "modal") return void requestCloseModal();
   if (e.target.closest(".drag-handle")) return;   // 拖动分组标题时不触发折叠
   const el = e.target.closest("[data-action]");
-  if (!el || !ACTIONS[el.dataset.action]) return;
+  if (!el || !ACTIONS[el.dataset.action] || el.disabled || el.closest('[inert]') || (el.closest('#modal') && modalState?.busy)) return;
   e.preventDefault();
   safe(() => ACTIONS[el.dataset.action](el));
 });
 
 document.addEventListener("keydown", (e) => {
+  if (e.key === 'Escape') {
+    const menu = document.querySelector('.more-actions[open]');
+    if (menu) { menu.open=false; openDetails.delete(menu.dataset.key); menu.querySelector('summary').focus(); e.preventDefault(); return; }
+  }
   if ($("#modal").hidden) return;
   if (e.target.matches?.('[data-resource-search]') && e.key === 'Enter') {e.preventDefault();return;}
   if (e.key === 'Escape') {
     e.preventDefault();
     const discard = $('#modal [data-discard=no]');
     const picker = $('#modal .resource-picker[open]');
-    if (discard) discard.click();
+    if (modalState?.confirm) modalState.confirm.finish(false);
+    else if (discard) discard.click();
     else if (picker) { picker.open = false; picker.querySelector('summary').focus(); }
     else void requestCloseModal();
   }
@@ -1315,7 +1415,7 @@ let drag = null;
 
 document.addEventListener("pointerdown", (e) => {
   const handle = e.target.closest(".drag-handle");
-  if (!handle || e.button > 0) return;
+  if (!handle || e.button > 0 || handle.closest('[inert]') || (handle.closest('#modal') && modalState?.busy)) return;
   e.preventDefault();
   const card = handle.closest(".sort-item");
   handle.setPointerCapture(e.pointerId);
@@ -1404,11 +1504,20 @@ function drawRoutes() {
 }
 
 const qualityViews = new Map();
+let qualityResizeObserver = null;
+let qualityResizeFrame = null;
+
+function releaseQuality() {
+  qualityResizeObserver?.disconnect();
+  qualityResizeObserver = null;
+  cancelAnimationFrame(qualityResizeFrame);
+  qualityResizeFrame = null;
+}
 const QUALITY_STATES = {unknown: "未知", ok: "成功", timeout: "探测超时", error: "探测异常", offline: "节点离线", stopped: "探测已停止", unsupported: "需要升级 Agent", disabled: "探测已关闭", waiting: "等待探测就绪", missing: "未采样", collecting: "持续采集中"};
 const qualityNumber = (n, unit = " ms") => n == null ? "—" : Number(n).toFixed(1) + unit;
 
 const QUALITY_PROTOCOLS = {"tcp-connect-v1": ["TCP", "var(--yellow)"], "udp-echo-v1": ["UDP", "var(--blue)"], "icmp-echo-v1": ["ICMP", "var(--green)"]};
-const QUALITY_PLOT = {width:900, height:250, left:55, right:16, top:18, bottom:40};
+const QUALITY_PLOT = {height:250, left:55, right:16, top:18, bottom:40};
 
 function qualityLegend(series) {
   return `<div class="quality-legend">${series.map(s=>{
@@ -1433,10 +1542,11 @@ function qualityTable(series, now) {
   return `<div class="quality-table"><table><thead><tr><th>探测</th><th>最新延迟</th><th>5 分钟平均</th><th>P95</th><th>波动</th><th>超时率</th><th>状态</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
-function qualityChart(series, now, seconds) {
+function qualityChart(series, now, seconds, width = app.clientWidth - 42) {
   const {height,left,right,top,bottom}=QUALITY_PLOT;
-  const width=Math.max(300,Math.min(QUALITY_PLOT.width,app.clientWidth-42));
-  const maximum = Math.max(1, ...series.flatMap(s => s.points.map(p => p.peak || 0))) * 1.1;
+  width = Math.max(160, Math.round(width));
+  series = series.map(s => ({...s, points:s.points.filter(p => p.time >= now-seconds && p.time <= now)}));
+  const maximum = Math.max(1, ...series.flatMap(s => s.points.map(p => p.peak ?? p.mean ?? 0))) * 1.1;
   const x = t => left + (t - (now - seconds)) / seconds * (width - left - right);
   const y = n => top + (height - top - bottom) * (1 - n / maximum);
   const grid = [0, .25, .5, .75, 1].map(f => `<line x1="${left}" x2="${width-right}" y1="${y(maximum*f)}" y2="${y(maximum*f)}" stroke="var(--border)" stroke-dasharray="3 5"/><text x="${left-8}" y="${y(maximum*f)+4}" text-anchor="end">${(maximum*f).toFixed(1)}</text>`).join("");
@@ -1445,22 +1555,25 @@ function qualityChart(series, now, seconds) {
   const curves = series.map((s, index) => {
     const [name, color] = QUALITY_PROTOCOLS[s.protocol];
     let previous = null, pathKey = null, elements = "";
-    for (const p of s.points.filter(p => p.time >= now - seconds)) {
+    for (const p of s.points) {
       if(p.path_key && pathKey && pathKey!==p.path_key && !changes.has(p.time)) {
         changes.add(p.time);elements+=`<line x1="${x(p.time)}" x2="${x(p.time)}" y1="${top}" y2="${height-bottom}" stroke="var(--muted)" stroke-dasharray="3 4"><title>路径切换 · ${esc(p.path_label||'')}</title></line>`;
       }
       if(p.path_key)pathKey=p.path_key;
       const title = `<title>${name} · ${esc(fmtTime(p.time))} · ${esc(QUALITY_STATES[p.status] || p.status)} · 平均 ${qualityNumber(p.mean)} · 峰值 ${qualityNumber(p.peak)} · 探测超时 ${qualityNumber(p.loss, "%")}（${p.lost}/${p.samples}）${p.resolved_ip ? " · " + esc(p.resolved_ip) : ""}${p.error ? " · " + esc(p.error) : ""}</title>`;
       const px = x(p.time).toFixed(1);
+      if (p.failures > 0 || (p.status !== "ok" && p.status !== "missing")) {
+        const py = height - bottom + 8 + index * 8;
+        elements += `<path d="M ${x(p.time)-2},${py-2} l 4,4 m -4,0 l 4,-4" stroke="${color}" stroke-width="1.5">${title}</path>`;
+      }
       if (p.mean == null) {
-        previous = null;
-        if (p.status !== "missing") {
-          const py = height - bottom + 8 + index * 8;
-          elements += `<path d="M ${x(p.time)-2},${py-2} l 4,4 m -4,0 l 4,-4" stroke="${color}" stroke-width="1.5">${title}</path>`;
-        }
+        // A bucket can be empty when nominal 10 s probes arrive slightly late.
+        // Keep the previous sample only when real timestamps can bound the gap.
+        if (p.status !== "missing" || previous?.last_slot == null) previous = null;
         continue;
       }
-      if (previous && !previous.gap && !p.gap && !previous.endpoint_change && !p.endpoint_change && previous.resolved_ip === p.resolved_ip && previous.path_key === p.path_key) {
+      const continuous = previous && (p.first_slot == null || previous.last_slot == null || p.first_slot - previous.last_slot <= 20);
+      if (continuous && !previous.gap && !p.gap && !previous.endpoint_change && !p.endpoint_change && previous.resolved_ip === p.resolved_ip && previous.path_key === p.path_key) {
         elements += `<line x1="${x(previous.time).toFixed(1)}" y1="${y(previous.mean).toFixed(1)}" x2="${px}" y2="${y(p.mean).toFixed(1)}" stroke="${color}" stroke-width="2"/>`;
       }
       if (p.peak != null && p.peak !== p.mean) elements += `<line x1="${px}" x2="${px}" y1="${y(p.mean).toFixed(1)}" y2="${y(p.peak).toFixed(1)}" stroke="${color}" opacity=".3">${title}</line>`;
@@ -1488,7 +1601,7 @@ function showQualityPoint(plot, time) {
   const {left,right}=QUALITY_PLOT, width=svg.viewBox.baseVal.width, x=left+(time-now+seconds)/seconds*(width-left-right);
   line.setAttribute('x1',x);line.setAttribute('x2',x);line.removeAttribute('hidden');
   tip.innerHTML=`<strong>${esc(fmtTime(time))}</strong>${series.map(s=>{
-    const p=s.points.find(p=>p.time===time),[name,color]=QUALITY_PROTOCOLS[s.protocol];
+    const p=s.points.find(p=>p.time===time || (p.time<time && time<p.end)),[name,color]=QUALITY_PROTOCOLS[s.protocol];
     return `<div><span class="quality-key" style="--series-color:${color}">${name}</span><b>${qualityNumber(p?.mean)}</b></div><small>${esc(QUALITY_STATES[p?.status||'missing']||p?.status)}${p?.mean!=null?` · 峰值 ${qualityNumber(p.peak)}`:''}${p?.loss!=null?` · 超时 ${qualityNumber(p.loss,'%')}`:''}</small>`;
   }).join('')}`;
   tip.hidden=false;
@@ -1497,6 +1610,7 @@ function showQualityPoint(plot, time) {
 }
 
 function renderQuality(html, charts) {
+  releaseQuality();
   const key=el=>el.closest('.quality-card').dataset.key+'/'+(el.dataset.qualityValue||'plot');
   const before=new Map([...app.querySelectorAll('.quality-card [data-quality-value],.quality-card .quality-plot')].map(el=>[key(el),el.dataset.version||el.textContent]));
   render(html);
@@ -1506,9 +1620,21 @@ function renderQuality(html, charts) {
         el.animate([{opacity:.45},{opacity:1}],{duration:240,easing:'ease-out'});
     });
   }
+  qualityResizeObserver = new ResizeObserver(() => {
+    if (qualityResizeFrame != null) return;
+    // Changing the viewBox also changes SVG height; draw outside the observer
+    // callback so its own resize notification cannot loop in the same frame.
+    qualityResizeFrame = requestAnimationFrame(() => {
+      qualityResizeFrame = null;
+      app.querySelectorAll('.quality-plot').forEach(plot => resizeQualityPlot(plot,plot.clientWidth));
+    });
+  });
   app.querySelectorAll('.quality-plot').forEach((plot,i)=>{
     const data=charts[i], svg=plot.querySelector('svg');
-    plot.qualityData={...data,times:[...new Set(data.series.flatMap(s=>s.points.filter(p=>p.time>=data.now-data.seconds && p.time<=data.now).map(p=>p.time)))].sort((a,b)=>a-b)};
+    const series=data.series.map(s=>({...s,points:s.points.filter(p=>p.time>=data.now-data.seconds && p.time<=data.now)}));
+    plot.qualityData={...data,series,times:[...new Set(series.flatMap(s=>s.points.map(p=>p.time)))].sort((a,b)=>a-b)};
+    resizeQualityPlot(plot,plot.clientWidth);
+    qualityResizeObserver.observe(plot);
     const point=e=>{
       const cursor=svg.createSVGPoint();cursor.x=e.clientX;cursor.y=e.clientY;
       const x=cursor.matrixTransform(svg.getScreenCTM().inverse()).x;
@@ -1529,6 +1655,20 @@ function renderQuality(html, charts) {
     };
     if(plot.qualityTime!=null)showQualityPoint(plot,plot.qualityTime);
   });
+}
+
+function resizeQualityPlot(plot, width) {
+  if (!plot.isConnected || width <= 0) return;
+  width = Math.max(160,Math.round(width));
+  const svg = plot.querySelector('svg');
+  if (svg.viewBox.baseVal.width === width) return;
+  const {series,now,seconds} = plot.qualityData;
+  const template = document.createElement('template');
+  template.innerHTML = qualityChart(series,now,seconds,width);
+  const next = template.content.querySelector('svg');
+  svg.setAttribute('viewBox',next.getAttribute('viewBox'));
+  morph(svg,next);
+  if (plot.qualityTime != null) showQualityPoint(plot,plot.qualityTime);
 }
 
 async function qualityPage(scope, id, request) {
@@ -1586,7 +1726,7 @@ function drawManagedList(kind, rows, card, newAction, newLabel, hint, extraActio
   const body = !items.length && isFiltering(kind) ? emptyState("⌕", "没有匹配的记录。")
     : !rows.length && groups.length === 1 ? emptyState("◎", `还没有${KIND_LABEL[kind]}，点击右上角新增。`)
     : groupedList(kind, items, card, () => "");
-  render(listHead(kind, rows.length, items.length, newAction, newLabel, extraActions) + `<p class="hint">${hint}</p>` + controls + body);
+  render(listHead(kind, rows.length, items.length, newAction, newLabel, extraActions) + (hint?`<p class="hint">${hint}</p>`:'') + controls + body);
   syncFilters();
 }
 
@@ -1615,11 +1755,9 @@ async function targetList(request) {
 }
 
 function drawTargets() {
-  const card = t => `<div class="card" data-key="target-${t.id}"><div class="card-head"><div class="title">${esc(t.name)}</div><div class="actions"><button class="small" data-action="target-edit" data-id="${t.id}">编辑</button><button class="small danger" data-action="target-delete" data-id="${t.id}">删除</button></div></div>
-    <div class="path">${esc(PROTOCOLS[t.type])}<span class="arrow">·</span><span class="mono">${esc(t.host)}:${t.port}</span></div>
-    <div class="sub">${t.configs.length ? `引用配置：${t.configs.map(c => esc(c.remark)).join("、")}` : "尚未被配置引用"}</div></div>`;
-  drawManagedList("targets", list.data.targets, card, "target-new", "添加地址目标", "保存外部服务的连接信息，可在配置中组合链路或直连使用。",
-    `<button data-action="target-import">导入分享链接</button>`);
+  const card = t => `<div class="card target-row" data-key="target-${t.id}"><div class="collection-main inline-summary"><button class="plain-title" data-action="target-edit" data-id="${t.id}" title="${esc(t.name)}">${esc(t.name)}</button><div class="sub"><span>${esc(t.type==='endpoint'?'地址':PROTOCOLS[t.type])}</span> · <span class="mono">${esc(t.host)}:${t.port}</span></div></div><span class="collection-meta muted" title="${esc(t.configs.map(c=>c.remark).join('、'))}">${t.configs.length?`${t.configs.length} 个引用`:'未引用'}</span><div class="row-actions"><button class="small" data-action="copy" data-text="${esc(t.uri||t.host+':'+t.port)}">复制</button><button class="small" data-action="target-edit" data-id="${t.id}">编辑</button>${moreActions(`target-actions-${t.id}`,`<button class="danger" data-action="target-delete" data-id="${t.id}">删除</button>`)}</div></div>`;
+  drawManagedList("targets", list.data.targets, card, "target-new", "添加地址", "",
+    `<button data-action="target-import" title="导入 SS 或 VLESS 分享链接">导入</button>`);
 }
 
 function targetForm(t, imported = false) {

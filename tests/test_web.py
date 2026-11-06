@@ -1,12 +1,15 @@
 """Exercise real DOM rendering, modes, white activity bars and target-only forms in Chrome."""
 import os
+import asyncio
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+import aiohttp
 from test_server import ROOT
+import network_quality as q
 
 
 class InstallCommandTests(unittest.TestCase):
@@ -46,6 +49,17 @@ class BrowserTests(unittest.TestCase):
     def test_views_forms_and_passive_activity(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);chrome=shutil.which('google-chrome') or shutil.which('chromium')
+            def sample(slot, rtt=20, path='same', status='ok'):
+                return dict(slot=slot, rtt=rtt if status == 'ok' else None, path_key=path,
+                            path_label=path, resolved_ip='192.0.2.1', status=status, error='')
+            histories = {}
+            for seconds in (900, 3600, 86400):
+                histories[str(seconds)] = dict(now=seconds, seconds=seconds, series=[dict(protocol='tcp-connect-v1',
+                    **q.summarize([sample(t) for t in range(0, seconds + 1, 12)], seconds, seconds))])
+            for name, rows in dict(switch=[sample(3540, 200, 'old'), sample(3550, 20, 'new'), sample(3560, 25, 'old')],
+                                   failure=[sample(3540), sample(3550, status='timeout'), sample(3560, 30)],
+                                   outage=[sample(3540, 10), sample(3580, 30)]).items():
+                histories[name] = dict(now=3600, seconds=3600, series=[dict(protocol='tcp-connect-v1', **q.summarize(rows, 3600, 3600))])
             setup=r'''
 const group={id:1,name:"默认分组",builtin:1};
 const node={id:1,name:"passive node",addr:"192.0.2.1",ports:"10000-10020",kind:"forward",desired_mode:"passive",protocol_version:2,manual_required:true,first_seen:1,last_seen:2,group_id:1,status:"syncing",key:"ab".repeat(32),bar:{start:1,window:60,levels:["white","ok"],counts:[0,2],times:[null,2]},applied_generation:1,desired_generation:2};
@@ -134,6 +148,50 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(!gaps.includes('stroke-width="2"'),"chart joins missing samples");
   const changedPathChart=qualityChart([{protocol:'tcp-connect-v1',points:[{time:1190,mean:10,peak:10,status:'ok',resolved_ip:'a',path_key:'old'},{time:1200,mean:20,peak:20,status:'ok',resolved_ip:'a',path_key:'new'}]}],1200,900);
   assert(!changedPathChart.includes('stroke-width="2"')&&changedPathChart.includes('路径切换'),'chart joined different paths');
+  const drawing=data=>{
+    const t=document.createElement('template');t.innerHTML=qualityChart(data.series,data.now,data.seconds);return t.content;
+  };
+  for(const range of ['900','3600','86400']) {
+    const graph=drawing(qualityHistories[range]);
+    assert(graph.querySelectorAll('.quality-series line[stroke-width="2"]').length===graph.querySelectorAll('circle').length-1,'delayed samples break '+range+' s curve');
+  }
+  const switched=drawing(qualityHistories.switch);
+  assert(switched.querySelectorAll('circle').length===3&&!switched.querySelector('line[stroke-width="2"]'),'path switch is averaged or joined');
+  assert(switched.querySelectorAll('line[stroke-dasharray="3 4"]').length===2,'switch markers missing');
+  const failed=drawing(qualityHistories.failure);
+  assert(failed.querySelectorAll('circle').length===1&&failed.querySelectorAll('.quality-series path').length===1,'partial failure needs both latency and failure marker');
+  assert(!drawing(qualityHistories.outage).querySelector('line[stroke-width="2"]'),'curve bridges a real outage');
+  const bounded={now:1205,seconds:900,series:[{protocol:'tcp-connect-v1',points:[{time:310,mean:20,peak:20,status:'ok'}]}]};
+  const labels=data=>[...drawing(data).querySelectorAll('svg > text')].map(t=>t.textContent).join('|');
+  const scale=labels(bounded);
+  bounded.series[0].points.unshift({time:300,mean:1000,peak:1000,status:'ok'});
+  bounded.series[0].points.push({time:1210,mean:2000,peak:2000,status:'ok'});
+  assert(labels(bounded)===scale&&drawing(bounded).querySelectorAll('circle').length===1,'offscreen samples change chart scale or escape plot');
+  const chartData=qualityHistories.switch;
+  // Other protocols can have a single aggregate spanning this path switch.
+  const combined={...chartData,series:[...chartData.series,{protocol:'udp-echo-v1',points:[{time:3540,end:3600,mean:18,peak:18,status:'ok'}]}]};
+  const redraw=()=>renderQuality(`<section class="quality-card" data-key="drawing-test">${qualityChart(combined.series,combined.now,combined.seconds)}</section>`,[combined]);
+  redraw();
+  const plot=app.querySelector('.quality-plot'),qualitySvg=plot.querySelector('svg');
+  showQualityPoint(plot,3550);
+  assert(plot.querySelector('.quality-tooltip').textContent.includes('18.0 ms'),'shared cursor loses protocol aggregates with different timestamps');
+  redraw();
+  assert(plot.qualityTime===3550&&!plot.querySelector('.quality-tooltip').hidden,'refresh loses selected timestamp');
+  const requestsBeforeResize=requests.length;
+  for (const width of [360,740]) {
+    app.style.width=width+'px';
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    assert(Math.abs(qualitySvg.viewBox.baseVal.width-plot.clientWidth)<=1,`resize did not recompute chart width (${qualitySvg.viewBox.baseVal.width} / ${plot.clientWidth})`);
+    assert(Math.abs(qualitySvg.getScreenCTM().a-1)<.02,'resize shrinks text instead of laying it out');
+    assert(plot.qualityTime===3550&&!plot.querySelector('.quality-tooltip').hidden,'resize loses selected timestamp');
+  }
+  assert(requests.length===requestsBeforeResize,'resize requests fresh network data');
+  qualitySvg.dispatchEvent(new KeyboardEvent('keydown',{key:'End'}));
+  assert(plot.qualityTime===plot.qualityData.times.at(-1),'keyboard End failed');
+  qualitySvg.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));
+  assert(plot.querySelector('.quality-tooltip').hidden,'keyboard Escape failed');
+  app.style.removeProperty('width');
+  leaveView();assert(qualityResizeObserver===null,'quality resize observer leaked after leaving page');
   leaveView();await show(poolList,false);assert(app.textContent.includes('香港池'),'pool list missing');
   poolForm(pool);await ACTIONS['pool-up']({dataset:{index:'1'}});
   assert(templateEditor.members[0]===2,'template reorder failed');closeModal();
@@ -143,6 +201,12 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(app.querySelectorAll('.topology-flow').length===2,'confirmed route must animate through both gaps');
   const canvas=app.querySelector('.topology-canvas'), svg=app.querySelector('.topology-cables');
   assert(canvas.offsetWidth===Number(svg.getAttribute('width')),'SVG and cards use different coordinates');
+  const cable=svg.querySelector('.topology-candidate'), canvasRect=canvas.getBoundingClientRect();
+  for(const [end,point] of [[false,cable.dataset.from],[true,cable.dataset.to]]) {
+    const cardRect=canvas.querySelector(`[data-point="${point}"]`).getBoundingClientRect();
+    const position=cable.getPointAtLength(end?cable.getTotalLength():0),scale=topologyViews.get(1).scale;
+    assert(Math.abs(position.x-((end?cardRect.left:cardRect.right)-canvasRect.left)/scale)<1.5 && Math.abs(position.y-((cardRect.top+cardRect.bottom)/2-canvasRect.top)/scale)<1.5,'compact cards and cable endpoints are misaligned');
+  }
   assert(app.querySelector('.topology-flow').getAttribute('d').split('C').length===2,'links must connect nodes directly');
   const camera=topologyViews.get(1), initialScale=camera.scale;
   ACTIONS['canvas-in']();
@@ -251,18 +315,147 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(!document.body.classList.contains('canvas-fullscreen'),'fullscreen body state leaked');
   leaveView();await show(settingsPage,false);assert(!app.textContent.includes('sing-box'),"obsolete core settings");
   assert(!document.querySelector('a[href="#/tunnels"]'),"obsolete nav");
+
+  const normalFetch=window.fetch, tick=()=>new Promise(resolve=>setTimeout(resolve,30));
+  const response=data=>({ok:true,status:200,json:async()=>data});
+  leaveView();await show(poolList,false);poolForm({name:'new pool',members:[1,2]});
+  const saves=[];
+  window.fetch=async(url,options)=>options?.method==='POST'&&String(url).endsWith('api/pools')
+    ?await new Promise(resolve=>saves.push({resolve,body:JSON.parse(options.body)})):normalFetch(url,options);
+  let editing=document.querySelector('#modal form');editing.requestSubmit();await tick();
+  assert(editing.inert&&modalState.busy,'saving form must lock all controls');
+  document.querySelector('[data-action=pool-down]:not(:disabled)').click();editing.requestSubmit();
+  assert(saves.length===1&&templateEditor.members.join(',')==='1,2','saving can be reordered or submitted twice');
+  assert(!(await requestCloseModal()),'pending save can be accidentally closed');
+  window.fetch=normalFetch;saves[0].resolve(response({id:1}));await tick();
+  assert(document.querySelector('#modal').hidden,'successful save did not close');
+
+  // Bound both fetch and body reads; a timeout must leave the form editable.
+  poolForm({name:'keep on timeout',members:[1]});editing=document.querySelector('#modal form');
+  const nativeTimeout=window.setTimeout;
+  window.setTimeout=(fn,ms,...args)=>nativeTimeout(fn,ms===20000?10:ms,...args);
+  window.fetch=async(url,options)=>({ok:true,status:200,json:()=>new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(new DOMException('aborted','AbortError'))))});
+  editing.requestSubmit();await tick();window.setTimeout=nativeTimeout;window.fetch=normalFetch;
+  assert(!editing.inert&&!modalState.busy&&!editing.querySelector('.primary').disabled,'timeout left form locked');
+  assert(editing.querySelector('[name=name]').value==='keep on timeout'&&editing.textContent.includes('超时'),'timeout lost form data or feedback');closeModal();
+
+  leaveView();await show(subscriptionList,false);subscriptionForm(subscriptionView.subscriptions[0]);
+  const subscriptionEditor=document.querySelector('#modal form');subscriptionEditor.elements.name.value='unsaved subscription';
+  let confirmation=ACTIONS['subscription-reset'](document.querySelector('[data-action=subscription-reset]'));
+  document.querySelector('[data-confirm="0"]').click();await confirmation;
+  assert(document.querySelector('#modal form')===subscriptionEditor&&!subscriptionEditor.closest('.modal-box').inert&&subscriptionEditor.elements.name.value==='unsaved subscription','cancel reset lost original editor');
+  confirmation=ACTIONS['subscription-delete'](document.querySelector('[data-action=subscription-delete]'));
+  document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));await confirmation;
+  assert(document.querySelector('#modal form')===subscriptionEditor,'Escape from nested confirm closed editor');
+  confirmation=ACTIONS['subscription-reset'](document.querySelector('[data-action=subscription-reset]'));
+  document.querySelector('[data-confirm="1"]').click();await confirmation;
+  assert(subscriptionEditor.elements.name.value==='unsaved subscription'&&!subscriptionEditor.inert,'successful reset erased unrelated edits');closeModal();
+
+  leaveView();await show(r=>nodeDetail(1,r),false);
+  let finishQuery;window.fetch=async(url,options)=>String(url).endsWith('/query')?await new Promise(resolve=>finishQuery=resolve):normalFetch(url,options);
+  const querying=ACTIONS['node-query']({dataset:{kind:'inventory'}});await tick();
+  assert(document.querySelector('#modal').textContent.includes('查询中'),'query has no pending feedback');
+  closeModal();leaveView();await show(subscriptionList,false);subscriptionForm(subscriptionView.subscriptions[0]);
+  const newerEditor=document.querySelector('#modal form');newerEditor.elements.name.value='new edit';
+  window.fetch=normalFetch;finishQuery(response({data:{host:'old node'}}));await querying;
+  assert(document.querySelector('#modal form')===newerEditor&&newerEditor.elements.name.value==='new edit','late query replaced newer editor');closeModal();
+
+  const clipboardDescriptor=Object.getOwnPropertyDescriptor(navigator,'clipboard'),execCopy=document.execCommand;
+  Object.defineProperty(navigator,'clipboard',{value:undefined,configurable:true});document.execCommand=()=>false;
+  assert(!(await copy('test'))&&document.querySelector('#toast').classList.contains('error'),'failed copy reported success');
+  document.execCommand=()=>true;assert(await copy('test'),'successful fallback copy failed');
+  document.execCommand=execCopy;if(clipboardDescriptor)Object.defineProperty(navigator,'clipboard',clipboardDescriptor);else delete navigator.clipboard;
+
+  leaveView();await show(r=>linkDetail(1,r),false);linkForm(poolView.link);
+  document.querySelector('#modal [name=name]').value='unsaved link';
+  window.fetch=async(url,options)=>options?.method==='PATCH'&&String(url).endsWith('api/links/1')
+    ?{ok:false,status:409,json:async()=>({error:'链路已变化，请刷新后重试'})}:normalFetch(url,options);
+  document.querySelector('#modal form').requestSubmit();await tick();
+  assert(document.querySelector('[data-action=link-reload]'),'conflict has no recovery action');
+  let reloading=ACTIONS['link-reload'](document.querySelector('[data-action=link-reload]'));
+  document.querySelector('[data-confirm="0"]').click();await reloading;
+  assert(document.querySelector('#modal [name=name]').value==='unsaved link','cancel reload lost edits');
+  link.revision+=1;window.fetch=normalFetch;
+  reloading=ACTIONS['link-reload'](document.querySelector('[data-action=link-reload]'));
+  document.querySelector('[data-confirm="1"]').click();await reloading;
+  assert(linkEditor.revision===link.revision,'reload kept stale link revision');
+  document.querySelector('#modal form').requestSubmit();await tick();
+  assert(requests.filter(r=>r.path==='links/1').at(-1).body.revision===link.revision,'retry sent stale revision');
+  // Saving a link may enqueue a hashchange; settle navigation before next view.
+  await tick();closeModal();
+
+  leaveView();await show(poolList,false);
+  poolView.nodes.push({id:4,name:'passive choice',mode:'passive',eligible:false,status:'synced'},
+    {id:5,name:'offline choice',mode:'active',eligible:true,status:'offline'});
+  poolForm();
+  assert(document.querySelector('[data-member-choice][value="4"]').disabled&&document.querySelector('#modal').textContent.includes('被动节点不能加入池'),'unavailable member has no reason');
+  assert(!document.querySelector('[data-member-choice][value="5"]').disabled,'offline active node cannot be added to a template');
+  closeModal();linkForm(link);
+  assert(document.querySelector('[name=entry]').closest('.resource-picker').textContent.includes('离线'),'resource selector omits node state');closeModal();
+
+  leaveView();await show(linkList,false);await ACTIONS['sort-start']({dataset:{kind:'links'}});
+  const groupList=app.querySelector('.sort-list');groupList.prepend(groupList.lastElementChild);
+  assert(sortChanged(),'changed group order was not detected');
+  history.replaceState(null,'','#/routes');renderedHash='#/routes';history.replaceState(null,'','#/targets');
+  let navigating=route();document.querySelector('[data-confirm="0"]').click();await navigating;
+  assert(sortMode==='links'&&sortChanged()&&location.hash==='#/routes','cancel navigation lost ordering');
+  history.replaceState(null,'','#/targets');navigating=route();document.querySelector('[data-confirm="1"]').click();await navigating;
+  assert(sortMode===null&&app.querySelector('[data-action=target-new]'),'confirmed navigation did not leave sorting');
+  leaveView();await show(linkList,false);app.style.width='360px';
+  const controls=app.querySelector('.collection-tools');
+  assert(getComputedStyle(controls).flexWrap==='wrap'&&controls.querySelector('input').getBoundingClientRect().bottom<=controls.querySelector('select').getBoundingClientRect().top,'mobile filters did not wrap');
+  app.style.removeProperty('width');
+
+  window.fetch=async(url,options)=>String(url).endsWith('api/links/999')?{ok:false,status:404,json:async()=>({error:'链路不存在'})}:normalFetch(url,options);
+  leaveView();await show(r=>linkDetail(999,r),false);window.fetch=normalFetch;
+  assert(app.textContent.includes('链路不存在')&&!app.querySelector('.collection-row')&&currentView===null,'missing link retained old page or refresh loop');
+  leaveView();await show(poolList,false);expandedPools.clear();
+  poolView.pools[0].members=[1,2,3,4,5];
+  poolView.nodes.push({id:4,name:'第四个成员'},{id:5,name:'第五个成员'});drawCollection();
+  assert(app.querySelectorAll('.member-tags > span').length===3,'pool preview shows all members by default');
+  app.querySelector('[data-action=pool-expand]').click();
+  assert(app.querySelectorAll('.member-tags > span').length===5 && app.textContent.includes('第五个成员'),'expanding pool loses members');
+  await show(targetList,false);
+  const actionMenu=app.querySelector('.target-row .more-actions');actionMenu.querySelector('summary').click();
+  assert(actionMenu.open && actionMenu.querySelector('[data-action=target-delete]').getClientRects().length,'target actions are unreachable');
+  document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+  assert(!actionMenu.open && document.activeElement===actionMenu.querySelector('summary'),'Escape did not dismiss action menu');
   document.querySelector('#result').textContent='PASS';
  }catch(e){document.querySelector('#result').textContent='FAIL '+e.stack;}
 })();
 '''
+            setup='const qualityHistories='+json.dumps(histories)+';\n'+setup
             html=(ROOT/'server/web/index.html').read_text().replace('<script src="app.js"></script>',
                 '<pre id="result">RUNNING</pre><script>'+setup+'</script><script>'+(ROOT/'server/web/app.js').read_text()+'</script><script>'+(ROOT/'server/web/pools.js').read_text()+'</script><script>'+(ROOT/'server/web/subscriptions.js').read_text()+'</script><script>'+exercise+'</script>')
             html=html.replace('<script src="pools.js"></script>','').replace('<script src="subscriptions.js"></script>','')
             html=html.replace('<link rel="stylesheet" href="style.css">','<style>'+(ROOT/'server/web/style.css').read_text()+'</style>')
             (root/'index.html').write_text(html)
-            r=subprocess.run([chrome,'--headless','--no-sandbox','--disable-gpu','--disable-background-networking',
-                '--no-first-run','--no-default-browser-check','--disable-dev-shm-usage',f'--user-data-dir={root}/profile',
-                '--virtual-time-budget=5000','--dump-dom',(root/'index.html').as_uri()],capture_output=True,text=True,timeout=30)
-            self.assertEqual(r.returncode,0,r.stderr[-3000:])
-            result=r.stdout.split('<pre id="result">')[-1].split('</pre>')[0]
+            async def browser_result():
+                # Real frames are needed for ResizeObserver/requestAnimationFrame;
+                # --virtual-time-budget can finish before those frames are drawn.
+                port_file=root/'profile/DevToolsActivePort'
+                for _ in range(100):
+                    if port_file.exists():break
+                    await asyncio.sleep(.05)
+                port=port_file.read_text().splitlines()[0]
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f'http://127.0.0.1:{port}/json/list') as response:
+                        pages=await response.json()
+                    page=next(p for p in pages if p['type']=='page')
+                    async with session.ws_connect(page['webSocketDebuggerUrl']) as ws:
+                        await ws.send_json(dict(id=1,method='Runtime.evaluate',params=dict(awaitPromise=True,returnByValue=True,
+                            expression="(async()=>{for(;;){const r=document.querySelector('#result')?.textContent;if(r&&r!=='RUNNING')return r;await new Promise(resolve=>setTimeout(resolve,50));}})()")))
+                        reply=await ws.receive_json(timeout=20)
+                        return reply['result']['result']['value']
+            with (root/'chrome.log').open('w') as log:
+                process=subprocess.Popen([chrome,'--headless','--no-sandbox','--disable-gpu','--disable-background-networking',
+                    '--no-first-run','--no-default-browser-check','--disable-dev-shm-usage','--window-size=500,900',f'--user-data-dir={root}/profile',
+                    '--remote-debugging-address=127.0.0.1','--remote-debugging-port=0',(root/'index.html').as_uri()],stdout=log,stderr=log)
+                try:
+                    result=asyncio.run(browser_result())
+                finally:
+                    process.terminate()
+                    try:process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill();process.wait()
             self.assertEqual(result,'PASS',result[-4000:])

@@ -1,8 +1,12 @@
 // Templates provide membership; every link owns its selection and preferences.
 const LINK_STATES = {draft:'草稿', active:'已应用', pending:'等待应用', preparing:'准备下游', switching:'切换入口', waiting:'等待确认', error:'异常', deleting:'删除中', manual:'等待手动同步', timeout:'确认超时', failed:'应用失败', offline:'节点离线'};
 let poolView = null, linkEditor = null, templateEditor = null, instanceEditor = null, quickSwitch = null;
+const expandedPools = new Set();
 const resourceName = (items, id, fallback='已删除') => items.find(x => x.id === id)?.name || fallback;
 const memberName = (id) => id === 0 ? 'direct' : resourceName(poolView.nodes, id);
+const nodeNote = n => `${n.mode==='passive'?'被动':'主动'} · ${STATUS[n.status]?.[0]||'未就绪'}${n.mode!=='passive'&&!n.eligible?' · 待确认主动 Agent':''}`;
+const nodeChoice = n => ({...n, note:nodeNote(n), disabled:n.status==='deleting'});
+const poolMemberReason = n => n.status==='deleting'?'节点正在删除':n.mode==='passive'?'被动节点不能加入池':!n.eligible?'需要先确认安装主动 Agent':'';
 const linkStatus = l => l.sync?.state || l.state;
 const linkState = l => {
   const state=linkStatus(l), problem=['error','timeout','failed','offline'].includes(state);
@@ -38,7 +42,7 @@ async function poolList(request) {
     const rows=d.pools.filter(p=>matchesSearch('pools',p.name+' '+p.members.map(n=>memberName(n)+' '+(d.nodes.find(x=>x.id===n)?.addr||'')).join(' ')) && (!collectionFilters.pools.state || (p.references.length?'used':'free')===collectionFilters.pools.state));
     render(poolHead('池','<button class="primary" data-action="pool-new">新增池</button>')+
       collectionTools('pools',rows.length,d.pools.length,[['used','已引用'],['free','未引用']])+
-      `<div class="collection">${rows.map(p=>`<div class="collection-row" data-key="pool-${p.id}"><div class="collection-main"><button class="plain-title" data-action="pool-edit" data-id="${p.id}">${esc(p.name)}</button><div class="member-tags">${p.members.map(n=>`<span>${esc(memberName(n))}</span>`).join('')||'<span>暂无成员</span>'}</div></div><span class="muted collection-meta" title="${esc(p.references.join('、'))}">${p.references.length?`${p.references.length} 条链路`:'未引用'}</span><div class="row-actions"><button class="small" data-action="pool-edit" data-id="${p.id}">编辑</button><button class="small danger" data-action="pool-delete" data-id="${p.id}" ${p.references.length?'disabled title="请先解除链路引用"':''}>删除</button></div></div>`).join('')||emptyState('◉',d.pools.length?'没有匹配的池':'暂无池')}</div>`);
+      `<div class="collection">${rows.map(p=>`<div class="collection-row" data-key="pool-${p.id}"><div class="collection-main inline-summary"><button class="plain-title" data-action="pool-edit" data-id="${p.id}" title="${esc(p.name)}">${esc(p.name)}</button><div class="member-tags">${(expandedPools.has(p.id)?p.members:p.members.slice(0,3)).map(n=>`<span title="${esc(memberName(n))}">${esc(memberName(n))}</span>`).join('')||'<span>暂无成员</span>'}${p.members.length>3?`<button class="small" data-action="pool-expand" data-id="${p.id}" aria-expanded="${expandedPools.has(p.id)}">${expandedPools.has(p.id)?'收起':`+${p.members.length-3}`}</button>`:''}</div></div><span class="muted collection-meta" title="${esc(p.references.join('、'))}">${p.members.length} 个成员 · ${p.references.length?`${p.references.length} 条链路`:'未引用'}</span><div class="row-actions"><button class="small" data-action="pool-edit" data-id="${p.id}">编辑</button>${moreActions(`pool-actions-${p.id}`,`<button class="danger" data-action="pool-delete" data-id="${p.id}" ${p.references.length?'disabled title="请先解除链路引用"':''}>删除</button>`)}</div></div>`).join('')||emptyState('◉',d.pools.length?'没有匹配的池':'暂无池')}</div>`);
   };drawCollection();
 }
 
@@ -48,8 +52,8 @@ function poolForm(p) {
   templateEditor = {id:p?.id, name:p?.name || '', members:[...(p?.members || [])]}; drawPoolForm();
 }
 function drawPoolForm(preserve=false) {
-  const p = templateEditor, available=poolView.nodes.filter(n=>n.eligible&&!p.members.includes(n.id));
-  openModal(`<form data-form="pool-save"><h2>${p.id ? '编辑池' : '新增池'}</h2><label><span>名称</span><input name="name" value="${esc(p.name)}" required maxlength="100"></label><div class="member-list" data-reorder="pool">${p.members.map((n,i)=>`<div class="member-row sort-item" data-order="${n}">${dragHandle}<span class="member-label">${i+1}. ${esc(memberName(n))}</span>${orderButtons('pool',i,p.members.length)}<button type="button" class="small danger" data-action="pool-remove" data-index="${i}">移除</button></div>`).join('')}</div><p class="hint">仅已完成迁移并确认安装的主动节点可加入池；旧节点请先在节点详情中复制一键接入命令完成升级。</p><details class="member-picker"><summary>添加成员 <span class="count">${available.length}</span></summary><div class="resource-menu"><input type="search" data-resource-search data-ignore-dirty placeholder="搜索名称或地址" aria-label="搜索成员"><div class="member-options">${available.map(n=>`<label data-search="${esc((n.name+' '+n.addr).toLowerCase())}"><input type="checkbox" value="${n.id}" data-member-choice data-ignore-dirty><span>${esc(n.name)}<small>${esc(n.addr||'')}</small></span></label>`).join('')}<span class="resource-empty" ${available.length?'hidden':''}>没有匹配项</span></div><button type="button" class="small" data-action="pool-add">添加所选成员</button></div></details><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`,preserve);
+  const p = templateEditor, available=poolView.nodes.filter(n=>!p.members.includes(n.id));
+  openModal(`<form data-form="pool-save"><h2>${p.id ? '编辑池' : '新增池'}</h2><label><span>名称</span><input name="name" value="${esc(p.name)}" required maxlength="100"></label><div class="member-list" data-reorder="pool">${p.members.map((n,i)=>`<div class="member-row sort-item" data-order="${n}">${dragHandle}<span class="member-label">${i+1}. ${esc(memberName(n))}</span>${orderButtons('pool',i,p.members.length)}<button type="button" class="small danger" data-action="pool-remove" data-index="${i}">移除</button></div>`).join('')}</div><p class="hint">仅已完成迁移并确认安装的主动节点可加入池；旧节点请先在节点详情中复制一键接入命令完成升级。</p><details class="member-picker"><summary>添加成员 <span class="count">${available.filter(n=>!poolMemberReason(n)).length}</span></summary><div class="resource-menu"><input type="search" data-resource-search data-ignore-dirty placeholder="搜索名称或地址" aria-label="搜索成员"><div class="member-options">${available.map(n=>`<label data-search="${esc((n.name+' '+n.addr).toLowerCase())}"><input type="checkbox" value="${n.id}" data-member-choice data-ignore-dirty ${poolMemberReason(n)?'disabled':''}><span>${esc(n.name)}<small>${esc([n.addr,poolMemberReason(n)||nodeNote(n)].filter(Boolean).join(' · '))}</small></span></label>`).join('')}<span class="resource-empty" ${available.length?'hidden':''}>没有匹配项</span></div><button type="button" class="small" data-action="pool-add">添加所选成员</button></div></details><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`,preserve);
 }
 function rememberPool() { templateEditor.name = $('#modal [name=name]').value; }
 
@@ -58,10 +62,10 @@ async function linkList(request) {
   list={kind:'links',data:d,draw:()=>drawCollection()};
   drawCollection=()=>{
     const route=l=>[l.plan.entry?resourceName(d.nodes,l.plan.entry):null,...l.plan.stages.map(st=>st.kind==='pool'?resourceName(d.pools,st.pool_id):memberName(st.node_id)),resourceName(d.targets,l.plan.target,'未选择目标')].filter(Boolean).join(' → ');
-    if(sortMode==='links')return render(listHead('links',d.links.length,d.links.length)+sortList('links',d.links,l=>`<div class="title">${esc(l.name)}</div><div class="sub">${esc(route(l))}</div>`));
+    if(sortMode==='links')return render(listHead('links',d.links.length,d.links.length)+sortList('links',d.links,l=>`<div class="title">${esc(l.name)}</div><div class="sub route-summary" title="${esc(route(l))}">${esc(route(l))}</div>`));
     const f=collectionFilters.links;
     const rows=d.links.filter(l=>matchesSearch('links',l.name+' '+route(l)+' '+(l.connection?l.connection.host+':'+l.connection.port:''))&&(!f.state || statusGroup(l)===f.state)&&(!f.group || l.group_id===Number(f.group)));
-    const card=l=>`<a href="#/routes/${l.id}" class="collection-row link-card" data-key="link-${l.id}"><div class="collection-main"><div class="title">${esc(l.name)}</div><div class="sub">${esc(route(l))}</div>${l.error?`<div class="row-error">${esc(l.error)}</div>`:''}</div>${l.cleanup.length?`<span class="muted collection-meta">${l.cleanup.length} 项待清理</span>`:''}${linkState(l)}<span class="muted">›</span></a>`;
+    const card=l=>`<a href="#/routes/${l.id}" class="collection-row link-card" data-key="link-${l.id}"><div class="collection-main"><div class="title">${esc(l.name)}</div><div class="sub route-summary" title="${esc(route(l))}">${esc(route(l))}</div>${l.error?`<div class="row-error">${esc(l.error)}</div>`:''}</div>${l.cleanup.length?`<span class="muted collection-meta">${l.cleanup.length} 项待清理</span>`:''}${linkState(l)}<span class="muted">›</span></a>`;
     render(listHead('links',d.links.length,rows.length,'link-new','新增链路')+
       collectionTools('links',rows.length,d.links.length,[['active','已应用'],['pending','等待同步'],['error','异常'],['draft','草稿'],['deleting','删除中']],d.groups)+
       `<div class="collection">${groupedList('links',rows,card,()=> '链路')||emptyState('⇄',d.links.length?'没有匹配的链路':'暂无链路')}</div>`);
@@ -83,13 +87,13 @@ function switchBlocked(l, stage, member) {
 function topology(l) {
   const d = poolView, plan = l.plan;
   // Fixed dimensions keep HTML cards and SVG cables aligned without layout observers.
-  const cardH = 76, gap = 12, inset = 14, headerH = 56, gutter = 76;
+  const cardH = 60, gap = 8, inset = 10, headerH = 46, gutter = 48;
   const columns = [];
-  const fixed = (kind, id, label) => ({kind, id, label, width:204, height:104});
+  const fixed = (kind, id, label) => ({kind, id, label, width:180, height:84});
   if (plan.entry) columns.push(fixed('entry', plan.entry, '入口'));
   for (const stage of plan.stages) {
     columns.push(stage.kind === 'pool'
-      ? {kind:'pool', stage, width:232, height:headerH + inset*2 + Math.max(1,stage.order.length)*(cardH+gap)-gap+2}
+      ? {kind:'pool', stage, width:210, height:headerH + inset*2 + Math.max(1,stage.order.length)*(cardH+gap)-gap+2}
       : fixed('node', stage.node_id, '节点'));
   }
   columns.push(fixed('target', plan.target, '目标'));
@@ -290,11 +294,20 @@ document.addEventListener('change',e=>{
 });
 
 async function linkDetail(id, request) {
-  const d = await api('GET',`links/${id}`); if (request !== viewRequest) return; poolView=d; const l=d.link;
+  let d;
+  try { d = await api('GET',`links/${id}`); }
+  catch (err) {
+    if (request !== viewRequest) return;
+    if (err.status !== 404) throw err;
+    leaveView(); poolView=null;
+    render('<h1>链路不存在</h1><p class="muted">该链路可能已被删除。</p><a href="#/routes">返回链路列表</a>');
+    return;
+  }
+  if (request !== viewRequest) return; poolView=d; const l=d.link;
   render(`<a class="back" href="#/routes">← 链路</a>` + poolHead(esc(l.name), `${linkState(l)}<button data-action="link-edit" ${l.job || l.state === 'deleting' ? 'disabled' : ''}>编辑链路</button><button class="danger" data-action="link-delete" ${l.job || l.state === 'deleting' ? 'disabled' : ''}>删除</button>`) +
     `<div class="panel topology-panel${topologyViews.get(l.id)?.fullscreen?' is-fullscreen':''}">${topology(l)}${syncFeedback(l)}${l.cleanup.length ? `<p class="hint">旧规则待清理：${l.cleanup.map(r=>`${esc(memberName(r.node_id))}:${r.port}`).join('、')}</p>` : ''}</div>` +
-    `<div class="panel"><h2>当前连接</h2>${l.connection ? `<div class="entry"><code>${esc(l.connection.host)}:${l.connection.port}</code><button class="small" data-action="copy" data-text="${esc(l.connection.uri)}">复制${l.connection.protocol==='endpoint' ? '地址' : '导入链接'}</button></div>` : '<p class="muted">尚未确认生效</p>'}<a href="#/quality/links/${l.id}">网络质量 →</a></div>` +
-    `<div class="panel"><h2>切换记录</h2>${l.events.length ? `<table><tbody>${l.events.map(e=>`<tr><td>${esc(fmtTime(e.ts))}</td><td>${esc(e.message)}</td></tr>`).join('')}</tbody></table>` : '<p class="muted">暂无记录</p>'}</div>`);
+    `<div class="panel link-connection"><h2>当前连接</h2>${l.connection ? `<div class="entry"><code>${esc(l.connection.host)}:${l.connection.port}</code><button class="small" data-action="copy" data-text="${esc(l.connection.uri)}">复制${l.connection.protocol==='endpoint' ? '地址' : '导入链接'}</button></div>` : '<p class="muted">尚未确认生效</p>'}<a href="#/quality/links/${l.id}">网络质量 →</a></div>` +
+    detailsBlock(`link-events-${id}`, `切换记录 <span class="count">${l.events.length}</span>`, l.events.length ? `<div class="table-scroll"><table><tbody>${l.events.map(e=>`<tr><td>${esc(fmtTime(e.ts))}</td><td>${esc(e.message)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">暂无记录</p>'));
   mountTopology(id);
 }
 
@@ -309,8 +322,9 @@ function rememberLink() {
 }
 function drawLinkForm(preserve=false) {
   const p=linkEditor.plan;
-  const stages=[...poolView.pools.map(x=>({id:'p:'+x.id,name:'池 · '+x.name})),...poolView.nodes.map(x=>({...x,id:'n:'+x.id}))];
-  openModal(`<form data-form="link-save"><h2>${linkEditor.id?'编辑链路':'新增链路'}</h2><label><span>名称</span><input name="name" value="${esc(linkEditor.name)}" required></label>${groupSelect(poolView.groups,linkEditor.group_id)}<div class="inline-fields"><label><span>入口节点</span>${resourceSelect('entry',poolView.nodes,p.entry,'无入口（直达目标）')}</label><label><span>入口端口</span><input name="port" type="number" min="1" max="65535" value="${p.port||''}" placeholder="自动分配"></label></div><h3>中间路径</h3><div class="member-list" data-reorder="stage">${p.stages.map((st,i)=>`<div class="member-row sort-item" data-order="${esc(st.id)}">${dragHandle}<span class="member-label">${i+1}. ${st.kind==='pool'?'池 · '+esc(resourceName(poolView.pools,st.pool_id)):esc(memberName(st.node_id))}</span>${orderButtons('stage',i,p.stages.length)}<button type="button" class="small danger" data-action="stage-remove" data-index="${i}">移除</button></div>`).join('')||'<p class="muted">入口直接连接目标</p>'}</div><div class="inline-fields">${resourceSelect('stage-add',stages,'','选择池或固定节点',true)}<button type="button" data-action="stage-add">添加阶段</button></div><label><span>目标</span>${resourceSelect('target',poolView.targets,p.target,'未选择')}</label><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button>${!linkEditor.id || poolView.link?.state==='draft'?'<button name="draft" value="1">保存草稿</button>':''}<button class="primary">保存并应用</button></div></form>`,preserve);
+  const nodes=poolView.nodes.map(nodeChoice);
+  const stages=[...poolView.pools.map(x=>({id:'p:'+x.id,name:'池 · '+x.name,note:`${x.members.length} 个成员`})),...nodes.map(x=>({...x,id:'n:'+x.id}))];
+  openModal(`<form data-form="link-save"><h2>${linkEditor.id?'编辑链路':'新增链路'}</h2><label><span>名称</span><input name="name" value="${esc(linkEditor.name)}" required></label>${groupSelect(poolView.groups,linkEditor.group_id)}<div class="inline-fields"><label><span>入口节点</span>${resourceSelect('entry',nodes,p.entry,'无入口（直达目标）')}</label><label><span>入口端口</span><input name="port" type="number" min="1" max="65535" value="${p.port||''}" placeholder="自动分配"></label></div><h3>中间路径</h3><div class="member-list" data-reorder="stage">${p.stages.map((st,i)=>`<div class="member-row sort-item" data-order="${esc(st.id)}">${dragHandle}<span class="member-label">${i+1}. ${st.kind==='pool'?'池 · '+esc(resourceName(poolView.pools,st.pool_id)):esc(memberName(st.node_id))}</span>${orderButtons('stage',i,p.stages.length)}<button type="button" class="small danger" data-action="stage-remove" data-index="${i}">移除</button></div>`).join('')||'<p class="muted">入口直接连接目标</p>'}</div><div class="inline-fields">${resourceSelect('stage-add',stages,'','选择池或固定节点',true)}<button type="button" data-action="stage-add">添加阶段</button></div><label><span>目标</span>${resourceSelect('target',poolView.targets,p.target,'未选择')}</label><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button>${!linkEditor.id || poolView.link?.state==='draft'?'<button name="draft" value="1">保存草稿</button>':''}<button class="primary">保存并应用</button></div></form>`,preserve);
   $('#stage-add').setAttribute('data-ignore-dirty','');
   if(!preserve)modalState.initial=modalValues();
 }
@@ -322,8 +336,12 @@ function instance() { return instanceEditor.link.plan.stages.find(s=>s.id===inst
 function drawInstance(preserve=false) {
   const s=instance(),l=instanceEditor.link;
   const nodeOrder=new Map(poolView.nodes.map((n,i)=>[n.id,i]));
-  const members=s.order.map(n=>({id:n,name:memberName(n)})).sort((a,b)=>(nodeOrder.get(a.id)??nodeOrder.size)-(nodeOrder.get(b.id)??nodeOrder.size));
-  openModal(`<form data-form="instance-save"><h2>${esc(resourceName(poolView.pools,s.pool_id))}</h2><div class="member-list" data-reorder="instance">${s.order.map((n,i)=>`<div class="member-row sort-item" data-order="${n}">${dragHandle}<span class="member-label">${i+1}. ${esc(memberName(n))}${l.selected[s.id]===n?' <b class="t-green">生效</b>':''}${s.default===n?' <small>默认</small>':''}</span>${orderButtons('instance',i,s.order.length)}<button type="button" class="small" data-action="instance-disable" data-member="${n}" ${l.selected[s.id]===n?'disabled':''}>${s.disabled.includes(n)?'启用':'禁用'}</button></div>`).join('')}</div><label><span>默认节点</span>${resourceSelect('instance-default',members,s.default,'请选择',true)}</label><label><span>锁定</span>${resourceSelect('instance-lock',members.filter(n=>!s.disabled.includes(n.id)),s.locked,'不锁定',true)}</label><button type="button" data-action="instance-direct" ${l.selected[s.id]===0 || s.locked===0 ? 'disabled' : ''}>${s.direct?'移除 direct':'添加 direct'}</button><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`,preserve);
+  const members=s.order.map(id=>{
+    const n=poolView.nodes.find(n=>n.id===id), disabled=s.disabled.includes(id);
+    return {id,name:memberName(id),note:disabled?'已禁用':id===0?'':n?nodeNote(n):'节点不存在',
+      disabled:disabled || (id!==0 && (!n?.eligible || n.status!=='synced'))};
+  }).sort((a,b)=>(nodeOrder.get(a.id)??nodeOrder.size)-(nodeOrder.get(b.id)??nodeOrder.size));
+  openModal(`<form data-form="instance-save"><h2>${esc(resourceName(poolView.pools,s.pool_id))}</h2><div class="member-list" data-reorder="instance">${s.order.map((n,i)=>`<div class="member-row sort-item" data-order="${n}">${dragHandle}<span class="member-label">${i+1}. ${esc(memberName(n))}${l.selected[s.id]===n?' <b class="t-green">生效</b>':''}${s.default===n?' <small>默认</small>':''}</span>${orderButtons('instance',i,s.order.length)}<button type="button" class="small" data-action="instance-disable" data-member="${n}" ${l.selected[s.id]===n?'disabled':''}>${s.disabled.includes(n)?'启用':'禁用'}</button></div>`).join('')}</div><label><span>默认节点</span>${resourceSelect('instance-default',members,s.default,'请选择',true)}</label><label><span>锁定</span>${resourceSelect('instance-lock',members,s.locked,'不锁定',true)}</label><button type="button" data-action="instance-direct" ${l.selected[s.id]===0 || s.locked===0 ? 'disabled' : ''}>${s.direct?'移除 direct':'添加 direct'}</button><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`,preserve);
 }
 
 function rememberInstance() {
@@ -337,7 +355,7 @@ async function configSummary(request) {
   drawCollection=()=>{
     const view=c=>({state:c.link_state||c.status,sync:c.link_sync}),f=collectionFilters.configs;
     const rows=d.chains.filter(c=>matchesSearch('configs',c.remark+' '+(c.connection?c.connection.host+':'+c.connection.port:''))&&(!f.state || statusGroup(view(c))===f.state)&&(!f.group || c.group_id===Number(f.group)));
-    const card=c=>`<div class="collection-row" data-key="summary-${c.id}"><div class="collection-main"><a class="title" href="#/routes/${c.link_id||''}">${esc(c.remark)}</a><div class="sub"><code>${c.connection?esc(c.connection.host)+':'+c.connection.port:'等待入口确认'}</code></div>${c.link_error?`<div class="row-error">${esc(c.link_error)}</div>`:''}</div>${linkState(view(c))}<div class="row-actions">${c.connection?`<button class="small" data-action="copy" data-text="${esc(c.connection.uri)}">复制${c.connection.protocol==='endpoint'?'地址':'导入链接'}</button>`:''}</div></div>`;
+    const card=c=>`<div class="collection-row" data-key="summary-${c.id}"><div class="collection-main inline-summary"><a class="title" href="#/routes/${c.link_id||''}" title="${esc(c.remark)}">${esc(c.remark)}</a><div class="sub"><code>${c.connection?esc(c.connection.host)+':'+c.connection.port:'等待入口确认'}</code></div>${c.link_error?`<div class="row-error">${esc(c.link_error)}</div>`:''}</div>${linkState(view(c))}<div class="row-actions">${c.connection?`<button class="small" data-action="copy" data-text="${esc(c.connection.uri)}">复制${c.connection.protocol==='endpoint'?'地址':'导入链接'}</button>`:''}</div></div>`;
     render(poolHead('配置','<a class="button" href="#/routes">管理链路 →</a>')+
       collectionTools('configs',rows.length,d.chains.length,[['active','已应用'],['pending','等待同步'],['error','异常'],['deleting','删除中']],d.groups)+
       `<div class="collection">${groupedList('configs',rows,card,()=> '配置',false)||emptyState('⇄',d.chains.length?'没有匹配的配置':'暂无配置')}</div>`);
@@ -362,6 +380,27 @@ Object.assign(FORMS, {
 });
 document.addEventListener('submit',e=>{if(e.target.dataset.form==='link-save')e.target.dataset.draft=e.submitter?.name==='draft'?'1':'0';},true);
 Object.assign(ACTIONS, {
+  'pool-expand'(el) {
+    const id=Number(el.dataset.id);
+    expandedPools.has(id)?expandedPools.delete(id):expandedPools.add(id);
+    drawCollection();
+  },
+  async 'link-reload'(el) {
+    const form=el.closest('form'), kind=form.dataset.form;
+    const id=kind==='link-save'?linkEditor.id:kind==='instance-save'?instanceEditor.link.id:quickSwitch.id;
+    const stage=kind==='instance-save'?instanceEditor.stage:quickSwitch?.stage, member=quickSwitch?.member;
+    if(modalChanged() && !await confirmBox('载入最新配置？','当前未保存的修改将被丢弃。','重新载入'))return;
+    const session=modalState,page=pageVersion;
+    const d=await withBusyForm(form,()=>api('GET',`links/${id}`));
+    if(!d || session!==modalState || page!==pageVersion)return;
+    poolView=d;closeModal();
+    if(d.link.job || d.link.state==='deleting')toast('链路正在变更，请等待完成后再编辑',true);
+    else if(kind==='link-save')linkForm(d.link);
+    else if(kind==='instance-save' && d.link.plan.stages.some(s=>s.id===stage && s.kind==='pool'))instanceForm(stage);
+    else if(kind==='quick-switch')quickSwitchForm(d.link,stage,member);
+    else toast('该池已从链路移除',true);
+    await refresh();
+  },
   'canvas-in':()=>topologyBinding?.zoom(1.2),
   'canvas-out':()=>topologyBinding?.zoom(1/1.2),
   'canvas-fit':()=>topologyBinding?.fit(),
@@ -373,7 +412,7 @@ Object.assign(ACTIONS, {
   'pool-down'(el){rememberPool();const i=Number(el.dataset.index),a=templateEditor.members;[a[i],a[i+1]]=[a[i+1],a[i]];markModalDirty();drawPoolForm(true);},
   'pool-up'(el){rememberPool();const i=Number(el.dataset.index),a=templateEditor.members;[a[i-1],a[i]]=[a[i],a[i-1]];markModalDirty();drawPoolForm(true);},
   'pool-remove'(el){rememberPool();templateEditor.members.splice(Number(el.dataset.index),1);markModalDirty();drawPoolForm(true);},
-  'pool-add'(){rememberPool();const ids=[...document.querySelectorAll('[data-member-choice]:checked')].map(el=>Number(el.value));if(!ids.length)return;templateEditor.members.push(...ids);markModalDirty();drawPoolForm(true);},
+  'pool-add'(){rememberPool();const ids=[...document.querySelectorAll('[data-member-choice]:checked:not(:disabled)')].map(el=>Number(el.value));if(!ids.length)return;templateEditor.members.push(...ids);markModalDirty();drawPoolForm(true);},
   'link-new':()=>linkForm(), 'link-edit':()=>linkForm(poolView.link),
   async 'link-delete'(){if(!(await confirmBox('删除链路','删除 <b>'+esc(poolView.link.name)+'</b> 并清理其转发规则？','删除',true)))return;await api('DELETE',`links/${poolView.link.id}`);location.hash='#/routes';},
   async 'link-cancel'(){const l=poolView.link;if(!(await confirmBox('取消切换',l.job.phase==='prepare'?'撤销新路径准备，保留当前路径？':'恢复旧路径，确认入口恢复后清理新路径？','确认')))return;await api('POST',`links/${l.id}/action`,{action:'cancel',revision:l.revision});refresh();},

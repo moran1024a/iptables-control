@@ -6,17 +6,17 @@ async function subscriptionList(request) {
   const url=(row,format)=>(d.public_url||location.origin)+row.path+'?format='+format;
   render(poolHead('订阅','<button class="primary" data-action="subscription-new">新增订阅</button>')+
     `<div class="collection">${d.subscriptions.map(s=>`<div class="collection-row" data-key="subscription-${s.id}">
-      <div class="collection-main"><button class="plain-title" data-action="subscription-edit" data-id="${s.id}">${esc(s.name)}</button><div class="sub">${s.link_ids.length} 个配置 · Mihomo ${s.counts.clash} · v2rayN ${s.counts.v2ray}</div></div>
+      <div class="collection-main inline-summary"><button class="plain-title" data-action="subscription-edit" data-id="${s.id}">${esc(s.name)}</button><div class="sub">${s.link_ids.length} 个配置 · Mihomo ${s.counts.clash} · v2rayN ${s.counts.v2ray}</div></div>
       <span class="badge ${s.enabled?'applied':'removing'}">${s.enabled?'已启用':'已禁用'}</span>
-      <div class="row-actions"><button class="small" data-action="copy" data-text="${esc(url(s,'clash'))}">复制 Clash 链接</button><button class="small" data-action="copy" data-text="${esc(url(s,'v2ray'))}">复制 v2rayN 链接</button><button class="small" data-action="subscription-edit" data-id="${s.id}">编辑</button></div>
+      <div class="row-actions"><button class="small" data-action="copy" data-text="${esc(url(s,'clash'))}" title="复制 Clash 订阅链接" aria-label="复制 Clash 订阅链接">Clash</button><button class="small" data-action="copy" data-text="${esc(url(s,'v2ray'))}" title="复制 v2rayN 订阅链接" aria-label="复制 v2rayN 订阅链接">v2rayN</button><button class="small" data-action="subscription-edit" data-id="${s.id}">编辑</button></div>
     </div>`).join('')||emptyState('⇅','暂无订阅')}</div>`);
 }
 
 function subscriptionForm(row) {
   const d=subscriptionView,ids=row?.link_ids||[];
   openModal(`<form data-form="subscription" data-id="${row?.id||''}"><h2>${row?'编辑订阅':'新增订阅'}</h2>
-    <label><span>名称</span><input name="name" value="${esc(row?.name||'')}" maxlength="64" required></label>
-    <label><span>状态</span><select name="enabled"><option value="1">启用</option><option value="0" ${row&&!row.enabled?'selected':''}>禁用</option></select></label>
+    <div class="form-row"><label><span>名称</span><input name="name" value="${esc(row?.name||'')}" maxlength="64" required></label>
+    <label><span>状态</span><select name="enabled"><option value="1">启用</option><option value="0" ${row&&!row.enabled?'selected':''}>禁用</option></select></label></div>
     <div class="subscription-heading"><h3>绑定配置</h3><label><input type="checkbox" data-subscription-all data-ignore-dirty>全选</label></div><div class="subscription-choices">${d.groups.map(g=>{
       const items=d.configs.filter(c=>c.group_id===g.id);if(!items.length)return '';
       return `<div class="subscription-group">${d.groups.length>1?`<strong>${esc(g.name)}</strong>`:''}${items.map(c=>`<label><input type="checkbox" name="link_id" value="${c.id}" ${ids.includes(c.id)?'checked':''} ${c.error&&!ids.includes(c.id)?'disabled':''}><span>${esc(c.name)}${c.error||c.clash_error?`<small class="muted">${esc(c.error||c.clash_error+'；可用于 v2rayN')}</small>`:''}</span></label>`).join('')}</div>`;
@@ -52,13 +52,17 @@ Object.assign(ACTIONS,{
   'subscription-new':()=>subscriptionForm(),
   'subscription-edit':el=>subscriptionForm(subscriptionView.subscriptions.find(x=>x.id===Number(el.dataset.id))),
   async 'subscription-reset'(el){
-    const id=el.dataset.id;
+    const id=el.dataset.id, form=el.closest('form');
     if(!await confirmBox('重置订阅链接','旧链接将立即失效，需要在客户端重新导入。','重置',true))return;
-    await api('PATCH',`subscriptions/${id}`,{reset_token:true});toast('链接已重置');await refresh();
+    await withBusyForm(form,async()=>{
+      await api('PATCH',`subscriptions/${id}`,{reset_token:true});toast('链接已重置');await refresh();
+    });
   },
   async 'subscription-delete'(el){
-    const id=el.dataset.id;
+    const id=el.dataset.id, form=el.closest('form');
     if(!await confirmBox('删除订阅','订阅链接将失效，已绑定的链路保留。','删除',true))return;
-    await api('DELETE',`subscriptions/${id}`);toast('订阅已删除');await refresh();
+    await withBusyForm(form,async()=>{
+      await api('DELETE',`subscriptions/${id}`);closeModal();toast('订阅已删除');await refresh();
+    });
   }
 });

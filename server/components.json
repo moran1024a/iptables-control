@@ -4,7 +4,7 @@
     2,
     3
   ],
-  "server": "0.4.5",
+  "server": "0.4.6",
   "forward_agent": "0.2.1",
   "legacy_agent": "0.2.1",
   "active_agent": "0.4.4",

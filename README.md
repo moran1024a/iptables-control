@@ -4,7 +4,7 @@
 
 支持多跳链路、SS／SS2022／VLESS Reality 目标、主动与被动同步，以及 Agent 与单机脚本共存。
 
-**当前正式版：0.4.5**。支持订阅分享、链路分组排序、全段／分段质量图、池模板、可视化链路及节点失联灾备。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，可选择开启认证唤醒。转发节点无需安装代理核心，目标服务需自行准备。
+**当前正式版：0.4.6**。支持订阅分享、链路分组排序、全段／分段质量图、池模板、可视化链路及节点失联灾备。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，可选择开启认证唤醒。转发节点无需安装代理核心，目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -27,14 +27,14 @@
 
 ## 安装
 
-按使用场景选择：管理多台服务器，安装**服务端 + 节点 Agent**；只管理本机转发，安装**单机脚本**即可。以下命令固定使用 0.4.5 正式版；旧版用户升级前请先阅读[升级说明](#升级)。
+按使用场景选择：管理多台服务器，安装**服务端 + 节点 Agent**；只管理本机转发，安装**单机脚本**即可。以下命令固定使用 0.4.6 正式版；旧版用户升级前请先阅读[升级说明](#升级)。
 
 ### 服务端
 
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.5/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.6/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -42,7 +42,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.5/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.6/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
 新主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口（默认 `8730`），并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址，再接入节点。
@@ -66,7 +66,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.5/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.6/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -80,7 +80,7 @@ sudo bash /root/ipt.sh
 
 ### 服务端升级
 
-0.4.0 的 Docker 安装器会因健康检查误判而回滚，请直接使用 0.4.5 安装命令重试。已经回滚到 0.3.x 的服务端无需手动恢复数据库；0.3.x 节点的迁移方式仍见下文。
+0.4.0 的 Docker 安装器会因健康检查误判而回滚，请直接使用 0.4.6 安装命令重试。已经回滚到 0.3.x 的服务端无需手动恢复数据库；0.3.x 节点的迁移方式仍见下文。
 
 重新执行[服务端安装命令](#服务端)即可。安装器沿用现有端口和数据挂载，保留升级前数据库备份；新容器启动或就绪检查失败时尝试恢复旧容器和数据库。相同版本需要重建时，将命令末尾的 `| bash` 改为 `| bash -s -- --force`。
 
@@ -90,7 +90,7 @@ sudo bash /root/ipt.sh
 
 ### 节点 Agent 升级
 
-**0.4.5 只需升级服务端。** 本次更新导入名称、资源选择排序、订阅全选和质量图表交互，各节点 Agent 版本不变。
+**0.4.6 只需升级服务端。** 本次更新紧凑界面、操作交互和网络质量曲线，各节点 Agent 版本不变。
 
 **0.4.4 的全段 TCP 探测需要主动 Agent 0.4.4。** 请先升级服务端，再更新主动 Agent；已在 0.4.3 的被动 Agent、管理器和唤醒组件无需为本次功能升级。0.4.x 服务端升级会保留现有节点、目标、池和链路。
 
@@ -133,7 +133,7 @@ sudo ictl --credentials  # 修改接入地址或重置后的节点密钥（先�
 删除容器和镜像，保留数据卷，之后可重新安装恢复使用：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.5/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.4.6/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；若要完整停用，请先处理节点。
@@ -385,7 +385,7 @@ sudo unshare -nm python3 tests/kernel_pool_switch.py /tmp/ictl-active
 
 | 组件 | 当前版本 |
 | --- | --- |
-| 服务端 | 0.4.5 |
+| 服务端 | 0.4.6 |
 | 主动 Agent | 0.4.4 |
 | 被动 Agent／管理器 | 0.4.3 |
 | 唤醒组件 | 0.4.3 |

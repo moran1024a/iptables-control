@@ -9,6 +9,53 @@ import network_quality as q
 import transport
 
 
+class HistoryTests(unittest.TestCase):
+    @staticmethod
+    def row(slot, rtt=20, path='same', address='192.0.2.1', status='ok'):
+        return dict(slot=slot, rtt=rtt if status == 'ok' else None, path_key=path,
+                    path_label=path, resolved_ip=address, status=status, error='probe failed' if status != 'ok' else '')
+
+    def test_delayed_successful_samples_do_not_break_hour_or_day_charts(self):
+        for seconds in (900, 3600, 86400):
+            with self.subTest(seconds=seconds):
+                data = q.summarize([self.row(t) for t in range(0, seconds + 1, 12)], seconds, seconds)
+                good = [p for p in data['points'] if p['mean'] is not None]
+                self.assertTrue(good)
+                self.assertTrue(all(not p['gap'] and p['mean'] == 20 for p in good))
+                self.assertTrue(all(b['first_slot'] - a['last_slot'] == 12 for a, b in zip(good, good[1:])))
+
+    def test_path_and_endpoint_switches_are_not_averaged_together(self):
+        for field in ('path_key', 'resolved_ip'):
+            with self.subTest(field=field):
+                rows = [self.row(3540, 200), self.row(3550, 20), self.row(3560, 100)]
+                rows[1][field] = 'other'
+                points = [p for p in q.summarize(rows, 3600, 3600)['points'] if p['mean'] is not None]
+                self.assertEqual([p['mean'] for p in points], [200, 20, 100])
+                self.assertEqual([p['time'] for p in points], [3540, 3550, 3560])
+                self.assertEqual([p['end'] for p in points], [3550, 3560, 3600])
+
+    def test_partial_failure_is_preserved_after_a_successful_sample(self):
+        rows = [self.row(3540), self.row(3550, address='', status='timeout'), self.row(3560, 30)]
+        points = [p for p in q.summarize(rows, 3600, 3600)['points'] if p['mean'] is not None]
+        self.assertEqual(len(points), 1)
+        point = points[0]
+        self.assertEqual((point['mean'], point['samples'], point['lost'], point['failures']), (25, 3, 1, 1))
+        self.assertEqual((point['status'], point['error']), ('timeout', 'probe failed'))
+        self.assertTrue(point['gap'])
+
+    def test_boundary_bucket_excludes_samples_outside_visible_window(self):
+        data = q.summarize([self.row(0, 1000), self.row(10, 20), self.row(20, 30), self.row(3610, 2000)], 3600, 3605)
+        points = [p for p in data['points'] if p['mean'] is not None]
+        self.assertEqual(len(points), 1)
+        self.assertEqual((points[0]['time'], points[0]['mean'], points[0]['peak']), (5, 25, 30))
+        self.assertTrue(all(5 <= p['time'] <= 3605 for p in data['points']))
+
+    def test_real_outage_splits_a_bucket(self):
+        points = [p for p in q.summarize([self.row(3540, 10), self.row(3580, 30)], 3600, 3600)['points'] if p['mean'] is not None]
+        self.assertEqual([p['mean'] for p in points], [10, 30])
+        self.assertEqual(points[1]['first_slot'] - points[0]['last_slot'], 40)
+
+
 class QualityTests(Fixture, unittest.TestCase):
     def test_rc1_upgrade_keeps_rules_and_does_not_reassign_conflicting_port(self):
         a, b = self.node(ports='33000-34000'), self.node('B')
