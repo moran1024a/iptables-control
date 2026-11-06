@@ -55,4 +55,22 @@ class ModularityTests(Fixture, unittest.TestCase):
         with patch.object(migrations.time, 'time', return_value=now + 100):
             self.db = migrations.init_db()
         self.assertEqual(probe_store.cutoff(self.db), now)
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 405)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], settings.DATABASE_VERSION)
+
+    def test_rc1_upgrade_adds_stream_columns_without_losing_samples(self):
+        nid = self.node()
+        self.config(self.route([nid]), [10001])
+        identity = dict(kind='path', protocol='icmp-echo-v1', source=(nid, '192.0.2.1'),
+                        path=[], endpoint=('198.51.100.1',443))
+        with self.db:
+            key = probe_store.task(self.db, identity)
+            probe_store.record(self.db, key, 123, 'ok', 12)
+            for column in ('epoch', 'previous_slot'):
+                self.db.execute('ALTER TABLE probe_samples DROP COLUMN '+column)
+            for column in ('applied', 'failure_scope'):
+                self.db.execute('ALTER TABLE links DROP COLUMN '+column)
+            self.db.execute('PRAGMA user_version=405')
+        self.db.close(); self.db = migrations.init_db()
+        sample = self.db.execute('SELECT * FROM probe_samples').fetchone()
+        self.assertEqual((sample['slot'], sample['rtt'], sample['epoch']), (123, 12, None))
+        self.assertTrue(self.db.execute('SELECT applied FROM links').fetchone()[0])

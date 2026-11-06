@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.4.3"
+VERSION="0.4.7-rc.2"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -107,6 +107,17 @@ rollback() {
   if [ "$FROM" != "$TARGET" ]; then
     if [ "$TARGET" = active ] && [ -x "$PKG/active" ]; then ICTL_LOCK_HELD=1 "$PKG/active" --clear || result=1; fi
     if [ "$TARGET" = passive ]; then ICTL_LOCK_HELD=1 bash "$WORK/passive-helper.sh" --clear-owned || result=1; fi
+  fi
+  # Never restore forwarding while a passive cleanup journal is unfinished.
+  if [ -f "$LIB/clear-owned.rules" ]; then
+    ICTL_LOCK_HELD=1 bash "$WORK/passive-helper.sh" --clear-owned || result=1
+  fi
+  if [ "$result" != 0 ]; then
+    PHASE=failed; journal
+    flock -u 9; exec 9>&-
+    rpc failed 'error=连接清理未完成，已保留事务和备份' || true
+    die '连接清理未完成；事务和备份已保留，请排除错误后执行 --recover'
+    return 1
   fi
   tar -xf "$WORK/backup.tar" -C / || result=1
   if [ "$FROM" = active ] && [ -x "$PKG/active" ]; then

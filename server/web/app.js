@@ -1568,9 +1568,9 @@ function qualityChart(series, now, seconds, width = app.clientWidth - 42) {
       if (a !== b) elements += `<line class="${cls}" x1="${x(a).toFixed(1)}" y1="${y(av).toFixed(1)}" x2="${x(b).toFixed(1)}" y2="${y(bv).toFixed(1)}" stroke="${color}" stroke-width="2"/>`;
     };
     // Draw each run through its aggregate centres, keeping its real endpoints.
-    const finish = () => { if(previous) segment(middle(previous),previous.mean,last(previous),previous.mean,'quality-span'); };
+    const finish = () => { if(previous && !previous.gap && !previous.endpoint_change) segment(middle(previous),previous.mean,last(previous),previous.mean,'quality-span'); };
     for (const p of s.points) {
-      if(p.path_key && pathKey && pathKey!==p.path_key && !changes.has(p.time)) {
+      if((p.endpoint_change || (p.path_key && pathKey && pathKey!==p.path_key)) && !changes.has(p.time)) {
         changes.add(p.time);elements+=`<line x1="${x(p.time)}" x2="${x(p.time)}" y1="${top}" y2="${height-bottom}" stroke="var(--muted)" stroke-dasharray="3 4"><title>路径切换 · ${esc(p.path_label||'')}</title></line>`;
       }
       if(p.path_key)pathKey=p.path_key;
@@ -1586,12 +1586,12 @@ function qualityChart(series, now, seconds, width = app.clientWidth - 42) {
         if (p.status !== "missing" || previous?.last_slot == null) { finish(); previous = null; }
         continue;
       }
-      const continuous = previous && (p.first_slot == null || previous.last_slot == null || p.first_slot - previous.last_slot <= 20);
+      const continuous = previous && (p.connect ?? (p.first_slot == null || previous.last_slot == null || p.first_slot - previous.last_slot <= 20));
       if (continuous && !previous.gap && !p.gap && !previous.endpoint_change && !p.endpoint_change && previous.resolved_ip === p.resolved_ip && previous.path_key === p.path_key) {
         segment(middle(previous),previous.mean,middle(p),p.mean,'quality-connection');
       } else {
         finish();
-        segment(first(p),p.mean,middle(p),p.mean,'quality-span');
+        if(!p.gap && !p.endpoint_change) segment(first(p),p.mean,middle(p),p.mean,'quality-span');
       }
       if (p.peak != null && p.peak !== p.mean) elements += `<line x1="${px}" x2="${px}" y1="${y(p.mean).toFixed(1)}" y2="${y(p.peak).toFixed(1)}" stroke="${color}" opacity=".3">${title}</line>`;
       elements += `<circle cx="${px}" cy="${y(p.mean).toFixed(1)}" r="2.5" fill="${color}">${title}</circle>`;
@@ -1620,7 +1620,7 @@ function showQualityPoint(plot, time) {
   line.setAttribute('x1',x);line.setAttribute('x2',x);line.removeAttribute('hidden');
   tip.innerHTML=`<strong>${esc(fmtTime(time))}</strong>${series.map(s=>{
     const p=s.points.find(p=>p.time===time || (p.time<time && time<p.end)),[name,color]=QUALITY_PROTOCOLS[s.protocol];
-    return `<div><span class="quality-key" style="--series-color:${color}">${name}</span><b>${qualityNumber(p?.mean)}</b></div><small>${esc(QUALITY_STATES[p?.status||'missing']||p?.status)}${p?.mean!=null?` · 峰值 ${qualityNumber(p.peak)}`:''}${p?.loss!=null?` · 超时 ${qualityNumber(p.loss,'%')}`:''}</small>`;
+    return `<div><span class="quality-key" style="--series-color:${color}">${name}</span><b>${qualityNumber(p?.mean)}</b></div><small>${esc(QUALITY_STATES[p?.status||'missing']||p?.status)}${p?.mean!=null?` · 峰值 ${qualityNumber(p.peak)}`:''}${p?.loss!=null?` · 超时 ${qualityNumber(p.loss,'%')}`:''}${p?.interval!=null?` · 采样间隔 ${p.interval} 秒`:''}</small>`;
   }).join('')}`;
   tip.hidden=false;
   const matrix=svg.getScreenCTM(), offset=matrix.a*x+matrix.e-plot.getBoundingClientRect().left;

@@ -318,6 +318,7 @@ def init_db():
             pools.migrate(conn)
             migrate_v044(conn)
             migrate_v047(conn)
+            migrate_v047_rc2(conn)
             with conn:
                 ensure_active_windows(conn)
             return conn
@@ -329,7 +330,53 @@ def init_db():
     pools.migrate(conn)
     migrate_v044(conn)
     migrate_v047(conn)
+    migrate_v047_rc2(conn)
     return conn
+
+
+def migrate_v047_rc2(conn):
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 406:
+        return
+    database.backup_database(conn, settings.DB_PATH + ".pre-0.4.7-rc.2.bak")
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for table, fields in {
+            "links": {"applied": "TEXT", "failure_scope": "TEXT NOT NULL DEFAULT ''"},
+            "probe_samples": {"epoch": "TEXT", "previous_slot": "INTEGER"},
+        }.items():
+            columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in fields.items():
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        for row in conn.execute("SELECT * FROM links").fetchall():
+            link = dict(row)
+            if link["applied"]:
+                continue
+            plan = json.loads(link["plan"])
+            selected = json.loads(link["selected"])
+            previous = None
+            if link["job"]:
+                previous = json.loads(link["job"]).get("previous")
+                if previous:
+                    plan, selected = previous["plan"], previous["selected"]
+            hops = list(conn.execute("SELECT * FROM hops WHERE chain_id=? ORDER BY seq", (link["chain_id"],)))
+            expected = ([plan["entry"]] if plan["entry"] else []) + [
+                n for st in plan["stages"]
+                if (n := st["node_id"] if st["kind"] == "node" else selected.get(st["id"]))
+            ]
+            chain = conn.execute("SELECT * FROM chains WHERE id=?", (link["chain_id"],)).fetchone()
+            trustworthy = previous is not None or link["state"] not in ("error", "waiting", "switching", "preparing")
+            if trustworthy and chain and expected == [h["node_id"] for h in hops] and plan["target"] == chain["target_id"]:
+                if hops:
+                    plan["port"] = hops[0]["port"]
+                target = dict(database.get_target(conn, plan["target"]))
+                old_rules = json.loads(link["job"]).get("old", []) if link["job"] else pools.rows(conn, link["id"])
+                last = next((r for r in old_rules if hops and r["id"] == hops[-1]["id"]), None)
+                if last:
+                    target.update(host=last["host"], port=last["tport"])
+                pools.save_applied(conn, link["id"], plan, target)
+        database.set_setting(conn, "probe_identity_v2", str(int(time.time())))
+        conn.execute("PRAGMA user_version=406")
 
 
 def migrate_v047(conn):

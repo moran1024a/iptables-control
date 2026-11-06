@@ -96,6 +96,38 @@ class V3Tests(Fixture, unittest.TestCase):
 
 
 class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
+    async def test_updates_are_coalesced_and_stale_receipts_do_not_replace_inflight(self):
+        nid = self.node()
+        cid = self.config(self.route([nid]), [10001])
+        with self.db:
+            self.db.execute("UPDATE nodes SET installed_agent='active' WHERE id=?", (nid,))
+        ws, session, first = await self.connect(nid)
+        self.call('api_config_save', dict(ports=[10002]), cid)
+        self.call('api_config_save', dict(ports=[10003]), cid)
+        with self.db:
+            self.db.execute('UPDATE nodes SET last_seen=1 WHERE id=?', (nid,))
+        self.app['hub'].notify()
+        await asyncio.sleep(.05)
+        self.assertEqual(self.db.execute('SELECT op FROM sync_ops WHERE node_id=?', (nid,)).fetchone()[0], first['op'])
+        self.assertEqual(database.get_node(self.db, nid)['last_seen'], 1)
+
+        async def receipt(config):
+            await ws.send_json(dict(type='apply_result', session=session, op=config['op'],
+                                   generation=config['generation'], hash=config['hash'], ok=True, held_ports=[]))
+            return await ws.receive_json(timeout=3)
+
+        self.assertEqual((await receipt(first))['result'], 'changed')
+        latest = await ws.receive_json(timeout=3)
+        self.assertEqual(latest['generation'], database.get_node(self.db, nid)['desired_generation'])
+        self.assertEqual(latest['rules'][0]['port'], 10003)
+        self.assertEqual((await receipt(first))['result'], 'expired')
+        self.assertEqual(self.db.execute('SELECT op FROM sync_ops WHERE node_id=?', (nid,)).fetchone()[0], latest['op'])
+        self.assertEqual((await receipt(latest))['result'], 'confirmed')
+        self.assertEqual((await ws.receive_json(timeout=3))['type'], 'ready')
+        n = database.get_node(self.db, nid)
+        self.assertEqual(n['applied_generation'], n['desired_generation'])
+        await ws.close()
+
     async def asyncSetUp(self):
         http_harness.Handler.sync_path=database.setting(self.db,'sync_path')
         http_harness.Handler.panel_path=database.setting(self.db,'panel_path')

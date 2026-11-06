@@ -21,9 +21,9 @@ def fingerprint(value):
 
 
 def sections(c, link, nodes):
-    plan = json.loads(link["plan"])
+    plan = pools.runtime_plan(link) or json.loads(link["plan"])
     selected = json.loads(link["selected"])
-    if link["job"]:
+    if link["job"] and not link["applied"]:
         previous = json.loads(link["job"]).get("previous")
         if previous:
             plan, selected = (previous["plan"], previous["selected"])
@@ -31,16 +31,19 @@ def sections(c, link, nodes):
     target = c.execute(
         "SELECT * FROM targets WHERE id=?", (chain["target_id"] if chain else plan["target"],)
     ).fetchone()
+    if link["applied"]:
+        target = pools.applied_target(c, link)
     hops = [
         dict(r) for r in c.execute("SELECT * FROM hops WHERE chain_id=? ORDER BY seq", (link["chain_id"],))
     ]
     by_node = {h["node_id"]: h for h in hops}
+    live_rules = {r["id"]: r for r in pools.rows(c, link["id"])} if link["managed"] else {}
     stages = [
         (st["id"], st["node_id"] if st["kind"] == "node" else selected.get(st["id"])) for st in plan["stages"]
     ]
     actual = [n for _, n in stages if n]
     expected = ([plan["entry"]] if plan["entry"] else []) + actual
-    ready = bool(chain and target and ([h["node_id"] for h in hops] == expected))
+    ready = bool(link["applied"] and chain and target and ([h["node_id"] for h in hops] == expected))
     name = lambda nid: "direct" if nid == 0 else nodes[nid]["name"] if nid in nodes else "未选择"
     target_name = target["name"] if target else "目标"
     descriptors = [("full", "全段", actual[0] if actual else None, None, actual)]
@@ -80,8 +83,8 @@ def sections(c, link, nodes):
                 h = by_node[source]
                 next_hop = next((x for x in hops if x["seq"] == h["seq"] + 1), None)
                 spec.update(
-                    host=nodes[next_hop["node_id"]]["addr"] if next_hop else target["host"],
-                    port=next_hop["port"] if next_hop else target["port"],
+                    host=live_rules[h["id"]]["host"] if h["id"] in live_rules else nodes[next_hop["node_id"]]["addr"] if next_hop else target["host"],
+                    port=live_rules[h["id"]]["tport"] if h["id"] in live_rules else next_hop["port"] if next_hop else target["port"],
                     rule_id=h["id"],
                     target=None,
                 )

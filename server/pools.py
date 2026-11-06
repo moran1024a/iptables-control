@@ -27,6 +27,46 @@ def default_member(stage):
     return stage.get("default", next(iter(stage["order"]), None))
 
 
+def save_applied(c, ident, plan, target=None):
+    target = dict(target or database.get_target(c, plan["target"]))
+    c.execute("UPDATE links SET applied=? WHERE id=?", (dump(dict(plan=plan, target=target)), ident))
+
+
+def runtime_plan(link):
+    if link["applied"]:
+        return json.loads(link["applied"])["plan"]
+    return None
+
+
+def applied_target(c, link):
+    target = json.loads(link["applied"])["target"]
+    current = database.get_target(c, target["id"])
+    # Credentials and labels can change without changing the forwarding path.
+    return current if not link["managed"] or (current["host"], current["port"]) == (target["host"], target["port"]) else target
+
+
+def pending_plan(link, c=None):
+    current = runtime_plan(link)
+    if current is None:
+        return link["chain_id"] is not None
+    desired = json.loads(link["plan"])
+    if desired.get("port") is None:
+        desired["port"] = current["port"]
+    if desired != current:
+        return True
+    if c is not None and link["managed"]:
+        target = database.get_target(c, desired["target"])
+        applied = json.loads(link["applied"])["target"]
+        if (target["host"], target["port"]) != (applied["host"], applied["port"]):
+            return True
+        hops = list(c.execute("SELECT * FROM hops WHERE chain_id=? ORDER BY seq", (link["chain_id"],)))
+        live = {r["id"]: r for r in rows(c, link["id"])}
+        for a, b in zip(hops, hops[1:]):
+            if a["id"] in live and live[a["id"]]["host"] != database.get_node(c, b["node_id"])["addr"]:
+                return True
+    return False
+
+
 def migrate(c):
     if c.execute("PRAGMA user_version").fetchone()[0] >= 403:
         return
@@ -100,6 +140,8 @@ def sync_legacy(c):
                 "INSERT INTO links(name,chain_id,plan,state,group_id,sort) VALUES (?,?,?,'active',?,(SELECT COALESCE(MAX(sort),0)+1 FROM links))",
                 (chain["remark"], chain["id"], dump(plan), group),
             )
+        ident = c.execute("SELECT id FROM links WHERE chain_id=?", (chain["id"],)).fetchone()[0]
+        save_applied(c, ident, plan)
 
 
 def refresh_links(c, node=None, target=None):
@@ -111,6 +153,8 @@ def refresh_links(c, node=None, target=None):
             for r in c.execute("SELECT node_id FROM hops WHERE chain_id=? ORDER BY seq", (link["chain_id"],))
         ]
         if node is not None and node in path or (target is not None and plan["target"] == target):
+            if pending_plan(link):
+                raise errors.UserError(f"链路「{link['name']}」有未生效的方案，请先重试或编辑确认", status=409)
             begin(c, link, plan, json.loads(link["selected"]), path, "资源地址更新")
 
 
@@ -135,6 +179,8 @@ def references(c, pool_id):
     result = []
     for l in c.execute("SELECT * FROM links"):
         stages = json.loads(l["plan"])["stages"] + [dict(x, retained=True) for x in json.loads(l["retained"])]
+        if l["applied"]:
+            stages += [dict(x, applied=True) for x in runtime_plan(l)["stages"]]
         result.extend(
             ((dict(l), stage) for stage in stages if stage["kind"] == "pool" and stage["pool_id"] == pool_id)
         )
@@ -155,8 +201,8 @@ def protected(c, link, stage, node):
 def node_references(c, nid):
     names = ["池：" + p["name"] for p in c.execute("SELECT * FROM pools") if nid in json.loads(p["members"])]
     for link in c.execute("SELECT * FROM links"):
-        plan = json.loads(link["plan"])
-        if plan["entry"] == nid or any((x["kind"] == "node" and x["node_id"] == nid for x in plan["stages"])):
+        plans = [json.loads(link["plan"])] + ([runtime_plan(link)] if link["applied"] else [])
+        if any(plan["entry"] == nid or any(x["kind"] == "node" and x["node_id"] == nid for x in plan["stages"]) for plan in plans):
             names.append("链路：" + link["name"])
     if c.execute("SELECT 1 FROM link_retired WHERE node_id=?", (nid,)).fetchone():
         names.append("等待旧规则清理")
@@ -188,7 +234,7 @@ def pool_save(c, body, ident=None):
     else:
         before = json.loads(old["members"])
         removed, added = (set(before) - set(members), [n for n in members if n not in before])
-        affected = {}
+        affected, applied_affected = {}, {}
         for link, stage in references(c, ident):
             if stage.get("retained"):
                 if removed.intersection(stage["order"]):
@@ -203,7 +249,11 @@ def pool_save(c, body, ident=None):
                     )
             if link["job"] and (removed or added):
                 raise errors.UserError(f"链路「{link['name']}」正在切换，请稍后修改成员", status=409)
-            plan = affected.setdefault(link["id"], json.loads(link["plan"]))
+            if stage.get("applied"):
+                snapshot = applied_affected.setdefault(link["id"], json.loads(link["applied"]))
+                plan = snapshot["plan"]
+            else:
+                plan = affected.setdefault(link["id"], json.loads(link["plan"]))
             instance = next((x for x in plan["stages"] if x["id"] == stage["id"]))
             instance["default"] = default_member(instance)
             instance["order"] = [n for n in instance["order"] if n not in removed] + added
@@ -212,6 +262,8 @@ def pool_save(c, body, ident=None):
                 instance["default"] = next(iter(instance["order"]), None)
         for lid, plan in affected.items():
             c.execute("UPDATE links SET plan=?, revision=revision+1 WHERE id=?", (dump(plan), lid))
+        for lid, snapshot in applied_affected.items():
+            c.execute("UPDATE links SET applied=?, revision=revision+1 WHERE id=?", (dump(snapshot), lid))
         c.execute("UPDATE pools SET name=?,members=? WHERE id=?", (name, dump(members), ident))
     return dict(id=ident)
 
@@ -332,7 +384,8 @@ def ready(n, now):
 def choose(c, link, plan, prefer_current=False, forced=None, now=None):
     now = int(time.time()) if now is None else now
     nodes = {n["id"]: n for n in c.execute("SELECT * FROM nodes")}
-    current, failed = (json.loads(link["selected"]), json.loads(link["failures"]))
+    current = json.loads(link["selected"])
+    failed = json.loads(link["failures"]) if link["failure_scope"] in ("", dump(plan)) else []
     options = []
     for stage in plan["stages"]:
         if stage["kind"] == "node":
@@ -403,12 +456,12 @@ def rows(c, lid):
     ]
 
 
-def begin(c, link, plan, selected, path, reason, previous=None):
+def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=True, target_snapshot=None):
     if link["job"]:
         raise errors.UserError("链路已有未完成的切换，请先等待确认或重试同步", status=409)
     if plan["target"] is None:
         raise errors.UserError("请选择目标")
-    target = database.get_target(c, plan["target"])
+    target = target_snapshot or database.get_target(c, plan["target"])
     cid = link["chain_id"]
     if cid is None:
         cid = c.execute(
@@ -459,6 +512,8 @@ def begin(c, link, plan, selected, path, reason, previous=None):
             "UPDATE links SET selected=?,state='active',error='' WHERE id=?", (dump(selected), link["id"])
         )
         c.execute("UPDATE chains SET target_id=?,remark=? WHERE id=?", (target["id"], link["name"], cid))
+        applied_plan = {**plan, "port": old_hops[0]["port"] if old_hops else plan["port"]}
+        save_applied(c, link["id"], applied_plan, target)
         return
     new = []
     for index, nid in enumerate(path):
@@ -515,6 +570,10 @@ def begin(c, link, plan, selected, path, reason, previous=None):
         target=target["id"],
         reason=reason,
         wait=sorted({r["node_id"] for r in new[1:]}),
+        plan=plan,
+        target_snapshot=dict(target),
+        update_plan=update_plan,
+        previous_applied=link["applied"],
     )
     previous = previous or link
     job["previous"] = dict(
@@ -684,6 +743,8 @@ def cancel_complete(c, link, job):
             link["id"],
         ),
     )
+    if "previous_applied" in job:
+        c.execute("UPDATE links SET applied=? WHERE id=?", (job["previous_applied"], link["id"]))
     if not job["old"]:
         c.execute("DELETE FROM chains WHERE id=?", (link["chain_id"],))
     event(c, link["id"], "切换已取消，新路径规则开始清理")
@@ -752,8 +813,8 @@ def progress(c, link, now):
             c.execute("DELETE FROM link_rules WHERE link_id=? AND phase='stage'", (link["id"],))
             failed = list(set(json.loads(link["failures"])) | set(failures))
             c.execute(
-                "UPDATE links SET job=NULL,state='error',error=?,failures=? WHERE id=?",
-                ("新路径准备失败，旧入口未切换；请查看节点错误", dump(failed), link["id"]),
+                "UPDATE links SET job=NULL,state='error',error=?,failures=?,failure_scope=? WHERE id=?",
+                ("新路径准备失败，旧入口未切换；请查看节点错误", dump(failed), dump(job.get("plan", json.loads(link["plan"]))), link["id"]),
             )
             event(c, link["id"], "新路径准备失败，已取消本次切换")
         elif failures or now - job["at"] >= WAIT_SECONDS:
@@ -802,12 +863,14 @@ def progress(c, link, now):
     c.execute(
         "UPDATE chains SET target_id=?,remark=? WHERE id=?", (job["target"], link["name"], link["chain_id"])
     )
-    plan = json.loads(link["plan"])
+    plan = job.get("plan", json.loads(link["plan"]))
     if job["new"]:
         plan["port"] = job["new"][0]["port"]
+    save_applied(c, link["id"], plan, job.get("target_snapshot"))
+    desired = plan if job.get("update_plan", True) else json.loads(link["plan"])
     c.execute(
-        "UPDATE links SET selected=?,plan=?,job=NULL,state='active',error='',revision=revision+1 WHERE id=?",
-        (dump(job["selected"]), dump(plan), link["id"]),
+        "UPDATE links SET selected=?,plan=?,job=NULL,state='active',error='',failures='[]',failure_scope='',revision=revision+1 WHERE id=?",
+        (dump(job["selected"]), dump(desired), link["id"]),
     )
     event(c, link["id"], "新路径已确认生效，旧规则开始清理")
 
@@ -844,13 +907,15 @@ def tick(c, now=None, allow_failover=True):
         if link["job"]:
             progress(c, link, now)
             continue
-        if link["state"] in ("active", "draft") and (
+        if (
             not c.execute("SELECT 1 FROM link_retired WHERE link_id=?", (link["id"],)).fetchone()
         ):
             c.execute("UPDATE links SET retained='[]' WHERE id=?", (link["id"],))
         if link["chain_id"] is None or not allow_failover:
             continue
-        plan, selected = (json.loads(link["plan"]), json.loads(link["selected"]))
+        plan, selected = (runtime_plan(link), json.loads(link["selected"]))
+        if plan is None:
+            continue
         lost = []
         for stage in plan["stages"]:
             nid = selected.get(stage["id"]) if stage["kind"] == "pool" else None
@@ -863,14 +928,15 @@ def tick(c, now=None, allow_failover=True):
             try:
                 chosen, path = choose(c, link, plan, prefer_current=True, now=now)
                 if chosen != selected:
-                    begin(c, link, plan, chosen, path, "节点持续失联，自动灾备")
+                    begin(c, link, plan, chosen, path, "节点持续失联，自动灾备", update_plan=False,
+                          target_snapshot=json.loads(link["applied"])["target"])
             except errors.UserError as exc:
                 error = str(exc)
                 if exc.field and exc.field.startswith("capacity:"):
                     nid = int(exc.field.split(":")[1])
                     if any((st["kind"] == "pool" and nid in st["order"] for st in plan["stages"])):
                         failures = list(set(json.loads(link["failures"])) | {nid})
-                        c.execute("UPDATE links SET failures=? WHERE id=?", (dump(failures), link["id"]))
+                        c.execute("UPDATE links SET failures=?,failure_scope=? WHERE id=?", (dump(failures), dump(plan), link["id"]))
                 if link["error"] != error:
                     event(c, link["id"], "灾备等待：" + error)
                 c.execute("UPDATE links SET state='error',error=? WHERE id=?", (error, link["id"]))
@@ -895,6 +961,8 @@ def display_state(c, link):
                 )
             if status != "synced":
                 state, error = ("pending", f"等待节点 {n['name']} 确认配置")
+    if state == "active" and pending_plan(link, c):
+        return ("pending", "变更未生效，当前仍使用已确认的路径")
     return (state, error)
 
 
@@ -966,6 +1034,11 @@ def detail(c, link):
             stage["default"] = default_member(stage)
     result.pop("retained", None)
     result["job"] = json.loads(result["job"]) if result["job"] else None
+    result.pop("applied", None)
+    result.pop("failure_scope", None)
+    result["applied_plan"] = runtime_plan(link)
+    result["pending_changes"] = pending_plan(link, c)
+    result["recovery_required"] = bool(link["chain_id"] and not link["applied"] and not link["job"] and link["state"] != "draft")
     result["cleanup"] = [
         dict(r) for r in c.execute("SELECT node_id,port FROM link_retired WHERE link_id=?", (link["id"],))
     ]
@@ -986,7 +1059,7 @@ def detail(c, link):
     result["applied_target_id"] = None
     if link["chain_id"] and (result["hops"] or result["plan"]["entry"] is None):
         chain = database.get_chain(c, link["chain_id"])
-        target = database.get_target(c, chain["target_id"])
+        target = applied_target(c, link) if link["applied"] else database.get_target(c, chain["target_id"])
         result["applied_target_id"] = target["id"]
         first = result["hops"][0] if result["hops"] else dict(addr=target["host"], port=target["port"])
         result["connection"] = target_config.connection(
@@ -1032,7 +1105,7 @@ def quality_paths(c, only=None):
     for link in c.execute("SELECT * FROM links WHERE state NOT IN ('draft','deleting')"):
         if only is not None and link["id"] != only:
             continue
-        plan = json.loads(link["plan"])
+        plan = runtime_plan(link) or json.loads(link["plan"])
         stages = [[plan["entry"]]] if plan["entry"] else []
         for x in plan["stages"]:
             stages.append(

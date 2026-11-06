@@ -133,7 +133,7 @@ def artifact(name):
     return (path, hashlib.sha256(path.read_bytes()).hexdigest())
 
 
-def packet(conn, node, source="auto", op=None, status=None):
+def packet(conn, node, source="auto", op=None, status=None, *, observe=True, observe_only=False):
     status = status or {}
     data = {
         "t": str(int(time.time())),
@@ -149,7 +149,9 @@ def packet(conn, node, source="auto", op=None, status=None):
         "generation": str(status.get("generation", node["applied_generation"])),
         "v": status.get("hash", node["reported_v"] or ""),
     }
-    result = fields(node_sync.sync_report(conn, node, data, status.get("source_ip", "")))
+    result = fields(node_sync.sync_report(
+        conn, node, data, status.get("source_ip", ""), observe=observe, observe_only=observe_only
+    ))
     if result.get("action") == "apply":
         result["rules"] = forwarding.node_rule_rows(conn, node)
         result["generation"] = int(result["generation"])

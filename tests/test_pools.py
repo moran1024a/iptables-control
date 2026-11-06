@@ -20,6 +20,62 @@ from test_server import Fixture
 
 
 class PoolTests(Fixture, unittest.TestCase):
+    def test_upgrade_restores_running_job_but_does_not_guess_lost_pool_plan(self):
+        lid = self.link(); self.finish(lid)
+        before = self.get(lid)
+        self.call('api_link_action', dict(action='switch', stage='pool-a', member=self.b, revision=before['revision']), lid)
+        with self.db:
+            self.db.execute('UPDATE links SET applied=NULL WHERE id=?', (lid,))
+            self.db.execute('PRAGMA user_version=405')
+        self.db.close(); self.db = migrations.init_db()
+        self.assertEqual(self.get(lid)['applied_plan'], before['plan'])
+        self.ack(self.b, False); self.tick()
+        with self.db:
+            self.db.execute('UPDATE links SET applied=NULL WHERE id=?', (lid,))
+            self.db.execute('PRAGMA user_version=405')
+        self.db.close(); self.db = migrations.init_db()
+        self.assertTrue(self.get(lid)['recovery_required'])
+        self.assertEqual([h['node_id'] for h in self.get(lid)['hops']], [self.entry, self.a])
+
+    def test_failed_endpoint_update_keeps_old_endpoint_during_failover(self):
+        lid = self.link(); self.finish(lid)
+        self.call('api_target_save', dict(host='203.0.113.44'), self.target_id)
+        self.ack(self.a, False); self.tick()
+        with self.db:
+            self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?', (int(time.time())-61, self.a))
+        self.tick(); self.finish(lid)
+        link = self.get(lid)
+        self.assertEqual(link['selected']['pool-a'], self.b)
+        self.assertTrue(link['pending_changes'])
+        last = self.db.execute("SELECT host FROM link_rules WHERE node_id=? AND phase='live'", (self.b,)).fetchone()[0]
+        self.assertEqual(last, '198.51.100.1')
+
+    def test_failed_structural_edit_keeps_old_pool_probes_and_failover(self):
+        import link_quality
+        lid = self.link(); self.finish(lid)
+        old = self.get(lid)
+        plan = dict(entry=self.entry, port=10001, target=self.target_id,
+                    stages=[dict(id='fixed-c', kind='node', node_id=self.c)])
+        self.call('api_link_save', dict(plan=plan, revision=old['revision']), lid)
+        self.ack(self.c, False); self.tick()
+        failed = self.get(lid)
+        self.assertTrue(failed['pending_changes'])
+        self.assertEqual(failed['applied_plan'], old['plan'])
+        nodes = {r['id']: dict(r) for r in self.db.execute('SELECT * FROM nodes')}
+        raw = self.db.execute('SELECT * FROM links WHERE id=?', (lid,)).fetchone()
+        full = link_quality.sections(self.db, raw, nodes)[0]['probes'][0]
+        self.assertEqual(full['source'], self.a)
+        self.assertIsNone(full['reason'])
+        with self.db:
+            self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?', (int(time.time())-61, self.a))
+        self.tick()
+        self.assertEqual(self.get(lid)['job']['selected']['pool-a'], self.b)
+        self.finish(lid)
+        after = self.get(lid)
+        self.assertEqual(after['plan']['stages'], plan['stages'])
+        self.assertEqual(after['selected']['pool-a'], self.b)
+        self.assertTrue(after['pending_changes'])
+
     def setUp(self):
         super().setUp()
         self.old_agent = agent_files.AGENT

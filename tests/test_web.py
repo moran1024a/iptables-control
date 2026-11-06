@@ -57,6 +57,9 @@ class BrowserTests(unittest.TestCase):
                 return dict(slot=slot, rtt=rtt if status == 'ok' else None, path_key=path,
                             path_label=path, resolved_ip='192.0.2.1', status=status, error='')
             histories = {}
+            histories['loaded'] = dict(now=900, seconds=900, series=[dict(protocol='tcp-connect-v1',
+                **q.summarize([dict(sample(t), epoch='loaded', previous_slot=t-28 if t else None)
+                               for t in range(0, 901, 28)], 900, 900))])
             for seconds in q.HISTORY_STEPS:
                 histories[str(seconds)] = dict(now=seconds, seconds=seconds, series=[dict(protocol='tcp-connect-v1',
                     **q.summarize([sample(t) for t in range(0, seconds + 1, 12)], seconds, seconds))])
@@ -165,6 +168,8 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   const drawing=data=>{
     const t=document.createElement('template');t.innerHTML=qualityChart(data.series,data.now,data.seconds);return t.content;
   };
+  const loadedGraph=drawing(qualityHistories.loaded);
+  assert(loadedGraph.querySelectorAll('.quality-connection').length===loadedGraph.querySelectorAll('circle').length-1,'scheduler delays break the curve');
   for(const range of ['900','3600','86400','604800']) {
     const graph=drawing(qualityHistories[range]);
     assert(graph.querySelectorAll('.quality-connection').length===graph.querySelectorAll('circle').length-1,'delayed samples break '+range+' s curve');

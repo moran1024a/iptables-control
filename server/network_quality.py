@@ -92,6 +92,16 @@ def stopped(nodes, pair):
     return None
 
 
+def continuous(a, b):
+    if (a["status"] != "ok" or b["status"] != "ok"
+            or a.get("resolved_ip", "") != b.get("resolved_ip", "")
+            or a.get("path_key") != b.get("path_key")):
+        return False
+    if a.get("epoch") or b.get("epoch"):
+        return bool(a.get("epoch") == b.get("epoch") and b.get("previous_slot") == a["slot"])
+    return 0 < b["slot"] - a["slot"] <= INTERVAL * 2
+
+
 def aggregate(rows):
     good = [r["rtt"] for r in rows if r["status"] == "ok" and r["rtt"] is not None]
     lost = sum((r["status"] == "timeout" for r in rows))
@@ -99,10 +109,7 @@ def aggregate(rows):
     changes = [
         abs(b["rtt"] - a["rtt"])
         for a, b in zip(rows, rows[1:])
-        if a["status"] == b["status"] == "ok"
-        and b["slot"] - a["slot"] <= INTERVAL * 2
-        and (a["resolved_ip"] == b["resolved_ip"])
-        and (a.get("path_key") == b.get("path_key"))
+        if continuous(a, b)
     ]
     ordered = sorted(good)
     return dict(
@@ -124,47 +131,50 @@ def history(conn, pair_id, seconds, now):
 
 def summarize(rows, seconds, now):
     step = HISTORY_STEPS[seconds]
-    rows = [r for r in rows if r["slot"] <= now]
+    rows = sorted((r for r in rows if r["slot"] <= now), key=lambda r: r["slot"])
     start = now - seconds
     buckets = defaultdict(list)
     for row in rows:
         if start <= row["slot"] <= now:
             buckets[row["slot"] // step * step].append(row)
-    points = []
+    points, previous_sample = [], None
     for slot in range(start // step * step, now // step * step + 1, step):
-        batch = buckets.get(slot, [])
-        groups, group, address = ([], [], "")
-        for row in batch:
-            if group and (
-                row.get("path_key") != group[-1].get("path_key")
-                or row["status"] != group[-1]["status"]
-                or (address and row["resolved_ip"] and (address != row["resolved_ip"]))
-                or (row["slot"] - group[-1]["slot"] > INTERVAL * 2)
-            ):
+        samples = buckets.get(slot, [])
+        groups, group = [], []
+        for row in samples:
+            if group and not continuous(group[-1], row):
                 groups.append(group)
-                group, address = ([], "")
+                group = []
             group.append(row)
-            address = row["resolved_ip"] or address
         groups.append(group)
-        for group in groups:
-            failures = [r for r in group if r["status"] != "ok"]
-            state = (failures or group)[-1] if group else None
-            points.append(
-                dict(
-                    time=group[0]["slot"] if group else max(start, slot),
-                    end=min(group[-1]["slot"] + INTERVAL * 2 if group else slot + step, now + 1),
-                    **aggregate(group),
-                    status=state["status"] if state else "missing",
-                    error=state["error"] if state else "",
-                    failures=len(failures),
-                    resolved_ip=next((r["resolved_ip"] for r in reversed(group) if r["resolved_ip"]), ""),
-                    first_slot=group[0]["slot"] if group else None,
-                    last_slot=group[-1]["slot"] if group else None,
-                    gap=bool(failures),
-                    path_key=group[-1].get("path_key") if group else None,
-                    path_label=group[-1].get("path_label", "") if group else "",
-                )
-            )
+        # Preserve ordinary failure boundaries without unbounded SVG growth.
+        if len(groups) > 16:
+            groups = [samples]
+        for batch in groups:
+            failures = [r for r in batch if r["status"] != "ok"]
+            state = (failures or batch)[-1] if batch else None
+            broken = any(not continuous(a, b) for a, b in zip(batch, batch[1:]))
+            endpoints = {(r.get("path_key"), r.get("resolved_ip", "")) for r in batch if r["status"] == "ok"}
+            points.append(dict(
+                time=batch[0]["slot"] if batch else max(start, slot),
+                end=min(batch[-1]["slot"] + INTERVAL * 2 if batch else slot + step, now + 1),
+                **aggregate(batch),
+                status=state["status"] if state else "missing",
+                error=state["error"] if state else "",
+                failures=len(failures),
+                resolved_ip=next((r["resolved_ip"] for r in reversed(batch) if r["resolved_ip"]), ""),
+                first_slot=batch[0]["slot"] if batch else None,
+                last_slot=batch[-1]["slot"] if batch else None,
+                gap=bool(failures) or broken,
+                endpoint_change=len(endpoints) > 1,
+                connect=bool(batch and previous_sample and continuous(previous_sample, batch[0])),
+                path_key=batch[-1].get("path_key") if batch else None,
+                path_label=batch[-1].get("path_label", "") if batch else "",
+                interval=(batch[-1]["slot"] - batch[-1]["previous_slot"])
+                    if batch and batch[-1].get("previous_slot") is not None else None,
+            ))
+            if batch:
+                previous_sample = batch[-1]
     previous = None
     for point in points:
         if point["first_slot"] is not None:

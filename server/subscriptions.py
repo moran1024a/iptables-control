@@ -127,6 +127,8 @@ def configurations(c):
             continue
         chain = database.get_chain(c, link["chain_id"])
         target = database.get_target(c, chain["target_id"])
+        if link["applied"]:
+            target = pools.applied_target(c, link)
         info = pools.detail(c, link)
         connection = info["connection"] if link["state"] != "deleting" else None
         error = ("配置正在删除" if link["state"] == "deleting" else "配置尚未生效") if not connection else ""

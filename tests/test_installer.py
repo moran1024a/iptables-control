@@ -92,7 +92,7 @@ class InstallerTests(unittest.TestCase):
     def test_success_removes_only_old_container_and_keeps_backup(self):
         r=self.run_install();self.assertEqual(r.returncode,0,r.stderr)
         containers=json.loads((self.root/'containers').read_text());self.assertEqual(list(containers),['ictl-server'])
-        self.assertTrue(containers['ictl-server']['image'].endswith('0.4.7-rc.1'))
+        self.assertTrue(containers['ictl-server']['image'].endswith('0.4.7-rc.2'))
         backup=next((self.root/'data').glob('*.bak'));c=sqlite3.connect(backup)
         self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],202);c.close()
 

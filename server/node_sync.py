@@ -64,7 +64,7 @@ def clear_pending(conn, node):
     lifecycle.finish_deleted_chains(conn)
 
 
-def sync_report(conn, node, fields, source_ip, now=None):
+def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observe_only=False):
     """Return authenticated plaintext. Network IO is handled outside the DB transaction."""
     now = int(time.time()) if now is None else now
     state = fields.get("state")
@@ -104,13 +104,16 @@ def sync_report(conn, node, fields, source_ip, now=None):
         ):
             return agent_files.AGENT[2]
         raise errors.UserError("没有可用更新")
-    node_state.record_report(conn, node, now, health, err, skew)
-    conn.execute(
-        "UPDATE nodes SET first_seen=COALESCE(first_seen,?),last_seen=?,src_ip=?,\n        agent=?,skew=?,health=?,auto_update=?,protocol_version=MAX(protocol_version,?) WHERE id=?",
-        (now, now, source_ip, agent, skew, health, au, 2 if proto else 1, node["id"]),
-    )
-    if proto and fields.get("mode") in ("active", "passive"):
-        conn.execute("UPDATE nodes SET reported_mode=? WHERE id=?", (fields["mode"], node["id"]))
+    if observe:
+        node_state.record_report(conn, node, now, health, err, skew)
+        conn.execute(
+            "UPDATE nodes SET first_seen=COALESCE(first_seen,?),last_seen=?,src_ip=?,\n        agent=?,skew=?,health=?,auto_update=?,protocol_version=MAX(protocol_version,?) WHERE id=?",
+            (now, now, source_ip, agent, skew, health, au, 2 if proto else 1, node["id"]),
+        )
+        if proto and fields.get("mode") in ("active", "passive"):
+            conn.execute("UPDATE nodes SET reported_mode=? WHERE id=?", (fields["mode"], node["id"]))
+    if observe_only:
+        return "proto=2\n"
     lines = forwarding.node_rules(conn, node)
     want = forwarding.rules_version(lines)
     update = (

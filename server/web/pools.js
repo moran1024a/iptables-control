@@ -10,7 +10,7 @@ const poolMemberReason = n => n.status==='deleting'?'节点正在删除':n.mode=
 const linkStatus = l => l.sync?.state || l.state;
 const linkState = l => {
   const state=linkStatus(l), problem=['error','timeout','failed','offline'].includes(state);
-  return `<span class="badge ${problem?'removing':state==='active'?'applied':'applying'}">${LINK_STATES[state] || esc(state)}</span>`;
+  return `<span class="badge ${problem?'removing':state==='active'?'applied':'applying'}">${l.recovery_required?'需确认运行方案':l.pending_changes&&!l.job?'变更未生效':LINK_STATES[state] || esc(state)}</span>`;
 };
 const poolHead = (title, button='') => `<div class="page-head"><h1>${title}</h1><div class="head-actions">${button}</div></div>`;
 
@@ -61,7 +61,7 @@ async function linkList(request) {
   const d = await api('GET','links'); if (request !== viewRequest) return; poolView = d;
   list={kind:'links',data:d,draw:()=>drawCollection()};
   drawCollection=()=>{
-    const route=l=>[l.plan.entry?resourceName(d.nodes,l.plan.entry):null,...l.plan.stages.map(st=>st.kind==='pool'?resourceName(d.pools,st.pool_id):memberName(st.node_id)),resourceName(d.targets,l.plan.target,'未选择目标')].filter(Boolean).join(' → ');
+    const route=l=>{const p=l.applied_plan||l.plan;return [p.entry?resourceName(d.nodes,p.entry):null,...p.stages.map(st=>st.kind==='pool'?resourceName(d.pools,st.pool_id):memberName(st.node_id)),resourceName(d.targets,p.target,'未选择目标')].filter(Boolean).join(' → ');};
     if(sortMode==='links')return render(listHead('links',d.links.length,d.links.length)+sortList('links',d.links,l=>`<div class="title">${esc(l.name)}</div><div class="sub route-summary" title="${esc(route(l))}">${esc(route(l))}</div>`));
     const f=collectionFilters.links;
     const rows=d.links.filter(l=>matchesSearch('links',l.name+' '+route(l)+' '+(l.connection?l.connection.host+':'+l.connection.port:''))&&(!f.state || statusGroup(l)===f.state)&&(!f.group || l.group_id===Number(f.group)));
@@ -76,6 +76,7 @@ function switchBlocked(l, stage, member) {
   if (l.job) return '已有切换正在进行，请等待确认';
   if (l.state === 'deleting') return '链路正在删除';
   if (!l.chain_id) return '请先保存并应用链路';
+  if (l.recovery_required || (l.pending_changes && !l.plan.stages.some(s=>s.id===stage.id && s.kind==='pool' && s.pool_id===stage.pool_id))) return '请先编辑并确认未生效的链路方案';
   if (stage.disabled.includes(member)) return '此成员已禁用';
   if (stage.locked != null && stage.locked !== member) return '请先在池设置中解除锁定';
   const node = poolView.nodes.find(n => n.id === member);
@@ -85,7 +86,7 @@ function switchBlocked(l, stage, member) {
 }
 
 function topology(l) {
-  const d = poolView, plan = l.plan;
+  const d = poolView, plan = l.applied_plan || l.plan;
   // Fixed dimensions keep HTML cards and SVG cables aligned without layout observers.
   const cardH = 60, gap = 8, inset = 10, headerH = 46, gutter = 48;
   const columns = [];
@@ -114,8 +115,9 @@ function topology(l) {
   const matches=current.every(Boolean) && currentIds.join(',')===l.hops.map(h=>h.node_id).join(',')
     && plan.target===l.applied_target_id && (!plan.entry || plan.port===l.hops[0]?.port);
   const healthy=currentIds.every(id=>!['offline','error','skew','deleting','new'].includes(d.nodes.find(n=>n.id===id)?.status));
-  const flowing=matches && healthy && (l.state==='active' || l.state==='preparing');
-  const pending=l.job ? columns.map(col=>picked(col,l.job.phase==='rollback' ? l.selected : l.job.selected)) : [];
+  const flowing=matches && healthy && !l.recovery_required && !['draft','deleting'].includes(l.state) && (!l.job || l.job.phase==='prepare');
+  const shape=p=>JSON.stringify([p.entry,p.target,p.stages.map(s=>[s.id,s.kind,s.node_id,s.pool_id])]);
+  const pending=l.job && shape(plan)===shape(l.job.plan||l.plan) ? columns.map(col=>picked(col,l.job.phase==='rollback' ? l.selected : l.job.selected)) : [];
   const cables=[], active=[], waiting=[], hits=[];
   const pathBetween=(a,b)=>{
     const x=a.x+a.width,bend=Math.min(32,(b.x-x)/4);
@@ -145,7 +147,7 @@ function topology(l) {
       return `<div class="topology-fixed${flowing?' on-route':''}" data-key="fixed-${index}-${col.id}" data-point="${col.points[0].key}" ${matches?'data-current':''} style="left:${col.x}px;top:${col.y}px;width:${col.width}px"><small>${col.label}${col.kind!=='target'?` · ${node?.mode==='passive'?'被动':'主动'}`:''}</small>${col.kind==='target'?`<strong title="${esc(name)}">${esc(name)}</strong>`:`<a href="#/nodes/${col.id}" title="${esc(name)}">${esc(name)}</a>`}<span class="topology-address" title="${esc(subtitle)}">${esc(subtitle)}</span></div>`;
     }
     const st=col.stage;
-    return `<section class="topology-pool" data-key="stage-${esc(st.id)}" aria-label="${esc(resourceName(d.pools,st.pool_id))}" style="left:${col.x}px;top:${col.y}px;width:${col.width}px;height:${col.height}px"><div class="topology-pool-head"><div><small>池 · ${st.order.length} 个候选${st.locked!=null?' · 已锁定':''}</small><strong title="${esc(resourceName(d.pools,st.pool_id))}">${esc(resourceName(d.pools,st.pool_id))}</strong></div><button class="small" data-action="instance-edit" data-stage="${esc(st.id)}" ${l.job||l.state==='deleting'?'disabled':''}>设置</button></div><div class="topology-members">${col.points.map((p,i)=>{
+    return `<section class="topology-pool" data-key="stage-${esc(st.id)}" aria-label="${esc(resourceName(d.pools,st.pool_id))}" style="left:${col.x}px;top:${col.y}px;width:${col.width}px;height:${col.height}px"><div class="topology-pool-head"><div><small>池 · ${st.order.length} 个候选${st.locked!=null?' · 已锁定':''}</small><strong title="${esc(resourceName(d.pools,st.pool_id))}">${esc(resourceName(d.pools,st.pool_id))}</strong></div><button class="small" data-action="instance-edit" data-stage="${esc(st.id)}" ${l.job||l.state==='deleting'||!l.plan.stages.some(s=>s.id===st.id&&s.kind==='pool'&&s.pool_id===st.pool_id)?'disabled':''}>设置</button></div><div class="topology-members">${col.points.map((p,i)=>{
       const node=d.nodes.find(n=>n.id===p.member),isCurrent=matches&&l.selected[st.id]===p.member,isPending=l.job?.selected[st.id]===p.member;
       const reason=switchBlocked(l,st,p.member),disabled=st.disabled.includes(p.member);
       const status=p.member===0?'':({synced:'在线',offline:'离线',syncing:'等待同步',new:'未连接',error:'异常',skew:'时间异常',deleting:'删除中'}[node?.status]||'未就绪');
@@ -271,6 +273,8 @@ function mountTopology(id) {
 
 function syncFeedback(l) {
   const pending=l.sync?.nodes||[];
+  const notice=l.recovery_required?'旧运行方案不完整，请编辑并确认链路。':l.pending_changes&&!l.job?'变更未生效，当前仍使用已确认的路径。':'';
+  if(notice)return `<div class="sync-feedback" role="status"><span>${notice}</span>${l.error?`<p class="row-error">${esc(l.error)}</p>`:''}<button class="small" data-action="link-retry">重试同步</button></div>`;
   if(!pending.length && !l.error && !l.job)return '';
   return `<div class="sync-feedback" role="status">${l.error?`<p class="row-error">${esc(l.error)}</p>`:''}${pending.length?`<div class="sync-nodes">${pending.map(n=>`<a href="#/nodes/${n.id}" title="${esc(n.error)}">${esc(n.name)} <span>${LINK_STATES[n.reason]||'等待确认'}</span></a>`).join('')}</div>`:l.job?'<span class="muted">等待节点确认</span>':''}${pending.some(n=>n.reason==='manual'||n.mode==='passive'&&['failed','timeout'].includes(n.reason))?'<span class="manual-sync">在对应节点执行 <code>sudo ictl --sync</code><button class="small" data-action="copy" data-text="sudo ictl --sync">复制</button></span>':''}${l.job?.phase==='rollback'?'<span class="muted">正在恢复旧路径</span>':l.job?'<button class="small" data-action="link-cancel">取消切换</button>':''}${l.sync?.retry || !l.sync&&l.error?'<button class="small" data-action="link-retry">重试同步</button>':''}</div>`;
 }

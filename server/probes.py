@@ -20,6 +20,8 @@ class Monitor:
         self.budget = {}
         self.task = None
         self.cleanup_at = 0
+        self.streams = {}
+        self.last_tick = None
 
     async def view(self, body):
         return await q.view(self, body)
@@ -150,10 +152,14 @@ class Monitor:
 
     async def tick(self):
         now = int(time.time())
+        if self.last_tick is not None and not 0 <= now - self.last_tick <= 5:
+            self.streams.clear()
+        self.last_tick = now
         self.extra = {k: v for k, v in self.extra.items() if v > now}
         nodes, demands = await self.hub.database(lambda c: self.plan(c, now))
         await self.setup(nodes, demands, now)
         _, tasks = await self.hub.database(lambda c: self.bind(c, now))
+        self.streams = {k: v for k, v in self.streams.items() if k in tasks}
         if now >= self.cleanup_at:
             await self.hub.database(lambda c: store.cleanup(c, now - q.RETENTION))
             self.cleanup_at = now + 60
@@ -176,7 +182,8 @@ class Monitor:
             elif now - task["at"] >= 8:
                 self.pending.pop(op, None)
                 await self.hub.database(
-                    lambda c: store.record(c, task["task_id"], task["at"], "error", error="探测结果未返回")
+                    lambda c: store.record(c, task["task_id"], task["at"], "error", error="探测结果未返回",
+                                           epoch=task["epoch"], previous_slot=task["previous_slot"])
                 )
         busy = {t["task_id"] for t in self.pending.values()}
         self.budget = {n: t for n, t in self.budget.items() if t >= now - 1}
@@ -194,6 +201,11 @@ class Monitor:
             self.last[task_id] = now
             source = self.hub.sessions[spec["source"]]
             target = self.hub.sessions.get(spec["target"])
+            session_key = (source.get("id", id(source)), target.get("id", id(target)) if target else None,
+                           target.get("quality_setup_id") if target else None)
+            stream = self.streams.get(task_id)
+            if stream is None or stream["session"] != session_key:
+                stream = self.streams[task_id] = dict(epoch=secrets.token_hex(16), previous=None, session=session_key)
             op = secrets.token_hex(16)
             self.pending[op] = dict(
                 task_id=task_id,
@@ -202,7 +214,9 @@ class Monitor:
                 session=source,
                 target_session=target,
                 setup_id=target.get("quality_setup_id") if target else None,
+                epoch=stream["epoch"], previous_slot=stream["previous"],
             )
+            stream["previous"] = now
             message = dict(
                 type="quality_probe",
                 id=op,
@@ -216,9 +230,10 @@ class Monitor:
             try:
                 await asyncio.wait_for(source["send"](message), 2)
             except (ConnectionError, asyncio.TimeoutError):
-                self.pending.pop(op, None)
+                failed = self.pending.pop(op)
                 await self.hub.database(
-                    lambda c: store.record(c, task_id, now, "error", error="探测指令发送失败")
+                    lambda c: store.record(c, task_id, now, "error", error="探测指令发送失败",
+                                           epoch=failed["epoch"], previous_slot=failed["previous_slot"])
                 )
 
     async def result(self, nid, session, data):
@@ -248,6 +263,7 @@ class Monitor:
                     rtt if status == "ok" else None,
                     data.get("error", ""),
                     data.get("resolved_ip", ""),
+                    epoch=task["epoch"], previous_slot=task["previous_slot"],
                 )
 
         await self.hub.database(save)

@@ -541,6 +541,8 @@ class Resources:
             row = database.get_chain(conn, c["id"])
             t = database.get_target(conn, row["target_id"])
             link = conn.execute("SELECT * FROM links WHERE chain_id=?", (c["id"],)).fetchone()
+            if link and link["applied"]:
+                t = pools.applied_target(conn, link)
             c.update(
                 route_id=row["route_id"],
                 route_name=database.get_route(conn, row["route_id"])["name"] if row["route_id"] else None,

@@ -13,10 +13,24 @@ import network_quality as q
 import transport
 import probe_store
 import database
+import pools
 from quality_fixtures import link_record
 
 
 class LinkQualityTests(Fixture, unittest.IsolatedAsyncioTestCase):
+    async def test_icmp_shares_target_across_business_ports_but_tcp_does_not(self):
+        target = self.target(port=8443)
+        self.config(self.route(self.ids, 'alternate'), [10011, 10012, 10013], target_id=target)
+        with self.db:
+            self.db.execute('UPDATE nodes SET applied_generation=desired_generation')
+            _, tasks = self.hub.quality.bind(self.db, int(time.time()))
+        def terminal(protocol):
+            return [specs for specs in tasks.values() if specs[0]['protocol'] == protocol
+                    and specs[0]['source'] == self.ids[-1] and specs[0]['target'] is None]
+        self.assertEqual(len(terminal('icmp-echo-v1')), 1)
+        self.assertEqual(len(terminal('icmp-echo-v1')[0]), 2)
+        self.assertEqual(len(terminal('tcp-connect-v1')), 2)
+
     async def asyncSetUp(self):
         self.ids = [self.node(n) for n in ('入口A', 'B', 'C')]
         self.cid = self.config(self.route(self.ids), [10001, 10002, 10003])
@@ -60,6 +74,7 @@ class LinkQualityTests(Fixture, unittest.IsolatedAsyncioTestCase):
             plan = json.loads(row[0])
             plan['stages'].insert(1, dict(id='direct', kind='pool', pool_id=1, direct=True, order=[0], disabled=[], default=0))
             self.db.execute('UPDATE links SET plan=?,selected=? WHERE id=?', (json.dumps(plan), json.dumps({'direct': 0}), self.lid))
+            pools.save_applied(self.db, self.lid, plan)
         sections = self.plan()
         self.assertEqual(len(sections), 4)
         self.assertEqual(sections[0]['label'], 'B → C → target')
@@ -131,6 +146,7 @@ class LinkQualityTests(Fixture, unittest.IsolatedAsyncioTestCase):
             row = self.db.execute('SELECT plan FROM links WHERE id=?', (self.lid,)).fetchone()
             plan = json.loads(row[0]); plan['stages'].pop()
             self.db.execute('UPDATE links SET plan=? WHERE id=?', (json.dumps(plan), self.lid))
+            pools.save_applied(self.db, self.lid, plan)
         await self.hub.quality.tick()
         tasks = list(self.hub.quality.pending.values())
         self.assertEqual(len(tasks), 1)

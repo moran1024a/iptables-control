@@ -136,26 +136,28 @@ class Hub:
         )
         inflight = None
 
-        async def reconcile():
+        async def reconcile(received=False):
             nonlocal inflight
 
             def prepare(c):
                 n = c.execute("SELECT * FROM nodes WHERE id=?", (nid,)).fetchone()
                 if n is None or n["key"] != node["key"]:
                     return {"action": "revoked"}
+                if received:
+                    agent_v3.packet(c, n, status=status, observe_only=True)
                 if n["desired_mode"] != "active" or n["manual_required"] or n["installed_agent"] != "active":
                     return {"action": "pause"}
-                if inflight == n["desired_generation"]:
-                    c.execute("UPDATE nodes SET last_seen=? WHERE id=?", (int(time.time()), nid))
+                if inflight is not None:
                     return {"action": "waiting"}
                 if "held_ports" in status:
                     agent_v3.refresh_held_ports(c, n, status)
-                return agent_v3.packet(c, n, status=status)
+                return agent_v3.packet(c, n, status=status, observe=False)
 
             result = await self.database(prepare)
             action = result.get("action")
             if action == "apply":
-                inflight = result["generation"]
+                inflight = {k: result[k] for k in ("op", "generation", "hash")}
+                inflight["deadline"] = time.monotonic() + 600
                 await send({"type": "config", **result})
             elif action in ("pause", "revoked"):
                 session["paused"] = True
@@ -171,11 +173,15 @@ class Hub:
 
         receive = wake = None
         try:
-            await reconcile()
+            await reconcile(received=True)
             receive = asyncio.create_task(ws.receive())
             wake = asyncio.create_task(session["wake"].wait())
             while not ws.closed and self.sessions.get(nid) is session:
-                done, _ = await asyncio.wait((receive, wake), return_when=asyncio.FIRST_COMPLETED)
+                timeout = max(0, inflight["deadline"] - time.monotonic()) if inflight else None
+                done, _ = await asyncio.wait((receive, wake), timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+                if inflight and time.monotonic() >= inflight["deadline"]:
+                    await ws.close(code=1011, message=b"configuration receipt timeout")
+                    break
                 if self.sessions.get(nid) is not session:
                     break
                 if wake in done:
@@ -207,8 +213,12 @@ class Hub:
                             if k in data
                         }
                     )
-                    await reconcile()
+                    await reconcile(received=True)
                 elif kind == "apply_result":
+                    if not inflight or any(data.get(k) != inflight[k] for k in ("op", "generation", "hash")):
+                        await send({"type": "apply_ack", "id": data.get("op"), "result": "expired"})
+                        receive = asyncio.create_task(ws.receive())
+                        continue
 
                     def ack(c):
                         n = c.execute("SELECT * FROM nodes WHERE id=?", (nid,)).fetchone()

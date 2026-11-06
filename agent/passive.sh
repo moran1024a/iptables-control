@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.4.3"
+VERSION="0.4.7-rc.2"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/lib/ictl/passive.sh"
@@ -534,6 +534,11 @@ jump_flags() {
 
 restore_owned() {
   local snapshot="$1" flags="$2" table parent chain flag i=0 item
+  # Complete a partial deletion before restored rules can create new connections.
+  if [ -f "$LIB/clear-owned.rules" ]; then
+    clear_changed_connections "$(cat "$LIB/clear-owned.rules")" '' || return 1
+    rm -f "$LIB/clear-owned.rules" || return 1
+  fi
   # Empty owned chains absent from the original snapshot before removing them.
   local input="$snapshot"
   [[ "$input" == *':ICTL-PRE '* ]] || input="${input/\*nat/*nat$'\n':ICTL-PRE - [0:0]}"
@@ -592,6 +597,9 @@ clear_changed_connections() {
 
 apply_rules() {
   local out previous flags actual
+  if [ -f "$LIB/clear-owned.rules" ]; then
+    remove_rules || { ERRS+=('上次连接清理尚未完成'); return 1; }
+  fi
   render
   [ "${#ERRS[@]}" -eq 0 ] || return 1
   check_port_conflicts "$(cat "$CONFIG" 2>/dev/null)" || return 1
@@ -648,9 +656,18 @@ remove_chain() {
 }
 
 remove_rules() {
+  local current saved="$LIB/clear-owned.rules" pending
+  current="$(owned_snapshot)" || return 1
+  pending="$(cat "$saved" 2>/dev/null || true)"
+  # Persist exact destinations so retries also work after the chains are gone.
+  mkdir -p "$LIB" || return 1
+  printf '%s\n%s\n' "$pending" "$current" | awk '!seen[$0]++' > "$saved.tmp" || return 1
+  chmod 600 "$saved.tmp" && sync -f "$saved.tmp" && mv "$saved.tmp" "$saved" && sync -f "$LIB" || return 1
   remove_chain nat PREROUTING ICTL-PRE || return 1
   remove_chain nat POSTROUTING ICTL-POST || return 1
-  remove_chain filter FORWARD ICTL-FWD
+  remove_chain filter FORWARD ICTL-FWD || return 1
+  clear_changed_connections "$(cat "$saved")" '' || { printf '%s\n' "${ERRS[@]}" >&2; return 1; }
+  rm -f "$saved"
 }
 
 # ---------------------------------------------------------------- 同步

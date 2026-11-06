@@ -44,6 +44,14 @@ def fingerprint(identity):
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def measurement_identity(identity):
+    if identity["protocol"] != "icmp-echo-v1" or identity["kind"] == "icmp":
+        return identity
+    destination = identity["target"][1] if identity["kind"] == "pair" else identity["endpoint"][0]
+    return dict(kind="icmp", protocol="icmp-echo-v1", source=identity["source"],
+                host=destination.lower().rstrip("."))
+
+
 def pair_identity(nodes, a, b, protocol):
     return dict(
         kind="pair",
@@ -55,6 +63,7 @@ def pair_identity(nodes, a, b, protocol):
 
 
 def task(c, identity):
+    identity = measurement_identity(identity)
     key = fingerprint(identity)
     c.execute(
         "INSERT OR IGNORE INTO probe_tasks VALUES (?,?)",
@@ -90,10 +99,10 @@ def bind(c, demands, now):
         c.execute("UPDATE probe_bindings SET ended=? WHERE id=?", (now, previous["id"]))
 
 
-def record(c, task_id, slot, status, rtt=None, error="", resolved_ip=""):
+def record(c, task_id, slot, status, rtt=None, error="", resolved_ip="", *, epoch=None, previous_slot=None):
     c.execute(
-        "INSERT OR IGNORE INTO probe_samples VALUES (?,?,?,?,?,?)",
-        (task_id, slot, status, rtt, str(error)[:300], str(resolved_ip)[:64]),
+        "INSERT OR IGNORE INTO probe_samples(task_id,slot,status,rtt,error,resolved_ip,epoch,previous_slot) VALUES (?,?,?,?,?,?,?,?)",
+        (task_id, slot, status, rtt, str(error)[:300], str(resolved_ip)[:64], epoch, previous_slot),
     )
 
 
@@ -116,11 +125,14 @@ def pair_rows(c, pair, since):
         protocol=pair["protocol"],
         port=pair["port"],
     )
+    old_key, key = fingerprint(identity), fingerprint(measurement_identity(identity))
+    identity_cut = int(database.setting(c, "probe_identity_v2", "0"))
     rows.extend(
         dict(r)
         for r in c.execute(
-            "SELECT * FROM probe_samples WHERE task_id=? AND slot>=?",
-            (fingerprint(identity), max(cut, since)),
+            """SELECT * FROM probe_samples WHERE slot>=? AND
+            (task_id=? OR (task_id=? AND slot<?))""",
+            (max(cut, since), key, old_key, identity_cut),
         )
     )
     return sorted(rows, key=lambda r: r["slot"])

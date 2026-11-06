@@ -19,6 +19,28 @@ from quality_fixtures import pair_record
 
 
 class HistoryTests(unittest.TestCase):
+    def test_sparse_dispatched_samples_remain_continuous_and_week_is_bounded(self):
+        rows = [dict(self.row(t, rtt=20+t%3), epoch='run', previous_slot=t-28 if t else None)
+                for t in range(0, q.RETENTION+1, 28)]
+        for seconds in q.HISTORY_STEPS:
+            data = q.summarize(rows, seconds, q.RETENTION)
+            good = [p for p in data['points'] if p['mean'] is not None]
+            self.assertTrue(all(p['connect'] and not p['gap'] for p in good[1:]))
+            self.assertIsNotNone(data['summary']['jitter'])
+        self.assertEqual(len(q.summarize(rows, q.RETENTION, q.RETENTION)['points']), 337)
+        broken = [dict(self.row(100), epoch='first', previous_slot=None),
+                  dict(self.row(128), epoch='second', previous_slot=100)]
+        self.assertFalse(q.continuous(*broken))
+        broken[1].update(epoch='first', previous_slot=114)
+        self.assertFalse(q.continuous(*broken))
+
+    def test_many_path_changes_cannot_expand_the_week_without_bound(self):
+        rows = [self.row(t, path=str(t)) for t in range(0, q.RETENTION+1, 10)]
+        data = q.summarize(rows, q.RETENTION, q.RETENTION)
+        self.assertLessEqual(len(data['points']), 337*16)
+        self.assertTrue(data['points'][0]['endpoint_change'])
+        self.assertTrue(data['points'][0]['gap'])
+
     @staticmethod
     def row(slot, rtt=20, path='same', address='192.0.2.1', status='ok'):
         return dict(slot=slot, rtt=rtt if status == 'ok' else None, path_key=path,
@@ -83,6 +105,24 @@ class HistoryTests(unittest.TestCase):
 
 
 class QualityTests(Fixture, unittest.TestCase):
+    def test_icmp_history_reads_both_identity_generations(self):
+        import probe_store
+        import database
+        a, b = self.node(), self.node('B')
+        nodes = {n['id']: dict(n) for n in self.db.execute('SELECT * FROM nodes')}
+        now = int(time.time())
+        with self.db:
+            pair = q.ensure_pair(self.db, nodes, a, b, 'icmp-echo-v1')
+            identity = probe_store.pair_identity(nodes, a, b, 'icmp-echo-v1')
+            old = probe_store.fingerprint(identity)
+            self.db.execute('INSERT INTO probe_tasks VALUES (?,?)', (old, json.dumps(identity)))
+            new = probe_store.task(self.db, identity)
+            database.set_setting(self.db, 'probe_cutover', str(now-100))
+            database.set_setting(self.db, 'probe_identity_v2', str(now))
+            probe_store.record(self.db, old, now-10, 'ok', 11)
+            probe_store.record(self.db, new, now+10, 'ok', 22)
+        self.assertEqual([r['rtt'] for r in probe_store.pair_rows(self.db, pair, now-100)], [11, 22])
+
     def test_rc1_upgrade_keeps_rules_and_does_not_reassign_conflicting_port(self):
         a, b = self.node(ports='33000-34000'), self.node('B')
         route = self.route([a, b])

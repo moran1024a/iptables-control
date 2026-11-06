@@ -11,6 +11,37 @@ class PassiveTests(AgentHarness,unittest.TestCase):
 
     def tearDown(self):self.temp.cleanup()
 
+    def test_clear_removes_only_owned_tcp_and_udp_connections(self):
+        self.assertShell('printf "v=abc\\n1 both 10001 192.0.2.1 443\\n" > "$CONFIG"\nlocal_apply\n[ "$R_STATE" = ok ]')
+        self.assertShell('remove_rules')
+        calls = [line for line in (self.root/'commands').read_text().splitlines() if line.startswith('conntrack ')]
+        self.assertEqual(len(calls), 2)
+        for proto, call in zip(('tcp', 'udp'), calls):
+            self.assertIn(f'-p {proto} --orig-port-dst 10001 --reply-src 192.0.2.1 --reply-port-src 443 --dst-nat', call)
+        self.assertFalse((self.lib/'clear-owned.rules').exists())
+
+    def test_clear_failure_keeps_destinations_for_retry_after_chains_are_gone(self):
+        self.assertShell('printf "v=abc\\n1 both 10001 192.0.2.1 443\\n" > "$CONFIG"\nlocal_apply\n[ "$R_STATE" = ok ]')
+        self.assertShell('conntrack() { echo failed >&2; return 1; }; ! remove_rules')
+        self.assertIn('--to-destination 192.0.2.1:443', (self.lib/'clear-owned.rules').read_text())
+        self.assertShell('remove_rules')
+        self.assertFalse((self.lib/'clear-owned.rules').exists())
+        calls = (self.root/'commands').read_text()
+        self.assertIn('conntrack -D -f ipv4 -p udp --orig-port-dst 10001', calls)
+
+    def test_restore_does_not_forget_unfinished_cleanup(self):
+        self.assertShell('''printf 'v=abc\n1 both 10001 192.0.2.1 443\n' > "$CONFIG"
+local_apply
+snapshot="$(owned_snapshot)"
+conntrack() { return 1; }
+! remove_rules || exit 1
+! restore_owned "$snapshot" $'1\n1\n1' || exit 1
+[ -f "$LIB/clear-owned.rules" ] || exit 1
+unset -f conntrack
+restore_owned "$snapshot" $'1\n1\n1' && jumps_ok
+[ ! -f "$LIB/clear-owned.rules" ]
+''')
+
     def test_restore_reconnects_parent_chains_after_handover_cleanup(self):
         self.assertShell('''printf 'v=abc\n1 both 10001 192.0.2.1 443\n' > "$CONFIG"
 local_apply
