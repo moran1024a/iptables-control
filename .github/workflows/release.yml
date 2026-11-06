@@ -50,6 +50,8 @@ jobs:
           done
           cp agent/*.sh deploy/install-server.sh deploy/install-agent.sh server/components.json ipt.sh dist/
           (cd dist && sha256sum *.sh components.json ictl-active-* ictl-wake-* > SHA256SUMS)
+          mkdir -p "$RUNNER_TEMP/agent-assets/out"
+          cp dist/ictl-*-linux-* "$RUNNER_TEMP/agent-assets/out/"
 
       - name: 验证隔离网络中的实际转发
         run: |
@@ -62,6 +64,8 @@ jobs:
           sudo unshare -nm python3 tests/kernel_quality.py "$PWD/dist/ictl-active-linux-amd64" "$RUNNER_TEMP/ictl-active-test"
 
       - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -72,9 +76,14 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
+          # 复用已打包和验证的二进制，覆盖 Dockerfile 中同名的编译阶段。
+          build-contexts: agent-build=${{ runner.temp }}/agent-assets
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.version.outputs.tags }}
+          # 标签触发的发布通过 registry 共享缓存，避免每个新标签从头构建。
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/ictl-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/ictl-server:buildcache,mode=max,ignore-error=true
 
       - name: 创建 Release
         env:
