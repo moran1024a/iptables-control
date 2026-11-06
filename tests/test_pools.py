@@ -1,16 +1,29 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+import agent_files
+import agent_v3
+import database
+import errors
+import forwarding
+import migrations
+import node_sync
+import pools
+import settings
+import wake
 """Pool behavior through real rule compilation and authenticated-sync receipts."""
 import json
 from pathlib import Path
 import time
 import unittest
-from test_server import Fixture, s
+from test_server import Fixture
 
 
 class PoolTests(Fixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
-        self.old_agent = s.AGENT
-        s.load_agent()
+        self.old_agent = agent_files.AGENT
+        agent_files.load_agent()
         self.entry, self.a, self.b, self.c = [self.node(n, ports='10000-10100') for n in ('entry','a','b','c')]
         self.target_id = self.target()
         for i, nid in enumerate((self.entry, self.a, self.b, self.c), 1):
@@ -21,22 +34,22 @@ class PoolTests(Fixture, unittest.TestCase):
         self.pool = self.call('api_pool_save', dict(name='pool', members=[self.a,self.b]))['id']
 
     def tearDown(self):
-        s.AGENT = self.old_agent
+        agent_files.AGENT = self.old_agent
         super().tearDown()
 
     def ack(self, nid, ok=True):
         with self.db:
-            n = s.get_node(self.db, nid)
-            p = s.agent_v3.packet(s._module(), self.db, n, status=dict(version='0.4.0-rc.2',state='ok'))
+            n = database.get_node(self.db, nid)
+            p = agent_v3.packet(self.db, n, status=dict(version='0.4.0-rc.2',state='ok'))
             if p.get('action') == 'apply':
-                return s.agent_v3.acknowledge(s._module(), self.db, s.get_node(self.db,nid),
+                return agent_v3.acknowledge(self.db, database.get_node(self.db,nid),
                     dict(op=p['op'],generation=p['generation'],hash=p['hash'],ok=ok,error='' if ok else '端口冲突：测试',version='0.4.0-rc.2'))
 
     def tick(self, now=None):
         with self.db:
-            before=s.mutation_snapshot(self.db)
-            s.pools.tick(s._module(), self.db, now=now)
-            s.finish_mutation(self.db,before)
+            before=node_sync.mutation_snapshot(self.db)
+            pools.tick(self.db, now=now)
+            node_sync.finish_mutation(self.db,before)
 
     def link(self):
         return self.call('api_link_save',dict(name='link',plan=dict(entry=self.entry,target=self.target_id,
@@ -62,25 +75,25 @@ class PoolTests(Fixture, unittest.TestCase):
         after=self.get(lid)
         self.assertIsNone(after['job']); self.assertEqual(after['plan'],before['plan'])
         self.assertEqual(after['selected'],before['selected'])
-        self.assertFalse(s.node_rules(self.db,s.get_node(self.db,self.b)))
+        self.assertFalse(forwarding.node_rules(self.db,database.get_node(self.db,self.b)))
         self.assertTrue(after['cleanup'])
         self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.a,revision=after['revision']),lid)
 
     def test_cancel_commit_keeps_downstream_until_entry_restored(self):
         lid=self.link(); self.finish(lid)
         before=self.get(lid)
-        old_rules=s.node_rules(self.db,s.get_node(self.db,self.entry))
+        old_rules=forwarding.node_rules(self.db,database.get_node(self.db,self.entry))
         self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=before['revision']),lid)
         self.ack(self.b); self.tick()
         switching=self.get(lid); self.assertEqual(switching['job']['phase'],'commit')
         self.call('api_link_action',dict(action='cancel',revision=switching['revision']),lid)
         self.assertEqual(self.get(lid)['job']['phase'],'rollback')
-        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,self.entry)),old_rules)
-        self.assertTrue(s.node_rules(self.db,s.get_node(self.db,self.b)))
+        self.assertEqual(forwarding.node_rules(self.db,database.get_node(self.db,self.entry)),old_rules)
+        self.assertTrue(forwarding.node_rules(self.db,database.get_node(self.db,self.b)))
         self.tick(); self.assertIsNotNone(self.get(lid)['job'])
         self.ack(self.entry); self.tick()
         self.assertIsNone(self.get(lid)['job'])
-        self.assertFalse(s.node_rules(self.db,s.get_node(self.db,self.b)))
+        self.assertFalse(forwarding.node_rules(self.db,database.get_node(self.db,self.b)))
         self.assertEqual(self.get(lid)['plan'],before['plan'])
 
     def test_cancel_new_link_returns_to_editable_draft(self):
@@ -104,7 +117,7 @@ class PoolTests(Fixture, unittest.TestCase):
         self.assertFalse(before['sync']['retry'])
         with self.db:
             self.db.execute('UPDATE nodes SET wake_enabled=1,wake_port=33446 WHERE id=?', (self.entry,))
-            s.wake.queue(s._module(), self.db, s.get_node(self.db,self.entry))
+            wake.queue(self.db, database.get_node(self.db,self.entry))
         self.assertEqual(self.get(lid)['sync']['state'], 'switching')
         with self.db:
             self.db.execute("UPDATE wake_jobs SET state='timeout' WHERE node_id=?", (self.entry,))
@@ -122,8 +135,8 @@ class PoolTests(Fixture, unittest.TestCase):
     def test_prepare_commit_and_stable_entry(self):
         lid=self.link()
         self.assertIsNone(self.get(lid)['connection'])
-        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,self.entry)),[])
-        self.assertEqual(len(s.node_rules(self.db,s.get_node(self.db,self.a))),1)
+        self.assertEqual(forwarding.node_rules(self.db,database.get_node(self.db,self.entry)),[])
+        self.assertEqual(len(forwarding.node_rules(self.db,database.get_node(self.db,self.a))),1)
         self.tick();self.assertEqual(self.get(lid)['state'],'preparing')
         self.ack(self.a);self.tick();self.assertEqual(self.get(lid)['state'],'switching')
         self.assertEqual(self.get(lid)['hops'],[])
@@ -145,8 +158,8 @@ class PoolTests(Fixture, unittest.TestCase):
         self.assertEqual(self.get(lid)['plan']['stages'][0]['order'],[self.b,self.a,self.c])
         self.assertEqual(self.get(lid)['selected']['pool-a'],self.a)
         self.assertEqual(self.get(lid)['plan']['stages'][0]['default'],self.a)
-        with self.assertRaises(s.UserError):self.call('api_pool_delete',{},self.pool)
-        with self.assertRaises(s.UserError):self.call('api_pool_save',dict(members=[self.b,self.c]),self.pool)
+        with self.assertRaises(errors.UserError):self.call('api_pool_delete',{},self.pool)
+        with self.assertRaises(errors.UserError):self.call('api_pool_save',dict(members=[self.b,self.c]),self.pool)
         l=self.get(lid)
         self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
         self.finish(lid)
@@ -178,19 +191,19 @@ class PoolTests(Fixture, unittest.TestCase):
         l=self.get(lid);l['plan']['stages'][0]['locked']=self.a
         self.call('api_link_save',dict(plan=l['plan'],revision=l['revision']),lid)
         l=self.get(lid)
-        with self.assertRaises(s.UserError):
+        with self.assertRaises(errors.UserError):
             self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
         self.assertEqual(self.get(lid)['plan'],l['plan'])
         l['plan']['stages'][0]['locked']=None
         self.call('api_link_save',dict(plan=l['plan'],revision=l['revision']),lid)
         l=self.get(lid)
         with self.db:self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?',(int(time.time())-120,self.b))
-        with self.assertRaises(s.UserError):
+        with self.assertRaises(errors.UserError):
             self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
         self.assertEqual(self.get(lid)['plan'],l['plan'])
         self.assertIsNone(self.get(lid)['job'])
         self.ack(self.b)
-        with self.assertRaises(s.UserError):
+        with self.assertRaises(errors.UserError):
             self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']-1),lid)
         self.assertEqual(self.get(lid)['plan'],l['plan'])
 
@@ -200,13 +213,13 @@ class PoolTests(Fixture, unittest.TestCase):
         # A recovered first-priority node need not be the currently selected one.
         l['plan']['stages'][0].update(order=[self.b,self.a,0],direct=True)
         with self.db:self.db.execute('UPDATE links SET plan=? WHERE id=?',(json.dumps(l['plan']),lid))
-        before=s.node_rules(self.db,s.get_node(self.db,self.entry))
+        before=forwarding.node_rules(self.db,database.get_node(self.db,self.entry))
         self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.a,revision=l['revision']),lid)
         l=self.get(lid)
         self.assertIsNone(l['job'])
         self.assertEqual(l['plan']['stages'][0]['order'],[self.b,self.a,0])
         self.assertEqual(l['plan']['stages'][0]['default'],self.a)
-        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,self.entry)),before)
+        self.assertEqual(forwarding.node_rules(self.db,database.get_node(self.db,self.entry)),before)
         self.call('api_link_action',dict(action='switch',stage='pool-a',member=0,revision=l['revision']),lid)
         self.assertEqual(self.get(lid)['plan']['stages'][0]['order'],[self.b,self.a,0])
         self.assertEqual(self.get(lid)['plan']['stages'][0]['default'],0)
@@ -263,7 +276,7 @@ class PoolTests(Fixture, unittest.TestCase):
         l=self.get(lid);self.tick(l['job']['at']+31)
         self.assertEqual(self.get(lid)['state'],'waiting')
         self.assertIsNotNone(self.get(lid)['job'])
-        with self.assertRaises(s.UserError):self.call('api_pool_save',dict(members=[self.b]),self.pool)
+        with self.assertRaises(errors.UserError):self.call('api_pool_save',dict(members=[self.b]),self.pool)
         self.ack(self.entry);self.tick()
         self.assertEqual(self.get(lid)['state'],'active')
 
@@ -290,10 +303,10 @@ class PoolTests(Fixture, unittest.TestCase):
         lid=self.link();self.finish(lid);l=self.get(lid)
         l['plan']['stages'][0]['locked']=self.a
         self.call('api_link_save',dict(name=l['name'],plan=l['plan'],revision=l['revision']),lid)
-        with self.assertRaises(s.UserError):self.call('api_node_edit',dict(desired_mode='passive'),self.a)
-        with self.assertRaises(s.UserError):self.call('api_node_del',{},self.b)
+        with self.assertRaises(errors.UserError):self.call('api_node_edit',dict(desired_mode='passive'),self.a)
+        with self.assertRaises(errors.UserError):self.call('api_node_del',{},self.b)
         l=self.get(lid)
-        with self.assertRaises(s.UserError):self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
+        with self.assertRaises(errors.UserError):self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
         l['plan']['stages'][0].update(locked=None,direct=True,order=[0,self.a,self.b],default=0)
         self.call('api_link_save',dict(name=l['name'],plan=l['plan'],revision=l['revision']),lid);self.finish(lid)
         self.assertEqual(self.get(lid)['selected']['pool-a'],0)
@@ -301,21 +314,21 @@ class PoolTests(Fixture, unittest.TestCase):
 
     def test_pending_entry_port_is_reserved_and_delete_waits_for_cleanup(self):
         lid=self.link()
-        with self.assertRaises(s.UserError):self.link()
+        with self.assertRaises(errors.UserError):self.link()
         self.finish(lid)
         self.call('api_link_delete',{},lid);self.tick()
         self.assertEqual(self.get(lid)['state'],'deleting')
         self.ack(self.entry);self.ack(self.a);self.tick()
-        with self.assertRaises(s.UserError):self.get(lid)
+        with self.assertRaises(errors.UserError):self.get(lid)
 
     def test_preparation_failure_keeps_old_entry(self):
         lid=self.link();self.finish(lid)
-        before=s.node_rules(self.db,s.get_node(self.db,self.entry))
+        before=forwarding.node_rules(self.db,database.get_node(self.db,self.entry))
         l=self.get(lid)
         self.call('api_link_action',dict(action='switch',stage='pool-a',member=self.b,revision=l['revision']),lid)
         self.ack(self.b,False);self.tick()
         self.assertEqual(self.get(lid)['state'],'error')
-        self.assertEqual(s.node_rules(self.db,s.get_node(self.db,self.entry)),before)
+        self.assertEqual(forwarding.node_rules(self.db,database.get_node(self.db,self.entry)),before)
         self.assertEqual(self.get(lid)['selected']['pool-a'],self.a)
 
     def test_graph_probes_candidates_and_bypass_without_pool_internal_edges(self):
@@ -323,7 +336,7 @@ class PoolTests(Fixture, unittest.TestCase):
         lid=self.call('api_link_save',dict(name='graph',apply=False,plan=dict(entry=self.entry,target=self.target_id,
             stages=[dict(id='one',kind='pool',pool_id=self.pool),dict(id='two',kind='pool',pool_id=p2,direct=True)])))['id']
         with self.db:self.db.execute("UPDATE links SET state='active' WHERE id=?",(lid,))
-        paths,edges=s.pools.quality_paths(self.db)
+        paths,edges=pools.quality_paths(self.db)
         self.assertIn((self.entry,self.a),edges);self.assertIn((self.a,self.c),edges)
         self.assertNotIn((self.a,self.b),edges)
         self.assertEqual(set(paths[('links',lid)]),{self.entry,self.a,self.b,self.c})
@@ -332,19 +345,19 @@ class PoolTests(Fixture, unittest.TestCase):
         route=self.route([self.entry,self.a])
         cid=self.config(route,[10003,10004],target_id=self.target_id)
         self.route([self.b],name='unused')
-        before={n:s.node_rules(self.db,s.get_node(self.db,n)) for n in (self.entry,self.a)}
+        before={n:forwarding.node_rules(self.db,database.get_node(self.db,n)) for n in (self.entry,self.a)}
         with self.db:
             for table in ('link_rules','link_retired','link_events','links','pools'):
                 self.db.execute('DROP TABLE '+table)
             self.db.execute('PRAGMA user_version=402')
-        self.db.close();self.db=s.init_db()
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],s.DATABASE_VERSION)
-        self.assertEqual(before,{n:s.node_rules(self.db,s.get_node(self.db,n)) for n in before})
+        self.db.close();self.db=migrations.init_db()
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],settings.DATABASE_VERSION)
+        self.assertEqual(before,{n:forwarding.node_rules(self.db,database.get_node(self.db,n)) for n in before})
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM links WHERE state='draft'").fetchone()[0],1)
         self.assertEqual(self.db.execute('SELECT chain_id FROM links WHERE chain_id IS NOT NULL').fetchone()[0],cid)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM routes').fetchone()[0],0)
-        self.assertTrue(Path(s.DB_PATH+'.pre-0.4.0-rc.4.bak').is_file())
-        self.db.close();self.db=s.init_db()
+        self.assertTrue(Path(settings.DB_PATH+'.pre-0.4.0-rc.4.bak').is_file())
+        self.db.close();self.db=migrations.init_db()
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM links').fetchone()[0],2)
 
     def test_passive_wake_receipt_and_restart_resume(self):
@@ -355,14 +368,14 @@ class PoolTests(Fixture, unittest.TestCase):
         job=self.db.execute('SELECT * FROM wake_jobs WHERE node_id=?',(self.entry,)).fetchone()
         self.assertEqual(job['state'],'waiting')
         self.tick(l['job']['at']+31)
-        self.db.close();self.db=s.init_db()
+        self.db.close();self.db=migrations.init_db()
         self.assertEqual(self.get(lid)['state'],'waiting')
         fields=dict(t=str(int(time.time())),proto='2',source='wake',phase='begin',op='a'*32,
                     agent_kind='passive',agent='0.4.0-rc.4',mode='passive',state='ok',v='',au='0',wake_id=job['token'])
         with self.db:
-            p=s.agent_v3.fields(s.sync_report(self.db,s.get_node(self.db,self.entry),fields,'127.0.0.1'))
+            p=agent_v3.fields(node_sync.sync_report(self.db,database.get_node(self.db,self.entry),fields,'127.0.0.1'))
             self.assertEqual(p['action'],'apply')
             fields.update(phase='ack',op=p['op'],generation=p['generation'],v=p['v'])
-            receipt=s.agent_v3.fields(s.sync_report(self.db,s.get_node(self.db,self.entry),fields,'127.0.0.1'))
+            receipt=agent_v3.fields(node_sync.sync_report(self.db,database.get_node(self.db,self.entry),fields,'127.0.0.1'))
             self.assertEqual(receipt['result'],'confirmed')
         self.tick();self.assertEqual(self.get(lid)['state'],'active')

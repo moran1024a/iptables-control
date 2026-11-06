@@ -1,10 +1,18 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+import database
+import errors
+import http_harness
+import node_state
+import node_sync
 """Passive wake-up authorization, durable deadlines and configuration receipts."""
 import secrets
 import time
 import threading
 import types
 import unittest
-from test_server import Fixture, s
+from test_server import Fixture
 from test_sync import fields
 import wake
 from test_agent import AgentHarness
@@ -17,7 +25,7 @@ class WakeTests(Fixture, unittest.TestCase):
                     mode='passive', generation='0', agent_kind='passive')
         data.update(kw)
         with self.db:
-            return fields(s.sync_report(self.db, s.get_node(self.db, nid), data, '192.0.2.2'))
+            return fields(node_sync.sync_report(self.db, database.get_node(self.db, nid), data, '192.0.2.2'))
 
     def ack(self, nid, operation, **kw):
         data = {k: operation[k] for k in ('op', 'generation', 'mode', 'v')}
@@ -44,21 +52,21 @@ class WakeTests(Fixture, unittest.TestCase):
 
     def test_default_off_and_explicit_port_reservation(self):
         nid, config = self.setup_passive()
-        node = s.get_node(self.db, nid)
+        node = database.get_node(self.db, nid)
         self.assertEqual((node['wake_enabled'], node['wake_port']), (0, 0))
-        with self.assertRaises(s.UserError):
+        with self.assertRaises(errors.UserError):
             self.call('api_node_edit', {'wake_enabled': True, 'wake_port': 10001}, nid)
         self.enable(nid)
         self.call('api_node_edit', {'ports': '10000-40000'}, nid)
-        with self.assertRaises(s.UserError):
+        with self.assertRaises(errors.UserError):
             self.call('api_config_save', {'ports': [39001]}, config)
         self.call('api_node_edit', {'wake_enabled': False}, nid)
-        self.assertIsNone(wake.summary(self.db, s.get_node(self.db, nid)))
+        self.assertIsNone(wake.summary(self.db, database.get_node(self.db, nid)))
 
     def test_three_attempts_timeout_survives_restart_new_change_rearms(self):
         nid, config = self.setup_passive()
         job = self.enable(nid)
-        monitor = wake.Monitor(types.SimpleNamespace(s=s))
+        monitor = wake.Monitor(types.SimpleNamespace())
         start = job['started']
         with self.db:
             self.assertEqual(len(monitor.due(self.db, start)), 1)
@@ -66,10 +74,10 @@ class WakeTests(Fixture, unittest.TestCase):
             self.assertEqual(len(monitor.due(self.db, start+10)), 1)
             self.assertEqual(len(monitor.due(self.db, start+20)), 1)
             self.assertEqual(monitor.due(self.db, start+30), [])
-        node = s.get_node(self.db, nid)
+        node = database.get_node(self.db, nid)
         self.assertEqual(wake.summary(self.db, node)['state'], 'timeout')
-        self.assertEqual(s.node_status(self.db, node, start+30), 'error')
-        restarted = wake.Monitor(types.SimpleNamespace(s=s))
+        self.assertEqual(node_state.node_status(self.db, node, start+30), 'error')
+        restarted = wake.Monitor(types.SimpleNamespace())
         self.assertEqual(restarted.due(self.db, start+100), [])
         self.call('api_node_edit', {'name': 'renamed'}, nid)
         self.assertEqual(wake.summary(self.db, node)['state'], 'timeout')
@@ -86,19 +94,19 @@ class WakeTests(Fixture, unittest.TestCase):
         with self.db:
             self.db.execute('UPDATE nodes SET manual_required=1 WHERE id=?', (nid,))
         self.assertEqual(self.begin_wake(nid)['action'], 'pause')
-        self.assertTrue(s.get_node(self.db, nid)['manual_required'])
+        self.assertTrue(database.get_node(self.db, nid)['manual_required'])
 
     def test_late_receipt_recovers_timeout_and_marks_activity_once(self):
         nid, _ = self.setup_passive()
         job = self.enable(nid)
         operation = self.begin_wake(nid)
         with self.db:
-            wake.Monitor(types.SimpleNamespace(s=s)).due(self.db, job['started']+30)
+            wake.Monitor(types.SimpleNamespace()).due(self.db, job['started']+30)
         before = self.db.execute('SELECT SUM(manual_count) FROM windows WHERE node_id=?', (nid,)).fetchone()[0]
         self.assertEqual(self.ack(nid, operation, source='wake'), 'confirmed')
         self.assertEqual(self.ack(nid, operation, source='wake'), 'confirmed')
-        node = s.get_node(self.db, nid)
-        self.assertEqual(s.node_status(self.db, node, int(time.time())), 'synced')
+        node = database.get_node(self.db, nid)
+        self.assertEqual(node_state.node_status(self.db, node, int(time.time())), 'synced')
         self.assertEqual(wake.summary(self.db, node)['state'], 'confirmed')
         after = self.db.execute('SELECT SUM(manual_count) FROM windows WHERE node_id=?', (nid,)).fetchone()[0]
         self.assertEqual(after, before+1)
@@ -109,13 +117,13 @@ class WakeTests(Fixture, unittest.TestCase):
         old = self.begin_wake(nid)
         self.call('api_config_save', {'route_id': None}, config)
         self.assertEqual(self.ack(nid, old, source='wake'), 'changed')
-        self.assertEqual(wake.summary(self.db, s.get_node(self.db, nid))['state'], 'waiting')
+        self.assertEqual(wake.summary(self.db, database.get_node(self.db, nid))['state'], 'waiting')
         current = self.begin_wake(nid)
         self.assertEqual(self.ack(nid, current, source='wake', state='error', err='apply failed'), 'failed')
-        self.assertEqual(wake.summary(self.db, s.get_node(self.db, nid))['error'], 'apply failed')
-        self.assertEqual(s.node_status(self.db, s.get_node(self.db, nid), int(time.time())), 'error')
+        self.assertEqual(wake.summary(self.db, database.get_node(self.db, nid))['error'], 'apply failed')
+        self.assertEqual(node_state.node_status(self.db, database.get_node(self.db, nid), int(time.time())), 'error')
         self.assertEqual(self.ack(nid, self.report(nid)), 'confirmed')
-        self.assertEqual(wake.summary(self.db, s.get_node(self.db, nid))['state'], 'confirmed')
+        self.assertEqual(wake.summary(self.db, database.get_node(self.db, nid))['state'], 'confirmed')
 
     def test_packet_is_authenticated_and_contains_no_node_secret(self):
         key = 'ab'*32
@@ -133,9 +141,9 @@ class PassiveWakeHTTPTests(AgentHarness, Fixture, unittest.TestCase):
     def setUp(self):
         Fixture.setUp(self)
         self.setup_agent()
-        s.Handler.panel_path = s.setting(self.db, 'panel_path')
-        s.Handler.sync_path = s.setting(self.db, 'sync_path')
-        self.server = s.LimitedHTTPServer(('127.0.0.1', 0), s.Handler)
+        http_harness.Handler.panel_path = database.setting(self.db, 'panel_path')
+        http_harness.Handler.sync_path = database.setting(self.db, 'sync_path')
+        self.server = http_harness.LimitedHTTPServer(('127.0.0.1', 0), http_harness.Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
@@ -149,9 +157,9 @@ class PassiveWakeHTTPTests(AgentHarness, Fixture, unittest.TestCase):
         nid = self.node()
         self.config(self.route([nid]), [10001])
         self.call('api_node_edit', {'desired_mode': 'passive'}, nid)
-        key = s.get_node(self.db, nid)['key']
+        key = database.get_node(self.db, nid)['key']
         (self.conf/'agent.conf').write_text(
-            f'URL=http://127.0.0.1:{self.server.server_port}{s.Handler.sync_path}\nKEY={key}\nAUTO_UPDATE=1\n')
+            f'URL=http://127.0.0.1:{self.server.server_port}{http_harness.Handler.sync_path}\nKEY={key}\nAUTO_UPDATE=1\n')
         self.assertShell('with_lock cycle manual; [ "$CONFIRM" = confirmed ]')
         with self.db:
             self.db.execute("UPDATE nodes SET installed_agent='passive' WHERE id=?", (nid,))
@@ -164,7 +172,7 @@ auto_update() {{ echo unexpected-upgrade >&2; return 99; }}
 main --wake-sync {token}
 [ "$CONFIRM" = confirmed ] && [ "$MODE" = passive ]
 ''')
-        node = s.get_node(self.db, nid)
+        node = database.get_node(self.db, nid)
         self.assertEqual(wake.summary(self.db, node)['state'], 'confirmed')
         self.assertFalse((self.lib/'wake-ack').exists())
         self.assertIn('10001', (self.lib/'config').read_text())

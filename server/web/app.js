@@ -1517,7 +1517,14 @@ const QUALITY_STATES = {unknown: "未知", ok: "成功", timeout: "探测超时"
 const qualityNumber = (n, unit = " ms") => n == null ? "—" : Number(n).toFixed(1) + unit;
 
 const QUALITY_PROTOCOLS = {"tcp-connect-v1": ["TCP", "var(--yellow)"], "udp-echo-v1": ["UDP", "var(--blue)"], "icmp-echo-v1": ["ICMP", "var(--green)"]};
-const QUALITY_PLOT = {height:250, left:55, right:16, top:18, bottom:40};
+const QUALITY_PLOT = {height:250, left:55, right:16, top:18, bottom:56};
+const QUALITY_RANGES = [[900,'15 分钟'],[3600,'1 小时'],[86400,'24 小时'],[604800,'7 天']];
+
+function qualityTick(time, seconds) {
+  if (seconds < 86400) return clock(time);
+  const d = new Date(time * 1000);
+  return `${pad(d.getMonth()+1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
 
 function qualityLegend(series) {
   return `<div class="quality-legend">${series.map(s=>{
@@ -1546,40 +1553,51 @@ function qualityChart(series, now, seconds, width = app.clientWidth - 42) {
   const {height,left,right,top,bottom}=QUALITY_PLOT;
   width = Math.max(160, Math.round(width));
   series = series.map(s => ({...s, points:s.points.filter(p => p.time >= now-seconds && p.time <= now)}));
-  const maximum = Math.max(1, ...series.flatMap(s => s.points.map(p => p.peak ?? p.mean ?? 0))) * 1.1;
+  const maximum = series.reduce((max,s)=>s.points.reduce((max,p)=>Math.max(max,p.peak??p.mean??0),max),1) * 1.1;
   const x = t => left + (t - (now - seconds)) / seconds * (width - left - right);
   const y = n => top + (height - top - bottom) * (1 - n / maximum);
   const grid = [0, .25, .5, .75, 1].map(f => `<line x1="${left}" x2="${width-right}" y1="${y(maximum*f)}" y2="${y(maximum*f)}" stroke="var(--border)" stroke-dasharray="3 5"/><text x="${left-8}" y="${y(maximum*f)+4}" text-anchor="end">${(maximum*f).toFixed(1)}</text>`).join("");
-  const ticks = [0, .5, 1].map(f => { const time = now-seconds+seconds*f; return `<text x="${x(time)}" y="${height-5}" text-anchor="${f === 0 ? "start" : f === 1 ? "end" : "middle"}">${esc(clock(time))}</text>`; }).join("");
+  const ticks = (seconds>=86400 && width<500 ? [0,1] : [0,.5,1]).map(f => { const time = now-seconds+seconds*f; return `<text class="quality-tick" x="${x(time)}" y="${height-5}" text-anchor="${f === 0 ? "start" : f === 1 ? "end" : "middle"}">${esc(qualityTick(time,seconds))}</text>`; }).join("");
   const changes = new Set();
   const curves = series.map((s, index) => {
     const [name, color] = QUALITY_PROTOCOLS[s.protocol];
     let previous = null, pathKey = null, elements = "";
+    const first = p => p.first_slot ?? p.time, last = p => p.last_slot ?? p.time;
+    const middle = p => (first(p) + last(p)) / 2;
+    const segment = (a, av, b, bv, cls) => {
+      if (a !== b) elements += `<line class="${cls}" x1="${x(a).toFixed(1)}" y1="${y(av).toFixed(1)}" x2="${x(b).toFixed(1)}" y2="${y(bv).toFixed(1)}" stroke="${color}" stroke-width="2"/>`;
+    };
+    // Draw each run through its aggregate centres, keeping its real endpoints.
+    const finish = () => { if(previous) segment(middle(previous),previous.mean,last(previous),previous.mean,'quality-span'); };
     for (const p of s.points) {
       if(p.path_key && pathKey && pathKey!==p.path_key && !changes.has(p.time)) {
         changes.add(p.time);elements+=`<line x1="${x(p.time)}" x2="${x(p.time)}" y1="${top}" y2="${height-bottom}" stroke="var(--muted)" stroke-dasharray="3 4"><title>路径切换 · ${esc(p.path_label||'')}</title></line>`;
       }
       if(p.path_key)pathKey=p.path_key;
       const title = `<title>${name} · ${esc(fmtTime(p.time))} · ${esc(QUALITY_STATES[p.status] || p.status)} · 平均 ${qualityNumber(p.mean)} · 峰值 ${qualityNumber(p.peak)} · 探测超时 ${qualityNumber(p.loss, "%")}（${p.lost}/${p.samples}）${p.resolved_ip ? " · " + esc(p.resolved_ip) : ""}${p.error ? " · " + esc(p.error) : ""}</title>`;
-      const px = x(p.time).toFixed(1);
+      const px = x(middle(p)).toFixed(1);
       if (p.failures > 0 || (p.status !== "ok" && p.status !== "missing")) {
         const py = height - bottom + 8 + index * 8;
-        elements += `<path d="M ${x(p.time)-2},${py-2} l 4,4 m -4,0 l 4,-4" stroke="${color}" stroke-width="1.5">${title}</path>`;
+        elements += `<path class="quality-failure" d="M ${x(p.time)-2},${py-2} l 4,4 m -4,0 l 4,-4" stroke="${color}" stroke-width="1.5">${title}</path>`;
       }
       if (p.mean == null) {
         // A bucket can be empty when nominal 10 s probes arrive slightly late.
         // Keep the previous sample only when real timestamps can bound the gap.
-        if (p.status !== "missing" || previous?.last_slot == null) previous = null;
+        if (p.status !== "missing" || previous?.last_slot == null) { finish(); previous = null; }
         continue;
       }
       const continuous = previous && (p.first_slot == null || previous.last_slot == null || p.first_slot - previous.last_slot <= 20);
       if (continuous && !previous.gap && !p.gap && !previous.endpoint_change && !p.endpoint_change && previous.resolved_ip === p.resolved_ip && previous.path_key === p.path_key) {
-        elements += `<line x1="${x(previous.time).toFixed(1)}" y1="${y(previous.mean).toFixed(1)}" x2="${px}" y2="${y(p.mean).toFixed(1)}" stroke="${color}" stroke-width="2"/>`;
+        segment(middle(previous),previous.mean,middle(p),p.mean,'quality-connection');
+      } else {
+        finish();
+        segment(first(p),p.mean,middle(p),p.mean,'quality-span');
       }
       if (p.peak != null && p.peak !== p.mean) elements += `<line x1="${px}" x2="${px}" y1="${y(p.mean).toFixed(1)}" y2="${y(p.peak).toFixed(1)}" stroke="${color}" opacity=".3">${title}</line>`;
       elements += `<circle cx="${px}" cy="${y(p.mean).toFixed(1)}" r="2.5" fill="${color}">${title}</circle>`;
       previous = p;
     }
+    finish();
     return `<g class="quality-series" data-protocol="${s.protocol}">${elements}</g>`;
   }).join("");
   const version=esc(JSON.stringify([seconds,series.map(s=>s.latest||s.points.at(-1))]));
@@ -1595,7 +1613,7 @@ function hideQualityPoint(plot) {
 function showQualityPoint(plot, time) {
   const {series,now,seconds,times}=plot.qualityData;
   if(!times.length)return;
-  time=times.reduce((a,b)=>Math.abs(b-time)<Math.abs(a-time)?b:a);
+  time=Math.max(now-seconds,Math.min(now,Math.round(time)));
   plot.qualityTime=time;
   const line=plot.querySelector('.quality-cursor'), tip=plot.querySelector('.quality-tooltip'), svg=plot.querySelector('svg');
   const {left,right}=QUALITY_PLOT, width=svg.viewBox.baseVal.width, x=left+(time-now+seconds)/seconds*(width-left-right);
@@ -1649,9 +1667,10 @@ function renderQuality(html, charts) {
       if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;
       e.preventDefault();
       const times=plot.qualityData.times;if(!times.length)return;
-      const current=plot.qualityTime==null?times.length-1:times.indexOf(plot.qualityTime);
-      const index=e.key==='Home'?0:e.key==='End'?times.length-1:Math.max(0,Math.min(times.length-1,current+(e.key==='ArrowLeft'?-1:1)));
-      showQualityPoint(plot,times[index]);
+      const current=plot.qualityTime??times.at(-1);
+      const time=e.key==='Home'?times[0]:e.key==='End'?times.at(-1):e.key==='ArrowLeft'?
+        times.findLast(t=>t<current)??times[0]:times.find(t=>t>current)??times.at(-1);
+      showQualityPoint(plot,time);
     };
     if(plot.qualityTime!=null)showQualityPoint(plot,plot.qualityTime);
   });
@@ -1682,7 +1701,9 @@ async function qualityPage(scope, id, request) {
       qualityViews.set(key, {range: selection.range});
       return qualityPage(scope, id, request);
     }
-    if (request === viewRequest) render(`<h1>网络质量</h1><p class="t-red">${esc(err.message)}</p><a href="#/${scope === "links" ? "routes/" + id : scope}">返回列表</a>`);
+    if (err.status === 404) leaveView();
+    else releaseQuality();
+    render(`<h1>网络质量</h1><p class="t-red">${esc(err.message)}</p><a href="#/${scope}">返回列表</a>`);
     return;
   }
   if (request !== viewRequest) return;
@@ -1694,14 +1715,14 @@ async function qualityPage(scope, id, request) {
     <div class="panel quality-controls" data-quality="${key}">
       <label><span>发起节点</span><select name="quality-source">${options(d.pair.source)}</select></label>
       <span class="quality-arrow">→</span><label><span>接收节点</span><select name="quality-target">${options(d.pair.target)}</select></label>
-      <label><span>时间范围</span><select name="quality-range">${[[900,"最近 15 分钟"],[3600,"最近 1 小时"],[86400,"最近 24 小时"]].map(([n,label]) => `<option value="${n}" ${n === selection.range ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+      <label><span>时间范围</span><select name="quality-range">${QUALITY_RANGES.map(([n,label]) => `<option value="${n}" ${n === selection.range ? "selected" : ""}>最近 ${label}</option>`).join("")}</select></label>
     </div>
     <div class="panel quality-card" data-key="quality-${scope}-${id}"><div class="quality-heading"><h2>往返延迟 <span class="count">ms</span></h2>${qualityLegend(d.series)}</div>
       ${qualityChart(d.series,d.now,selection.range)}
       ${qualityTable(d.series,d.now)}
       ${notes.length ? `<p class="hint">${notes.join("；")}</p>` : ""}
     </div>
-    <p class="hint">${d.adjacent ? "后台持续采集" : "查看期间采集非相邻节点的直达网络"}，每种协议默认 10 秒一次，共享节点限速。历史保留 24 小时。底部 × 表示异常或未知。</p>`,[{series:d.series,now:d.now,seconds:selection.range}]);
+    <p class="hint">${d.adjacent ? "后台持续采集" : "查看期间采集非相邻节点的直达网络"}，每种协议默认 10 秒一次，共享节点限速。历史保留 7 天。底部 × 表示异常或未知。</p>`,[{series:d.series,now:d.now,seconds:selection.range}]);
 
 }
 

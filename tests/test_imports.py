@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+import database
+import errors
+import forwarding
+import target_config
 """External share links, configuration propagation and compatibility migrations."""
 import base64
 import json
@@ -9,7 +16,7 @@ import unittest
 from urllib.parse import parse_qs, quote, urlsplit
 
 import test_server
-from test_server import Fixture, s
+from test_server import Fixture
 
 
 def ss_uri(host='192.0.2.50', port=23456, key=b'k' * 16):
@@ -42,10 +49,10 @@ class ImportTests(Fixture, unittest.TestCase):
         self.assertEqual((data['connection']['host'], data['connection']['port']), ('192.0.2.50', 23456))
         self.assertFalse(data['pending'])
         self.assertFalse(data['hops'])
-        with self.assertRaises(s.UserError):
+        with self.assertRaises(errors.UserError):
             self.call('api_target_del', {}, tid)
         self.assertTrue(self.call('api_chain_del', {}, c)['deleted'])
-        self.assertIsNotNone(s.get_target(self.db, tid))
+        self.assertIsNotNone(database.get_target(self.db, tid))
         self.assertTrue(self.call('api_target_del', {}, tid)['deleted'])
         self.assertFalse(self.db.execute('SELECT * FROM retired_ports').fetchall())
 
@@ -67,7 +74,7 @@ class ImportTests(Fixture, unittest.TestCase):
         self.assertEqual(configs[routed]['status'], 'applying')
         self.assertEqual(configs[routed]['connection']['host'], '192.0.2.1')
         self.assertEqual(configs[routed]['connection']['port'], 10001)
-        self.assertIn('other.example.com 34567', s.node_rules(self.db, s.get_node(self.db, nid))[0])
+        self.assertIn('other.example.com 34567', forwarding.node_rules(self.db, database.get_node(self.db, nid))[0])
         self.assertEqual([tuple(r) for r in self.db.execute('SELECT * FROM hops')], old_hops)
         self.db.execute('DELETE FROM chain_pending'); self.db.commit()
         self.call('api_target_save', {'uri': ss_uri('other.example.com', 34567, b'z' * 16)}, tid)
@@ -78,21 +85,21 @@ class ImportTests(Fixture, unittest.TestCase):
         tid = self.imported()
         group = self.call('api_group_add', {'kind': 'targets', 'name': 'external'})['id']
         self.call('api_target_save', {'group_id': group, 'name': 'renamed'}, tid)
-        self.assertEqual(s.get_target(self.db, tid)['group_id'], group)
-        self.call('api_order', {'groups': [group, s.default_group(self.db, 'targets')], 'ids': [tid]}, 'targets')
+        self.assertEqual(database.get_target(self.db, tid)['group_id'], group)
+        self.call('api_order', {'groups': [group, database.default_group(self.db, 'targets')], 'ids': [tid]}, 'targets')
         self.assertEqual(self.call('api_targets')['targets'][0]['id'], tid)
         self.call('api_group_del', {}, group)
-        self.assertEqual(s.get_target(self.db, tid)['group_id'], s.default_group(self.db, 'targets'))
-        with self.assertRaises(s.UserError): self.call('api_target_save', {'port': 80}, tid)
-        with self.assertRaises(s.UserError): self.imported(group_id=s.default_group(self.db, 'nodes'))
+        self.assertEqual(database.get_target(self.db, tid)['group_id'], database.default_group(self.db, 'targets'))
+        with self.assertRaises(errors.UserError): self.call('api_target_save', {'port': 80}, tid)
+        with self.assertRaises(errors.UserError): self.imported(group_id=database.default_group(self.db, 'nodes'))
 
     def test_share_links_round_trip_without_losing_transport_or_secrets(self):
         for uri in (ss_uri(), reality_uri()):
             tid = self.imported(uri)
-            t = s.get_target(self.db, tid)
-            original = s.target_config.import_uri(uri)
-            link = s.target_config.connection(t, 'entry.example.com', 10001, '入口 + # 中文')['uri']
-            parsed = s.target_config.import_uri(link)
+            t = database.get_target(self.db, tid)
+            original = target_config.import_uri(uri)
+            link = target_config.connection(t, 'entry.example.com', 10001, '入口 + # 中文')['uri']
+            parsed = target_config.import_uri(link)
             self.assertEqual(parsed['host'], 'entry.example.com')
             self.assertEqual(parsed['port'], 10001)
             self.assertEqual(parsed['name'], '入口 + # 中文')
@@ -102,7 +109,7 @@ class ImportTests(Fixture, unittest.TestCase):
                                  parse_qs(urlsplit(uri).query, keep_blank_values=True))
 
     def test_ss22_plain_and_legacy_base64_and_sip002_plugin(self):
-        tc = s.target_config
+        tc = target_config
         password = base64.b64encode(b'k' * 16).decode()
         auth = '2022-blake3-aes-128-gcm:' + password
         b64 = base64.urlsafe_b64encode(auth.encode()).decode().rstrip('=')
@@ -129,7 +136,7 @@ class ImportTests(Fixture, unittest.TestCase):
 
     def test_invalid_import_is_atomic_and_keeps_existing_references(self):
         tid = self.imported(); self.direct(tid)
-        before = tuple(s.get_target(self.db, tid))
+        before = tuple(database.get_target(self.db, tid))
         invalid = ['vmess://abc', 'https://example.com', ss_uri().replace('23456', '0'),
                    ss_uri().replace('23456', '65536'), ss_uri().replace('192.0.2.50', '[::1]'),
                    'ss://invalid@192.0.2.1:1000', ss_uri().replace('a2tra2tra2tra2tra2traw', 'bad'),
@@ -138,7 +145,7 @@ class ImportTests(Fixture, unittest.TestCase):
                    reality_uri().replace('&sid=aabb', '&security=reality&sid=aabb'),
                    reality_uri().replace('pbk=', 'missing='), ss_uri() + '\nss://another']
         for uri in invalid:
-            with self.subTest(uri=uri), self.assertRaises(s.UserError):
+            with self.subTest(uri=uri), self.assertRaises(errors.UserError):
                 self.call('api_target_save', {'uri': uri}, tid)
-            self.assertEqual(tuple(s.get_target(self.db, tid)), before)
+            self.assertEqual(tuple(database.get_target(self.db, tid)), before)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM targets').fetchone()[0], 1)

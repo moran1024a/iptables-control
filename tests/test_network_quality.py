@@ -1,12 +1,21 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+import database
+import errors
+import forwarding
+import migrations
+import settings
 """RC2 pair selection, history semantics, migration and WSS probe scheduling."""
 import json
 from pathlib import Path
 import time
 import unittest
 
-from test_server import Fixture, s
+from test_server import Fixture
 import network_quality as q
 import transport
+from quality_fixtures import pair_record
 
 
 class HistoryTests(unittest.TestCase):
@@ -16,7 +25,7 @@ class HistoryTests(unittest.TestCase):
                     path_label=path, resolved_ip=address, status=status, error='probe failed' if status != 'ok' else '')
 
     def test_delayed_successful_samples_do_not_break_hour_or_day_charts(self):
-        for seconds in (900, 3600, 86400):
+        for seconds in q.HISTORY_STEPS:
             with self.subTest(seconds=seconds):
                 data = q.summarize([self.row(t) for t in range(0, seconds + 1, 12)], seconds, seconds)
                 good = [p for p in data['points'] if p['mean'] is not None]
@@ -32,28 +41,45 @@ class HistoryTests(unittest.TestCase):
                 points = [p for p in q.summarize(rows, 3600, 3600)['points'] if p['mean'] is not None]
                 self.assertEqual([p['mean'] for p in points], [200, 20, 100])
                 self.assertEqual([p['time'] for p in points], [3540, 3550, 3560])
-                self.assertEqual([p['end'] for p in points], [3550, 3560, 3600])
+                self.assertEqual([p['end'] for p in points], [3550, 3560, 3580])
 
     def test_partial_failure_is_preserved_after_a_successful_sample(self):
         rows = [self.row(3540), self.row(3550, address='', status='timeout'), self.row(3560, 30)]
-        points = [p for p in q.summarize(rows, 3600, 3600)['points'] if p['mean'] is not None]
-        self.assertEqual(len(points), 1)
-        point = points[0]
-        self.assertEqual((point['mean'], point['samples'], point['lost'], point['failures']), (25, 3, 1, 1))
-        self.assertEqual((point['status'], point['error']), ('timeout', 'probe failed'))
-        self.assertTrue(point['gap'])
+        data = q.summarize(rows, 3600, 3600)
+        points = [p for p in data['points'] if p['first_slot'] is not None]
+        self.assertEqual([p['status'] for p in points], ['ok', 'timeout', 'ok'])
+        self.assertEqual([p['mean'] for p in points], [20, None, 30])
+        self.assertEqual([p['gap'] for p in points], [False, True, False])
+        self.assertEqual([p['end'] for p in points], [3550, 3560, 3580])
+        self.assertEqual(points[1]['error'], 'probe failed')
+        self.assertEqual((data['summary']['samples'], data['summary']['lost'], data['summary']['mean']), (3, 1, 25))
 
     def test_boundary_bucket_excludes_samples_outside_visible_window(self):
         data = q.summarize([self.row(0, 1000), self.row(10, 20), self.row(20, 30), self.row(3610, 2000)], 3600, 3605)
         points = [p for p in data['points'] if p['mean'] is not None]
         self.assertEqual(len(points), 1)
-        self.assertEqual((points[0]['time'], points[0]['mean'], points[0]['peak']), (5, 25, 30))
+        self.assertEqual((points[0]['time'], points[0]['mean'], points[0]['peak']), (10, 25, 30))
         self.assertTrue(all(5 <= p['time'] <= 3605 for p in data['points']))
+        self.assertEqual(data['latest']['slot'], 20)
 
     def test_real_outage_splits_a_bucket(self):
         points = [p for p in q.summarize([self.row(3540, 10), self.row(3580, 30)], 3600, 3600)['points'] if p['mean'] is not None]
         self.assertEqual([p['mean'] for p in points], [10, 30])
         self.assertEqual(points[1]['first_slot'] - points[0]['last_slot'], 40)
+        self.assertEqual(points[0]['end'], 3560)
+
+    def test_week_aggregates_healthy_runs_and_retains_sparse_failures(self):
+        rows = [self.row(t, rtt=100 if t == 150 else 20) for t in range(0, q.RETENTION + 1, 10)]
+        data = q.summarize(rows, q.RETENTION, q.RETENTION)
+        self.assertEqual(data['step'], 1800)
+        self.assertEqual(len(data['points']), 337)
+        self.assertEqual(data['points'][0]['peak'], 100)
+        # One timeout per five minutes must not invalidate the surrounding runs.
+        rows = [self.row(t, status='timeout' if t % 300 == 150 else 'ok') for t in range(0, 3600, 10)]
+        data = q.summarize(rows, q.RETENTION, 3600)
+        good = [p for p in data['points'] if p['mean'] is not None]
+        self.assertTrue(all(not p['gap'] and p['last_slot'] > p['first_slot'] for p in good))
+        self.assertEqual(sum(p['lost'] for p in data['points']), 12)
 
 
 class QualityTests(Fixture, unittest.TestCase):
@@ -64,7 +90,7 @@ class QualityTests(Fixture, unittest.TestCase):
         with self.db:
             self.db.execute('UPDATE nodes SET quality_port=0')
         self.config(route, [33445, 10001])
-        before = s.node_rules(self.db, s.get_node(self.db, a))
+        before = forwarding.node_rules(self.db, database.get_node(self.db, a))
         with self.db:
             self.db.execute('ALTER TABLE nodes DROP COLUMN quality_port')
             self.db.execute('ALTER TABLE nodes DROP COLUMN wake_enabled')
@@ -73,18 +99,18 @@ class QualityTests(Fixture, unittest.TestCase):
             for table in ('link_rules','link_retired','link_events','links','pools'):
                 self.db.execute('DROP TABLE '+table)
             self.db.execute('PRAGMA user_version=400')
-        Path(s.DB_PATH + '.pre-0.4.0-rc.2.bak').unlink()
-        upgraded = s.init_db()
-        self.assertEqual(upgraded.execute('PRAGMA user_version').fetchone()[0], s.DATABASE_VERSION)
-        self.assertEqual(s.node_rules(upgraded, s.get_node(upgraded, a)), before)
-        self.assertEqual(s.get_node(upgraded, a)['quality_port'], q.PORT)
-        self.assertTrue(Path(s.DB_PATH + '.pre-0.4.0-rc.2.bak').is_file())
+        Path(settings.DB_PATH + '.pre-0.4.0-rc.2.bak').unlink()
+        upgraded = migrations.init_db()
+        self.assertEqual(upgraded.execute('PRAGMA user_version').fetchone()[0], settings.DATABASE_VERSION)
+        self.assertEqual(forwarding.node_rules(upgraded, database.get_node(upgraded, a)), before)
+        self.assertEqual(database.get_node(upgraded, a)['quality_port'], q.PORT)
+        self.assertTrue(Path(settings.DB_PATH + '.pre-0.4.0-rc.2.bak').is_file())
         upgraded.close()
 
     def test_probe_port_reserved_and_can_be_disabled(self):
         a = self.node(ports='33445')
         route = self.route([a])
-        with self.assertRaises(s.UserError):
+        with self.assertRaises(errors.UserError):
             self.config(route)
         self.call('api_node_edit', {'quality_port': 0}, a)
         self.config(route, [33445])
@@ -94,12 +120,12 @@ class QualityTests(Fixture, unittest.TestCase):
         nodes = {n['id']: dict(n) for n in self.db.execute('SELECT * FROM nodes')}
         pair = q.ensure_pair(self.db, nodes, a, b)
         now = 1200
-        q.record(self.db, pair['id'], 1000, 'ok', 10, resolved_ip='192.0.2.1')
-        q.record(self.db, pair['id'], 1010, 'ok', 90, resolved_ip='192.0.2.1')
-        q.record(self.db, pair['id'], 1020, 'timeout')
-        q.record(self.db, pair['id'], 1030, 'offline')
-        q.record(self.db, pair['id'], 1040, 'error')
-        q.record(self.db, pair['id'], 1010, 'ok', 1000)
+        pair_record(self.db, pair['id'], 1000, 'ok', 10, resolved_ip='192.0.2.1')
+        pair_record(self.db, pair['id'], 1010, 'ok', 90, resolved_ip='192.0.2.1')
+        pair_record(self.db, pair['id'], 1020, 'timeout')
+        pair_record(self.db, pair['id'], 1030, 'offline')
+        pair_record(self.db, pair['id'], 1040, 'error')
+        pair_record(self.db, pair['id'], 1010, 'ok', 1000)
         data = q.history(self.db, pair['id'], 3600, now)
         self.assertEqual(data['summary']['samples'], 3)
         self.assertEqual(data['summary']['lost'], 1)
@@ -113,7 +139,7 @@ class QualityTests(Fixture, unittest.TestCase):
 
 class SchedulerTests(Fixture, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.hub = transport.Hub(s._module())
+        self.hub = transport.Hub()
         self.a, self.b, self.c = self.node(), self.node('B'), self.node('C')
         self.route_id = self.route([self.a, self.b, self.c])
         self.route([self.a, self.b], 'shared')
@@ -147,7 +173,7 @@ class SchedulerTests(Fixture, unittest.IsolatedAsyncioTestCase):
         task['at'] += 10
         await monitor.result(self.a, self.hub.sessions[self.a], receipt)
         self.assertNotIn(op, monitor.pending)
-        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM quality_samples WHERE status='ok'").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM probe_samples WHERE status='ok'").fetchone()[0], 1)
         with self.db:
             self.db.execute("UPDATE nodes SET desired_mode='passive' WHERE id=?", (self.b,))
         monitor.last.clear()
@@ -161,7 +187,7 @@ class SchedulerTests(Fixture, unittest.IsolatedAsyncioTestCase):
         monitor = self.hub.quality
         await monitor.tick()
         op, task = next(iter(monitor.pending.items()))
-        self.assertEqual(task['pair']['protocol'], 'icmp-echo-v1')
+        self.assertEqual(task['spec']['protocol'], 'icmp-echo-v1')
         await monitor.result(self.a, self.hub.sessions[self.a], dict(id=op, status='ok', rtt=8.25))
         self.ready()
         self.hub.sessions[self.b]['quality_listener']['error'] = 'UDP port conflict'
@@ -178,22 +204,27 @@ class SchedulerTests(Fixture, unittest.IsolatedAsyncioTestCase):
         monitor = self.hub.quality
         view = await monitor.view(dict(scope='routes', id=self.route_id, source=self.a, target=self.c))
         self.assertFalse(view['adjacent'])
-        self.call('api_order', dict(groups=[s.default_group(self.db, 'nodes')], ids=[self.c, self.b, self.a]), 'nodes')
+        self.call('api_order', dict(groups=[database.default_group(self.db, 'nodes')], ids=[self.c, self.b, self.a]), 'nodes')
         default_view = await monitor.view(dict(scope='routes', id=self.route_id))
         self.assertEqual([n['id'] for n in default_view['nodes']], [self.c, self.b, self.a])
         self.assertEqual((default_view['pair']['source'], default_view['pair']['target']), (self.a, self.b))
         self.assertTrue(default_view['adjacent'])
         await monitor.tick()
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM quality_pairs').fetchone()[0], 6)
-        with self.assertRaises(s.UserError):
+        with self.assertRaises(errors.UserError):
             await monitor.view(dict(scope='routes', id=self.route_id, source=self.a, target=999))
+        now = int(time.time())
         with self.db:
-            q.record(self.db, view['pair']['id'], int(time.time()) - 90000, 'ok', 10)
+            pair_record(self.db, view['pair']['id'], now - 90000, 'ok', 10)
+            pair_record(self.db, view['pair']['id'], now - q.RETENTION + 60, 'ok', 15)
+            pair_record(self.db, view['pair']['id'], now - q.RETENTION - 60, 'ok', 20)
         monitor.extra.clear()
         monitor.cleanup_at = 0
         await monitor.tick()
         self.assertNotIn(view['pair']['id'], monitor.last)
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM quality_samples WHERE slot<?', (int(time.time())-86400,)).fetchone()[0], 0)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM quality_samples WHERE slot<?', (now-q.RETENTION,)).fetchone()[0], 0)
+        week = await monitor.view(dict(scope='routes', id=self.route_id, source=self.a, target=self.c, range=q.RETENTION))
+        self.assertEqual([p['mean'] for p in week['series'][0]['points'] if p['mean'] is not None], [15, 10])
 
 
 if __name__ == '__main__':

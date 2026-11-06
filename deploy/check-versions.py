@@ -8,7 +8,7 @@ import sys
 root = Path(__file__).resolve().parent.parent
 manifest = json.loads((root / "server/components.json").read_text())
 checks = [
-    ("server/ictl-server.py", r'^VERSION = "([^"]+)"', manifest["server"]),
+    ("server/settings.py", r'^VERSION = "([^"]+)"', manifest["server"]),
     ("deploy/install-server.sh", r'^VERSION="([^"]+)"', manifest["server"]),
     ("agent/ictl.sh", r'^VERSION="([^"]+)"', manifest["forward_agent"]),
     ("agent/passive.sh", r'^VERSION="([^"]+)"', manifest["passive_agent"]),

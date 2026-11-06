@@ -1,15 +1,25 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+import database
+import lifecycle
+import migrations
+import node_state
+import node_sync
+import settings
+import time
 """Different bar resolutions, accurate history cutover and independent retention."""
 import secrets
 import unittest
 from unittest.mock import patch
-from test_server import Fixture, s
+from test_server import Fixture
 
 
 class StatusBarTests(Fixture, unittest.TestCase):
     NOW = 1_800_000_000  # Aligned to both 20- and 60-second windows.
 
     def setUp(self):
-        clock = patch.object(s.time, 'time', return_value=self.NOW)
+        clock = patch.object(time, 'time', return_value=self.NOW)
         clock.start()
         self.addCleanup(clock.stop)
         super().setUp()
@@ -20,13 +30,13 @@ class StatusBarTests(Fixture, unittest.TestCase):
                     source=source, phase='begin' if source == 'manual' else 'poll',
                     op=op or secrets.token_hex(16), mode='active', generation='0')
         with self.db:
-            return s.sync_report(self.db, s.get_node(self.db, nid), data, '127.0.0.1', now)
+            return node_sync.sync_report(self.db, database.get_node(self.db, nid), data, '127.0.0.1', now)
 
     def test_active_20_second_buckets_preserve_faults_and_show_missing_reports(self):
         nid = self.node()
         for offset, state in ((1, 'ok'), (5, 'error'), (19, 'ok'), (20, 'ok'), (60, 'ok')):
             self.report(nid, offset, state=state)
-        bar = s.node_bar(self.db, s.get_node(self.db, nid), self.NOW + 61)
+        bar = node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 61)
         self.assertEqual(bar['window'], 20)
         self.assertEqual(len(bar['levels']), 60)
         self.assertEqual(bar['window'] * len(bar['levels']), 1200)
@@ -43,15 +53,15 @@ class StatusBarTests(Fixture, unittest.TestCase):
         self.report(nid, 25, 'manual')
         self.report(nid, 45, 'manual', op=token)
         self.report(nid, 46, 'manual', op=token)
-        bar = s.node_bar(self.db, s.get_node(self.db, nid), self.NOW + 61)
+        bar = node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 61)
         self.assertEqual((bar['window'], len(bar['levels'])), (60, 60))
         self.assertEqual(bar['levels'][-2:], ['ok', 'white'])
         self.assertEqual(bar['counts'][-2:], [3, 0])
         self.assertEqual(bar['times'][-2:], [self.NOW + 45, None])
         self.call('api_node_edit', {'desired_mode': 'active'}, nid)
-        self.assertEqual(s.node_bar(self.db, s.get_node(self.db, nid), self.NOW + 61)['window'], 20)
+        self.assertEqual(node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 61)['window'], 20)
         self.call('api_node_edit', {'desired_mode': 'passive'}, nid)
-        self.assertEqual(s.node_bar(self.db, s.get_node(self.db, nid), self.NOW + 61), bar)
+        self.assertEqual(node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 61), bar)
 
     def test_existing_300_history_is_retained_without_inventing_fine_samples(self):
         nid = self.node()
@@ -64,21 +74,21 @@ class StatusBarTests(Fixture, unittest.TestCase):
                             (nid, self.NOW // 60 - 1, self.NOW - 1))
         old = [tuple(r) for r in self.db.execute('SELECT * FROM windows')]
         self.db.close()
-        with patch.object(s.time, 'time', return_value=self.NOW + 7):
-            self.db = s.init_db()
-        bar = s.node_bar(self.db, s.get_node(self.db, nid), self.NOW + 8)
+        with patch.object(time, 'time', return_value=self.NOW + 7):
+            self.db = migrations.init_db()
+        bar = node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 8)
         self.assertEqual(set(bar['levels']), {'none'})
         self.assertEqual([tuple(r) for r in self.db.execute('SELECT * FROM windows')], old)
         self.report(nid, 21)
-        bar = s.node_bar(self.db, s.get_node(self.db, nid), self.NOW + 61)
+        bar = node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 61)
         self.assertEqual(bar['levels'][-4:], ['none', 'ok', 'lost', 'none'])
         rows = [tuple(r) for r in self.db.execute('SELECT * FROM active_windows')]
         self.db.close()
-        self.db = s.init_db()
-        self.assertEqual(s.setting(self.db, 'active_window_start'), str(self.NOW + 7))
+        self.db = migrations.init_db()
+        self.assertEqual(database.setting(self.db, 'active_window_start'), str(self.NOW + 7))
         self.assertEqual([tuple(r) for r in self.db.execute('SELECT * FROM active_windows')], rows)
         self.call('api_node_edit', {'desired_mode': 'passive'}, nid)
-        bar = s.node_bar(self.db, s.get_node(self.db, nid), self.NOW + 61)
+        bar = node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 61)
         self.assertEqual(sum(bar['counts']), 2)
         self.assertEqual(bar['levels'].count('ok'), 1)
 
@@ -89,8 +99,8 @@ class StatusBarTests(Fixture, unittest.TestCase):
             with self.db:
                 self.db.execute(f'INSERT INTO {table}(node_id,win,level) VALUES (?,?,2)', (nid, cutoff - 1))
                 self.db.execute(f'INSERT INTO {table}(node_id,win,level) VALUES (?,?,2)', (nid, cutoff))
-        with patch.object(s.time, 'time', return_value=self.NOW + s.RETENTION):
-            s.cleanup(self.db)
+        with patch.object(time, 'time', return_value=self.NOW + settings.RETENTION):
+            lifecycle.cleanup(self.db)
         for table, width in (('windows', 60), ('active_windows', 20)):
             self.assertEqual([r[0] for r in self.db.execute(f'SELECT win FROM {table}')], [self.NOW // width])
         self.call('api_node_del', {}, nid)

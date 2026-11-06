@@ -282,11 +282,20 @@ document.addEventListener('keydown',e=>{
 
 async function linkQualityPage(id, request) {
   const range=qualityViews.get('links/'+id)?.range||900;
-  const d=await api('POST','quality',{scope:'links',id,range});if(request!==viewRequest)return;
+  let d;
+  try { d=await api('POST','quality',{scope:'links',id,range}); }
+  catch(err) {
+    if(request!==viewRequest)return;
+    if(err.status!==404)throw err;
+    leaveView();
+    render('<h1>链路不存在</h1><p class="muted">该链路可能已被删除。</p><a href="#/routes">返回链路列表</a>');
+    return;
+  }
+  if(request!==viewRequest)return;
   const cards=d.sections.map(section=>{
     return `<section class="panel quality-card" data-key="quality-${section.id}"><div class="quality-heading"><h2><span class="quality-kind">${esc(section.kind)}</span> ${esc(section.label)}</h2>${qualityLegend(section.series)}</div>${qualityChart(section.series,d.now,range)}${qualityTable(section.series,d.now)}</section>`;
   }).join('');
-  renderQuality(`<a class="back" href="#/routes/${id}">← ${esc(d.name)}</a>`+poolHead('网络质量',`<select data-link-quality-range="${id}" aria-label="时间范围">${[[900,'15 分钟'],[3600,'1 小时'],[86400,'24 小时']].map(([n,label])=>`<option value="${n}" ${n===range?'selected':''}>${label}</option>`).join('')}</select>`)+cards,d.sections.map(section=>({series:section.series,now:d.now,seconds:range})));
+  renderQuality(`<a class="back" href="#/routes/${id}">← ${esc(d.name)}</a>`+poolHead('网络质量',`<select data-link-quality-range="${id}" aria-label="时间范围">${QUALITY_RANGES.map(([n,label])=>`<option value="${n}" ${n===range?'selected':''}>${label}</option>`).join('')}</select>`)+cards,d.sections.map(section=>({series:section.series,now:d.now,seconds:range})));
 }
 document.addEventListener('change',e=>{
   if(!e.target.hasAttribute('data-link-quality-range'))return;

@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+import database
+import http_harness
+import node_state
+import node_sync
 """Run the real Bash Agent against fake kernel/systemd commands and local encrypted HTTP."""
 import json
 import os
@@ -9,7 +16,7 @@ import time
 import unittest
 from unittest.mock import patch
 import test_server
-from test_server import ROOT, s
+from test_server import ROOT
 
 FAKE_IPTABLES = r'''#!/usr/bin/env python3
 import sys,os,json,pathlib
@@ -278,8 +285,8 @@ class AgentHTTPTests(AgentHarness,test_server.HTTPTests):
     def setUp(self):super().setUp();self.setup_agent()
 
     def enroll(self):
-        n=self.node();r=self.route([n]);c=self.config(r,[10001]);key=s.get_node(self.db,n)['key']
-        (self.conf/'agent.conf').write_text(f'URL=http://127.0.0.1:{self.port}{s.Handler.sync_path}\nKEY={key}\nAUTO_UPDATE=0\n')
+        n=self.node();r=self.route([n]);c=self.config(r,[10001]);key=database.get_node(self.db,n)['key']
+        (self.conf/'agent.conf').write_text(f'URL=http://127.0.0.1:{self.port}{http_harness.Handler.sync_path}\nKEY={key}\nAUTO_UPDATE=0\n')
         self.assertShell('with_lock cycle manual; rc=$?; print_net_result; exit "$rc"')
         return n,r,c
 
@@ -287,15 +294,15 @@ class AgentHTTPTests(AgentHarness,test_server.HTTPTests):
         n,r,c=self.enroll();self.assertFalse(self.db.execute('SELECT 1 FROM chain_pending').fetchone())
         self.call('api_node_edit',{'desired_mode':'passive'},n)
         self.assertShell('with_lock cycle auto; [ "$MODE" = passive ] && [ "$CONFIRM" = waiting ]')
-        self.assertTrue(s.get_node(self.db,n)['manual_required'])
+        self.assertTrue(database.get_node(self.db,n)['manual_required'])
         self.assertShell('with_lock cycle manual; [ "$CONFIRM" = confirmed ]')
-        self.assertFalse(s.get_node(self.db,n)['manual_required'])
+        self.assertFalse(database.get_node(self.db,n)['manual_required'])
         self.assertEqual((self.lib/'mode').read_text(),'passive\n')
         self.call('api_node_edit',{'desired_mode':'active'},n)
         (self.root/'service').write_text('[Service]\nRestart=always\n')
         self.assertShell('sync_now')
         self.assertEqual((self.lib/'mode').read_text(),'active\n')
-        self.assertFalse(s.get_node(self.db,n)['manual_required'])
+        self.assertFalse(database.get_node(self.db,n)['manual_required'])
 
     def test_lost_ack_response_retry_and_empty_cleanup(self):
         n,r,c=self.enroll();self.call('api_chain_del',{},c)
@@ -318,24 +325,24 @@ with_lock cycle manual
         self.call('api_node_edit',{'desired_mode':'active'},n)
         (self.root/'service').write_text('[Service]\nRestart=on-failure\n');(self.root/'fail-service').touch()
         self.assertShell('! with_lock cycle manual; [ "$R_STATE" = error ]')
-        self.assertTrue(s.get_node(self.db,n)['manual_required'])
+        self.assertTrue(database.get_node(self.db,n)['manual_required'])
         self.assertEqual((self.lib/'mode').read_text(),'passive\n')
 
     def test_mode_change_during_auto_apply_stops_even_when_ack_gets_pause(self):
-        n,r,c=self.enroll();self.call('api_target_save',{'port':8443},s.get_chain(self.db,c)['target_id'])
-        original=s.sync_report
+        n,r,c=self.enroll();self.call('api_target_save',{'port':8443},database.get_chain(self.db,c)['target_id'])
+        original=node_sync.sync_report
         def intercept(conn,node,fields,source_ip,now=None):
             if fields.get('source')=='auto' and fields.get('phase')=='ack':
                 conn.execute("UPDATE nodes SET desired_mode='passive',manual_required=1,desired_generation=desired_generation+1 WHERE id=?",(n,))
-                node=s.get_node(conn,n)
+                node=database.get_node(conn,n)
             return original(conn,node,fields,source_ip,now)
-        with patch.object(s,'sync_report',side_effect=intercept):
+        with patch.object(node_sync, 'sync_report',side_effect=intercept):
             self.assertShell('! with_lock cycle auto; [ "$MODE" = passive ] && [ "$CONFIRM" = waiting ] && [ ! -f "$ACK_FILE" ]')
-        self.assertTrue(s.get_node(self.db,n)['manual_required'])
+        self.assertTrue(database.get_node(self.db,n)['manual_required'])
         self.assertTrue(self.db.execute('SELECT 1 FROM chain_pending').fetchone())
 
     def test_pending_ack_pause_stops_before_another_auto_poll(self):
-        n,r,c=self.enroll();self.call('api_target_save',{'port':8443},s.get_chain(self.db,c)['target_id'])
+        n,r,c=self.enroll();self.call('api_target_save',{'port':8443},database.get_chain(self.db,c)['target_id'])
         self.assertShell('''eval "$(declare -f send_request | sed '1s/send_request/real_send_request/')"
 send_request() {
   local text
@@ -346,17 +353,17 @@ send_request() {
 [ -f "$ACK_FILE" ]
 ''')
         self.call('api_node_edit',{'desired_mode':'passive'},n)
-        original=s.sync_report;phases=[]
+        original=node_sync.sync_report;phases=[]
         def intercept(conn,node,fields,source_ip,now=None):
             phases.append(fields['phase'])
             return original(conn,node,fields,source_ip,now)
-        with patch.object(s,'sync_report',side_effect=intercept):
+        with patch.object(node_sync, 'sync_report',side_effect=intercept):
             self.assertShell('with_lock cycle auto; [ "$MODE" = passive ] && [ "$CONFIRM" = waiting ] && [ ! -f "$ACK_FILE" ]')
         self.assertEqual(phases,['ack'])
-        self.assertTrue(s.get_node(self.db,n)['manual_required'])
+        self.assertTrue(database.get_node(self.db,n)['manual_required'])
         self.assertTrue(self.db.execute('SELECT 1 FROM chain_pending').fetchone())
         self.assertShell('with_lock cycle manual; [ "$CONFIRM" = confirmed ]')
-        self.assertFalse(s.get_node(self.db,n)['manual_required'])
+        self.assertFalse(database.get_node(self.db,n)['manual_required'])
 
     def test_real_conflict_is_reported_latched_and_cleared_after_port_edit(self):
         n,r,c=self.enroll();before=json.loads((self.root/'kernel.json').read_text());config=(self.lib/'config').read_bytes()
@@ -366,7 +373,7 @@ send_request() {
         self.assertEqual(before,json.loads((self.root/'kernel.json').read_text()))
         self.assertEqual((self.lib/'config').read_bytes(),config)
         self.assertTrue(self.db.execute('SELECT 1 FROM chain_pending').fetchone())
-        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())),'error')
+        self.assertEqual(node_state.node_status(self.db,database.get_node(self.db,n),int(time.time())),'error')
         count=(self.root/'commands').read_text().count('iptables-restore')
         self.assertShell('! with_lock cycle auto; [ "$R_STATE" = error ]')
         self.assertEqual((self.root/'commands').read_text().count('iptables-restore'),count)
@@ -387,5 +394,5 @@ send_request() {
         n,r,c=self.enroll();before=json.loads((self.root/'kernel.json').read_text())
         (self.root/'tcp.sockets').write_text('LISTEN 0 128 0.0.0.0:10001 0.0.0.0:*\n')
         self.assertShell('! with_lock cycle auto; [[ "$R_ERR" == "端口冲突：TCP 10001"* ]]')
-        self.assertEqual(s.node_status(self.db,s.get_node(self.db,n),int(time.time())),'error')
+        self.assertEqual(node_state.node_status(self.db,database.get_node(self.db,n),int(time.time())),'error')
         self.assertEqual(before,json.loads((self.root/'kernel.json').read_text()))

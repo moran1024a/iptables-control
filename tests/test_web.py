@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+
 """Exercise real DOM rendering, modes, white activity bars and target-only forms in Chrome."""
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,9 +57,11 @@ class BrowserTests(unittest.TestCase):
                 return dict(slot=slot, rtt=rtt if status == 'ok' else None, path_key=path,
                             path_label=path, resolved_ip='192.0.2.1', status=status, error='')
             histories = {}
-            for seconds in (900, 3600, 86400):
+            for seconds in q.HISTORY_STEPS:
                 histories[str(seconds)] = dict(now=seconds, seconds=seconds, series=[dict(protocol='tcp-connect-v1',
                     **q.summarize([sample(t) for t in range(0, seconds + 1, 12)], seconds, seconds))])
+                histories['sparse'+str(seconds)] = dict(now=3600, seconds=seconds, series=[dict(protocol='tcp-connect-v1',
+                    **q.summarize([sample(t, status='timeout' if t % 300 == 150 else 'ok') for t in range(0, 3601, 10)], seconds, 3600))])
             for name, rows in dict(switch=[sample(3540, 200, 'old'), sample(3550, 20, 'new'), sample(3560, 25, 'old')],
                                    failure=[sample(3540), sample(3550, status='timeout'), sample(3560, 30)],
                                    outage=[sample(3540, 10), sample(3580, 30)]).items():
@@ -151,7 +157,7 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(app.textContent.includes('探测超时'),"timeout missing");
   assert(app.querySelector('svg [data-protocol="udp-echo-v1"] circle').getAttribute('fill') !== app.querySelector('svg [data-protocol="icmp-echo-v1"] circle').getAttribute('fill'),"protocol colours must differ");
   assert(!app.innerHTML.includes('NaN'),"chart contains NaN");
-  assert(app.querySelector('[name="quality-range"]').options.length===3,"time ranges missing");
+  assert(app.querySelector('[name="quality-range"]').options.length===4,"time ranges missing");
   const gaps=qualityChart([{protocol:"udp-echo-v1",points:[{time:1180,mean:10,peak:10,status:"ok",resolved_ip:"a"},{time:1190,mean:null,status:"missing"},{time:1200,mean:20,peak:20,status:"ok",resolved_ip:"a"}]}],1200,900);
   assert(!gaps.includes('stroke-width="2"'),"chart joins missing samples");
   const changedPathChart=qualityChart([{protocol:'tcp-connect-v1',points:[{time:1190,mean:10,peak:10,status:'ok',resolved_ip:'a',path_key:'old'},{time:1200,mean:20,peak:20,status:'ok',resolved_ip:'a',path_key:'new'}]}],1200,900);
@@ -159,15 +165,23 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   const drawing=data=>{
     const t=document.createElement('template');t.innerHTML=qualityChart(data.series,data.now,data.seconds);return t.content;
   };
-  for(const range of ['900','3600','86400']) {
+  for(const range of ['900','3600','86400','604800']) {
     const graph=drawing(qualityHistories[range]);
-    assert(graph.querySelectorAll('.quality-series line[stroke-width="2"]').length===graph.querySelectorAll('circle').length-1,'delayed samples break '+range+' s curve');
+    assert(graph.querySelectorAll('.quality-connection').length===graph.querySelectorAll('circle').length-1,'delayed samples break '+range+' s curve');
+    const data=qualityHistories['sparse'+range],sparse=drawing(data),lines=[...sparse.querySelectorAll('line[stroke-width="2"]')];
+    assert(lines.length>0,'occasional timeouts reduce '+range+' s curve to dots');
+    const width=sparse.querySelector('svg').viewBox.baseVal.width;
+    for(const failure of data.series[0].points.filter(p=>p.status==='timeout')) {
+      const x=QUALITY_PLOT.left+(failure.time-data.now+data.seconds)/data.seconds*(width-QUALITY_PLOT.left-QUALITY_PLOT.right);
+      assert(!lines.some(line=>Number(line.getAttribute('x1'))<x-.1&&Number(line.getAttribute('x2'))>x+.1),'curve crosses a real timeout');
+    }
   }
+  assert([...drawing(qualityHistories['604800']).querySelectorAll('.quality-tick')].every(t=>/\d\d\/\d\d/.test(t.textContent)),'weekly ticks omit dates');
   const switched=drawing(qualityHistories.switch);
   assert(switched.querySelectorAll('circle').length===3&&!switched.querySelector('line[stroke-width="2"]'),'path switch is averaged or joined');
   assert(switched.querySelectorAll('line[stroke-dasharray="3 4"]').length===2,'switch markers missing');
   const failed=drawing(qualityHistories.failure);
-  assert(failed.querySelectorAll('circle').length===1&&failed.querySelectorAll('.quality-series path').length===1,'partial failure needs both latency and failure marker');
+  assert(failed.querySelectorAll('circle').length===2&&failed.querySelectorAll('.quality-failure').length===1&&!failed.querySelector('line[stroke-width="2"]'),'partial failure must split successful runs');
   assert(!drawing(qualityHistories.outage).querySelector('line[stroke-width="2"]'),'curve bridges a real outage');
   const bounded={now:1205,seconds:900,series:[{protocol:'tcp-connect-v1',points:[{time:310,mean:20,peak:20,status:'ok'}]}]};
   const labels=data=>[...drawing(data).querySelectorAll('svg > text')].map(t=>t.textContent).join('|');
@@ -175,6 +189,10 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   bounded.series[0].points.unshift({time:300,mean:1000,peak:1000,status:'ok'});
   bounded.series[0].points.push({time:1210,mean:2000,peak:2000,status:'ok'});
   assert(labels(bounded)===scale&&drawing(bounded).querySelectorAll('circle').length===1,'offscreen samples change chart scale or escape plot');
+  const outage=qualityHistories.outage;
+  renderQuality(`<section class="quality-card" data-key="outage">${qualityChart(outage.series,outage.now,outage.seconds)}</section>`,[outage]);
+  const outagePlot=app.querySelector('.quality-plot');showQualityPoint(outagePlot,3570);
+  assert(outagePlot.qualityTime===3570&&outagePlot.querySelector('.quality-tooltip').textContent.includes('未采样')&&!outagePlot.querySelector('.quality-tooltip').textContent.includes('10.0 ms'),'gap tooltip reuses an old successful sample');
   const chartData=qualityHistories.switch;
   // Other protocols can have a single aggregate spanning this path switch.
   const combined={...chartData,series:[...chartData.series,{protocol:'udp-echo-v1',points:[{time:3540,end:3600,mean:18,peak:18,status:'ok'}]}]};
@@ -196,6 +214,10 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(requests.length===requestsBeforeResize,'resize requests fresh network data');
   qualitySvg.dispatchEvent(new KeyboardEvent('keydown',{key:'End'}));
   assert(plot.qualityTime===plot.qualityData.times.at(-1),'keyboard End failed');
+  showQualityPoint(plot,3555);
+  qualitySvg.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft'}));assert(plot.qualityTime===3550,'left key from hovered interval skipped sample');
+  showQualityPoint(plot,3555);
+  qualitySvg.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight'}));assert(plot.qualityTime===3560,'right key from hovered interval skipped sample');
   qualitySvg.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));
   assert(plot.querySelector('.quality-tooltip').hidden,'keyboard Escape failed');
   app.style.removeProperty('width');
@@ -301,6 +323,14 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(app.querySelectorAll('.quality-chart').length===3,'automatic segment charts missing');
   assert(!app.querySelector('[name=quality-source]'),'segment page still asks for source');
   assert(app.textContent.includes('B → C → 目标'),'full path label missing');
+  assert(app.querySelector('[data-link-quality-range] option[value="604800"]'),'link quality lacks weekly range');
+  const failureBoxes=[...app.querySelectorAll('.quality-failure')].map(p=>p.getBBox());
+  const tickBoxes=[...app.querySelectorAll('.quality-tick')].map(p=>p.getBBox());
+  assert(failureBoxes.every(p=>tickBoxes.every(t=>p.y+p.height<t.y)),'failure markers overlap time labels');
+  const qualityFetch=window.fetch;
+  window.fetch=async(url,options)=>String(url).endsWith('api/quality')?{ok:false,status:404,json:async()=>({error:'链路不存在'})}:qualityFetch(url,options);
+  await refresh();window.fetch=qualityFetch;
+  assert(!app.querySelector('.quality-chart')&&app.textContent.includes('链路不存在')&&currentView===null&&qualityResizeObserver===null,'deleted link retains chart or polling');
   await show(configSummary,false);assert(!app.querySelector('[data-action=group-rename]'),'config groups must be read-only');
   await show(linkList,false);await ACTIONS['sort-start']({dataset:{kind:'links'}});
   assert(app.querySelector('.sort-card'),'link sort mode missing');await ACTIONS['sort-save']({dataset:{kind:'links'}});
