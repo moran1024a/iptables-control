@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.4.7-rc.2"
+VERSION="0.4.7"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/lib/ictl/passive.sh"

@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.4.7-rc.2"
+VERSION="0.4.7"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
