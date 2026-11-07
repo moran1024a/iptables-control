@@ -88,7 +88,7 @@ class SubscriptionTests(Fixture, unittest.TestCase):
         self.assertEqual(proxy['servername'], 'sni.example')
         self.assertEqual(proxy['reality-opts'], {'public-key': key, 'short-id': '0123'})
         self.assertEqual(proxy['ws-opts'], {'path': '/a?b=1', 'headers': {'Host': 'host.example'}})
-        self.assertEqual(proxy['name'], '香港#name: "quoted" # value')
+        self.assertEqual(proxy['name'], 'name: "quoted" # value')
         body, _ = subscriptions.export(self.db, row['token'], 'v2ray')
         parsed = target_config.import_uri(base64.b64decode(body).decode())
         self.assertEqual(parsed['name'], proxy['name'])
@@ -128,18 +128,35 @@ class SubscriptionTests(Fixture, unittest.TestCase):
         self.assertEqual(data['chains'][0]['group_id'], group)
         body, _ = subscriptions.export(self.db, row['token'], 'v2ray')
         uri = base64.b64decode(body).decode().splitlines()[0]
-        self.assertEqual(target_config.import_uri(uri)['name'], 'first group#second')
+        self.assertEqual(target_config.import_uri(uri)['name'], 'second')
         self.assertEqual(data['chains'][0]['connection']['uri'], uri)
         self.assertEqual(self.call('api_link_get', {}, lid2)['link']['connection']['uri'], uri)
         self.call('api_group_edit', dict(name='香港 # A'), group)
         body, _ = subscriptions.export(self.db, row['token'], 'clash')
-        self.assertEqual(json.loads(body.split('  - ', 1)[1].splitlines()[0])['name'], '香港 # A#second')
+        self.assertEqual(json.loads(body.split('  - ', 1)[1].splitlines()[0])['name'], 'second')
         self.call('api_group_del', {}, group)
         config = next(c for c in self.call('api_configs')['chains'] if c['link_id'] == lid2)
         self.assertEqual(target_config.import_uri(config['connection']['uri'])['name'], 'second')
         self.assertEqual(forwarding.node_rules(self.db, database.get_node(self.db, self.a)), before)
         self.call('api_chain_del', {}, cid2)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM subscription_links WHERE link_id=?', (lid2,)).fetchone()[0], 0)
+
+    def test_duplicate_names_are_disambiguated_only_when_clash_requires_it(self):
+        cid2=self.config(None,target_id=self.target_id)
+        lid2=self.db.execute('SELECT id FROM links WHERE chain_id=?',(cid2,)).fetchone()[0]
+        row=self.create([self.lid,lid2])
+        for name in ('相同名称','DIRECT'):
+            for cid in (self.cid,cid2):
+                self.call('api_config_save',dict(remark=name),cid)
+            body,_=subscriptions.export(self.db,row['token'],'v2ray')
+            self.assertEqual([target_config.import_uri(uri)['name'] for uri in base64.b64decode(body).decode().splitlines()],[name,name])
+            body,_=subscriptions.export(self.db,row['token'],'clash')
+            proxies=[json.loads(line[4:]) for line in body.split('proxy-groups:')[0].splitlines() if line.startswith('  - ')]
+            names=[p['name'] for p in proxies]
+            self.assertEqual(len(set(names)),2)
+            self.assertTrue(all(n.startswith(name) for n in names))
+            self.assertNotIn('DIRECT',names)
+            self.assertIn(f'{name} [C{lid2:04d}]',names)
 
     def test_v043_migration_preserves_rules_and_is_repeatable(self):
         before = forwarding.node_rules(self.db, database.get_node(self.db, self.a))

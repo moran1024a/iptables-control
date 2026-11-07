@@ -21,7 +21,7 @@ from test_server import ROOT
 FAKE_IPTABLES = r'''#!/usr/bin/env python3
 import sys,os,json,pathlib
 root=pathlib.Path(os.environ['MOCK_ROOT']);p=root/'kernel.json'
-x=json.loads(p.read_text()) if p.exists() else {'nat':{'PREROUTING':[],'POSTROUTING':[],'OTHER':['-j ACCEPT']},'filter':{'FORWARD':[],'OTHER':['-j ACCEPT']}}
+x=json.loads(p.read_text()) if p.exists() else {'nat':{'PREROUTING':[],'POSTROUTING':[],'OTHER':['-j ACCEPT']},'filter':{'FORWARD':[],'OTHER':['-j ACCEPT']},'mangle':{'PREROUTING':[],'OTHER':['-j ACCEPT']}}
 args=sys.argv[1:];name=pathlib.Path(sys.argv[0]).name
 with (root/'commands').open('a') as log:log.write(name+' '+' '.join(args)+'\n')
 def save():p.write_text(json.dumps(x))

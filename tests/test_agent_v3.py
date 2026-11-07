@@ -187,6 +187,11 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn('Set-Cookie', response.headers)
         response = await self.client.post(path, json={**payload, 'source': a, 'target': 999}, headers=headers)
         self.assertEqual(response.status, 400)
+        cid = self.config(rid, [10001, 10002])
+        lid = self.db.execute('SELECT id FROM links WHERE chain_id=?', (cid,)).fetchone()[0]
+        response = await self.client.post(path, json=dict(scope='links', id=lid, configuration=999), headers=headers)
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())['field'], 'configuration')
 
     async def test_seventy_idle_sessions_do_not_exhaust_http_workers(self):
         nodes=[self.node(str(i)) for i in range(70)]

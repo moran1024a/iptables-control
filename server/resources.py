@@ -9,9 +9,11 @@ import forwarding
 import lifecycle
 import network_quality
 import node_state
+import node_addresses
 import node_sync
 import pools
 import topology
+import topology_groups
 import security
 import settings
 import subscriptions
@@ -33,6 +35,7 @@ class Resources:
             "name": n["name"],
             "note": n["note"],
             "addr": n["addr"],
+            "addresses": node_addresses.listing(conn, n),
             "ports": n["ports"],
             "group_id": n["group_id"],
             "status": node_state.node_status(conn, n, now),
@@ -94,6 +97,8 @@ class Resources:
             else 0
         )
         conn.execute("UPDATE nodes SET quality_port=? WHERE id=?", (quality_port, cur.lastrowid))
+        if "addresses" in body:
+            node_addresses.save(conn, database.get_node(conn, cur.lastrowid), body["addresses"])
         self.set_wake(conn, body, database.get_node(conn, cur.lastrowid), mode)
         return {"id": cur.lastrowid}
 
@@ -128,6 +133,10 @@ class Resources:
             database.ordered("chains", "WHERE t.id IN (SELECT chain_id FROM hops WHERE node_id = ?)"),
             (node_id,),
         ).fetchall()
+        names = {r['chain_id']: r['config_name'] for r in conn.execute(
+            "SELECT chain_id,config_name FROM links WHERE chain_id IS NOT NULL AND config_name<>''")}
+        for rule in rules:
+            rule['chain_remark'] = names.get(rule['chain_id'], rule['chain_remark'])
         group = conn.execute("SELECT name FROM item_groups WHERE id = ?", (n["group_id"],)).fetchone()
         events = conn.execute(
             "SELECT ts, text FROM events WHERE node_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
@@ -164,13 +173,15 @@ class Resources:
                 else "same",
             },
             "rules": rules,
-            "chains": [{"id": c["id"], "remark": c["remark"]} for c in chains],
+            "chains": [{"id": c["id"], "remark": names.get(c['id'], c["remark"])} for c in chains],
             "events": [dict(e) for e in events],
         }
 
     @node_sync.track_mutation
     def api_node_edit(self, conn, body, node_id):
         n = database.get_node(conn, node_id)
+        if "addresses" in body:
+            node_addresses.save(conn, n, body["addresses"])
         table = database.node_table(n["kind"])
         if "heartbeat_interval" in body or "tunnel_heartbeat" in body:
             raise errors.UserError("新版只支持主动／被动同步模式")
@@ -342,6 +353,8 @@ class Resources:
         chain = database.get_chain(conn, chain_id)
         link = conn.execute("SELECT id FROM links WHERE chain_id=? AND managed=1", (chain_id,)).fetchone()
         if link:
+            if conn.execute('SELECT 1 FROM link_members WHERE link_id=?', (link['id'],)).fetchone():
+                raise errors.UserError('请在拓扑中移除对应入口或目标')
             return pools.delete_link(conn, link["id"])
         force = self.query.get("force") == ["1"]
         if force:
@@ -387,7 +400,9 @@ class Resources:
         """保存顺序：groups 为分组顺序，ids 为全部对象按显示顺序排列（只能在组内调整，不改变所属分组）。"""
         groups, ids = (body.get("groups"), body.get("ids"))
         existing_groups = {r[0] for r in conn.execute("SELECT id FROM item_groups WHERE kind = ?", (kind,))}
-        existing = {r[0] for r in conn.execute(f"SELECT id FROM {kind}")}
+        query = f'SELECT id FROM {kind}'
+        if kind == 'links': query += ' WHERE id NOT IN (SELECT link_id FROM link_members WHERE link_id<>root_id)'
+        existing = {r[0] for r in conn.execute(query)}
         if (
             not isinstance(groups, list)
             or not isinstance(ids, list)
@@ -443,6 +458,8 @@ class Resources:
 
     @node_sync.track_mutation
     def api_graph_save(self, conn, body, ident=None):
+        if ident and topology_groups.root_id(conn, ident) != ident:
+            raise errors.UserError("请编辑完整拓扑，不能单独修改入口与目标组合")
         return topology.save(conn, body, ident)
 
     def api_graph_preview(self, conn, body):
@@ -452,8 +469,10 @@ class Resources:
         return pools.listing(conn)
 
     def api_link_get(self, conn, body, ident):
-        result = pools.listing(conn)
-        result["link"] = pools.detail(conn, pools.get(conn, "links", ident))
+        ident = topology_groups.root_id(conn, ident)
+        cache = {}
+        result = pools.view_resources(conn, cache)
+        result["link"] = pools.detail(conn, pools.get(conn, "links", ident), cache)
         return result
 
     @node_sync.track_mutation
@@ -466,14 +485,22 @@ class Resources:
 
     @node_sync.track_mutation
     def api_link_save(self, conn, body, ident=None):
+        if ident and (topology_groups.canvas(conn, ident) or topology_groups.root_id(conn, ident) != ident):
+            raise errors.UserError('请在拓扑画布中编辑此链路')
         return pools.link_save(conn, body, ident)
 
     @node_sync.track_mutation
     def api_link_delete(self, conn, body, ident):
-        return pools.delete_link(conn, ident)
+        if topology_groups.root_id(conn, ident) != ident:
+            raise errors.UserError('请在拓扑中移除对应入口或目标')
+        return topology_groups.delete(conn, ident)
 
     @node_sync.track_mutation
     def api_link_action(self, conn, body, ident):
+        if topology_groups.root_id(conn, ident) != ident:
+            raise errors.UserError("请操作完整拓扑")
+        if topology_groups.canvas(conn, ident):
+            return topology_groups.action(conn, body, ident)
         return pools.action(conn, body, ident)
 
     def api_routes(self, conn, body):
@@ -561,10 +588,9 @@ class Resources:
             )
             if not c["deleting"]:
                 first = c["hops"][0] if c["hops"] else {"addr": t["host"], "port": t["port"]}
-                name = database.config_name(
-                    conn, link["name"] if link else c["remark"], link["group_id"] if link else c["group_id"]
-                )
-                c["connection"] = target_config.connection(t, first["addr"], first["port"], name)
+                name = topology_groups.config_name(conn, link) if link else c["remark"]
+                host = node_addresses.ingress_host(conn, link, first["addr"]) if link else first["addr"]
+                c["connection"] = target_config.connection(t, host, first["port"], name)
             c["status"] = (
                 "deleting"
                 if c["deleting"]
@@ -578,22 +604,40 @@ class Resources:
             )
             if link:
                 link = dict(link)
+                root_id = topology_groups.root_id(conn, link['id'])
+                parent = conn.execute('SELECT group_id FROM links WHERE id=?', (root_id,)).fetchone()
                 link["state"], link["error"] = pools.display_state(conn, link)
                 c.update(
-                    link_id=link["id"],
+                    link_id=root_id,
+                    configuration_id=link['id'],
+                    configuration_code=topology_groups.config_code(link['id']),
+                    remark=topology_groups.config_name(conn, link),
                     link_state=link["state"],
                     link_error=link["error"],
-                    group_id=link["group_id"],
+                    group_id=parent['group_id'],
                     link_sync=pools.sync_status(conn, link),
                 )
                 if link["state"] in ("preparing", "switching", "pending", "waiting", "error"):
                     c["status"] = "error" if link["state"] in ("waiting", "error") else "applying"
                 if not c["hops"] and link["state"] in ("preparing", "switching", "waiting"):
                     c["connection"] = None
-        order = {r["id"]: i for i, r in enumerate(conn.execute(database.ordered("links")))}
-        data["chains"].sort(key=lambda c: order.get(c.get("link_id"), len(order)))
+        order = topology_groups.config_order(conn)
+        data["chains"].sort(key=lambda c: order(c.get('configuration_id', c.get('link_id'))))
         data["groups"] = database.get_groups(conn, "links")
         return data
+
+    def api_config_rename(self, conn, body, chain_id):
+        chain = database.get_chain(conn, chain_id)
+        link = conn.execute('SELECT * FROM links WHERE chain_id=?', (chain_id,)).fetchone()
+        if not link or chain['deleting'] or link['state'] == 'deleting':
+            raise errors.UserError('配置已删除或正在删除，请刷新后重试', status=409)
+        name = validation.check_remark(body.get('name'), 'name', '配置名称')
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+            raise errors.UserError('配置名称不能包含控制字符', 'name')
+        if body.get('previous_name') != topology_groups.config_name(conn, link):
+            raise errors.UserError('配置名称已变化，请关闭后重新打开', status=409)
+        conn.execute('UPDATE links SET config_name=? WHERE id=?', (name, link['id']))
+        return dict(id=chain_id, configuration_id=link['id'], name=name)
 
     @node_sync.track_mutation
     def api_config_save(self, conn, body, chain_id=None):
@@ -630,6 +674,8 @@ class Resources:
             ).lastrowid
         forwarding.apply_config_hops(conn, chain_id, pairs)
         pools.sync_legacy(conn)
+        if 'remark' in body:
+            conn.execute('UPDATE links SET config_name=? WHERE chain_id=?', (remark, chain_id))
         return {"id": chain_id, "assigned": assigned}
 
     def api_targets(self, conn, body):
@@ -638,7 +684,8 @@ class Resources:
             refs = [
                 dict(c)
                 for c in conn.execute(
-                    "SELECT id,remark FROM chains WHERE target_id=? ORDER BY id", (t["id"],)
+                    "SELECT c.id,COALESCE(NULLIF(l.config_name,''),c.remark) AS remark "
+                    "FROM chains c LEFT JOIN links l ON l.chain_id=c.id WHERE c.target_id=? ORDER BY c.id", (t["id"],)
                 )
             ]
             targets.append(
@@ -707,13 +754,9 @@ class Resources:
     @node_sync.track_mutation
     def api_target_del(self, conn, body, target_id):
         database.get_target(conn, target_id)
-        for row in conn.execute("SELECT draft FROM link_graphs WHERE draft IS NOT NULL"):
-            if any(v.get("target_id") == target_id for v in json.loads(row[0])["graph"]["vertices"]):
-                raise errors.UserError("目标仍被拓扑草稿引用，请先解除引用")
-        if any(
-            (json.loads(l["plan"])["target"] == target_id for l in conn.execute("SELECT plan FROM links"))
-        ):
-            raise errors.UserError("目标仍被链路引用，请先解除引用")
+        for name, doc in topology.documents(conn):
+            if doc.get('target') == target_id or any(v.get('target_id') == target_id for v in doc.get('graph', {}).get('vertices', [])):
+                raise errors.UserError(f"目标仍被链路「{name}」引用，请先解除引用")
         if conn.execute("SELECT 1 FROM chains WHERE target_id=?", (target_id,)).fetchone():
             raise errors.UserError("目标仍被配置引用，请先解除引用")
         conn.execute("DELETE FROM targets WHERE id=?", (target_id,))

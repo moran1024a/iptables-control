@@ -161,6 +161,8 @@ class Request:
                     "PATCH": self.resources.api_config_save,
                     "DELETE": self.resources.api_chain_del,
                 }.get(method)
+            elif len(parts) == 3 and parts[0] == 'configs' and parts[1].isdigit() and parts[2] == 'name':
+                handler = {'PATCH': self.resources.api_config_rename}.get(method)
             elif parts == ["routes"]:
                 handler = {"GET": self.resources.api_routes, "POST": self.resources.api_route_save}.get(
                     method

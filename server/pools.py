@@ -15,6 +15,8 @@ import target_config
 import validation
 import wake
 import topology
+import topology_groups
+import node_addresses
 
 OFFLINE_AFTER = 60
 WAIT_SECONDS = 30
@@ -53,7 +55,16 @@ def pending_plan(link, c=None):
     desired = json.loads(link["plan"])
     if desired.get("port") is None:
         desired["port"] = current["port"]
-    comparison = (desired.get("graph") != current.get("graph") or desired.get("port") != current.get("port")) if "graph" in desired and "graph" in current else desired != current
+    if "graph" in desired and "graph" in current:
+        wanted_graph, active_graph = desired["graph"], current["graph"]
+        if wanted_graph.get('version') == active_graph.get('version') == 2:
+            # Earlier runtime switches retained unrelated endpoint metadata.
+            # Compare the relevant configuration without masking real edits.
+            wanted_graph = topology_groups.project(wanted_graph, *topology.endpoints(wanted_graph))
+            active_graph = topology_groups.project(active_graph, *topology.endpoints(active_graph))
+        comparison = topology.snapshot(wanted_graph) != topology.snapshot(active_graph) or desired.get("port") != current.get("port")
+    else:
+        comparison = desired != current
     if comparison:
         return True
     if c is not None and link["managed"]:
@@ -63,8 +74,9 @@ def pending_plan(link, c=None):
             return True
         hops = list(c.execute("SELECT * FROM hops WHERE chain_id=? ORDER BY seq", (link["chain_id"],)))
         live = {r["id"]: r for r in rows(c, link["id"])}
-        for a, b in zip(hops, hops[1:]):
-            if a["id"] in live and live[a["id"]]["host"] != database.get_node(c, b["node_id"])["addr"]:
+        for index, (a, b) in enumerate(zip(hops, hops[1:])):
+            next_address = current['hop_addresses'][index + 1] if current.get('hop_addresses') else database.get_node(c, b['node_id'])['addr']
+            if a["id"] in live and live[a["id"]]["host"] != next_address:
                 return True
     return False
 
@@ -139,14 +151,15 @@ def sync_legacy(c):
         else:
             group = c.execute("SELECT id FROM item_groups WHERE kind='links' AND builtin=1").fetchone()[0]
             c.execute(
-                "INSERT INTO links(name,chain_id,plan,state,group_id,sort) VALUES (?,?,?,'active',?,(SELECT COALESCE(MAX(sort),0)+1 FROM links))",
-                (chain["remark"], chain["id"], dump(plan), group),
+                "INSERT INTO links(name,config_name,chain_id,plan,state,group_id,sort) VALUES (?,?,?,?,'active',?,(SELECT COALESCE(MAX(sort),0)+1 FROM links))",
+                (chain["remark"], chain["remark"], chain["id"], dump(plan), group),
             )
         ident = c.execute("SELECT id FROM links WHERE chain_id=?", (chain["id"],)).fetchone()[0]
         save_applied(c, ident, plan)
 
 
 def refresh_links(c, node=None, target=None):
+    refreshed = set()
     for row in c.execute("SELECT * FROM links WHERE managed=1 AND state!='deleting'").fetchall():
         link = dict(row)
         plan = json.loads(link["plan"])
@@ -155,6 +168,18 @@ def refresh_links(c, node=None, target=None):
             for r in c.execute("SELECT node_id FROM hops WHERE chain_id=? ORDER BY seq", (link["chain_id"],))
         ]
         if node is not None and node in path or (target is not None and plan["target"] == target):
+            member = c.execute('SELECT root_id FROM link_members WHERE link_id=?', (link['id'],)).fetchone()
+            if member:
+                root_id = member['root_id']
+                if root_id not in refreshed:
+                    group = topology_groups.canvas(c, root_id)
+                    root = get(c, 'links', root_id)
+                    if topology_groups.pending(group) or any(pending_plan(m) for m in topology_groups.members(c, root_id)):
+                        raise errors.UserError(f"链路「{root['name']}」有未生效的方案，请先重试或编辑确认", status=409)
+                    topology_groups.save(c, dict(graph=json.loads(group['graph']),
+                        name=root['name'], group_id=root['group_id'], revision=root['revision'], apply=True), root_id)
+                    refreshed.add(root_id)
+                continue
             if pending_plan(link):
                 raise errors.UserError(f"链路「{link['name']}」有未生效的方案，请先重试或编辑确认", status=409)
             if "graph" in plan and runtime_plan(link):
@@ -471,7 +496,7 @@ def rows(c, lid):
     ]
 
 
-def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=True, target_snapshot=None):
+def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=True, target_snapshot=None, defer_same=False):
     if link["job"]:
         raise errors.UserError("链路已有未完成的切换，请先等待确认或重试同步", status=409)
     if plan["target"] is None:
@@ -501,8 +526,10 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
         c.execute("UPDATE links SET managed=1 WHERE id=?", (link["id"],))
     old = rows(c, link["id"])
     c.execute("UPDATE chains SET route_id=NULL WHERE id=?", (cid,))
+    addresses = plan.get("hop_addresses", [])
+    routes = plan.get("routing", [])
     desired_pairs = [
-        (nid, database.get_node(c, path[i + 1])["addr"] if i + 1 < len(path) else target["host"])
+        (nid, (addresses[i + 1] if addresses else database.get_node(c, path[i + 1])["addr"]) if i + 1 < len(path) else target["host"])
         for i, nid in enumerate(path)
     ]
     if (
@@ -514,6 +541,7 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
                     (
                         r["id"] == h["id"]
                         and r["host"] == host
+                        and node_addresses.rule_route(c, r["id"]) == (routes[i] if routes else "")
                         and (r["tport"] == (old_hops[i + 1]["port"] if i + 1 < len(path) else target["port"]))
                         for r in old
                     )
@@ -523,6 +551,19 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
         )
         and (not path or plan["port"] in (None, old_hops[0]["port"]))
     ):
+        if defer_same:
+            # A graph-only change still shares its entry's confirmation barrier.
+            # Reuse the installed rules rather than allocate duplicate ports.
+            previous = previous or link
+            ordered = [next(r for r in old if r['id']==h['id']) for h in old_hops]
+            job = dict(phase='prepare', at=int(time.time()), new=ordered, old=old,
+                       selected=selected, nodes=sorted({r['node_id'] for r in old}),
+                       target=target['id'], reason=reason, wait=[], plan=plan,
+                       target_snapshot=dict(target), update_plan=update_plan, metadata_only=True,
+                       previous_applied=link['applied'],
+                       previous=dict(plan=json.loads(previous['plan']), name=previous['name'], selected=json.loads(previous['selected'])))
+            c.execute("UPDATE links SET job=?,state='preparing',error='' WHERE id=?", (dump(job), link['id']))
+            return
         c.execute(
             "UPDATE links SET selected=?,state='active',error='' WHERE id=?", (dump(selected), link["id"])
         )
@@ -530,7 +571,7 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
         applied_plan = {**plan, "port": old_hops[0]["port"] if old_hops else plan["port"]}
         save_applied(c, link["id"], applied_plan, target)
         desired = json.loads(link["plan"])
-        if "graph" in plan and (update_plan or desired.get("graph") == plan["graph"]):
+        if "graph" in plan and (update_plan or topology.snapshot(desired.get("graph")) == topology.snapshot(plan["graph"])):
             # A different graph branch can compile to identical kernel rules.
             # Keep retry/edit metadata on that confirmed branch as well.
             c.execute("UPDATE links SET plan=? WHERE id=?", (dump(applied_plan), link["id"]))
@@ -538,6 +579,8 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
     new = []
     for index, nid in enumerate(path):
         n = database.get_node(c, nid)
+        if routes and agent_v3.newer("0.5.1-rc.1", n["agent"] or "0.0.0"):
+            raise errors.UserError(f"请先将节点 {n['name']} 升级到 0.5.1-rc.1，以支持指定 IP 转发")
         if n["deleting"] or n["manual_required"]:
             raise errors.UserError(f"{n['name']} 正在删除或等待模式确认")
         if (
@@ -572,9 +615,12 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
         new.append(dict(id=next_rule(c), node_id=nid, port=port))
     for i, rule in enumerate(new):
         rule.update(
-            host=database.get_node(c, new[i + 1]["node_id"])["addr"] if i + 1 < len(new) else target["host"],
+            host=desired_pairs[i][1],
             tport=new[i + 1]["port"] if i + 1 < len(new) else target["port"],
         )
+    for i, r in enumerate(new):
+        if routes:
+            c.execute("INSERT INTO rule_routes VALUES (?,?)", (r["id"], routes[i]))
     for r in new[1:]:
         c.execute(
             "INSERT INTO link_rules VALUES (?,?, 'stage',?,?,?,?)",
@@ -603,7 +649,7 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
     event(c, link["id"], reason + "：准备新路径")
 
 
-def link_save(c, body, ident=None):
+def link_save(c, body, ident=None, *, defer_same=False):
     old = get(c, "links", ident) if ident else None
     if old and body.get("revision") != old["revision"]:
         raise errors.UserError("链路已变化，请刷新后重试", status=409)
@@ -629,6 +675,7 @@ def link_save(c, body, ident=None):
             "INSERT INTO links(name,plan,group_id,sort) VALUES (?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM links))",
             (name, dump(plan), group),
         ).lastrowid
+        c.execute('UPDATE links SET config_name=? WHERE id=?', (f'配置 {ident:04d}', ident))
     link = get(c, "links", ident)
     if body.get("apply", True):
         old_stages = (
@@ -643,13 +690,13 @@ def link_save(c, body, ident=None):
             and (x["default"] != default_member(old_stages[x["id"]]))
         }
         selected, path = choose(c, link, plan, prefer_current=bool(old), forced=changed_defaults)
-        begin(c, link, plan, selected, path, "手动应用", previous=old)
+        begin(c, link, plan, selected, path, "手动应用", previous=old, defer_same=defer_same)
     elif old and old["chain_id"] is not None:
         raise errors.UserError("已经运行的链路请使用保存并应用")
     return dict(id=ident)
 
 
-def action(c, body, ident):
+def action(c, body, ident, *, retried_nodes=None):
     link = get(c, "links", ident)
     if body.get("revision") != link["revision"]:
         raise errors.UserError("链路已变化，请刷新后重试", status=409)
@@ -701,9 +748,9 @@ def action(c, body, ident):
         else:
             job = json.loads(link["job"])
             job["at"] = int(time.time())
-            for nid in job["wait"]:
-                c.execute("UPDATE nodes SET desired_generation=desired_generation+1 WHERE id=?", (nid,))
-                wake.queue(c, database.get_node(c, nid))
+            already = retried_nodes if retried_nodes is not None else set()
+            node_sync.retry_nodes(c, set(job["wait"]) - already)
+            already.update(job["wait"])
             c.execute(
                 "UPDATE links SET job=?,error='',state=? WHERE id=?",
                 (dump(job), "preparing" if job["phase"] == "prepare" else "switching", ident),
@@ -811,9 +858,9 @@ def confirmed(c, nodes):
     return True
 
 
-def progress(c, link, now):
+def progress(c, link, now, force=False):
     job = json.loads(link["job"])
-    if not confirmed(c, job["wait"]):
+    if not force and not confirmed(c, job["wait"]):
         failures = [
             nid
             for nid in job["wait"]
@@ -852,12 +899,13 @@ def progress(c, link, now):
         )
         if job["new"]:
             entry = job["new"][0]
-            if old_entry and (old_entry["node_id"], old_entry["port"]) == (entry["node_id"], entry["port"]):
-                c.execute("DELETE FROM link_rules WHERE id=?", (old_entry["id"],))
-            c.execute(
-                "INSERT INTO link_rules VALUES (?,?, 'stage',?,?,?,?)",
-                (entry["id"], link["id"], entry["node_id"], entry["port"], entry["host"], entry["tport"]),
-            )
+            if not job.get('metadata_only'):
+                if old_entry and (old_entry["node_id"], old_entry["port"]) == (entry["node_id"], entry["port"]):
+                    c.execute("DELETE FROM link_rules WHERE id=?", (old_entry["id"],))
+                c.execute(
+                    "INSERT INTO link_rules VALUES (?,?, 'stage',?,?,?,?)",
+                    (entry["id"], link["id"], entry["node_id"], entry["port"], entry["host"], entry["tport"]),
+                )
             job["wait"] = [entry["node_id"]]
         else:
             job["wait"] = []
@@ -873,8 +921,9 @@ def progress(c, link, now):
     old = [r for r in job["old"] if r["id"] not in new_ids]
     live_ports = {(r["node_id"], r["port"]) for r in job["new"]}
     retire(c, link["id"], [r for r in old if (r["node_id"], r["port"]) not in live_ports])
-    c.execute("DELETE FROM link_rules WHERE link_id=? AND phase='live'", (link["id"],))
-    c.execute("UPDATE link_rules SET phase='live' WHERE link_id=?", (link["id"],))
+    if not job.get('metadata_only'):
+        c.execute("DELETE FROM link_rules WHERE link_id=? AND phase='live'", (link["id"],))
+        c.execute("UPDATE link_rules SET phase='live' WHERE link_id=?", (link["id"],))
     c.execute("DELETE FROM hops WHERE chain_id=?", (link["chain_id"],))
     for index, r in enumerate(job["new"]):
         c.execute(
@@ -888,7 +937,7 @@ def progress(c, link, now):
         plan["port"] = job["new"][0]["port"]
     save_applied(c, link["id"], plan, job.get("target_snapshot"))
     desired = plan if job.get("update_plan", True) else json.loads(link["plan"])
-    if "graph" in plan and desired.get("graph") == plan["graph"]:
+    if "graph" in plan and topology.snapshot(desired.get("graph")) == topology.snapshot(plan["graph"]):
         desired = plan
     c.execute(
         "UPDATE links SET selected=?,plan=?,job=NULL,state='active',error='',failures='[]',failure_scope='',revision=revision+1 WHERE id=?",
@@ -909,6 +958,7 @@ def tick(c, now=None, allow_failover=True):
                 "DELETE FROM link_retired WHERE link_id=? AND node_id=? AND port=?",
                 (r["link_id"], r["node_id"], r["port"]),
             )
+    topology_groups.progress(c, now)
     for row in c.execute("SELECT * FROM links").fetchall():
         link = dict(row)
         if link["state"] == "deleting":
@@ -919,12 +969,20 @@ def tick(c, now=None, allow_failover=True):
             ):
                 continue
             if not c.execute("SELECT 1 FROM link_retired WHERE link_id=?", (link["id"],)).fetchone():
-                c.execute("DELETE FROM links WHERE id=?", (link["id"],))
+                if topology_groups.canvas(c, link["id"]):
+                    c.execute("DELETE FROM link_members WHERE link_id=?", (link["id"],))
+                    c.execute("UPDATE links SET chain_id=NULL,applied=NULL,plan=?,state='active',error='' WHERE id=?", (dump(dict(entry=None,target=None,stages=[])),link["id"]))
+                else:
+                    if c.execute("SELECT 1 FROM link_members WHERE root_id=? AND link_id<>root_id", (link["id"],)).fetchone():
+                        continue
+                    c.execute("DELETE FROM links WHERE id=?", (link["id"],))
                 if (
                     link["chain_id"]
                     and c.execute("SELECT 1 FROM chains WHERE id=?", (link["chain_id"],)).fetchone()
                 ):
                     lifecycle.delete_chain(c, link["chain_id"])
+            continue
+        if c.execute("SELECT 1 FROM link_members m JOIN link_batches b ON b.root_id=m.root_id WHERE m.link_id=?", (link["id"],)).fetchone():
             continue
         if link["job"]:
             progress(c, link, now)
@@ -933,6 +991,11 @@ def tick(c, now=None, allow_failover=True):
             not c.execute("SELECT 1 FROM link_retired WHERE link_id=?", (link["id"],)).fetchone()
         ):
             c.execute("UPDATE links SET retained='[]' WHERE id=?", (link["id"],))
+        # Independent canvas routes are manually controlled in this iteration.
+        if topology_groups.canvas(c, link['id']):
+            continue
+        if c.execute("SELECT 1 FROM link_members WHERE link_id=?", (link["id"],)).fetchone():
+            continue
         if link["chain_id"] is None or not allow_failover:
             continue
         plan, selected = (runtime_plan(link), json.loads(link["selected"]))
@@ -967,14 +1030,24 @@ def tick(c, now=None, allow_failover=True):
                 c.execute("UPDATE links SET state='error',error=? WHERE id=?", (error, link["id"]))
         elif link["state"] == "error" and (not json.loads(link["failures"])):
             c.execute("UPDATE links SET state='active',error='' WHERE id=?", (link["id"],))
+    node_addresses.cleanup_routes(c)
 
 
-def display_state(c, link):
+def view_node(c, nid, cache):
+    """One health calculation per node within a read request; never a global cache."""
+    if nid not in cache:
+        node = c.execute('SELECT * FROM nodes WHERE id=?', (nid,)).fetchone()
+        cache[nid] = (node, node_state.node_status(c, node, int(time.time())), confirmed(c, [nid])) if node else (None, None, False)
+    return cache[nid]
+
+
+def display_state(c, link, cache=None):
+    cache = {} if cache is None else cache
     state, error = (link["state"], link["error"])
     if state == "active" and link["chain_id"]:
         for h in c.execute("SELECT node_id FROM hops WHERE chain_id=? ORDER BY seq", (link["chain_id"],)):
-            n = database.get_node(c, h["node_id"])
-            status = node_state.node_status(c, n, int(time.time()))
+            n, status, _ = view_node(c, h['node_id'], cache)
+            if n is None: return ('error', '节点已删除')
             if status in ("error", "offline", "skew", "deleting"):
                 return (
                     "error",
@@ -991,9 +1064,10 @@ def display_state(c, link):
     return (state, error)
 
 
-def sync_status(c, link):
+def sync_status(c, link, cache=None, state=None):
     """UI-only receipt summary; scheduling and the stored link state stay unchanged."""
-    state, _ = display_state(c, link)
+    cache = {} if cache is None else cache
+    if state is None: state, _ = display_state(c, link, cache)
     job = json.loads(link["job"]) if link["job"] else None
     ids = (
         job["wait"]
@@ -1007,11 +1081,10 @@ def sync_status(c, link):
         ids = list(dict.fromkeys(ids + json.loads(link["failures"])))
     pending = []
     for nid in ids:
-        node = c.execute("SELECT * FROM nodes WHERE id=?", (nid,)).fetchone()
+        node, status, synced = view_node(c, nid, cache)
         if node is None:
             continue
-        status = node_state.node_status(c, node, int(time.time()))
-        if confirmed(c, [nid]) and status == "synced":
+        if synced and status == "synced":
             continue
         wake_status = wake.summary(c, node)
         current_wake = (
@@ -1048,10 +1121,11 @@ def sync_status(c, link):
     )
 
 
-def detail(c, link):
+def detail(c, link, cache=None):
+    cache = {} if cache is None else cache
     result = dict(link)
-    result["state"], result["error"] = display_state(c, link)
-    result["sync"] = sync_status(c, link)
+    result["state"], result["error"] = display_state(c, link, cache)
+    result["sync"] = sync_status(c, link, cache, result['state'])
     for key in ("plan", "selected", "failures"):
         result[key] = json.loads(result[key])
     for stage in result["plan"]["stages"]:
@@ -1086,17 +1160,23 @@ def detail(c, link):
         chain = database.get_chain(c, link["chain_id"])
         target = applied_target(c, link) if link["applied"] else database.get_target(c, chain["target_id"])
         result["applied_target_id"] = target["id"]
-        first = result["hops"][0] if result["hops"] else dict(addr=target["host"], port=target["port"])
+        first = dict(result["hops"][0]) if result["hops"] else dict(addr=target["host"], port=target["port"])
+        first["addr"] = node_addresses.ingress_host(c, link, first["addr"])
         result["connection"] = target_config.connection(
-            target, first["addr"], first["port"], database.config_name(c, link["name"], link["group_id"])
+            target, first["addr"], first["port"], topology_groups.config_name(c, link)
         )
-    topology.decorate(c, link, result)
+    topology.decorate(c, link, result, cache)
     return result
 
 
 def listing(c):
+    cache = {}
+    return dict(view_resources(c, cache), links=[detail(c, r, cache) for r in c.execute(database.ordered("links", "WHERE NOT EXISTS (SELECT 1 FROM link_members m WHERE m.link_id=t.id AND m.link_id<>m.root_id)"))])
+
+
+def view_resources(c, cache=None):
+    cache = {} if cache is None else cache
     return dict(
-        links=[detail(c, r) for r in c.execute(database.ordered("links"))],
         groups=database.get_groups(c, "links"),
         pools=[
             dict(
@@ -1112,16 +1192,17 @@ def listing(c):
                 id=n["id"],
                 name=n["name"],
                 addr=n["addr"],
+                addresses=node_addresses.listing(c, n),
                 mode=n["desired_mode"],
                 eligible=n["installed_agent"] == "active"
                 and n["desired_mode"] == "active"
                 and (not n["manual_required"])
                 and (not n["deleting"]),
-                status=node_state.node_status(c, n, int(time.time())),
+                status=view_node(c, n['id'], cache)[1],
             )
             for n in c.execute(database.ordered("nodes"))
         ],
-        targets=[dict(id=t["id"], name=t["name"]) for t in c.execute(database.ordered("targets"))],
+        targets=[dict(id=t["id"], name=t["name"], host=t["host"], port=t["port"]) for t in c.execute(database.ordered("targets"))],
     )
 
 

@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.4.7"
+VERSION="0.5.1-rc.1"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/lib/ictl/passive.sh"
@@ -45,7 +45,7 @@ need_root() {
     exit 1
   fi
   local c missing=()
-  for c in curl openssl iptables iptables-save iptables-restore getent flock od systemctl conntrack; do
+  for c in curl openssl ip iptables iptables-save iptables-restore getent flock od systemctl conntrack; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -135,10 +135,134 @@ valid_ipv4() {
   [[ "$1" =~ ^$o\.$o\.$o\.$o$ ]]
 }
 
+# Explicit IPv4 routes; the profile journal is shared with the Go Agent.
+route_fields() {
+  local value="$1" extra
+  IFS=, read -r R_IN R_OUT R_IDEV R_ODEV R_IGW R_OGW extra <<< "$value"
+  [ -z "${extra:-}" ] && [ "$(tr -cd ',' <<< "$value" | wc -c)" = 5 ] || return 1
+  valid_ipv4 "$R_IN" && valid_ipv4 "$R_OUT" || return 1
+  [[ "$R_IDEV" =~ ^[A-Za-z0-9_.:-]{1,15}$ && "$R_ODEV" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
+  { [ "$R_IGW" = - ] || valid_ipv4 "$R_IGW"; } && { [ "$R_OGW" = - ] || valid_ipv4 "$R_OGW"; }
+}
+route_numbers() {
+  local hash
+  hash="$(printf '%s' "$1" | sha256_hex)" || return 1
+  ROUTE_TABLE=$((100000+16#${hash:0:5}))
+  ROUTE_MARK=$((0x49000000+ROUTE_TABLE))
+  ROUTE_PRIORITY=$((18000+ROUTE_TABLE%10000))
+}
+# Run in a subshell: checking a neighbour must not overwrite this profile's IDs.
+route_policy_owned() (
+  local priority mark table protocol key expected_mark
+  read -r priority mark table protocol <<< "$(awk '{p=$1;for(i=2;i<NF;i++){if($i=="fwmark")m=$(i+1);if($i=="lookup")t=$(i+1);if($i=="proto")r=$(i+1)}print p,m,t,r}' <<< "$1")"
+  [[ "$table" =~ ^[0-9]+$ ]] && [ "$protocol" = 242 ] && [ -f "$LIB/routing/$table" ] || return 1
+  key="$(cat "$LIB/routing/$table")" || return 1
+  route_numbers "$key" || return 1
+  printf -v expected_mark '0x%x' "$ROUTE_MARK"
+  [ "$table" = "$ROUTE_TABLE" ] && [ "$priority" = "$ROUTE_PRIORITY:" ] || return 1
+  [ "$mark" = "$expected_mark" ] || [ "$mark" = "$expected_mark/0xffffffff" ]
+)
+route_prepare_profile() {
+  local local_ip="$1" device="$2" gateway="$3" key="$1,$2,$3" path existing routes line prefix resolved_gw='-' current own_rule=''
+  route_numbers "$key" || return 1
+  path="$LIB/routing/$ROUTE_TABLE"
+  ip -o -4 address show dev "$device" | awk '$3=="inet" {split($4,a,"/");print a[1]}' | grep -Fxq "$local_ip" || { echo "地址 $local_ip 未绑定在网卡 $device" >&2; return 1; }
+  routes="$(ip -N -4 route show table "$ROUTE_TABLE" 2>&1)" || {
+    [[ "$routes" == *'FIB table does not exist'* ]] || { echo "$routes" >&2; return 1; }; routes='';
+  }
+  existing="$(ip -N -4 -o rule show)" || return 1
+  existing="$(awk -v p="$ROUTE_PRIORITY:" '$1==p' <<< "$existing")"
+  if [ -f "$path" ]; then
+    [ "$(cat "$path")" = "$key" ] || { echo '路由表标识冲突' >&2; return 1; }
+    if [ -n "$routes" ] && grep -v 'proto 242' <<< "$routes" | grep -q .; then echo '路由表含有其他工具的规则' >&2; return 1; fi
+  elif [ -n "$routes" ]; then echo '路由表被占用' >&2; return 1
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    route_policy_owned "$line" || { echo '策略路由优先级冲突' >&2; return 1; }
+    awk -v t="$ROUTE_TABLE" '{for(i=1;i<NF;i++)if($i=="lookup"&&$(i+1)==t)found=1} END{exit !found}' <<< "$line" && own_rule=1
+  done <<< "$existing"
+  mkdir -p "$LIB/routing" || return 1
+  printf '%s\n' "$key" > "$path.tmp" && mv "$path.tmp" "$path" || return 1
+  routes="$(ip -N -4 route show dev "$device" scope link)" || return 1
+  while read -r prefix line; do
+    [ -n "$prefix" ] && [ "$prefix" != default ] || continue
+    ip -4 route replace "$prefix" dev "$device" src "$local_ip" table "$ROUTE_TABLE" proto 242 || return 1
+  done <<< "$routes"
+  if [ "$gateway" = - ]; then
+    routes="$(ip -N -4 route show default dev "$device")" || return 1
+    while read -r line; do
+      [ -n "$line" ] || continue
+      current="$(awk '{for(i=1;i<NF;i++)if($i=="via")print $(i+1)}' <<< "$line")"
+      [ -n "$current" ] || continue
+      [ "$resolved_gw" = - ] || [ "$resolved_gw" = "$current" ] || { echo '网卡存在多个网关，请明确指定' >&2; return 1; }
+      resolved_gw="$current"
+    done <<< "$routes"
+    gateway="$resolved_gw"
+  fi
+  ip -4 route replace unreachable default metric 32767 table "$ROUTE_TABLE" proto 242 || return 1
+  if [ "$gateway" != - ]; then
+    ip -4 route replace default via "$gateway" dev "$device" src "$local_ip" metric 10 table "$ROUTE_TABLE" proto 242 || return 1
+  fi
+  [ -n "$own_rule" ] || ip -4 rule add priority "$ROUTE_PRIORITY" fwmark "$ROUTE_MARK/0xffffffff" table "$ROUTE_TABLE" protocol 242 || return 1
+  current="$(cat "/proc/sys/net/ipv4/conf/$device/rp_filter")" || return 1
+  if [ "$current" = 1 ] || { [ "$current" = 0 ] && [ "$(cat /proc/sys/net/ipv4/conf/all/rp_filter)" = 1 ]; }; then
+    [ -f "$LIB/routing/rp_$device" ] || printf '%s\n' "$current" > "$LIB/routing/rp_$device" || return 1
+    printf '2\n' > "/proc/sys/net/ipv4/conf/$device/rp_filter" || return 1
+  fi
+}
+prepare_routes() {
+  local id proto port host target route ip result
+  [ -f "$CONFIG" ] || return 0
+  load_resolved
+  while read -r id proto port host target route; do
+    [ -n "${route:-}" ] || continue
+    route_fields "$route" || { echo '无效的地址路由配置' >&2; return 1; }
+    route_prepare_profile "$R_IN" "$R_IDEV" "$R_IGW" && route_prepare_profile "$R_OUT" "$R_ODEV" "$R_OGW" || return 1
+    ip="$host"
+    valid_ipv4 "$ip" || ip="${RCACHE[$host]:-}"
+    valid_ipv4 "$ip" || { echo "缺少下一跳的地址缓存：$host" >&2; return 1; }
+    route_numbers "$R_OUT,$R_ODEV,$R_OGW" || return 1
+    result="$(ip -4 route get "$ip" from "$R_OUT" mark "$ROUTE_MARK")" || return 1
+    awk -v d="$R_ODEV" '{for(i=1;i<NF;i++)if($i=="dev"&&$(i+1)==d)ok=1} END{exit !ok}' <<< "$result" || { echo '所选出口无法路由到下一跳' >&2; return 1; }
+  done < "$CONFIG"
+}
+prune_routes() {
+  local keep="${1:-}" path key local_ip device gateway existing
+  [ -d "$LIB/routing" ] || return 0
+  for path in "$LIB/routing/"[0-9]*; do
+    [ -f "$path" ] || continue
+    key="$(cat "$path")" || return 1
+    grep -Fxq "$key" <<< "$keep" && continue
+    route_numbers "$key" || return 1
+    [ "${path##*/}" = "$ROUTE_TABLE" ] || return 1
+    existing="$(ip -N -4 -o rule show)" || return 1
+    if awk -v p="$ROUTE_PRIORITY:" '$1==p' <<< "$existing" | grep -q "lookup $ROUTE_TABLE .*proto 242"; then
+      ip -4 rule del priority "$ROUTE_PRIORITY" fwmark "$ROUTE_MARK/0xffffffff" table "$ROUTE_TABLE" protocol 242 || return 1
+    fi
+    ip -4 route flush table "$ROUTE_TABLE" proto 242 || return 1
+    rm -f "$path" || return 1
+  done
+  for path in "$LIB/routing/"rp_*; do
+    [ -f "$path" ] || continue
+    device="${path##*/rp_}"
+    awk -F, -v d="$device" '$2==d{found=1} END{exit !found}' <<< "$keep" && continue
+    [[ "$device" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
+    if [ "$(cat "/proc/sys/net/ipv4/conf/$device/rp_filter" 2>/dev/null)" = 2 ]; then
+      cat "$path" > "/proc/sys/net/ipv4/conf/$device/rp_filter" || return 1
+    fi
+    rm -f "$path" || return 1
+  done
+}
+current_route_profiles() {
+  [ -f "$CONFIG" ] || return 0
+  awk 'NF==6 {split($6,r,",");print r[1]","r[3]","r[5];print r[2]","r[4]","r[6]}' "$CONFIG"
+}
+
 # 服务端下发的配置：首行 v=版本，其余每行 规则id 协议 入站端口 目标地址 目标端口
 valid_config() {
-  local line first=1
-  local re='^[0-9]+ (both|tcp|udp) ([1-9][0-9]{0,4}) [A-Za-z0-9.-]{1,253} ([1-9][0-9]{0,4})$'
+  local line first=1 route
+  local re='^[0-9]+ (both|tcp|udp) ([1-9][0-9]{0,4}) [A-Za-z0-9.-]{1,253} ([1-9][0-9]{0,4})( [A-Za-z0-9_.,:-]+)?$'
   while IFS= read -r line; do
     if [ "$first" -eq 1 ]; then
       [[ "$line" =~ ^v=[0-9a-f]{1,64}$ ]] || return 1
@@ -148,6 +272,8 @@ valid_config() {
     [ -z "$line" ] && continue
     [[ "$line" =~ $re ]] || return 1
     [ "${BASH_REMATCH[2]}" -le 65535 ] && [ "${BASH_REMATCH[3]}" -le 65535 ] || return 1
+    route="${BASH_REMATCH[4]:-}"
+    [ -z "$route" ] || route_fields "${route# }" || return 1
   done <<< "$1"
   [ "$first" -eq 0 ]
 }
@@ -320,7 +446,7 @@ check_native_ports() {
       /^[ \t]*chain / {
         chain=$2; k=family SUBSEP table SUBSEP chain
         scope[k]=family SUBSEP table; label[k]=table "/" chain
-        own[k]=(chain ~ /^ICTL-(PRE|POST|FWD)$/); next
+        own[k]=(chain ~ /^ICTL-(PRE|POST|FWD|ROUTE)$/); next
       }
       /^[ \t]*}[ \t]*$/ { chain=""; next }
       chain!="" {
@@ -444,13 +570,13 @@ clean_legacy_persistence() {
   local tmp rc=0
   [ -e "$LEGACY_PERSIST" ] || return 0
   [ -f "$LEGACY_PERSIST" ] || return 1
-  grep -Eq '(^:|^-A )(ICTL-PRE|ICTL-POST|ICTL-FWD) |-[jg] ICTL-(PRE|POST|FWD)( |$)' "$LEGACY_PERSIST" || rc=$?
+  grep -Eq '(^:|^-A )(ICTL-PRE|ICTL-POST|ICTL-FWD|ICTL-ROUTE) |-[jg] ICTL-(PRE|POST|FWD|ROUTE)( |$)' "$LEGACY_PERSIST" || rc=$?
   [ "$rc" -ne 1 ] || return 0
   [ "$rc" -eq 0 ] || return 1
   tmp="$(mktemp "${LEGACY_PERSIST}.XXXXXX")" || return 1
   if ! cp -p "$LEGACY_PERSIST" "$tmp" || ! awk '
     { line=$0; gsub(/"([^"\\]|\\.)*"/,"COMMENT",line)
-      if(line !~ /(^:|^-A )(ICTL-PRE|ICTL-POST|ICTL-FWD) / && line !~ /-[jg] ICTL-(PRE|POST|FWD)( |$)/) print
+      if(line !~ /(^:|^-A )(ICTL-PRE|ICTL-POST|ICTL-FWD|ICTL-ROUTE) / && line !~ /-[jg] ICTL-(PRE|POST|FWD|ROUTE)( |$)/) print
     }' "$LEGACY_PERSIST" > "$tmp"; then rm -f "$tmp"; return 1; fi
   if cmp -s "$tmp" "$LEGACY_PERSIST"; then rm -f "$tmp"; return 0; fi
   if [ -L "$LEGACY_PERSIST" ] || ! mkdir -p "$LIB"; then rm -f "$tmp"; return 1; fi
@@ -464,19 +590,30 @@ clean_legacy_persistence() {
 
 # 根据本地缓存的配置生成 iptables-restore 输入，写入 RENDERED；问题追加到 ERRS
 render() {
-  local id proto lport host tport p pre="" post="" fwd=""
+  local id proto lport host tport route p pre="" post="" fwd="" mangle="" in_match snat out_mark in_mark
   load_resolved
   if [ -f "$CONFIG" ]; then
-    while read -r id proto lport host tport; do
+    while read -r id proto lport host tport route; do
       [ -z "$tport" ] && continue
       if ! resolve "$host"; then
         ERRS+=("rule $id resolve failed: $host")
         continue
       fi
       [ "$RSTALE" -eq 1 ] && ERRS+=("rule $id resolve failed: $host, using cached $RIP")
+      in_match=""; snat="MASQUERADE"
+      if [ -n "$route" ]; then
+        route_fields "$route" || { ERRS+=('无效的地址路由配置'); continue; }
+        in_match="-d $R_IN "; snat="SNAT --to-source $R_OUT"
+        route_numbers "$R_IN,$R_IDEV,$R_IGW"; in_mark="$ROUTE_MARK"
+        route_numbers "$R_OUT,$R_ODEV,$R_OGW"; out_mark="$ROUTE_MARK"
+      fi
       for p in $(protos "$proto"); do
-        pre+="-A ICTL-PRE -p $p -m addrtype --dst-type LOCAL --dport $lport -j DNAT --to-destination $RIP:$tport"$'\n'
-        post+="-A ICTL-POST -p $p -d $RIP --dport $tport -m conntrack --ctstate DNAT --ctorigdstport $lport -j MASQUERADE"$'\n'
+        if [ -n "$route" ]; then
+          mangle+="-A ICTL-ROUTE -p $p -d $R_IN --dport $lport -j MARK --set-xmark $out_mark/0xffffffff"$'\n'
+          mangle+="-A ICTL-ROUTE -m conntrack --ctstate DNAT --ctdir REPLY --ctproto $p --ctorigdst $R_IN --ctorigdstport $lport --ctreplsrc $RIP --ctreplsrcport $tport -j MARK --set-xmark $in_mark/0xffffffff"$'\n'
+        fi
+        pre+="-A ICTL-PRE -p $p -m addrtype --dst-type LOCAL ${in_match}--dport $lport -j DNAT --to-destination $RIP:$tport"$'\n'
+        post+="-A ICTL-POST -p $p -d $RIP --dport $tport -m conntrack --ctstate DNAT --ctorigdstport $lport -j $snat"$'\n'
         # 原始/回复元组在两个方向保持不变；不用 -p，RELATED ICMP 也按原连接匹配。
         fwd+="-A ICTL-FWD -m conntrack --ctstate DNAT --ctproto $p --ctorigdstport $lport --ctreplsrc $RIP --ctreplsrcport $tport -j ACCEPT"$'\n'
       done
@@ -491,19 +628,24 @@ ${pre}${post}COMMIT
 *filter
 :ICTL-FWD - [0:0]
 ${fwd}COMMIT
+*mangle
+:ICTL-ROUTE - [0:0]
+${mangle}COMMIT
 "
 }
 
 jumps_ok() {
   iptables -t nat -C PREROUTING -j ICTL-PRE 2>/dev/null &&
     iptables -t nat -C POSTROUTING -j ICTL-POST 2>/dev/null &&
-    iptables -C FORWARD -j ICTL-FWD 2>/dev/null
+    iptables -C FORWARD -j ICTL-FWD 2>/dev/null &&
+    iptables -t mangle -C PREROUTING -j ICTL-ROUTE 2>/dev/null
 }
 
 ensure_jumps() {
   iptables -w -t nat -C PREROUTING -j ICTL-PRE 2>/dev/null || iptables -w -t nat -A PREROUTING -j ICTL-PRE || return 1
   iptables -w -t nat -C POSTROUTING -j ICTL-POST 2>/dev/null || iptables -w -t nat -A POSTROUTING -j ICTL-POST || return 1
   iptables -w -C FORWARD -j ICTL-FWD 2>/dev/null || iptables -w -I FORWARD 1 -j ICTL-FWD || return 1
+  iptables -w -t mangle -C PREROUTING -j ICTL-ROUTE 2>/dev/null || iptables -w -t mangle -A PREROUTING -j ICTL-ROUTE || return 1
 }
 
 ensure_ip_forward() {
@@ -515,18 +657,18 @@ ensure_ip_forward() {
 # Capture only our chains; counters and generated comments do not affect comparison.
 owned_snapshot() {
   local table rules
-  for table in nat filter; do
+  for table in nat filter mangle; do
     rules="$(iptables-save -t "$table")" || return 1
     printf '*%s\n' "$table"
-    printf '%s\n' "$rules" | awk '/^:ICTL-(PRE|POST|FWD) / {sub(/\[[0-9]+:[0-9]+\]/,"[0:0]"); print}
-      /^-A ICTL-(PRE|POST|FWD) / {print}'
+    printf '%s\n' "$rules" | awk '/^:ICTL-(PRE|POST|FWD|ROUTE) / {sub(/\[[0-9]+:[0-9]+\]/,"[0:0]"); print}
+      /^-A ICTL-(PRE|POST|FWD|ROUTE) / {print}'
     echo COMMIT
   done
 }
 
 jump_flags() {
   local table parent chain item
-  for item in 'nat PREROUTING ICTL-PRE' 'nat POSTROUTING ICTL-POST' 'filter FORWARD ICTL-FWD'; do
+  for item in 'nat PREROUTING ICTL-PRE' 'nat POSTROUTING ICTL-POST' 'filter FORWARD ICTL-FWD' 'mangle PREROUTING ICTL-ROUTE'; do
     read -r table parent chain <<< "$item"
     if iptables -t "$table" -C "$parent" -j "$chain" 2>/dev/null; then echo 1; else echo 0; fi
   done
@@ -544,8 +686,10 @@ restore_owned() {
   [[ "$input" == *':ICTL-PRE '* ]] || input="${input/\*nat/*nat$'\n':ICTL-PRE - [0:0]}"
   [[ "$input" == *':ICTL-POST '* ]] || input="${input/\*nat/*nat$'\n':ICTL-POST - [0:0]}"
   [[ "$input" == *':ICTL-FWD '* ]] || input="${input/\*filter/*filter$'\n':ICTL-FWD - [0:0]}"
+  [[ "$input" == *'*mangle'* ]] || input+=$'\n*mangle\n:ICTL-ROUTE - [0:0]\nCOMMIT\n'
+  [[ "$input" == *':ICTL-ROUTE '* ]] || input="${input/\*mangle/*mangle$'\n':ICTL-ROUTE - [0:0]}"
   printf '%s\n' "$input" | iptables-restore -w --noflush || return 1
-  for item in 'nat PREROUTING ICTL-PRE' 'nat POSTROUTING ICTL-POST' 'filter FORWARD ICTL-FWD'; do
+  for item in 'nat PREROUTING ICTL-PRE' 'nat POSTROUTING ICTL-POST' 'filter FORWARD ICTL-FWD' 'mangle PREROUTING ICTL-ROUTE'; do
     read -r table parent chain <<< "$item"
     i=$((i+1)); flag="$(sed -n "${i}p" <<< "$flags")"
     if [ "$flag" = 0 ]; then
@@ -562,6 +706,16 @@ restore_owned() {
   done
 }
 
+restore_cached_owned() {
+  local snapshot="$1"
+  if [[ "$snapshot" != *'*mangle'* ]]; then
+    snapshot+=$'\n*mangle\n:ICTL-ROUTE - [0:0]\nCOMMIT\n'
+  elif [[ "$snapshot" != *':ICTL-ROUTE '* ]]; then
+    snapshot="${snapshot/\*mangle/*mangle$'\n':ICTL-ROUTE - [0:0]}"
+  fi
+  prepare_routes && restore_owned "$snapshot" $'1\n1\n1\n1' && jumps_ok && prune_routes "$(current_route_profiles)"
+}
+
 rules_match() {
   local input="$1" actual="$2" line table="" expected=0 count=0
   local -a args
@@ -569,6 +723,7 @@ rules_match() {
     case "$line" in
       '*nat') table=nat ;;
       '*filter') table=filter ;;
+      '*mangle') table=mangle ;;
       '-A ICTL-'*)
         read -r -a args <<< "$line"
         args[0]=-C
@@ -581,12 +736,14 @@ rules_match() {
 }
 
 clear_changed_connections() {
-  local previous="$1" current="$2" line proto port ip target out
+  local previous="$1" current="$2" line proto port ip target out old_post new_post
   while IFS= read -r line; do
     [[ "$line" = '-A ICTL-PRE '* ]] || continue
-    grep -Fxq -- "$line" <<< "$current" && continue
     if [[ "$line" =~ -p[[:space:]](tcp|udp).*--dport[[:space:]]([0-9]+).*--to-destination[[:space:]]([0-9.]+):([0-9]+) ]]; then
       proto="${BASH_REMATCH[1]}" port="${BASH_REMATCH[2]}" ip="${BASH_REMATCH[3]}" target="${BASH_REMATCH[4]}"
+      old_post="$(grep -E "^-A ICTL-POST -p $proto .*--ctorigdstport $port( |$)" <<< "$previous")"
+      new_post="$(grep -E "^-A ICTL-POST -p $proto .*--ctorigdstport $port( |$)" <<< "$current")"
+      if grep -Fxq -- "$line" <<< "$current" && [ "$old_post" = "$new_post" ]; then continue; fi
       command -v conntrack >/dev/null || { ERRS+=('切换规则需要 conntrack，请安装 conntrack 后重试'); return 1; }
       if ! out="$(conntrack -D -f ipv4 -p "$proto" --orig-port-dst "$port" --reply-src "$ip" --reply-port-src "$target" --dst-nat 2>&1)"; then
         [[ "$out" = *'0 flow entries'* ]] || { ERRS+=("清理旧连接失败：$out"); return 1; }
@@ -604,11 +761,13 @@ apply_rules() {
   [ "${#ERRS[@]}" -eq 0 ] || return 1
   check_port_conflicts "$(cat "$CONFIG" 2>/dev/null)" || return 1
   ensure_ip_forward
+  if ! out="$(prepare_routes 2>&1)"; then ERRS+=("$out"); return 1; fi
   [ "${#ERRS[@]}" -eq 0 ] || return 1
   previous="$(owned_snapshot)" || { ERRS+=("read iptables failed"); return 1; }
   flags="$(jump_flags)"
   if [ -f "$APPLIED" ] && printf '%s' "$RENDERED" | cmp -s - "$APPLIED" &&
       [ -f "$KERNEL" ] && [ "$(cat "$KERNEL")" = "$previous" ] && jumps_ok; then
+    prune_routes "$(current_route_profiles)" || { ERRS+=("清理旧路由失败"); return 1; }
     return 0
   fi
   if ! out="$(printf '%s' "$RENDERED" | iptables-restore -w --noflush 2>&1)" || ! out="$(ensure_jumps 2>&1)"; then
@@ -631,6 +790,7 @@ apply_rules() {
     restore_owned "$previous" "$flags" || ERRS+=("rollback failed")
     return 1
   fi
+  prune_routes "$(current_route_profiles)" || { ERRS+=("清理旧路由失败"); return 1; }
 }
 
 remove_chain() {
@@ -666,7 +826,9 @@ remove_rules() {
   remove_chain nat PREROUTING ICTL-PRE || return 1
   remove_chain nat POSTROUTING ICTL-POST || return 1
   remove_chain filter FORWARD ICTL-FWD || return 1
+  remove_chain mangle PREROUTING ICTL-ROUTE || return 1
   clear_changed_connections "$(cat "$saved")" '' || { printf '%s\n' "${ERRS[@]}" >&2; return 1; }
+  prune_routes || return 1
   rm -f "$saved"
 }
 
@@ -825,7 +987,6 @@ apply_snapshot() {
     fi
   fi
   if [ "$R_STATE" != ok ]; then
-    restore_owned "$snapshot" "$flags" || R_ERR+="; rollback failed"
     for name in config applied kernel resolved state mode; do
       if [ -f "$dir/$name" ]; then
         cp "$dir/$name" "$LIB/$name.tmp" && mv "$LIB/$name.tmp" "$LIB/$name" || R_ERR+="; restore $name failed"
@@ -833,6 +994,7 @@ apply_snapshot() {
         rm -f "$LIB/$name" || R_ERR+="; restore $name failed"
       fi
     done
+    prepare_routes && restore_owned "$snapshot" "$flags" && prune_routes "$(current_route_profiles)" || R_ERR+="; rollback failed"
     MODE="$old_mode" R_GEN="$old_gen" R_V="$old_v"
   fi
   rm -rf "$dir"
@@ -973,6 +1135,7 @@ local_apply_saved() {
     fi
     ensure_ip_forward
     [ "${#ERRS[@]}" -eq 0 ] || return 1
+    prepare_routes || { R_STATE=error R_ERR="恢复路由失败"; save_state; return 1; }
     if [ -f "$APPLIED" ]; then
       previous="$(owned_snapshot)" && flags="$(jump_flags)" || return 1
       if ! iptables-restore -w --noflush < "$APPLIED" || ! ensure_jumps ||
@@ -1371,7 +1534,7 @@ main() {
     --snapshot-owned) need_root && owned_snapshot; return $? ;;
     --restore-owned)
       need_root || return 1
-      with_lock restore_owned "$(cat "$2")" $'1\n1\n1' && jumps_ok; return $? ;;
+      with_lock restore_cached_owned "$(cat "$2")"; return $? ;;
   esac
   if [ "${1:-}" = --daemon ]; then
     need_root || return 1

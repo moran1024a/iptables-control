@@ -38,7 +38,7 @@ def finish_mutation(conn, before):
     notified = False
     for nid, (n, rows, retired) in mutation_snapshot(conn).items():
         old, old_rows, old_retired = before.get(nid, ({}, [], set()))
-        key = lambda r: (r["id"], r["port"], r["host"], r["tport"])
+        key = lambda r: (r["id"], r["port"], r["host"], r["tport"], r.get("route", ""))
         changed = (
             [key(r) for r in rows] != [key(r) for r in old_rows]
             or retired != old_retired
@@ -62,6 +62,13 @@ def clear_pending(conn, node):
     conn.execute("DELETE FROM retired_ports WHERE node_id=?", (node["id"],))
     conn.execute("DELETE FROM chain_pending WHERE node_id=?", (node["id"],))
     lifecycle.finish_deleted_chains(conn)
+
+
+def retry_nodes(conn, node_ids):
+    """Request fresh receipts without changing forwarding rules or selected paths."""
+    for nid in sorted(set(node_ids)):
+        conn.execute("UPDATE nodes SET desired_generation=desired_generation+1 WHERE id=?", (nid,))
+        wake.queue(conn, database.get_node(conn, nid))
 
 
 def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observe_only=False):

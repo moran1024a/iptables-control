@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.4.7"
+VERSION="0.5.1-rc.1"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -219,7 +219,7 @@ sync_transaction() {
   bash -n "$WORK/manage.sh" && bash -n "$WORK/passive-helper.sh" || return 1
   if [ "$TARGET" = active ]; then
     [ "$("$WORK/target" --version)" = "$NEW_VERSION" ] || { die '主动组件版本不匹配'; return 1; }
-    for item in nft ss conntrack; do command -v "$item" >/dev/null || { die "缺少依赖：$item"; return 1; }; done
+    for item in ip nft ss conntrack; do command -v "$item" >/dev/null || { die "缺少依赖：$item"; return 1; }; done
     # Inspect the old failure journal before replacing it or its backup. Only
     # the new binary knows how to recover pre-1.0.8 empty, unmarked tables.
     if [ "$failed_active" = 1 ]; then "$WORK/target" --recover-empty-table || return 1; fi
@@ -227,7 +227,7 @@ sync_transaction() {
       printf '提示：当前 FORWARD 默认拒绝，请确认已单独放行本节点的转发范围；安装器不会修改该策略。\n' >&2
     fi
   else
-    for item in iptables iptables-save iptables-restore getent conntrack; do command -v "$item" >/dev/null || { die "缺少依赖：$item"; return 1; }; done
+    for item in ip iptables iptables-save iptables-restore getent conntrack; do command -v "$item" >/dev/null || { die "缺少依赖：$item"; return 1; }; done
   fi
   PHASE=prepared; journal || return 1
   SYNC_JOURNALED=1
@@ -241,7 +241,7 @@ sync_transaction() {
   exec 9>/run/ictl.lock
   flock -w 60 9 || { die '等待规则锁超时'; return 1; }
   local files=()
-  for item in /etc/ictl /usr/local/bin/ictl "$PKG" "$UNIT" /etc/systemd/system/ictl-wake.service "$LIB/config" "$LIB/applied" "$LIB/resolved" "$LIB/state" "$LIB/mode" "$LIB/agent-kind" "$LIB/installation-id" "$LIB/active"; do
+  for item in /etc/ictl /usr/local/bin/ictl "$PKG" "$UNIT" /etc/systemd/system/ictl-wake.service "$LIB/config" "$LIB/applied" "$LIB/resolved" "$LIB/state" "$LIB/mode" "$LIB/agent-kind" "$LIB/installation-id" "$LIB/active" "$LIB/routing"; do
     [ ! -e "$item" ] || files+=("${item#/}")
   done
   if [ "$FROM" = active ]; then

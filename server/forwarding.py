@@ -3,6 +3,7 @@ import json
 import database
 import errors
 import validation
+import node_addresses
 
 
 def reserve_removed(conn, node_id, port):
@@ -207,12 +208,15 @@ def node_rule_rows(conn, node):
         )
     if has_links:
         out.extend(rule_rows(conn, node["id"]))
+    for r in out:
+        route = node_addresses.rule_route(conn, r["id"])
+        if route: r["route"] = route
     return sorted(out, key=lambda r: r["id"])
 
 
 def node_rules(conn, node):
     """下发给节点的规则行：规则id 协议 入站端口 目标地址 目标端口。"""
-    return [f"{r['id']} both {r['port']} {r['host']} {r['tport']}" for r in node_rule_rows(conn, node)]
+    return [f"{r['id']} both {r['port']} {r['host']} {r['tport']}" + (" " + r["route"] if r.get("route") else "") for r in node_rule_rows(conn, node)]
 
 
 def rules_version(lines):

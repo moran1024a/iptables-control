@@ -13,6 +13,7 @@ from test_server import Fixture
 import http_harness
 import agent_v3
 import node_sync
+import node_addresses
 import test_pools as legacy_tests
 import agent_files
 import database
@@ -64,7 +65,10 @@ class TopologyTests(Fixture, unittest.TestCase):
         r=topology.preview(self.db,dict(graph=g,prefix=['entry'],required=['b']))
         self.assertEqual(r['options'],['b'])
         self.assertEqual(r['path'],['entry','b','target'])
-        self.assertEqual(g['edges'],[['entry','pool'],['pool','target'],['pool','c'],['c','target']])
+        self.assertEqual(g['edges'],[['entry','a'],['entry','b'],['a','target'],['b','target'],
+                                    ['a','c'],['b','c'],['c','target']])
+        self.assertNotIn('groups',g)
+        self.assertFalse(any('group' in v for v in g['vertices']))
         r=topology.preview(self.db,dict(graph=g,required=['b'],preferred=['entry','a','c','target']))
         self.assertEqual(r['path'],['entry','b','c','target'])
         with self.assertRaises(errors.UserError):self.save(['entry','c','target'])
@@ -88,8 +92,16 @@ class TopologyTests(Fixture, unittest.TestCase):
         self.assertTrue(complete['complete'])
         decision=topology.preview(self.db,dict(graph=self.graph,required=['b'],advance=True))
         self.assertEqual(decision['prefix'],['entry','b'])
-        self.assertEqual(set(decision['options']),{'target','c'})
+        self.assertEqual(decision['options'],['c'])
         self.assertFalse(decision['complete'])
+        final=topology.preview(self.db,dict(graph=self.graph,prefix=['entry','b','c']))
+        self.assertEqual(final['prefix'],['entry','b','c','target'])
+        self.assertTrue(final['complete'])
+        self.assertEqual(final['options'],[])
+        direct=topology.preview(self.db,dict(graph=self.graph,prefix=['entry','b'],finish=True,
+            preferred=['entry','b','c','target']))
+        self.assertEqual(direct['path'],['entry','b','target'])
+        self.assertTrue(direct['complete'])
 
     def test_same_rule_branch_switch_does_not_revert_when_retrying(self):
         self.graph['vertices'].append(dict(id='alias',kind='node',node_id=self.a,x=300,y=420))
@@ -106,7 +118,7 @@ class TopologyTests(Fixture, unittest.TestCase):
         self.assertEqual(generations,[r[0] for r in self.db.execute('SELECT desired_generation FROM nodes')])
 
     def test_invalid_pool_reference_returns_validation_error(self):
-        for reference in ([],{},7):
+        for reference in ([],{},7,'entry','missing'):
             graph=copy.deepcopy(self.graph);graph['vertices'][1]['group']=reference
             with self.subTest(reference=reference),self.assertRaises(errors.UserError):
                 topology.validate(self.db,graph)
@@ -147,7 +159,7 @@ class TopologyTests(Fixture, unittest.TestCase):
         g['edges'] += [['second','empty'],['empty','second']]
         with self.assertRaises(errors.UserError):topology.validate(self.db,g,complete=False)
 
-    def test_layout_centres_single_nodes_on_pool_and_keeps_parallel_lanes(self):
+    def test_layout_aligns_connected_nodes_and_keeps_parallel_lanes(self):
         g=copy.deepcopy(self.graph)
         g['vertices'] += [dict(id='d',kind='node',node_id=self.b,x=300,y=500),
                           dict(id='e',kind='node',node_id=self.c,x=600,y=500)]
@@ -155,33 +167,37 @@ class TopologyTests(Fixture, unittest.TestCase):
         original=copy.deepcopy(g)
         layout=topology.arrange(topology.validate(self.db,g))
         self.assertEqual(g,original)
-        vertices={v['id']:v for v in layout['vertices']};pool=layout['groups'][0]
-        centre=pool['y']+pool['height']/2
-        for ident in ('entry','c','target'):
-            self.assertEqual(vertices[ident]['y']+30,centre,ident)
+        vertices={v['id']:v for v in layout['vertices']}
+        self.assertNotIn('groups',layout)
+        self.assertEqual(vertices['entry']['y'],vertices['b']['y'])
+        self.assertEqual(vertices['c']['y'],(vertices['a']['y']+vertices['b']['y'])/2)
         self.assertEqual(vertices['d']['y'],vertices['e']['y'])
-        self.assertEqual(vertices['d']['x']+90,pool['x']+pool['width']/2)
-        self.assertGreaterEqual(vertices['d']['y'],pool['y']+pool['height']+48)
+        self.assertEqual(vertices['d']['x'],vertices['a']['x'])
+        self.assertGreaterEqual(vertices['d']['y'],vertices['b']['y']+86+48)
+        self.assertAlmostEqual(vertices['target']['y'],(vertices['c']['y']+vertices['e']['y'])/2,delta=.5)
         self.assertEqual(topology.arrange(layout),layout)
         for path in (['entry','a','c','target'],['entry','d','e','target']):
             self.assertEqual(topology.check_path(layout,path),path)
+        # Parallel targets stay centred around the nodes feeding them.
+        g['vertices'].append(dict(id='target2',kind='target',target_id=self.target_id,x=900,y=300))
+        g['edges'] += [['c','target2'],['e','target2']]
+        vertices={v['id']:v for v in topology.arrange(g)['vertices']}
+        self.assertAlmostEqual((vertices['target']['y']+vertices['target2']['y'])/2,
+                               (vertices['c']['y']+vertices['e']['y'])/2,delta=.5)
 
-    def test_free_layout_and_independent_pool_geometry_survive_draft(self):
+    def test_free_node_layout_survives_draft_without_pool_geometry(self):
         self.graph['groups'][0].update(x=-850,y=-420,width=520,height=380)
         self.graph['vertices'][1].update(x=-820,y=-370)
         self.graph['vertices'][2].update(x=-810,y=-280)
         lid=self.save()
         draft=self.get(lid)['draft']['graph']
-        self.assertEqual(draft['groups'],self.graph['groups'])
+        self.assertNotIn('groups',draft)
         self.assertEqual(draft['vertices'][1]['x'],-820)
+        self.assertEqual(draft['vertices'][2]['y'],-280)
         self.save(['entry','a','target'],lid,graph=draft);self.finish(lid)
-        graph=self.get(lid)['active_graph'];container=graph['groups'][0]
-        for v in graph['vertices']:
-            if v.get('group')==container['id']:
-                self.assertGreaterEqual(v['x'],container['x'])
-                self.assertGreaterEqual(v['y'],container['y']+32)
-                self.assertLessEqual(v['x']+180,container['x']+container['width'])
-                self.assertLessEqual(v['y']+60,container['y']+container['height'])
+        graph=self.get(lid)['active_graph']
+        self.assertFalse(any('group' in v for v in graph['vertices']))
+        self.assertEqual({tuple(e) for e in graph['edges']},{tuple(e) for e in draft['edges']})
 
     def test_manual_switch_keeps_draft_and_confirms_only_after_receipts(self):
         lid=self.save(['entry','a','target']);self.finish(lid)
@@ -218,6 +234,9 @@ class TopologyTests(Fixture, unittest.TestCase):
 
     def test_lock_prevents_alternative_and_recovery_clears_alarm(self):
         self.graph['groups'][0]['locked']='a'
+        graph=topology.flatten(self.graph)
+        self.assertTrue(next(v for v in graph['vertices'] if v['id']=='b')['disabled'])
+        self.assertNotIn('disabled',self.graph['vertices'][2])
         lid=self.save(['entry','a','target']);self.finish(lid)
         with self.db:self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?',(int(time.time())-61,self.a))
         self.tick();self.assertIsNone(self.get(lid)['job']);self.assertIn('灾备等待',self.get(lid)['error'])
@@ -250,7 +269,8 @@ class TopologyTests(Fixture, unittest.TestCase):
     def test_inactive_candidates_and_drafts_protect_resources(self):
         lid=self.save(['entry','a','target']);self.finish(lid)
         with self.assertRaises(errors.UserError):self.call('api_node_del',{},self.b)
-        with self.assertRaises(errors.UserError):self.call('api_node_edit',dict(desired_mode='passive'),self.b)
+        self.call('api_node_edit',dict(desired_mode='passive'),self.b)
+        self.assertEqual(database.get_node(self.db,self.b)['desired_mode'],'passive')
         tid=self.target(host='other.example')
         self.graph['vertices'][-1]['target_id']=tid;self.save(ident=lid)
         with self.assertRaises(errors.UserError):self.call('api_target_del',{},tid)
@@ -301,197 +321,331 @@ class TopologyTests(Fixture, unittest.TestCase):
     @unittest.skipUnless(shutil.which('google-chrome') or shutil.which('chromium'), 'Chrome unavailable')
     def test_canvas_with_real_http_api(self):
         lid=self.save(['entry','a','target']);self.finish(lid)
+        with self.db:
+            for nid in (self.entry,self.a,self.b,self.c):
+                node_addresses.save(self.db,database.get_node(self.db,nid),[
+                    dict(id='public',name='公网',host=f'192.0.2.{nid}',device='eth0'),
+                    dict(id='private',name='内网',host=f'10.8.0.{nid}',device='eth1')])
         token='topology-browser-test'
         with self.db:
             database.set_setting(self.db,'must_change','0')
             self.db.execute('INSERT INTO sessions VALUES (?,?)',(hashlib.sha256(token.encode()).hexdigest(),int(time.time())+86400*7))
         exercise=r'''
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
-const wait=async fn=>{for(let i=0;i<200;i++){if(fn())return;await pause(30);}throw Error('Timeout: '+fn);};
+const wait=async fn=>{for(let i=0;i<250;i++){if(fn())return;await pause(25);}throw Error('Timeout: '+fn);};
 const assert=(x,m)=>{if(!x)throw Error(m);};
+const click=selector=>{const el=document.querySelector(selector);assert(el,'missing '+selector);el.focus();el.click();};
 window.addEventListener('error',e=>fetch('/panel/test-result',{method:'POST',body:'FAIL '+e.message}));
+window.addEventListener('unhandledrejection',e=>fetch('/panel/test-result',{method:'POST',body:'FAIL '+e.reason}));
 (async()=>{try {
-  await wait(()=>document.querySelector('[data-graph-node="b"]'));
-  assert(!document.querySelector('[data-nav=pools]'),'obsolete pool navigation');
-  assert(!document.querySelector('.graph-port'),'runtime exposes editing');
-  const wireClear=(source,target,barriers)=>{
-    const boxes=new Map([source,target,...barriers].map(b=>[b.id,b]));
-    const path=document.createElementNS('http://www.w3.org/2000/svg','path');
-    path.setAttribute('d',graphCurve(source,target,boxes));
-    const length=path.getTotalLength();assert(Number.isFinite(length)&&length>0,'invalid wire geometry');
-    for(let t=0;t<=length;t+=2){const point=path.getPointAtLength(t);for(const b of barriers){
-      assert(!(point.x>b.x-4&&point.x<b.x+b.width+4&&point.y>b.y-4&&point.y<b.y+b.height+4),'wire crosses component '+b.id+': '+path.getAttribute('d'));
-    }}
-    return path.getAttribute('d');
-  };
-  const wireA={id:'wire-a',x:0,y:100,width:180,height:60},wireB={id:'wire-b',x:700,y:100,width:180,height:60};
-  assert(!wireClear(wireA,wireB,[]).includes('C'),'aligned endpoints should have a straight wire');
-  wireClear(wireA,wireB,[{id:'block',x:320,y:75,width:220,height:120}]);
-  wireClear(wireA,wireB,[{id:'block',x:320,y:75,width:220,height:120},{id:'upper',x:280,y:-20,width:260,height:70}]);
-  wireClear(wireB,wireA,[{id:'block',x:320,y:75,width:220,height:120}]);
-  const hoverNode=document.querySelector('[data-graph-node="b"]');hoverNode.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));
-  assert(document.querySelector('.graph-focus')&&document.querySelector('[data-graph-from="b"].graph-nearby'),'hover does not highlight connected wires');
-  hoverNode.dispatchEvent(new MouseEvent('mouseout',{bubbles:true}));assert(!document.querySelector('.graph-focus'),'wire focus was not cleared');
-  document.querySelector('[data-graph-node="b"] button').click();
-  await wait(()=>document.querySelector('[data-confirm="1"]'));
-  assert(graphSession.prefix.join(',')==='entry,b,target','pool switch failed to preserve downstream path');
-  assert(!(await api('GET','links/1')).link.job,'selection applied before confirmation');
-  document.querySelector('[data-confirm="0"]').click();await wait(()=>!graphSession&&!graphBusy);
-  document.querySelector('[data-action=link-edit]').click();
-  assert(graphSession.kind==='edit'&&document.querySelector('.graph-port'),'editor missing');
-  assert(!document.querySelector('[data-graph-node="a"] .graph-port'),'member still exposes individual ports');
-  assert(document.querySelector('[data-graph-group="pool"] .graph-port'),'pool ports missing');
-  assert(document.querySelectorAll('[data-graph-line]').length===4,'pool edges were not collapsed');
-  ACTIONS['canvas-fullscreen']();fullRender=true;drawGraph();
-  assert(getComputedStyle(document.querySelector('.topology-panel')).transform==='none','page entrance animation moves the interactive canvas');
-  assert(topologyBinding.view.fullscreen&&document.body.classList.contains('canvas-fullscreen'),'fullscreen state lost on redraw');
-  assert(document.querySelector('.graph-fullscreen-actions [data-action="graph-publish"]').getClientRects().length,'fullscreen cannot apply edits');
-  ACTIONS['canvas-fullscreen']();
-  const originalName=graphSession.name,nameInput=document.querySelector('[data-graph-field="name"]');
-  nameInput.value='renamed';nameInput.dispatchEvent(new Event('input',{bubbles:true}));nameInput.dispatchEvent(new Event('change',{bubbles:true}));
-  ACTIONS['graph-undo']();assert(graphSession.name===originalName&&document.querySelector('[data-graph-field="name"]').value===originalName,'undo left stale field value');
-  graphSession.selected='c';ACTIONS['graph-remove']();assert(!graphSession.graph.vertices.some(v=>v.id==='c'),'delete failed');
-  ACTIONS['graph-undo']();assert(graphSession.graph.vertices.some(v=>v.id==='c'),'undo lost deleted node');
-  ACTIONS['graph-redo']();assert(!graphSession.graph.vertices.some(v=>v.id==='c'),'redo failed');
-  ACTIONS['graph-undo']();
-  const originalEdges=JSON.stringify(graphSession.graph.edges);
-  graphSession.graph.groups.push({id:'other',name:'other',locked:null,x:900,y:500,width:260,height:180});graphTouch();
-  graphMembership(graphSession.graph.vertices.find(v=>v.id==='a'),'other');graphTouch();
-  assert(JSON.stringify(graphSession.graph.edges)===originalEdges,'cross-pool move imported another pool wiring');
-  ACTIONS['graph-undo']();assert(graphSession.graph.vertices.find(v=>v.id==='a').group==='pool','undo did not restore membership');
-  ACTIONS['graph-undo']();assert(!graphSession.graph.groups.some(p=>p.id==='other'),'undo did not remove temporary pool');
-  ACTIONS['graph-group']({dataset:{id:'pool'}});
-  const poolBefore=structuredClone(graphSession.graph.groups[0]),membersBefore=JSON.stringify(graphSession.graph.vertices.filter(v=>v.group==='pool'));
-  const grip=document.querySelector('[data-graph-group="pool"] .graph-resize'),gripRect=grip.getBoundingClientRect(),gripScale=topologyBinding.view.scale;
-  grip.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:9,clientX:gripRect.x+12,clientY:gripRect.y+12}));
-  document.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,pointerId:9,clientX:gripRect.x+12+60*gripScale,clientY:gripRect.y+12+40*gripScale}));
-  document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerId:9}));await pause(20);
-  assert(graphSession.graph.groups[0].width===poolBefore.width+60,'pool resize did not adjust width');
-  assert(JSON.stringify(graphSession.graph.vertices.filter(v=>v.group==='pool'))===membersBefore,'pool resize moved members');
-  ACTIONS['graph-undo']();assert(graphSession.graph.groups[0].width===poolBefore.width,'pool resize undo failed');
-  ACTIONS['graph-select']({dataset:{id:'c'}});
-  const previousResource=graphSession.graph.vertices.find(v=>v.id==='c').node_id,referenceEdges=JSON.stringify(graphSession.graph.edges);
-  const resource=document.querySelector('[data-graph-resource]');resource.value=poolView.nodes[0].id;resource.dispatchEvent(new Event('change',{bubbles:true}));
-  assert(graphSession.graph.vertices.find(v=>v.id==='c').node_id===poolView.nodes[0].id,'resource replacement failed');
-  assert(JSON.stringify(graphSession.graph.edges)===referenceEdges,'resource replacement dropped wires');
-  ACTIONS['graph-undo']();assert(graphSession.graph.vertices.find(v=>v.id==='c').node_id===previousResource,'resource undo failed');
-  const savedGraph=structuredClone(graphSession.graph);
-  const startDrag=(selector,dx,dy,corner=false)=>{
-    const el=document.querySelector(selector),r=el.getBoundingClientRect(),scale=topologyBinding.view.scale;
-    const x=corner?r.right-8:r.x+30,y=corner?r.bottom-8:r.y+20;
-    const hit=document.elementFromPoint(x,y);
-    if(corner)assert(hit?.closest('[data-graph-drag="group"]')===el,'pool background cannot be selected');
-    el.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:7,clientX:x,clientY:y}));
-    document.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,pointerId:7,clientX:x+dx*scale,clientY:y+dy*scale}));
-  };
-  const endDrag=async(cancel=false)=>{
-    document.dispatchEvent(new PointerEvent(cancel?'pointercancel':'pointerup',{bubbles:true,pointerId:7}));await pause(20);
-  };
-  ACTIONS['graph-add-open']({dataset:{kind:'pool'}});document.querySelector('#graph-pool-name').value='拖拽池';ACTIONS['graph-add-group']();
-  const container=graphSession.graph.groups.at(-1),poolId=container.id;
-  assert(graphSession.selected===poolId,'new pool is not selectable');
-  ACTIONS['graph-add-open']({dataset:{kind:'node'}});
-  assert(document.querySelector('#graph-add-resource').options.length===poolView.nodes.length+1,'resource list changed with selected pool');
-  document.querySelector('#graph-add-resource').value=poolView.nodes[0].id;ACTIONS['graph-add-node']();
-  const added=graphSession.graph.vertices.at(-1),nodeSelector=`[data-graph-node="${added.id}"] .graph-node-body`;
-  assert(!added.group,'adding a node implicitly joined selected pool');
-  startDrag(nodeSelector,container.x+30-added.x,container.y+50-added.y);
-  assert(document.querySelector(`[data-graph-group="${poolId}"]`).classList.contains('graph-drop-target'),'drop target not highlighted');
-  await endDrag();assert(added.group===poolId,'dragging into pool failed');
-  const box=JSON.stringify(graphBounds(graphSession.graph,container));
-  startDrag(nodeSelector,-500-added.x,-300-added.y);
-  assert(JSON.stringify(graphBounds(graphSession.graph,container))===box,'pool followed member during drag out');
-  await endDrag();assert(!added.group&&added.x===-500&&added.y===-300,'drag out still clamps coordinates or retains membership');
-  assert(JSON.stringify(graphBounds(graphSession.graph,container))===box,'empty pool lost independent geometry');
-  startDrag(nodeSelector,container.x+30-added.x,container.y+50-added.y);await endDrag();
-  topologyBinding.fit();
-  const beforeMove={x:container.x,y:container.y,nx:added.x,ny:added.y};
-  startDrag(`[data-graph-group="${poolId}"] .graph-pool-body`,-container.x-100,-container.y-80,true);
-  const dx=container.x-beforeMove.x,dy=container.y-beforeMove.y;
-  assert(added.x===beforeMove.nx+dx&&added.y===beforeMove.ny+dy,'members did not follow pool');
-  const beforeRelease=document.querySelector(nodeSelector).getBoundingClientRect();
-  const viewportBefore=topologyBinding.viewport.getBoundingClientRect(),scrollBefore=window.scrollY;
-  await endDrag();
-  const afterRelease=document.querySelector(nodeSelector).getBoundingClientRect();
-  assert(Math.abs(beforeRelease.x-afterRelease.x)<2&&Math.abs(beforeRelease.y-afterRelease.y)<2,'negative origin made canvas jump: '+JSON.stringify({before:beforeRelease,after:afterRelease,viewportBefore,viewportAfter:topologyBinding.viewport.getBoundingClientRect(),scrollBefore,scrollAfter:window.scrollY}));
-  assert(added.group===poolId&&container.x===-100&&container.y===-80,'pool move clamped or changed membership');
-  const cancelled={x:added.x,y:added.y};startDrag(nodeSelector,700,400);await endDrag(true);
-  assert(added.x===cancelled.x&&added.y===cancelled.y&&added.group===poolId,'cancelled drag committed a change');
-  graphSession.graph=savedGraph;graphSession.selected=null;graphSession.dirty=false;drawGraph();topologyBinding.fit();
-  const card=document.querySelector('[data-graph-node="a"] .graph-node-body');
-  const r=card.getBoundingClientRect(),before=graphSession.graph.vertices.find(v=>v.id==='a').x;
-  card.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:1,clientX:r.x+30,clientY:r.y+20}));
-  document.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,pointerId:1,clientX:r.x+55,clientY:r.y+30}));
-  document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerId:1}));await pause(20);
-  assert(graphSession.graph.vertices.find(v=>v.id==='a').x>before,'drag did not move node');
-  graphSession.edge=graphSession.graph.edges.findIndex(e=>e.join(',')==='pool,c');ACTIONS['graph-remove-edge']();
-  await ACTIONS['graph-check']();assert(graphSession.error,'disconnected topology passed validation');
-  const output=document.querySelector('[data-graph-group="pool"] .graph-port.out'),start=output.getBoundingClientRect();
-  output.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:8,clientX:start.x+16,clientY:start.y+16}));
-  const input=document.querySelector('[data-graph-node="c"] .graph-port.in').getBoundingClientRect();
-  document.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,pointerId:8,clientX:input.x+16,clientY:input.y+16}));
-  assert(document.querySelector('.graph-wire')?.getAttribute('d'),'wire preview missing');
-  document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerId:8,clientX:input.x+16,clientY:input.y+16}));await pause(20);
-  assert(graphSession.graph.edges.some(e=>e.join(',')==='pool,c'),'drag-to-connect failed');
-  ACTIONS['graph-undo']();assert(!graphSession.graph.edges.some(e=>e.join(',')==='pool,c'),'wire undo failed');
-  ACTIONS['graph-redo']();
-  ACTIONS['graph-port']({dataset:{id:'c',side:'out'}});ACTIONS['graph-port']({dataset:{id:'pool',side:'in'}});
-  assert(graphSession.error.includes('循环')&&!graphSession.graph.edges.some(e=>e.join(',')==='c,pool'),'cycle not rejected immediately');
-  graphSession.connect=null;drawGraph();
-  await ACTIONS['graph-check']();assert(!graphSession.error&&graphSession.notice,'valid topology rejected');
-  const members=graphSession.graph.vertices.filter(v=>v.group==='pool');
-  assert(members[0].x===members[1].x,'validated pool was not aligned');
-  assert(graphSession.graph.vertices.find(v=>v.id==='c').x>members[0].x,'layout is not left to right');
-  await ACTIONS['graph-save-draft']();await wait(()=>!graphSession&&document.querySelector('[data-action=link-edit]'));
-  let server=(await api('GET','links/1')).link;
-  assert(server.active_path.join(',')==='entry,a,target'&&server.draft,'draft changed running path');
-  document.querySelector('[data-action=link-edit]').click();
-  graphSession.graph.groups[0].locked='b';graphSession.dirty=true;
-  const publish=ACTIONS['graph-publish']();await wait(()=>document.querySelector('[data-confirm="1"]'));
-  assert(graphSession.prefix.join(',')==='entry,b,target','publish did not select valid complete path');
-  assert(graphChanged(),'unconfirmed editor was not protected from navigation');
-  document.querySelector('[data-confirm="1"]').click();await publish;await wait(()=>!graphSession);
-  server=(await api('GET','links/1')).link;assert(server.job&&server.active_path.join(',')==='entry,a,target','pending switch shown as already active');
-  await fetch('/panel/test-ack',{method:'POST'});await refresh();
-  server=(await api('GET','links/1')).link;assert(server.active_path.join(',')==='entry,b,target','confirmed path mismatch');
-  assert(document.querySelectorAll('.graph-live').length===2,'active cables mismatch');
-  await ACTIONS['graph-select']({dataset:{id:'b'}});
-  assert(graphSession.options.includes('c')&&!graphSession.complete,'current node did not offer alternate downstream route');
-  const select=ACTIONS['graph-select']({dataset:{id:'c'}});await wait(()=>document.querySelector('[data-confirm="1"]'));
-  assert(graphSession.prefix.join(',')==='entry,b,c,target','canvas selection ignored chosen continuation');
-  document.querySelector('[data-confirm="1"]').click();await select;
-  await fetch('/panel/test-ack',{method:'POST'});await refresh();
-  server=(await api('GET','links/1')).link;assert(server.active_path.join(',')==='entry,b,c,target','direct selection did not apply');
-  ACTIONS['link-edit']();graphSession.name='local unsaved';graphTouch();graphSession.revision=0;
-  await ACTIONS['graph-save-draft']();assert(graphSession.conflict,'stale revision was not recognized');
-  ACTIONS['canvas-fullscreen']();assert(document.querySelector('.topology-panel .graph-error')?.getClientRects().length,'fullscreen hid save error');
-  const cancelledReload=ACTIONS['graph-reload']();await wait(()=>document.querySelector('[data-confirm="0"]'));
-  document.querySelector('[data-confirm="0"]').click();await cancelledReload;
-  assert(graphSession.name==='local unsaved','cancelled reload lost local edits');
-  const reload=ACTIONS['graph-reload']();await wait(()=>document.querySelector('[data-confirm="1"]'));
-  document.querySelector('[data-confirm="1"]').click();await reload;
-  assert(!graphSession.dirty&&graphSession.revision>0,'reload did not restore current server state');
-  graphSession.name='keep after failed apply';graphSession.revision=0;graphSession.graph.vertices[0].x=-620;graphTouch();drawGraph();
-  const staleApply=ACTIONS['graph-publish']();await wait(()=>document.querySelector('[data-confirm="1"]'));
-  document.querySelector('[data-confirm="1"]').click();await staleApply;
-  assert(graphSession.kind==='edit'&&graphSession.conflict,'failed apply did not return to editor');
-  assert(graphSession.name==='keep after failed apply'&&graphSession.graph.vertices[0].x===-620,'failed apply lost draft or layout');
-  const discardReload=ACTIONS['graph-reload']();await wait(()=>document.querySelector('[data-confirm="1"]'));
-  document.querySelector('[data-confirm="1"]').click();await discardReload;
-  ACTIONS['canvas-fullscreen']();await ACTIONS['graph-exit']();
-  ACTIONS['link-new']();await wait(()=>graphSession?.kind==='edit'&&!graphSession.id);
-  graphSession.name='new';graphSession.graph=structuredClone(server.active_graph);graphSession.graph.vertices[0].x=-777;graphTouch();drawGraph();
-  const portInput=document.querySelector('[data-graph-field="port"]');portInput.value='0';portInput.dispatchEvent(new Event('input',{bubbles:true}));
-  await ACTIONS['graph-publish']();assert(graphSession.kind==='edit'&&graphSession.errorField==='port','invalid port reached confirmation');
-  assert(!document.querySelector('[data-confirm="1"]'),'invalid port opened confirm dialog');
-  document.querySelector('[data-graph-field="port"]').value='';document.querySelector('[data-graph-field="port"]').dispatchEvent(new Event('input',{bubbles:true}));
-  graphSession.name=' ';await ACTIONS['graph-save-draft']();assert(graphSession.errorField==='name','empty name was accepted');
-  graphSession.name='new';graphTouch();drawGraph();
-  const create=ACTIONS['graph-publish']();await wait(()=>document.querySelector('[data-confirm="1"]'));
-  document.querySelector('[data-confirm="0"]').click();await create;
-  assert(graphSession.kind==='edit'&&!graphSession.id,'cancel did not preserve new editor');
-  assert(graphSession.graph.vertices[0].x===-777,'cancelled apply changed free-form layout');
-  await fetch('/panel/test-result',{method:'POST',body:'PASS'});
+ await wait(()=>document.querySelector('[data-graph-node="b"]'));
+ assert(!document.querySelector('[data-nav=pools]'),'obsolete pool navigation');
+ assert(!document.querySelector('.graph-port'),'runtime exposes editing pins');
+ assert(document.querySelectorAll('[data-graph-line]').length===7,'legacy connections were not expanded to node edges');
+ assert(!document.querySelector('.graph-pool'),'runtime still contains a pool');
+ const wireClear=(source,target,barriers)=>{
+  const boxes=new Map([source,target,...barriers].map(b=>[b.id,b]));
+  const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d',graphCurve(source,target,boxes));
+  const length=path.getTotalLength();assert(Number.isFinite(length)&&length>0,'invalid wire geometry');
+  for(let t=0;t<=length;t+=2){const p=path.getPointAtLength(t);for(const b of barriers)assert(!(p.x>b.x-3&&p.x<b.x+b.width+3&&p.y>b.y-3&&p.y<b.y+b.height+3),'wire crosses '+b.id);}
+  assert(!path.getAttribute('d').includes('C'),'long bezier remained');
+ };
+ const a={id:'a',x:0,y:100,width:220,height:86},b={id:'b',x:780,y:100,width:220,height:86};
+ const barriers=[{id:'obstacle',x:350,y:70,width:220,height:130},{id:'upper',x:300,y:-60,width:300,height:70}];
+ wireClear(a,b,[]);wireClear(a,b,barriers);wireClear(b,a,barriers);
+ click('[data-graph-node="b"] .graph-node-body');
+ await wait(()=>!graphBusy&&!graphSession);
+ assert(document.querySelector('#modal').hidden,'switch unnecessarily opens a modal');
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ assert(poolView.link.active_path.join(',')==='entry,b,target','one-click switch did not preserve downstream');
+ click('[data-graph-node="b"] .graph-node-body');await wait(()=>!graphBusy&&graphSession?.kind==='choose');
+ click('[data-action=graph-autocomplete]');await wait(()=>!graphBusy&&!graphSession);
+ assert(poolView.link.active_path.join(',')==='entry,b,target','legacy autocomplete changed its selected path');
+ click('[data-action=link-edit]');
+ assert(graphSession.kind==='edit','editor missing');
+ assert(graphSession.graph.version===2,'existing topology did not enter the current editor format');
+ assert(graphSession.graph.ports['entry/target']===10001,'conversion lost the existing ingress port');
+ assert(document.querySelector('[data-graph-node="a"] .graph-port[data-address="private"]'),'existing topology hides extra IPs');
+ assert(!document.querySelector('[data-explicit-routing]'),'legacy routing toggle still visible');
+ assert(!document.querySelector('[data-action=graph-ports-edit]'),'combination port editor still visible');
+ assert(document.querySelector('[data-graph-node="a"] .graph-port'),'node IP controls missing');
+ assert(!document.querySelector('[data-graph-group]'),'editor still contains a pool');
+ const saved=structuredClone(graphSession.graph);
+ click('[data-action=graph-add-open]');
+ assert(document.querySelector('.graph-library')&&document.querySelector('#modal').hidden,'adding uses a modal');
+ assert([...document.querySelectorAll('[data-action=graph-library-kind]')].map(el=>el.dataset.kind).join(',')==='entry,node,target','unexpected component kinds');
+ const nodeID=poolView.nodes[0].id;graphAddResource('node',nodeID);
+ const added=graphSession.graph.vertices.at(-1);
+ const drag=(id,x,y)=>{
+  const el=document.querySelector(`[data-graph-node="${id}"] .graph-node-body`),r=el.getBoundingClientRect(),scale=topologyBinding.view.scale;
+  el.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:7,clientX:r.x+20,clientY:r.y+15}));
+  document.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,pointerId:7,clientX:r.x+20+x*scale,clientY:r.y+15+y*scale}));
+  document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerId:7}));
+ };
+ const start={x:added.x,y:added.y};
+ const otherBefore=JSON.stringify(graphSession.graph.vertices.filter(v=>v.id!==added.id));
+ drag(added.id,-500-added.x,-250-added.y);await pause(10);
+ assert(added.x===-500&&added.y===-250,'node drag constrained coordinates');
+ assert(JSON.stringify(graphSession.graph.vertices.filter(v=>v.id!==added.id))===otherBefore,'moving one node changed other nodes');
+ ACTIONS['graph-undo']();assert(graphSession.graph.vertices.at(-1).x===start.x&&graphSession.graph.vertices.at(-1).y===start.y,'undo node move failed');
+ graphSession.graph=saved;graphSession.library=false;graphSession.selected=null;graphSession.edge=null;drawGraph();topologyBinding.fit();
+ // Selecting a different node must display its own resource in the inspector.
+ click('[data-graph-node="a"] .graph-node-body');
+ assert(document.querySelector('[data-graph-resource]').value===String(saved.vertices.find(v=>v.id==='a').node_id),'wrong resource for a');
+ click('[data-graph-node="b"] .graph-node-body');
+ assert(document.querySelector('[data-graph-resource]').value===String(saved.vertices.find(v=>v.id==='b').node_id),'resource leaked between inspectors');
+ // Layout freezes both form fields and resource mutations until its response arrives.
+ graphSession.library=true;drawGraph();
+ const layoutAPI=api;let releaseLayout;
+ api=async(...args)=>{if(args[1]==='topology-preview')await new Promise(resolve=>releaseLayout=resolve);return layoutAPI(...args);};
+ const vertexCount=graphSession.graph.vertices.length;
+ const layingOut=ACTIONS['graph-check']();
+ assert(document.querySelector('[data-action=graph-library-add]').disabled&&document.querySelector('[data-graph-field=name]').disabled,'layout leaves editor fields active');
+ graphAddResource('node',nodeID);
+ assert(graphSession.graph.vertices.length===vertexCount,'layout allowed a mutation that could be lost');
+ releaseLayout();await layingOut;api=layoutAPI;
+ assert(graphSession.graph.vertices.length===vertexCount&&!document.querySelector('[data-graph-field=name]').disabled,'layout did not preserve and unlock the editor');
+ graphSession.library=false;graphSession.selected=null;drawGraph();
+ // Layout is available for unfinished drafts and does not mutate the running route.
+ graphSession.graph.vertices.push({id:'loose',kind:'node',node_id:nodeID,x:500,y:900,disabled:false});
+ await ACTIONS['graph-check']();assert(!graphSession.error,'cannot arrange an unfinished draft');
+ graphSession.selected='loose';ACTIONS['graph-remove']();
+ const runtime=(await api('GET','links/1')).link.active_path.join(',');
+ assert(runtime==='entry,b,target','editing changed live path');
+ ACTIONS['canvas-fullscreen']();drawGraph();assert(topologyBinding.view.fullscreen,'fullscreen lost');ACTIONS['canvas-fullscreen']();
+ // Build a new dual-ingress topology using visible IP pins and the add shelf.
+ for(const n of poolView.nodes)await api('PATCH',`nodes/${n.id}`,{addresses:[{id:'public',name:'公网',host:n.addr,device:'eth0'},{id:'private',name:'内网',host:`10.8.0.${n.id}`,device:'eth1'}]});
+ await fetch('/panel/test-ack',{method:'POST'});
+ graphSession=null;location.hash='#/routes/new';await wait(()=>graphSession?.kind==='edit'&&!graphSession.id);
+ graphSession.name='多入口共享网络';const nodes=poolView.nodes,tid=poolView.targets[0].id;
+ graphAddResource('entry',nodes[0].id);const e1=graphSession.graph.vertices.at(-1);
+ graphAddResource('entry',nodes[3].id);const e2=graphSession.graph.vertices.at(-1);
+ graphAddResource('node',nodes[1].id);const m1=graphSession.graph.vertices.at(-1);
+ graphAddResource('node',nodes[2].id);const m2=graphSession.graph.vertices.at(-1);
+ graphAddResource('target',tid);const t1=graphSession.graph.vertices.at(-1);
+ graphAddResource('target',tid);const t2=graphSession.graph.vertices.at(-1);
+ for(const e of [e1,e2])graphChooseAddress(e.id,'in','public');
+ for(const m of [m1,m2]){graphChooseAddress(m.id,'in','public');graphChooseAddress(m.id,'out','private');}
+ for(const e of [e1,e2])for(const m of [m1,m2]){graphConnect(e.id,'out','public');graphConnect(m.id,'in','public');}
+ for(const m of [m1,m2])for(const t of [t1,t2]){graphConnect(m.id,'out','private');graphConnect(t.id,'in');}
+ assert(graphSession.graph.bindings[`${m1.id}/${t1.id}`].from[m1.id]==='private','node output selection lost');
+ assert(graphSession.graph.bindings[`${e1.id}/${m2.id}`].to[m2.id]==='public','node input selection lost');
+ await ACTIONS['graph-check']();assert(!graphSession.error,'layout rejected IP topology');
+ // Cancelling a drag must not rewrite the source's existing outgoing bindings.
+ const beforeWire=JSON.stringify(graphSession.graph.bindings);
+ const port=document.querySelector(`[data-graph-node="${e1.id}"] .graph-port.out[data-address="private"]`),pr=port.getBoundingClientRect();
+ port.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:9,clientX:pr.x+5,clientY:pr.y+5}));
+ document.dispatchEvent(new PointerEvent('pointercancel',{bubbles:true,pointerId:9}));await pause(10);
+ assert(JSON.stringify(graphSession.graph.bindings)===beforeWire,'cancelled wire changed existing IP bindings');
+ // Selecting a wire scopes an IP change to that node connection.
+ const firstEdge=graphSession.graph.edges.findIndex(([a,b])=>a===m1.id&&b===t1.id);
+ graphSession.edge=firstEdge;drawGraph();
+ const pin=document.querySelector(`[data-graph-node="${m1.id}"] .graph-port.out[data-address="public"]`),rect=pin.getBoundingClientRect();
+ pin.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:10,clientX:rect.x+5,clientY:rect.y+5}));
+ document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerId:10}));await pause(10);
+ assert(graphSession.graph.bindings[`${m1.id}/${t1.id}`].from[m1.id]==='public','selected wire IP unchanged');
+ assert(graphSession.graph.bindings[`${m1.id}/${t2.id}`].from[m1.id]==='private','IP change leaked into another wire');
+ graphSession.edge=null;drawGraph();
+ // Choose a receive IP through the actual card button, without an address dialog.
+ click(`[data-graph-node="${e1.id}"] [data-action="graph-listen"][data-address="private"]`);
+ assert(graphSession.graph.vertices.find(v=>v.id===e1.id).address==='private','receive IP click ignored');
+ assert(document.querySelector('#modal').hidden,'IP picking opened a modal');
+ click(`[data-graph-node="${e1.id}"] .graph-node-body`);
+ const targetPicker=document.querySelector('[data-graph-port-target]');targetPicker.value=t2.id;targetPicker.dispatchEvent(new Event('change',{bubbles:true}));
+ const portInput=document.querySelector('[data-graph-entry-port]');portInput.value='10080';portInput.dispatchEvent(new Event('input',{bubbles:true}));portInput.dispatchEvent(new Event('change',{bubbles:true}));
+ assert(graphSession.graph.ports[`${e1.id}/${t2.id}`]===10080,'entry port was not saved for selected target');
+ targetPicker.value=t1.id;targetPicker.dispatchEvent(new Event('change',{bubbles:true}));
+ assert(document.querySelector('[data-graph-entry-port]').value==='','entry port leaked into another target');
+ targetPicker.value=t2.id;targetPicker.dispatchEvent(new Event('change',{bubbles:true}));
+ assert(document.querySelector('[data-graph-entry-port]').value==='10080','entry port was lost on target change');
+ click(`[data-graph-node="${e2.id}"] .graph-node-body`);
+ assert(document.querySelector('[data-graph-entry-port]').value==='','entry port leaked into another entry');
+ assert(document.querySelector('[data-graph-resource]').value===String(e2.node_id),'resource selector retained the previous entry');
+ click(`[data-graph-node="${e1.id}"] .graph-node-body`);
+ assert(document.querySelector('[data-graph-entry-port]').value==='10080','entry port was lost on entry change');
+ await ACTIONS['graph-publish']();await wait(()=>!graphBusy&&!graphSession);
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ assert(poolView.link.configurations.length===4,'combination generation failed');
+ assert(poolView.link.configurations.find(c=>c.entry===e1.id&&c.target===t2.id).port===10080,'custom entry port was not applied');
+ assert(poolView.link.active_path.includes(m1.id),'initial route missing');
+ assert(document.querySelectorAll('[data-graph-line]').length===8,'node connections missing from multi topology');
+ // A pending preview locks editing, and a superseded response cannot replace a newer session.
+ const originalAPI=api;let releasePreview;
+ api=async(...args)=>{if(args[1]==='topology-preview')await new Promise(resolve=>releasePreview=resolve);return originalAPI(...args);};
+ const choosing=ACTIONS['graph-select']({dataset:{id:e1.id}});
+ assert(graphBusy&&document.querySelector('[data-action=link-edit]').disabled,'preview left edit enabled');
+ ACTIONS['link-edit']();assert(!graphSession,'edit action bypassed the pending preview');
+ releasePreview();await choosing;api=originalAPI;
+ assert(graphSession?.kind==='choose','preview did not finish');
+ // Real focus followed by Escape used to remove the viewport twice during morph.
+ click(`[data-graph-node="${e2.id}"] .graph-node-body`);await wait(()=>!graphBusy&&graphSession?.prefix[0]===e2.id);
+ document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+ assert(!graphSession,'Escape did not leave route selection');
+ api=async(...args)=>{if(args[1]==='topology-preview')await new Promise(resolve=>releasePreview=resolve);return originalAPI(...args);};
+ const stale=ACTIONS['graph-select']({dataset:{id:e1.id}});
+ startGraphEditor(poolView.link);const newer=graphSession;
+ releasePreview();await stale;api=originalAPI;
+ assert(graphSession===newer&&newer.kind==='edit','late preview replaced a newer editor');
+ await ACTIONS['graph-exit']();
+ let rejectPreview;
+ api=(...args)=>args[1]==='topology-preview'?new Promise((_,reject)=>rejectPreview=reject):originalAPI(...args);
+ const failedPreview=ACTIONS['graph-select']({dataset:{id:e1.id}});
+ startGraphEditor(poolView.link);const newest=graphSession;
+ rejectPreview(new ApiError(503,{error:'old request'}));await failedPreview;api=originalAPI;
+ assert(graphSession===newest&&!newest.error,'late preview error polluted a newer editor');
+ await ACTIONS['graph-exit']();
+ const ports=poolView.link.configurations.map(c=>c.port).join(',');
+ click(`[data-graph-node="${m2.id}"] .graph-node-body`);await wait(()=>!graphBusy&&!graphSession);
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ assert(poolView.link.active_path.includes(m2.id),'click did not switch shared route');
+ assert(poolView.link.state==='active'&&!poolView.link.pending_changes,'confirmed switch shows unapplied changes');
+ assert(poolView.link.configurations.map(c=>c.port).join(',')===ports,'switch changed endpoint ports');
+ assert(document.querySelector('#modal').hidden,'switch opened a confirmation dialog');
+ // A new independent branch may serve only one entry, with both its targets.
+ click('[data-action=link-edit]');
+ graphAddResource('node',nodes[1].id);const extra=graphSession.graph.vertices.at(-1);
+ extra.x=30000;extra.y=30000;drawGraph();
+ await ACTIONS['graph-publish']();
+ assert(graphSession.kind==='edit'&&graphSession.error.includes(nodes[1].name),'disconnected node lacks a readable error');
+ assert(!graphSession.error.includes(extra.id),'error exposes an internal vertex ID');
+ const bad=document.querySelector(`[data-graph-node="${extra.id}"]`),br=bad.getBoundingClientRect(),vr=topologyBinding.viewport.getBoundingClientRect();
+ assert(bad.classList.contains('graph-invalid')&&br.left<vr.right&&br.right>vr.left&&br.top<vr.bottom&&br.bottom>vr.top,'invalid node is not revealed');
+ graphChooseAddress(extra.id,'in','public');graphChooseAddress(extra.id,'out','private');
+ graphConnect(e1.id,'out','public');graphConnect(extra.id,'in','public');
+ assert(graphSession.edge==null,'completed connection remained selected');
+ // A previously selected, unrelated edge must not swallow the next pin click.
+ graphSession.edge=graphSession.graph.edges.findIndex(([a,b])=>a===e1.id&&b===m1.id);drawGraph();
+ const nextPin=document.querySelector(`[data-graph-node="${extra.id}"] .graph-port.out[data-address="private"]`),nr=nextPin.getBoundingClientRect();
+ nextPin.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:11,clientX:nr.x+5,clientY:nr.y+5}));
+ document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerId:11}));await pause(10);
+ assert(graphSession.connect===extra.id,'next connection was discarded');
+ click(`[data-graph-node="${t1.id}"] .graph-port.in`);
+ assert(graphSession.graph.edges.some(([a,b])=>a===extra.id&&b===t1.id),'click-to-connect failed');
+ graphConnect(extra.id,'out','private');graphConnect(t2.id,'in');
+ await ACTIONS['graph-publish']();await wait(()=>!graphBusy&&!graphSession);
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ assert(poolView.link.graph.vertices.some(v=>v.id===extra.id),'complete independent branch was discarded');
+ assert(poolView.link.configurations.length===4&&poolView.link.state==='active'&&!poolView.link.pending_changes,'complete independent branch cannot be saved');
+ // Only the entry that can reach this branch switches; all its targets move together.
+ const originals=poolView.link.configurations.map(c=>({id:c.id,entry:c.entry,target:c.target,path:c.active_path.join('/')}));
+ const layout=JSON.stringify(poolView.link.active_graph.vertices.map(v=>[v.id,v.x,v.y]));
+ assert(new Set([...document.querySelectorAll('.graph-entry-chip')].map(el=>el.style.getPropertyValue('--route-color'))).size===2,'entries need distinct colors');
+ click(`[data-graph-node="${extra.id}"] .graph-node-body`);await wait(()=>!graphBusy&&!graphSession);
+ assert(document.querySelector('.graph-route-line.graph-next'),'pending route is not shown: '+JSON.stringify({configs:poolView.link.configurations.map(c=>({path:c.active_path,pending:c.pending_path})),job:poolView.link.job,toast:document.querySelector('#toast')?.textContent}));
+ assert(poolView.link.configurations.every(c=>c.active_path.join('/')===originals.find(x=>x.id===c.id).path),'path switched before acknowledgement');
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ for(const c of poolView.link.configurations){
+   if(c.entry===e1.id)assert(c.active_path.includes(extra.id),'entry targets did not switch together');
+   else assert(c.active_path.join('/')===originals.find(x=>x.id===c.id).path,'unreachable entry changed');
+ }
+ assert(JSON.stringify(poolView.link.active_graph.vertices.map(v=>[v.id,v.x,v.y]))===layout,'switch rearranged nodes');
+ // Targets are fixed suffixes. Choosing the final forwarding node completes the entry.
+ click(`[data-graph-node="${e1.id}"] .graph-node-body`);await wait(()=>!graphBusy&&graphSession?.kind==='choose');
+ assert(graphSession.options.includes(extra.id)&&graphSession.options.includes(m1.id),'next-hop choices incomplete');
+ assert(!document.querySelector(`[data-graph-node="${t1.id}"] [data-action="graph-select"]`),'target is still a route choice');
+ click(`[data-graph-node="${t1.id}"] .graph-node-body`);
+ assert(graphSession.prefix.join(',')===e1.id,'target click changed route selection');
+ click(`[data-graph-node="${e2.id}"] .graph-node-body`);await wait(()=>!graphBusy&&graphSession?.prefix[0]===e2.id);
+ click(`[data-graph-node="${e1.id}"] .graph-node-body`);await wait(()=>!graphBusy&&graphSession?.prefix[0]===e1.id);
+ click(`[data-graph-node="${m1.id}"] .graph-node-body`);await wait(()=>!graphBusy&&!graphSession);
+ assert(poolView.link.configurations.filter(c=>c.entry===e1.id).every(c=>c.active_path.includes(extra.id)),'final-hop selection bypassed node acknowledgement');
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ assert(poolView.link.configurations.find(c=>c.entry===e1.id&&c.target===t1.id).active_path.includes(m1.id),'selected pair not switched');
+ assert(poolView.link.configurations.find(c=>c.entry===e1.id&&c.target===t2.id).active_path.includes(m1.id),'other target did not share the selected middle path');
+ // Automatic completion respects the selected entry; Escape is inert.
+ click(`[data-graph-node="${e2.id}"] .graph-node-body`);await wait(()=>!graphBusy&&graphSession?.kind==='choose');
+ assert(!graphSession.options.includes(extra.id),'unreachable branch was offered');
+ click('[data-action=graph-autocomplete]');await wait(()=>!graphBusy&&!graphSession);
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ assert(poolView.link.configurations.filter(c=>c.entry===e2.id).every(c=>c.active_path.includes(m2.id)),'autocomplete did not preserve the selected entry path');
+ const rev=poolView.link.revision;
+ click(`[data-graph-node="${e1.id}"] .graph-node-body`);await wait(()=>!graphBusy&&graphSession?.kind==='choose');
+ document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+ assert(!graphSession&&poolView.link.revision===rev,'Escape changed runtime');
+ // Address inventory controls the rendered port rows even without a graph edit.
+ const model=graphDisplay(poolView.link.active_graph),middle=model.vertices.find(v=>v.id===m1.id);
+ const inventory=poolView.nodes.find(n=>n.id===middle.node_id).addresses;
+ graphRouteCache=null;graphRuntimeLines(model,poolView.link,graphBoxes(model));
+ const beforeGeometry=JSON.stringify(graphRouteCache.list);
+ inventory.reverse();graphRuntimeLines(model,poolView.link,graphBoxes(model));
+ const updatedGeometry=JSON.stringify(graphRouteCache.list);
+ assert(updatedGeometry!==beforeGeometry,'live IP rows did not invalidate route geometry');
+ graphRouteCache=null;graphRuntimeLines(model,poolView.link,graphBoxes(model));
+ assert(JSON.stringify(graphRouteCache.list)===updatedGeometry,'cached and fresh route geometry disagree');
+ inventory.reverse();graphRouteCache=null;
+ const mid={...middle,id:'mid',group:null,x:400,y:400},source=model.vertices.find(v=>v.id===e1.id);
+ const dest={...model.vertices.find(v=>v.id===t1.id),id:'dest',x:800,y:400};
+ const entries=Array.from({length:8},(_,i)=>({...source,id:'lane'+i,group:null,x:0,y:160*i}));
+ const lanes={version:2,vertices:[...entries,mid,dest],groups:[],edges:[...entries.map(e=>[e.id,'mid']),['mid','dest']],bindings:{'mid/dest':{from:{mid:'public'},to:{}}}};
+ for(const e of entries)lanes.bindings[e.id+'/mid']={from:{[e.id]:'public'},to:{mid:'public'}};
+ const laneLink={selection_mode:'independent',configurations:entries.map((e,i)=>({id:i,entry:e.id,target:'dest',state:'active',active_path:[e.id,'mid','dest']}))};
+ const laneMarkup=graphRuntimeLines(lanes,laneLink,graphBoxes(lanes));
+ const laneSVG=new DOMParser().parseFromString(`<svg xmlns="http://www.w3.org/2000/svg">${laneMarkup}</svg>`,'image/svg+xml');
+ // Different incoming edges must reserve distinct arrow space at a shared IP.
+ for(const target of ['mid','dest']){
+   const tips=[...laneSVG.querySelectorAll(`.graph-route-line[data-graph-to="${target}"]`)].map(line=>{
+     const marker=laneSVG.getElementById(line.getAttribute('marker-end').slice(5,-1));
+     const point=line.getPointAtLength(line.getTotalLength());
+     assert(marker.getAttribute('markerUnits')==='userSpaceOnUse','arrow size still depends on line width');
+     return {point,height:Number(marker.getAttribute('markerHeight')),stroke:Number(line.style.getPropertyValue('--route-stroke'))};
+   });
+   assert(tips.length===entries.length,'missing entry routes at shared receiving port');
+   for(let i=0;i<tips.length;i++)for(let j=0;j<i;j++){
+     const gap=Math.abs(tips[i].point.y-tips[j].point.y);
+     assert(gap>(tips[i].height+tips[j].height)/2+.2,'incoming arrowheads overlap');
+     assert(gap>Math.max(tips[i].height,tips[j].height)/2+Math.max(tips[i].stroke,tips[j].stroke)/2+.2,'arrowhead overlaps parallel line');
+   }
+ }
+ for(const span of graphRouteCache.list.filter(s=>s.a==='mid')){
+   const line=document.createElementNS('http://www.w3.org/2000/svg','path');line.setAttribute('d',span.d);
+   const start=line.getPointAtLength(0),end=line.getPointAtLength(line.getTotalLength());
+   assert(start.y>=mid.y+62&&start.y<=mid.y+86&&end.y>=dest.y+62&&end.y<=dest.y+86,'lane anchor left its IP row');
+ }
+ graphRouteCache=null;
+ // A branch reaching one target remains selectable; other configurations keep their routes.
+ click('[data-action=link-edit]');
+ graphSession.graph.edges=graphSession.graph.edges.filter(([a,b])=>a!==extra.id||b!==t2.id);
+ graphTouch();await ACTIONS['graph-publish']();await wait(()=>!graphBusy&&!graphSession);
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ const partialBefore=structuredClone(poolView.link.configurations);
+ click(`[data-graph-node="${extra.id}"] .graph-node-body`);await wait(()=>!graphBusy&&!graphSession);
+ assert(poolView.link.configurations.filter(c=>c.switching).length===1,'partial branch switched unreachable targets');
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ for(const c of poolView.link.configurations){
+   const old=partialBefore.find(p=>p.id===c.id);
+   assert(c.port===old.port&&c.name===old.name,'partial switch changed configuration identity');
+   if(c.entry===e1.id&&c.target===t1.id)assert(c.active_path.includes(extra.id),'reachable target did not switch');
+   else assert(c.active_path.join('/')===old.active_path.join('/'),'unreachable target changed its route');
+ }
+ graphFocusWires({type:'mouseover',target:document.querySelector(`[data-graph-node="${extra.id}"] .graph-node-body`)});
+ assert(document.querySelector(`.graph-route-line.graph-nearby[data-route-entry="${e1.id}"][data-graph-to="${t1.id}"]`),'hover did not highlight the reachable target');
+ assert(!document.querySelector(`.graph-route-line.graph-nearby[data-route-entry="${e1.id}"][data-graph-to="${t2.id}"]`),'hover highlighted another target path');
+ click(`[data-graph-node="${e1.id}"] .graph-node-body`);await wait(()=>!graphBusy&&graphSession?.kind==='choose');
+ assert(graphSession.options.includes(extra.id),'partial target branch is missing from next-hop choices');
+ click(`[data-graph-node="${extra.id}"] .graph-node-body`);await wait(()=>!graphBusy&&!graphSession);
+ assert(document.querySelector('#modal').hidden,'partial target branch required an extra confirmation');
+ // Renaming a configuration changes only its display/export name.
+ const rootId=poolView.link.id,revision=poolView.link.revision;
+ location.hash='#/configs';
+ await wait(()=>document.querySelector('[data-action=config-rename]'));
+ const config=list.data.chains.find(c=>c.link_id===rootId),code=config.configuration_code;
+ assert(/^C\d{4,}$/.test(code),'configuration ID is missing');
+ click(`[data-config-id="${config.id}"] [data-action=config-rename]`);
+ const name='香港 # "专线" <1>';
+ const input=document.querySelector('#modal input[name=name]');
+ assert(input.value===config.remark,'rename form uses a different name');
+ input.value=name;input.dispatchEvent(new Event('input',{bubbles:true}));
+ click('#modal button.primary');
+ await wait(()=>document.querySelector('#modal').hidden&&list.data.chains.some(c=>c.id===config.id&&c.remark===name));
+ const row=document.querySelector(`[data-config-id="${config.id}"]`);
+ assert(row.querySelector('.title').textContent===name,'renamed text was not safely rendered');
+ assert(row.querySelector('.config-id').textContent===code,'rename changed configuration ID');
+ const link=(await api('GET',`links/${rootId}`)).link;
+ assert(link.revision===revision,'rename revised the topology');
+ assert(link.configurations.find(c=>c.id===config.configuration_id).name===name,'topology has a stale configuration name');
+ const subs=await api('GET','subscriptions');
+ assert(subs.configs.find(c=>c.id===config.configuration_id).name===name,'subscription selector has a stale configuration name');
+ await fetch('/panel/test-result',{method:'POST',body:'PASS'});
 }catch(e){await fetch('/panel/test-result',{method:'POST',body:'FAIL '+e.stack});}})();
 '''
         html=(Path(settings.WEB_DIR)/'index.html').read_text().replace('</body>','<script>'+exercise+'</script></body>')
@@ -511,8 +665,8 @@ window.addEventListener('error',e=>fetch('/panel/test-result',{method:'POST',bod
                     for _ in range(8):
                         with c:
                             for n in c.execute('SELECT * FROM nodes').fetchall():
-                                packet=agent_v3.packet(c,n,status=dict(version='0.4.7',state='ok'))
-                                if packet.get('action')=='apply':agent_v3.acknowledge(c,database.get_node(c,n['id']),dict(op=packet['op'],generation=packet['generation'],hash=packet['hash'],ok=True,version='0.4.7'))
+                                packet=agent_v3.packet(c,n,status=dict(version='0.5.1-rc.1',state='ok'))
+                                if packet.get('action')=='apply':agent_v3.acknowledge(c,database.get_node(c,n['id']),dict(op=packet['op'],generation=packet['generation'],hash=packet['hash'],ok=True,version='0.5.1-rc.1'))
                             before=node_sync.mutation_snapshot(c);pools.tick(c);node_sync.finish_mutation(c,before)
                     c.close();self.send_response(204);self.send_header('Content-Length','0');self.end_headers();return
                 super().run_request()
@@ -523,7 +677,7 @@ window.addEventListener('error',e=>fetch('/panel/test-result',{method:'POST',bod
             process=subprocess.Popen([shutil.which('google-chrome') or shutil.which('chromium'),'--headless','--no-sandbox','--disable-gpu','--disable-background-networking','--no-first-run','--no-default-browser-check','--disable-dev-shm-usage','--window-size=1200,900',f'--user-data-dir={root}/chrome',f'http://127.0.0.1:{server.server_port}/panel/#/routes/{lid}'],stdout=log,stderr=log)
             try:
                 self.assertTrue(done.wait(30),'Browser timeout: '+(root/'chrome.log').read_text()[-2000:])
-                self.assertEqual(results[0],'PASS')
+                self.assertEqual(results[0],'PASS',results[0])
             finally:
                 process.terminate()
                 try:process.wait(timeout=5)

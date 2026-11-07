@@ -91,6 +91,11 @@ class CoexistTests(AgentHarness,unittest.TestCase):
         with self.assertRaisesRegex(self.ipt.Failure,'Agent 保存的配置'):self.add()
         self.assertFalse(self.ipt.CONF.exists());self.assertFalse((self.root/'kernel.json').exists())
 
+    def test_standalone_reserves_explicit_address_agent_ports(self):
+        (self.lib/'config').write_text('v=abc\n1 both 10001 192.0.2.1 443 10.0.0.1,10.0.0.2,eth0,eth1,-,-\n')
+        with self.assertRaisesRegex(self.ipt.Failure,'Agent 保存的配置'):self.add()
+        self.add(10002)
+
     def test_wake_port_remains_reserved_without_a_listening_process(self):
         self.ipt.WAKE_CONF.write_text('ENABLED=1\nPORT=10001\nALLOW=192.0.2.2\n')
         with self.assertRaisesRegex(self.ipt.Failure, '端口冲突'):

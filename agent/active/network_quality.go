@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -31,13 +32,24 @@ func validQualityPacket(b []byte, prefix string, key []byte) bool {
 
 func serveQuality(ctx context.Context, conn *net.UDPConn, key []byte) {
 	defer conn.Close()
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return
+	}
+	var optionErr error
+	if err = raw.Control(func(fd uintptr) {
+		optionErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_PKTINFO, 1)
+	}); err != nil || optionErr != nil {
+		return
+	}
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 	buffer := make([]byte, 128)
+	oob := make([]byte, 128)
 	window, count := time.Now(), 0
 	seen := map[string]time.Time{}
 	for {
-		n, peer, err := conn.ReadFromUDP(buffer)
+		n, oobn, _, peer, err := conn.ReadMsgUDP(buffer, oob)
 		if err != nil {
 			return
 		}
@@ -59,7 +71,18 @@ func serveQuality(ctx context.Context, conn *net.UDPConn, key []byte) {
 			continue
 		}
 		seen[nonce] = now
-		_, _ = conn.WriteToUDP(qualityPacket("IQR2", buffer[4:20], key), peer)
+		// Reply from the exact local address that received the request.
+		control := append([]byte(nil), oob[:oobn]...)
+		messages, parseErr := syscall.ParseSocketControlMessage(control)
+		if parseErr != nil {
+			continue
+		}
+		for _, message := range messages {
+			if message.Header.Level == syscall.IPPROTO_IP && message.Header.Type == syscall.IP_PKTINFO && len(message.Data) >= 12 {
+				copy(message.Data[4:8], message.Data[8:12])
+			}
+		}
+		_, _, _ = conn.WriteMsgUDP(qualityPacket("IQR2", buffer[4:20], key), control, peer)
 	}
 }
 
@@ -98,7 +121,27 @@ func validICMPReply(b, request []byte) bool {
 		icmpChecksum(b) == 0 && bytes.Equal(b[4:], request[4:])
 }
 
-func probeNetworkQuality(ctx context.Context, host string, port int, key []byte, protocol string) M {
+func probeNetworkQuality(ctx context.Context, host string, port int, key []byte, protocol string, profiles ...routeProfile) M {
+	dialer := &net.Dialer{}
+	if len(profiles) > 0 {
+		p := profiles[0]
+		ip := net.ParseIP(p.Local)
+		switch protocol {
+		case "tcp-connect-v1":
+			dialer.LocalAddr = &net.TCPAddr{IP: ip}
+		case "udp-echo-v1":
+			dialer.LocalAddr = &net.UDPAddr{IP: ip}
+		case "icmp-echo-v1":
+			dialer.LocalAddr = &net.IPAddr{IP: ip}
+		}
+		dialer.Control = func(network, address string, raw syscall.RawConn) error {
+			var err error
+			if e := raw.Control(func(fd uintptr) { err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, p.mark()) }); e != nil {
+				return e
+			}
+			return err
+		}
+	}
 	result := M{"status": "error"}
 	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
@@ -114,7 +157,7 @@ func probeNetworkQuality(ctx context.Context, host string, port int, key []byte,
 		probeCtx, stop := context.WithTimeout(ctx, 3*time.Second)
 		defer stop()
 		start := time.Now()
-		conn, err := (&net.Dialer{}).DialContext(probeCtx, "tcp4", net.JoinHostPort(ips[0].String(), strconv.Itoa(port)))
+		conn, err := dialer.DialContext(probeCtx, "tcp4", net.JoinHostPort(ips[0].String(), strconv.Itoa(port)))
 		if err != nil {
 			result["error"] = "TCP 建连失败: " + err.Error()
 			if timeout, ok := err.(net.Error); ok && timeout.Timeout() && ctx.Err() == nil {
@@ -130,7 +173,7 @@ func probeNetworkQuality(ctx context.Context, host string, port int, key []byte,
 	if protocol == "icmp-echo-v1" {
 		network, address = "ip4:icmp", ips[0].String()
 	}
-	c, err := (&net.Dialer{}).DialContext(ctx, network, address)
+	c, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		result["error"] = "无法启动探测: " + err.Error()
 		return result
@@ -316,6 +359,24 @@ func (q *qualityMonitor) probe(body M) {
 }
 
 func (q *qualityMonitor) probeWithAgent(a *Agent, body M) {
+	var selected []routeProfile
+	if key, _ := body["source_route"].(string); key != "" {
+		if a != nil {
+			for _, r := range a.config.Rules {
+				if r.Route != "" {
+					route, _ := parseRoute(r.Route)
+					if route.Out.key() == key {
+						selected = []routeProfile{route.Out}
+						break
+					}
+				}
+			}
+		}
+		if len(selected) == 0 {
+			_ = q.send(M{"type": "quality_result", "id": body["id"], "status": "error", "error": "探测出口与已安装规则不一致"})
+			return
+		}
+	}
 	// Bind route probes to an installed rule before starting asynchronous I/O.
 	// The session owns the state mutex while processing this message.
 	if id := int64(number(body["rule_id"])); id != 0 {
@@ -365,7 +426,7 @@ func (q *qualityMonitor) probeWithAgent(a *Agent, body M) {
 			if protocol == "tcp-connect-v1" && (port < 1 || port > 65535) {
 				return
 			}
-			result := probeNetworkQuality(q.ctx, host, port, key, protocol)
+			result := probeNetworkQuality(q.ctx, host, port, key, protocol, selected...)
 			result["type"], result["id"] = "quality_result", body["id"]
 			if q.ctx.Err() == nil {
 				_ = q.send(result)

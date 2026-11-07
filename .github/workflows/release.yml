@@ -40,6 +40,7 @@ jobs:
           node --check server/web/app.js
           node --check server/web/pools.js
           node --check server/web/topology.js
+          node --check server/web/topology_paths.js
           node --check server/web/subscriptions.js
           for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
           mkdir -p dist
@@ -60,6 +61,7 @@ jobs:
           sudo apt-get install -y nftables iptables iproute2 conntrack
           sudo unshare -nm env ICTL_KERNEL_TEST=1 python3 tests/kernel_network.py "$PWD/dist/ictl-active-linux-amd64"
           sudo unshare -n python3 tests/kernel_wake.py "$PWD/dist/ictl-wake-linux-amd64"
+          sudo unshare -nm python3 tests/kernel_multi_ip.py "$PWD/dist/ictl-active-linux-amd64"
           sudo unshare -nm python3 tests/kernel_pool_switch.py "$PWD/dist/ictl-active-linux-amd64"
           (cd agent/active && go test -c -o "$RUNNER_TEMP/ictl-active-test")
           sudo unshare -nm python3 tests/kernel_quality.py "$PWD/dist/ictl-active-linux-amd64" "$RUNNER_TEMP/ictl-active-test"

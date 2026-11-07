@@ -3,8 +3,8 @@
 import json
 import os
 
-VERSION = "0.5.0-rc.5"
-DATABASE_VERSION = 500
+VERSION = "0.5.1-rc.1"
+DATABASE_VERSION = 503
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -39,6 +39,7 @@ STATIC = {
     "index.html": "text/html; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
     "topology.js": "text/javascript; charset=utf-8",
+    "topology_paths.js": "text/javascript; charset=utf-8",
     "pools.js": "text/javascript; charset=utf-8",
     "subscriptions.js": "text/javascript; charset=utf-8",
     "style.css": "text/css; charset=utf-8",

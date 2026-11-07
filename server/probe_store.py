@@ -49,7 +49,7 @@ def measurement_identity(identity):
         return identity
     destination = identity["target"][1] if identity["kind"] == "pair" else identity["endpoint"][0]
     return dict(kind="icmp", protocol="icmp-echo-v1", source=identity["source"],
-                host=destination.lower().rstrip("."))
+                host=destination.lower().rstrip("."), **({"source_route": identity["source_route"]} if "source_route" in identity else {}))
 
 
 def pair_identity(nodes, a, b, protocol):

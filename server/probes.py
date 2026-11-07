@@ -58,7 +58,7 @@ class Monitor:
         }
         for link in c.execute("SELECT * FROM links WHERE state NOT IN ('draft','deleting')"):
             plan = pools.runtime_plan(link)
-            if plan and "graph" in plan:
+            if plan and "graph" in plan and not plan.get("routing"):
                 edges.update(("links", link["id"], a, b) for a,b in pools.quality_paths(c, link["id"])[1])
         for (scope, ident, a, b), expiry in self.extra.copy().items():
             if expiry > now and a in routes.get((scope, ident), []) and b in routes[(scope, ident)]:
@@ -89,7 +89,7 @@ class Monitor:
                         pair=pair,
                     )
                 )
-        for link in c.execute("SELECT * FROM links WHERE state NOT IN ('draft','deleting')"):
+        for link in c.execute("SELECT * FROM links l WHERE state NOT IN ('draft','deleting') AND NOT EXISTS (SELECT 1 FROM link_members m WHERE m.link_id=l.id AND m.root_id<>l.id)"):
             for section in link_quality.sections(c, link, nodes):
                 for spec in section["probes"]:
                     spec.update(
@@ -230,6 +230,8 @@ class Monitor:
                 port=spec["port"],
                 key=target.get("quality_key", "") if target else "",
             )
+            if spec.get("source_route"):
+                message["source_route"] = spec["source_route"]
             if spec["rule_id"]:
                 message["rule_id"] = spec["rule_id"]
             try:

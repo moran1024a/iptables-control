@@ -71,11 +71,6 @@ def get_groups(conn, kind):
     ]
 
 
-def config_name(conn, name, group_id):
-    group = conn.execute("SELECT name,builtin FROM item_groups WHERE id=?", (group_id,)).fetchone()
-    return f"{group['name']}#{name}" if group and (not group["builtin"]) else name
-
-
 def check_group(conn, kind, group_id):
     """校验所选分组；未选择时为默认分组。"""
     if group_id in (None, ""):
@@ -123,6 +118,8 @@ def move_group(conn, table, item_id, group_id):
         f"UPDATE {table} SET group_id = ?, sort =\n                 (SELECT COALESCE(MAX(sort), 0) + 1 FROM {table} WHERE group_id = ?)\n                 WHERE id = ?",
         (group_id, group_id, item_id),
     )
+    if table == 'links' and conn.execute("SELECT 1 FROM sqlite_master WHERE name='link_members'").fetchone():
+        conn.execute('UPDATE links SET group_id=? WHERE id IN (SELECT link_id FROM link_members WHERE root_id=?)', (group_id,item_id))
 
 
 def get_route(conn, route_id):

@@ -289,11 +289,12 @@ document.addEventListener('keydown',e=>{
 });
 
 async function linkQualityPage(id, request) {
-  const range=qualityViews.get('links/'+id)?.range||900;
+  const view=qualityViews.get('links/'+id)||{},range=view.range||900;
   let d;
-  try { d=await api('POST','quality',{scope:'links',id,range}); }
+  try { d=await api('POST','quality',{scope:'links',id,range,...(view.configuration?{configuration:view.configuration}:{})}); }
   catch(err) {
     if(request!==viewRequest)return;
+    if(err.field==='configuration'&&view.configuration){delete view.configuration;return linkQualityPage(id,request);}
     if(err.status!==404)throw err;
     leaveView();
     render('<h1>链路不存在</h1><p class="muted">该链路可能已被删除。</p><a href="#/routes">返回链路列表</a>');
@@ -303,11 +304,17 @@ async function linkQualityPage(id, request) {
   const cards=d.sections.map(section=>{
     return `<section class="panel quality-card" data-key="quality-${section.id}"><div class="quality-heading"><h2><span class="quality-kind">${esc(section.kind)}</span> ${esc(section.label)}</h2>${qualityLegend(section.series)}</div>${qualityChart(section.series,d.now,range)}${qualityTable(section.series,d.now)}</section>`;
   }).join('');
-  renderQuality(`<a class="back" href="#/routes/${id}">← ${esc(d.name)}</a>`+poolHead('网络质量',`<select data-link-quality-range="${id}" aria-label="时间范围">${QUALITY_RANGES.map(([n,label])=>`<option value="${n}" ${n===range?'selected':''}>${label}</option>`).join('')}</select>`)+cards,d.sections.map(section=>({series:section.series,now:d.now,seconds:range})));
+  const configurations=d.configurations?.length>1?`<select data-link-quality-configuration="${id}" aria-label="入口与目标">${d.configurations.map(c=>`<option value="${c.id}" ${c.id===d.configuration?'selected':''}>${esc(c.name)}</option>`).join('')}</select>`:'';
+  renderQuality(`<a class="back" href="#/routes/${id}">← ${esc(d.name)}</a>`+poolHead('网络质量',configurations+`<select data-link-quality-range="${id}" aria-label="时间范围">${QUALITY_RANGES.map(([n,label])=>`<option value="${n}" ${n===range?'selected':''}>${label}</option>`).join('')}</select>`)+cards,d.sections.map(section=>({series:section.series,now:d.now,seconds:range})));
 }
 document.addEventListener('change',e=>{
+  if(e.target.hasAttribute('data-link-quality-configuration')){
+    const key='links/'+e.target.dataset.linkQualityConfiguration;
+    qualityViews.set(key,{...qualityViews.get(key),configuration:Number(e.target.value)});refresh();return;
+  }
   if(!e.target.hasAttribute('data-link-quality-range'))return;
-  qualityViews.set('links/'+e.target.dataset.linkQualityRange,{range:Number(e.target.value)});refresh();
+  const key='links/'+e.target.dataset.linkQualityRange;
+  qualityViews.set(key,{...qualityViews.get(key),range:Number(e.target.value)});refresh();
 });
 
 async function linkDetail(id, request) {
@@ -371,12 +378,20 @@ async function configSummary(request) {
   list={kind:'configs',data:{...d,configs:d.chains},draw:()=>drawCollection()};
   drawCollection=()=>{
     const view=c=>({state:c.link_state||c.status,sync:c.link_sync}),f=collectionFilters.configs;
-    const rows=d.chains.filter(c=>matchesSearch('configs',c.remark+' '+(c.connection?c.connection.host+':'+c.connection.port:''))&&(!f.state || statusGroup(view(c))===f.state)&&(!f.group || c.group_id===Number(f.group)));
-    const card=c=>`<div class="collection-row" data-key="summary-${c.id}"><div class="collection-main inline-summary"><a class="title" href="#/routes/${c.link_id||''}" title="${esc(c.remark)}">${esc(c.remark)}</a><div class="sub"><code>${c.connection?esc(c.connection.host)+':'+c.connection.port:'等待入口确认'}</code></div>${c.link_error?`<div class="row-error">${esc(c.link_error)}</div>`:''}</div>${linkState(view(c))}<div class="row-actions">${c.connection?`<button class="small" data-action="copy" data-text="${esc(c.connection.uri)}">复制${c.connection.protocol==='endpoint'?'地址':'导入链接'}</button>`:''}</div></div>`;
+    const route=c=>[c.hops[0]?.name,c.target_name].filter(Boolean).join(' → ');
+    const rows=d.chains.filter(c=>matchesSearch('configs',[c.remark,c.configuration_code||'',route(c),c.connection?c.connection.host+':'+c.connection.port:''].join(' '))&&(!f.state || statusGroup(view(c))===f.state)&&(!f.group || c.group_id===Number(f.group)));
+    const card=c=>`<div class="collection-row" data-key="summary-${c.id}" data-config-id="${c.id}"><div class="collection-main inline-summary config-summary"><a class="title" href="#/routes/${c.link_id||''}" title="${esc(c.remark)}">${esc(c.remark)}</a>${c.configuration_code?`<small class="muted config-id">${esc(c.configuration_code)}</small>`:''}<div class="sub"><code>${c.connection?esc(c.connection.host)+':'+c.connection.port:'等待入口确认'}</code><span class="config-path" title="${esc(route(c))}">${esc(route(c))}</span></div>${c.link_error?`<div class="row-error">${esc(c.link_error)}</div>`:''}</div>${linkState(view(c))}<div class="row-actions"><button class="small" data-action="config-rename" data-id="${c.id}" ${c.deleting||c.link_state==='deleting'?'disabled':''}>改名</button>${c.connection?`<button class="small" data-action="copy" data-text="${esc(c.connection.uri)}">复制${c.connection.protocol==='endpoint'?'地址':'导入链接'}</button>`:''}</div></div>`;
     render(poolHead('配置','<a class="button" href="#/routes">管理链路 →</a>')+
       collectionTools('configs',rows.length,d.chains.length,[['active','已应用'],['pending','等待同步'],['error','异常'],['deleting','删除中']],d.groups)+
       `<div class="collection">${groupedList('configs',rows,card,()=> '配置',false)||emptyState('⇄',d.chains.length?'没有匹配的配置':'暂无配置')}</div>`);
   };drawCollection();
+}
+
+function configRename(ident) {
+  const config=list.data.chains.find(c=>c.id===ident);
+  if(!config||config.deleting||config.link_state==='deleting')return;
+  openModal(`<form data-form="config-rename" data-id="${config.id}" data-previous-name="${esc(config.remark)}"><h2>配置名称${config.configuration_code?` <small class="muted config-id">${esc(config.configuration_code)}</small>`:''}</h2><label><span>名称</span><input name="name" value="${esc(config.remark)}" maxlength="64" required autocomplete="off"></label><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
+  $('#modal input[name=name]').select();
 }
 
 document.addEventListener('reordered',e=>{
@@ -390,6 +405,10 @@ document.addEventListener('reordered',e=>{
 });
 
 Object.assign(FORMS, {
+  async 'config-rename'(form,data) {
+    await api('PATCH',`configs/${form.dataset.id}/name`,{name:data.name,previous_name:form.dataset.previousName});
+    closeModal();toast('配置名称已更新');await refresh();
+  },
   async 'quick-switch'() { const choice={...quickSwitch}; await api('POST',`links/${choice.id}/action`,{action:'switch',revision:choice.revision,stage:choice.stage,member:choice.member});closeModal();toast('等待节点确认');await refresh(); },
   async 'pool-save'(form,data) { await api(templateEditor.id?'PATCH':'POST',templateEditor.id?`pools/${templateEditor.id}`:'pools',{name:data.name,members:templateEditor.members});closeModal();refresh(); },
   async 'link-save'(form) { rememberLink(); const body={...linkEditor,apply:form.dataset.draft!=='1'};delete form.dataset.draft;const r=await api(body.id?'PATCH':'POST',body.id?`links/${body.id}`:'links',body);closeModal();location.hash=`#/routes/${r.id}`;refresh(); },
@@ -397,6 +416,7 @@ Object.assign(FORMS, {
 });
 document.addEventListener('submit',e=>{if(e.target.dataset.form==='link-save')e.target.dataset.draft=e.submitter?.name==='draft'?'1':'0';},true);
 Object.assign(ACTIONS, {
+  'config-rename':el=>configRename(Number(el.dataset.id)),
   'pool-expand'(el) {
     const id=Number(el.dataset.id);
     expandedPools.has(id)?expandedPools.delete(id):expandedPools.add(id);
@@ -433,7 +453,7 @@ Object.assign(ACTIONS, {
   'link-new':()=>linkForm(), 'link-edit':()=>linkForm(poolView.link),
   async 'link-delete'(){if(!(await confirmBox('删除链路','删除 <b>'+esc(poolView.link.name)+'</b> 并清理其转发规则？','删除',true)))return;await api('DELETE',`links/${poolView.link.id}`);location.hash='#/routes';},
   async 'link-cancel'(){const l=poolView.link;if(!(await confirmBox('取消切换',l.job.phase==='prepare'?'撤销新路径准备，保留当前路径？':'恢复旧路径，确认入口恢复后清理新路径？','确认')))return;await api('POST',`links/${l.id}/action`,{action:'cancel',revision:l.revision});refresh();},
-  async 'link-retry'(){const l=poolView.link;await api('POST',`links/${l.id}/action`,{action:'retry',revision:l.revision});refresh();},
+  async 'link-retry'(){const l=poolView.link,r=await api('POST',`links/${l.id}/action`,{action:'retry',revision:l.revision});if(r.skipped?.length)toast(`${r.skipped.length} 项暂未重试：${r.skipped[0].reason}`,true);refresh();},
   'stage-add'(){rememberLink();const [kind,id]=$('#stage-add').value.split(':');if(!id)return;linkEditor.plan.stages.push({id:crypto.randomUUID?.()||String(Date.now()),kind:kind==='p'?'pool':'node',...(kind==='p'?{pool_id:Number(id)}:{node_id:Number(id)})});markModalDirty();drawLinkForm(true);},
   'stage-down'(el){rememberLink();const i=Number(el.dataset.index),a=linkEditor.plan.stages;[a[i],a[i+1]]=[a[i+1],a[i]];markModalDirty();drawLinkForm(true);},
   'stage-up'(el){rememberLink();const i=Number(el.dataset.index),a=linkEditor.plan.stages;[a[i-1],a[i]]=[a[i],a[i-1]];markModalDirty();drawLinkForm(true);},

@@ -104,22 +104,28 @@ function moreActions(key, actions) {
 // 已有元素保持不变，不会重放动画、丢失悬停状态或文字选区
 let fullRender = true;
 let enterTimer = null;
+let rendering = false;
 
 function render(html) {
-  const tpl = document.createElement("template");
-  tpl.innerHTML = html;
-  tpl.content.querySelectorAll(".logo").forEach((el) => (el.innerHTML = LOGO));
-  if (!fullRender && app.firstChild) {
-    morph(app, tpl.content);
-    return;
+  rendering = true;
+  try {
+    const tpl = document.createElement("template");
+    tpl.innerHTML = html;
+    tpl.content.querySelectorAll(".logo").forEach((el) => (el.innerHTML = LOGO));
+    if (!fullRender && app.firstChild) {
+      morph(app, tpl.content);
+      return;
+    }
+    fullRender = false;
+    app.replaceChildren(tpl.content);
+    app.classList.remove("view-enter");
+    void app.offsetWidth;
+    app.classList.add("view-enter");
+    clearTimeout(enterTimer);
+    enterTimer = setTimeout(() => app.classList.remove("view-enter"), 600);
+  } finally {
+    rendering = false;
   }
-  fullRender = false;
-  app.replaceChildren(tpl.content);
-  app.classList.remove("view-enter");
-  void app.offsetWidth;
-  app.classList.add("view-enter");
-  clearTimeout(enterTimer);
-  enterTimer = setTimeout(() => app.classList.remove("view-enter"), 600);
 }
 
 // 用新节点树更新现有节点的子节点：类型、标签或 data-key 不同时替换，否则就地更新
@@ -991,6 +997,11 @@ function groupSelect(groups, selected) {
   return `<label><span>分组</span><select name="group_id">${opts.join("")}</select></label>`;
 }
 
+function nodeAddressRow(a={}) {
+  const id=a.id||('ip-'+(crypto.randomUUID?.()||`${Date.now()}-${Math.random().toString(16).slice(2)}`));
+  return `<div class="node-address-row" data-address-id="${esc(id)}">${[['name','名称'],['host','连接 IP'],['local','本机 IP（同上可留空）'],['device','网卡，如 eth0'],['gateway','网关（可选）']].map(([key,label])=>`<input data-address-field="${key}" value="${esc(a[key]||'')}" placeholder="${label}" aria-label="${label}" ${['name','host','device'].includes(key)?'required':''}>`).join('')}<button type="button" data-action="node-address-remove" aria-label="删除地址">×</button></div>`;
+}
+
 async function nodeForm(node) {
   const page = pageVersion;
   const { groups } = await api("GET", "nodes");
@@ -1003,6 +1014,7 @@ async function nodeForm(node) {
       <label><span>备注（选填，节点的说明）</span><textarea name="note" rows="3" maxlength="500">${esc(node?.note)}</textarea></label>
       <label><span>入站地址（IPv4 或域名，其他节点通过它连接到该节点）</span>
         <input name="addr" value="${esc(node?.addr)}" class="mono" required></label>
+      <details class="node-addresses"><summary>转发 IP 地址</summary><div data-address-list>${(node?.addresses||[]).map(nodeAddressRow).join('')}</div><button type="button" class="small" data-action="node-address-add">＋ 地址</button></details>
       <label><span>允许的入站端口（端口或范围，多个用逗号分隔，如 10000-20000,30000）</span>
         <input name="ports" value="${esc(node?.ports ?? "10000-65535")}" class="mono" required></label>
       <label><span>质量探测 UDP 端口（默认 33445，0 停止全部探测；仅主动节点使用）</span><input name="quality_port" type="number" min="0" max="65535" value="${node?.quality_port ?? 33445}" required></label>
@@ -1153,13 +1165,14 @@ const FORMS = {
 
   async node(form, data) {
     const id = form.dataset.id;
+    const addresses=[...form.querySelectorAll('[data-address-id]')].map(row=>Object.fromEntries([['id',row.dataset.addressId],...[...row.querySelectorAll('[data-address-field]')].map(input=>[input.dataset.addressField,input.value.trim()])]));
     if (!id) {
-      const r = await api("POST", "nodes", { name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
+      const r = await api("POST", "nodes", { addresses, name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
       closeModal();
       location.hash = `#/nodes/${r.id}`;
       return;
     }
-    const r = await api("PATCH", `nodes/${id}`, { name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
+    const r = await api("PATCH", `nodes/${id}`, { addresses, name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
     closeModal();
     if (r.key) {
       const ups = r.upstream.length ? `<p>以下节点需要同步规则：${r.upstream.map(esc).join("、")}</p>` : "";
@@ -1854,3 +1867,8 @@ document.querySelectorAll(".logo").forEach((el) => (el.innerHTML = LOGO));
 window.addEventListener("hashchange", route);
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', route, {once:true});
 else route();
+
+Object.assign(ACTIONS, {
+  'node-address-add':()=>$('#modal [data-address-list]').insertAdjacentHTML('beforeend',nodeAddressRow()),
+  'node-address-remove':el=>el.closest('[data-address-id]').remove(),
+});

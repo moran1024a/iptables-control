@@ -18,6 +18,7 @@ import settings
 import subscriptions
 import wake
 import topology
+import node_addresses
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS item_groups (
@@ -322,6 +323,10 @@ def init_db():
             migrate_v047_rc2(conn)
             topology.migrate(conn)
             with conn:
+                node_addresses.migrate(conn)
+            topology.migrate_nodes(conn)
+            migrate_config_names(conn)
+            with conn:
                 ensure_active_windows(conn)
             return conn
         conn.close()
@@ -334,7 +339,25 @@ def init_db():
     migrate_v047(conn)
     migrate_v047_rc2(conn)
     topology.migrate(conn)
+    with conn:
+        node_addresses.migrate(conn)
+    topology.migrate_nodes(conn)
+    migrate_config_names(conn)
     return conn
+
+
+def migrate_config_names(conn):
+    if conn.execute('PRAGMA user_version').fetchone()[0] >= 503:
+        return
+    database.backup_database(conn, settings.DB_PATH + '.pre-config-names.bak')
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if 'config_name' not in {r['name'] for r in conn.execute('PRAGMA table_info(links)')}:
+            conn.execute("ALTER TABLE links ADD COLUMN config_name TEXT NOT NULL DEFAULT ''")
+        conn.execute("""UPDATE links SET config_name=CASE
+            WHEN managed=0 AND chain_id IS NOT NULL THEN name
+            ELSE printf('配置 %04d',id) END WHERE config_name=''""")
+        conn.execute('PRAGMA user_version=503')
 
 
 def migrate_v047_rc2(conn):

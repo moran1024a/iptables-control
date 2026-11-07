@@ -1,6 +1,8 @@
 import hashlib
 import json
 import pools
+import node_addresses
+import topology_groups
 import probe_store
 
 PROTOCOLS = ("tcp-connect-v1", "udp-echo-v1", "icmp-echo-v1")
@@ -20,7 +22,17 @@ def fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
 
 
-def sections(c, link, nodes):
+def sections(c, link, nodes, expand=True, configuration=None):
+    if expand and topology_groups.canvas(c, link['id']):
+        result = []
+        for member in topology_groups.members(c, link['id']):
+            if configuration is not None and member['id'] != configuration: continue
+            for section in sections(c, member, nodes, expand=False):
+                ident = f"config:{member['id']}:" + section['id']
+                section['id'] = ident
+                for spec in section['probes']: spec.update(link_id=link['id'], section=ident)
+                result.append(section)
+        return result
     plan = pools.runtime_plan(link) or json.loads(link["plan"])
     selected = json.loads(link["selected"])
     if link["job"] and not link["applied"]:
@@ -41,6 +53,10 @@ def sections(c, link, nodes):
     stages = [
         (st.get("legacy_section", st["id"]), st["node_id"] if st["kind"] == "node" else selected.get(st["id"])) for st in plan["stages"]
     ]
+    if plan.get('graph_path'):
+        vertices = {v['id']: v for v in plan['graph']['vertices']}
+        stages = [(v.get('legacy_section', v['id']), v.get('node_id', 0))
+                  for ident in plan['graph_path'] for v in [vertices[ident]] if v['kind'] in ('node', 'direct')]
     actual = [n for _, n in stages if n]
     expected = ([plan["entry"]] if plan["entry"] else []) + actual
     ready = bool(link["applied"] and chain and target and ([h["node_id"] for h in hops] == expected))
@@ -99,6 +115,15 @@ def sections(c, link, nodes):
                     host=nodes[peer]["addr"],
                     port=nodes[peer]["quality_port"] if protocol == "udp-echo-v1" else 0,
                 )
+            explicit = bool(plan.get('routing'))
+            if explicit and source in by_node:
+                route = node_addresses.rule_route(c, by_node[source]['id'])
+                fields = route.split(',') if route else []
+                if len(fields) == 6:
+                    spec['source_route'] = ','.join((fields[1], fields[3], fields[5]))
+                if peer and not terminal:
+                    index = expected.index(peer)
+                    spec['host'] = plan['hop_addresses'][index]
             identity = dict(
                 source=source,
                 target=peer,
@@ -121,6 +146,12 @@ def sections(c, link, nodes):
                 )
             else:
                 shared = None
+            if explicit and shared:
+                shared['source'] = (source, spec.get('source_route', ''))
+                if shared['kind'] == 'pair': shared['target'] = (peer, spec['host'])
+                else:
+                    shared['path'] = [(n, plan['hop_addresses'][expected.index(n)], plan['routing'][expected.index(n)]) for n in path[1:] if n in expected]
+                shared['source_route'] = spec.get('source_route', '')
             spec.update(path_key=fingerprint(shared or identity), identity=shared, reason=reason)
             probes.append(spec)
         result.append(dict(id=sid, kind=kind, label=label, probes=probes))
@@ -170,8 +201,13 @@ async def view(monitor, body, now):
     def read(c):
         link = pools.get(c, "links", body["id"])
         nodes = {r["id"]: dict(r) for r in c.execute("SELECT * FROM nodes")}
+        choices = [dict(id=m['id'], name=topology_groups.config_name(c, m)) for m in topology_groups.members(c, link['id'])]
+        selected = body.get('configuration', choices[0]['id'] if choices else None)
+        if selected is not None and (type(selected) is not int or selected not in {x['id'] for x in choices}):
+            import errors
+            raise errors.UserError('请选择此链路中的配置', 'configuration')
         result = []
-        for section in sections(c, link, nodes):
+        for section in sections(c, link, nodes, configuration=selected):
             series = []
             for spec in section.pop("probes"):
                 rows = probe_store.link_rows(c, spec, now - max(body.get("range", 900), 300) - 300, now)
@@ -190,6 +226,6 @@ async def view(monitor, body, now):
                     )
                 )
             result.append(dict(section, series=series))
-        return dict(name=link["name"], sections=result, now=now, interval=q.INTERVAL)
+        return dict(name=link["name"], sections=result, now=now, interval=q.INTERVAL, configurations=choices, configuration=selected)
 
     return await monitor.hub.database(read)

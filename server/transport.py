@@ -330,7 +330,7 @@ def create_app():
                     response.headers.add("Set-Cookie", cookie)
                 return response
             except errors.UserError as exc:
-                return web.json_response({"error": str(exc)}, status=exc.status)
+                return web.json_response({"error": str(exc), "field": exc.field}, status=exc.status)
             except (ValueError, TypeError):
                 raise web.HTTPBadRequest()
         parts = request.path.removeprefix(panel_path + "/api/").split("/")

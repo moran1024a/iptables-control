@@ -4,6 +4,7 @@ import secrets
 import database
 import errors
 import pools
+import topology_groups
 import target_config
 import validation
 
@@ -122,7 +123,8 @@ def clash_proxy(target, connection, name):
 
 def configurations(c):
     result = []
-    for link in c.execute(database.ordered("links")):
+    order = topology_groups.config_order(c)
+    for link in sorted(c.execute(database.ordered("links")).fetchall(), key=lambda row: order(row["id"])):
         if not link["chain_id"]:
             continue
         chain = database.get_chain(c, link["chain_id"])
@@ -136,8 +138,9 @@ def configurations(c):
             error = "仅有地址和端口，缺少代理协议"
         item = dict(
             id=link["id"],
-            name=link["name"],
-            group_id=link["group_id"],
+            name=topology_groups.config_name(c, link),
+            code=topology_groups.config_code(link['id']),
+            group_id=topology_groups.config_group(c, link),
             connection=connection,
             target=dict(target),
             error=error,
@@ -175,7 +178,7 @@ def listing(c):
         )
     return dict(
         subscriptions=rows,
-        configs=[{k: x[k] for k in ("id", "name", "group_id", "error", "clash_error")} for x in configs],
+        configs=[{k: x[k] for k in ("id", "name", "code", "group_id", "error", "clash_error")} for x in configs],
         groups=database.get_groups(c, "links"),
         public_url=database.setting(c, "public_url", ""),
     )
@@ -230,9 +233,9 @@ def export(c, token, fmt):
     names = {"DIRECT", "REJECT", "GLOBAL", "订阅节点"}
     links, proxies = ([], [])
     for item in items:
-        name = database.config_name(c, item["name"], item["group_id"])
-        while name in names:
-            name += " [" + str(item["id"]) + "]"
+        name = item["name"]
+        while fmt == 'clash' and name in names:
+            name += " [" + item['code'] + "]"
         names.add(name)
         if fmt == "clash":
             if not item["clash_error"]:

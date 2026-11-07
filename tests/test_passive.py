@@ -11,6 +11,21 @@ class PassiveTests(AgentHarness,unittest.TestCase):
 
     def tearDown(self):self.temp.cleanup()
 
+    def test_policy_priority_can_be_shared_only_by_exact_owned_marks(self):
+        self.assertShell('''
+mkdir -p "$LIB/routing"
+for key in '10.0.0.95,eth0,-' '10.0.0.108,eth0,-'; do
+  route_numbers "$key"
+  [ "$ROUTE_PRIORITY" = 24860 ] || exit 1
+  printf '%s\\n' "$key" > "$LIB/routing/$ROUTE_TABLE"
+  printf -v mark '0x%x' "$ROUTE_MARK"
+  rule="$ROUTE_PRIORITY: from all fwmark $mark lookup $ROUTE_TABLE proto 242"
+  route_policy_owned "$rule" || exit 1
+  ! route_policy_owned "$ROUTE_PRIORITY: from all fwmark $mark/0xffffff00 lookup $ROUTE_TABLE proto 242" || exit 1
+  ! route_policy_owned "${rule/proto 242/proto 4}" || exit 1
+done
+''')
+
     def test_clear_removes_only_owned_tcp_and_udp_connections(self):
         self.assertShell('printf "v=abc\\n1 both 10001 192.0.2.1 443\\n" > "$CONFIG"\nlocal_apply\n[ "$R_STATE" = ok ]')
         self.assertShell('remove_rules')
@@ -35,10 +50,10 @@ local_apply
 snapshot="$(owned_snapshot)"
 conntrack() { return 1; }
 ! remove_rules || exit 1
-! restore_owned "$snapshot" $'1\n1\n1' || exit 1
+! restore_owned "$snapshot" $'1\n1\n1\n1' || exit 1
 [ -f "$LIB/clear-owned.rules" ] || exit 1
 unset -f conntrack
-restore_owned "$snapshot" $'1\n1\n1' && jumps_ok
+restore_owned "$snapshot" $'1\n1\n1\n1' && jumps_ok
 [ ! -f "$LIB/clear-owned.rules" ]
 ''')
 
@@ -48,7 +63,7 @@ local_apply
 [ "$R_STATE" = ok ] || exit 1
 snapshot="$(owned_snapshot)"
 remove_rules
-restore_owned "$snapshot" $'1\n1\n1' && jumps_ok
+restore_owned "$snapshot" $'1\n1\n1\n1' && jumps_ok
 ''')
 
     def test_ipv6_wake_listener_conflict(self):

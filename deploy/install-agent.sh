@@ -2,7 +2,7 @@
 # Install the explicitly selected release. RC releases never follow /latest.
 set -euo pipefail
 umask 077
-VERSION="0.5.0-rc.5"
+VERSION="0.5.1-rc.1"
 BASE="https://github.com/moran1024a/iptables-control/releases/download/v$VERSION"
 TRUSTED_BASE="$BASE"
 URL='' KEY='' KIND=active
@@ -19,7 +19,7 @@ done
 [[ "$URL" =~ ^https?://[^[:space:]\"\\]+$ && "$KEY" =~ ^[0-9a-f]{64}$ ]] || { echo '需要有效 --url 与 --key' >&2; exit 1; }
 [[ "$KIND" != active || "$URL" = https://* ]] || { echo '主动 Agent 需要 HTTPS 接入' >&2; exit 1; }
 [ "$(id -u)" = 0 ] || { echo '请使用 sudo bash 运行安装脚本' >&2; exit 1; }
-tools=(curl openssl flock systemctl tar)
+tools=(curl openssl ip flock systemctl tar)
 packages=(curl openssl util-linux)
 if [ "$KIND" = active ]; then tools+=(nft ss conntrack); packages+=(nftables iproute2 conntrack); else tools+=(iptables iptables-save iptables-restore ss conntrack); packages+=(iptables iproute2 conntrack); fi
 missing=0

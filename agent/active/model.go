@@ -23,12 +23,13 @@ import (
 	"time"
 )
 
-const version = "0.4.4"
+const version = "0.5.1-rc.1"
 const tableName = "ictl_active"
 
 type M = map[string]any
 
 type Rule struct {
+	Route      string `json:"route,omitempty"`
 	ID         int64  `json:"id"`
 	Protocol   string `json:"protocol"`
 	Port       int    `json:"port"`
@@ -242,7 +243,7 @@ func parseConfig(data []byte, gen int64) (Config, error) {
 		if len(p) == 0 {
 			continue
 		}
-		if len(p) != 5 {
+		if len(p) != 5 && len(p) != 6 {
 			return c, errors.New("配置行无效")
 		}
 		id, e := strconv.ParseInt(p[0], 10, 64)
@@ -257,7 +258,11 @@ func parseConfig(data []byte, gen int64) (Config, error) {
 		if e != nil {
 			return c, e
 		}
-		c.Rules = append(c.Rules, Rule{ID: id, Protocol: p[1], Port: port, Host: p[3], TargetPort: tp})
+		r := Rule{ID: id, Protocol: p[1], Port: port, Host: p[3], TargetPort: tp}
+		if len(p) == 6 {
+			r.Route = p[5]
+		}
+		c.Rules = append(c.Rules, r)
 	}
 	if e := s.Err(); e != nil {
 		return c, e
@@ -278,7 +283,14 @@ func validateConfig(c Config) error {
 			return errors.New("重复入站端口")
 		}
 		seen[r.Port] = true
-		lines = append(lines, fmt.Sprintf("%d %s %d %s %d", r.ID, r.Protocol, r.Port, r.Host, r.TargetPort))
+		if _, e := parseRoute(r.Route); e != nil {
+			return e
+		}
+		line := fmt.Sprintf("%d %s %d %s %d", r.ID, r.Protocol, r.Port, r.Host, r.TargetPort)
+		if r.Route != "" {
+			line += " " + r.Route
+		}
+		lines = append(lines, line)
 	}
 	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
 	if c.Hash != hex.EncodeToString(sum[:])[:12] {

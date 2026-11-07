@@ -31,7 +31,12 @@ func counterName(r Rule, p, dir, epoch string) string {
 	return fmt.Sprintf("r%d_%s_%s_%s", r.ID, p, dir, epoch)
 }
 func connMatch(r Rule, p string) []any {
-	return []any{match(meta("l4proto"), p), M{"match": M{"op": "in", "left": ct("status", ""), "right": "dnat"}}, match(ct("proto-dst", "original"), r.Port), match(ct("saddr", "reply"), r.IP), match(ct("proto-src", "reply"), r.TargetPort)}
+	expr := []any{match(meta("l4proto"), p), M{"match": M{"op": "in", "left": ct("status", ""), "right": "dnat"}}, match(ct("proto-dst", "original"), r.Port), match(ct("saddr", "reply"), r.IP), match(ct("proto-src", "reply"), r.TargetPort)}
+	if r.Route != "" {
+		route, _ := parseRoute(r.Route)
+		expr = append(expr, match(ct("daddr", "original"), route.In.Local))
+	}
+	return expr
 }
 
 func (a *Agent) nftState() (M, bool, error) {
@@ -206,7 +211,7 @@ func (a *Agent) transaction(c Config, current M, exists bool) M {
 	for _, ch := range []struct {
 		name, kind, hook string
 		priority         int
-	}{{"pre", "nat", "prerouting", -105}, {"post", "nat", "postrouting", 105}, {"forward", "filter", "forward", 10}} {
+	}{{"pre", "nat", "prerouting", -105}, {"post", "nat", "postrouting", 105}, {"forward", "filter", "forward", 10}, {"route", "filter", "prerouting", -90}} {
 		base := M{"family": "ip", "table": tableName, "name": ch.name}
 		if chains[ch.name] {
 			commands = append(commands, op("flush", "chain", base))
@@ -223,7 +228,12 @@ func (a *Agent) transaction(c Config, current M, exists bool) M {
 	}
 	for _, r := range c.Rules {
 		for _, p := range protocols(r) {
-			addRule("pre", []any{match(obj("fib", M{"result": "type", "flags": []string{"daddr"}}), "local"), match(payload(p, "dport"), r.Port), obj("dnat", M{"addr": r.IP, "port": r.TargetPort})})
+			expr := []any{match(obj("fib", M{"result": "type", "flags": []string{"daddr"}}), "local"), match(payload(p, "dport"), r.Port)}
+			if r.Route != "" {
+				route, _ := parseRoute(r.Route)
+				expr = append(expr, match(payload("ip", "daddr"), route.In.Local))
+			}
+			addRule("pre", append(expr, obj("dnat", M{"addr": r.IP, "port": r.TargetPort})))
 		}
 	}
 	seen := map[string]bool{}
@@ -234,7 +244,16 @@ func (a *Agent) transaction(c Config, current M, exists bool) M {
 				continue
 			}
 			seen[key] = true
-			addRule("post", append(connMatch(r, p), M{"masquerade": nil}))
+			nat := M{"masquerade": nil}
+			if r.Route != "" {
+				route, _ := parseRoute(r.Route)
+				nat = obj("snat", M{"addr": route.Out.Local})
+				for dir, profile := range map[string]routeProfile{"original": route.Out, "reply": route.In} {
+					expr := append(connMatch(r, p), match(ct("direction", ""), dir), obj("mangle", M{"key": meta("mark"), "value": profile.mark()}))
+					addRule("route", expr)
+				}
+			}
+			addRule("post", append(connMatch(r, p), nat))
 			for _, dir := range []string{"up", "down"} {
 				name := counterName(r, p, dir, c.Epoch)
 				if !counters[name] {
@@ -264,7 +283,7 @@ func executeNFT(data M, check bool) error {
 	return e
 }
 func sameRule(a, b Rule) bool {
-	return a.ID == b.ID && a.Protocol == b.Protocol && a.Port == b.Port && a.IP == b.IP && a.TargetPort == b.TargetPort
+	return a.Route == b.Route && a.ID == b.ID && a.Protocol == b.Protocol && a.Port == b.Port && a.IP == b.IP && a.TargetPort == b.TargetPort
 }
 func (a *Agent) projection(c Config) []byte {
 	rows := append(append([]Rule{}, c.Rules...), c.Retired...)
@@ -272,6 +291,9 @@ func (a *Agent) projection(c Config) []byte {
 	lines := []string{"v=" + c.Hash}
 	for _, r := range rows {
 		line := fmt.Sprintf("%d %s %d %s %d", r.ID, r.Protocol, r.Port, r.Host, r.TargetPort)
+		if r.Route != "" {
+			line += " " + r.Route
+		}
 		if !seen[line] {
 			lines = append(lines, line)
 			seen[line] = true
@@ -331,6 +353,27 @@ func (a *Agent) apply(c Config) error {
 			}
 		}
 		c.Retired = kept
+		if len(profiles(c)) > 0 || len(profiles(old)) > 0 {
+			defer func() {
+				if result != nil {
+					if err := a.prepareRoutes(old); err != nil {
+						result = fmt.Errorf("%w; 恢复旧路由失败: %v", result, err)
+					} else if err := a.pruneRoutes(old); err != nil {
+						result = fmt.Errorf("%w; 清理新路由失败: %v", result, err)
+					}
+				}
+			}()
+		}
+		if len(profiles(c)) > 0 {
+			if a.root == "/var/lib/ictl" {
+				if e = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644); e != nil {
+					return e
+				}
+			}
+			if e = a.prepareRoutes(c); e != nil {
+				return e
+			}
+		}
 		tx := a.transaction(c, state, exists)
 		if e = executeNFT(tx, true); e != nil {
 			return e
@@ -435,6 +478,9 @@ func (a *Agent) apply(c Config) error {
 				return e
 			}
 		}
+		if e = a.pruneRoutes(c); e != nil {
+			return e
+		}
 		return removeIfExists(a.path("active/pending.json"))
 	})
 }
@@ -519,12 +565,22 @@ func (a *Agent) heldPorts() []int {
 func (a *Agent) clear() error {
 	return a.locked(func() error {
 		state, exists, e := a.nftState()
-		if e != nil || !exists {
+		if e != nil {
 			return e
+		}
+		if !exists {
+			return a.pruneRoutes(Config{})
 		}
 		cmds := []any{}
 		for _, ch := range []string{"pre", "post", "forward"} {
 			cmds = append(cmds, op("flush", "chain", M{"family": "ip", "table": tableName, "name": ch}))
+		}
+		for _, item := range array(state["nftables"]) {
+			m, _ := item.(map[string]any)
+			ch, _ := m["chain"].(map[string]any)
+			if ch["name"] == "route" {
+				cmds = append(cmds, op("flush", "chain", M{"family": "ip", "table": tableName, "name": "route"}))
+			}
 		}
 		if e = executeNFT(M{"nftables": cmds}, false); e != nil {
 			return e
@@ -546,7 +602,10 @@ func (a *Agent) clear() error {
 			}
 		}
 		_ = state
-		return executeNFT(M{"nftables": []any{op("delete", "table", M{"family": "ip", "name": tableName})}}, false)
+		if e = executeNFT(M{"nftables": []any{op("delete", "table", M{"family": "ip", "name": tableName})}}, false); e != nil {
+			return e
+		}
+		return a.pruneRoutes(Config{})
 	})
 }
 func removeIfExists(path string) error {
