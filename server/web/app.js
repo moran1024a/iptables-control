@@ -83,7 +83,8 @@ function pill(status) {
 // 节点名称下方的小字：入站地址 · 备注（单行，过长显示省略号）
 function nodeSub(n) {
   const note = n.note ? `<span class="sep">·</span><span class="note" title="${esc(n.note)}">${esc(n.note.replace(/\n+/g, " "))}</span>` : "";
-  return `<div class="sub node-sub"><span class="mono">${esc(n.addr)}</span>${note}</div>`;
+  const secondary=(n.addresses||[]).filter(a=>!a.primary);
+  return `<div class="sub node-sub"><span class="mono">${esc(n.addr)}</span>${secondary.length?`<span class="muted" title="${esc(secondary.map(a=>a.host).join('、'))}">＋${secondary.length} IP</span>`:''}${note}</div>`;
 }
 
 // 页脚：登录后显示版本号，登录页只显示名称
@@ -623,12 +624,12 @@ async function nodeDetail(id, request) {
   render(`
     <a class="back" href="#/nodes">← 节点列表</a>
     <div class="detail-head">
-      <div class="node-head"><h1>${esc(n.name)}</h1><div class="sub mono">${esc(n.addr)}</div></div>
+      <div class="node-head"><h1>${esc(n.name)}</h1>${nodeSub(n)}</div>
       <div class="detail-actions"><div class="meta"><span class="muted">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${pill(n.status)}<span class="muted">最后上报 ${ago(n.last_seen, d.now)}</span></div><button data-action="node-edit">编辑</button>${moreActions(`node-actions-${id}`, `<button data-action="node-rekey">重置密钥</button>${n.status === 'deleting'?'<button class="danger" data-action="node-delete" data-force="1">强制删除</button>':'<button class="danger" data-action="node-delete">删除</button>'}`)}</div>
     </div>
     ${n.note ? `<div class="panel note-full"><h2>备注</h2><div>${esc(n.note)}</div></div>` : ""}
     <div class="detail-grid"><div class="panel">${bar(n.bar)}
-      ${n.installed_agent === "legacy" || !n.installed_agent ? `<p class="t-yellow">此节点尚未迁移。请在节点执行下方一键接入命令；新版主动 Agent 确认安装后才能加入池并显示采集信息。</p>` : ""}
+      ${n.installed_agent === "legacy" || !n.installed_agent ? `<p class="t-yellow">此节点尚未迁移，请在节点执行下方一键接入命令。</p>` : ""}
       ${n.desired_mode === "passive" || n.manual_required ? `<p class="hint">本机运行 <code>sudo ictl --sync</code> 或菜单「同步更新」。等待状态会持续到当前变更确认成功。白条上的绿色表示手动同步活动或远程同步成功，执行结果见下方事件。</p>` : ""}
       ${n.desired_mode === "passive" ? `<p class="hint">已同步表示最近一次确认结果，不表示实时在线；被动模式不自动轮询。</p>` : ""}
       ${n.desired_mode === "passive" ? `<p class="hint">远程唤醒：${n.wake_enabled ? `已开启，UDP ${n.wake_port}。${n.wake?.state === 'waiting' ? '正在等待同步确认，超过 30 秒转为等待手动同步。' : n.wake?.state === 'confirmed' ? '最近一次同步已确认。' : '请确保节点本地已配置白名单和相同端口。'}` : '未开启，配置变更需要本机手动同步。'}</p>` : ""}
@@ -647,6 +648,7 @@ async function nodeDetail(id, request) {
       <p class="hint">在对应节点执行一键接入命令。旧节点升级或切换类型也使用此入口，保留节点身份；新主动 Agent 需要 HTTPS。</p>
     </div>
     </div><div class="panel"><h2>转发规则<span class="count">允许端口 ${esc(n.ports)}</span></h2><div class="table-scroll">${rules}</div></div>
+    ${nodeAddressPanel(n)}
     ${telemetryPanel(d)}
     ${detailsBlock(`more-${id}`, "更多信息", more)}
     ${detailsBlock(`events-${id}`, "事件记录", events)}`);
@@ -663,6 +665,17 @@ function bytesText(value) {
   } catch (_) { return "-"; }
 }
 
+function nodeAddressStatus(a, network={}) {
+  if (!a.local || !a.device) return '待识别';
+  if (network.complete && !(network.addresses||[]).some(n=>n.local===a.local&&n.device===a.device)) return '最近采集未发现';
+  return a.device;
+}
+
+function nodeAddressPanel(n) {
+  if (!n.addresses?.length) return '';
+  return `<div class="panel"><h2>IP 地址</h2><div class="node-address-summary">${n.addresses.map(a=>`<div><span class="muted">${a.primary?'主 IP':'副 IP'}</span><code>${esc(a.host)}</code>${a.name?`<span>${esc(a.name)}</span>`:''}<small class="muted">${esc(nodeAddressStatus(a,n.network))}</small></div>`).join('')}</div><p class="hint">最近识别 ${fmtTime(n.network?.sampled_at)}${n.src_ip?` · 连接来源 ${esc(n.src_ip)}`:''}</p></div>`;
+}
+
 function telemetryPanel(d) {
   const n = d.node, t = d.telemetry || {}, m = t.metrics || {}, inv = t.inventory || {};
   if (n.installed_agent !== "active" && !(t.traffic || []).length) return "";
@@ -671,11 +684,9 @@ function telemetryPanel(d) {
   const mem = m.memory || {};
   const net = Object.entries(m.interfaces || {}).map(([name,v]) => `<tr><td>${esc(name)}</td><td>${bytesText(v.rx_bytes)}</td><td>${bytesText(v.tx_bytes)}</td><td>${v.rx_bytes_per_second == null ? "-" : bytesText(Math.round(v.rx_bytes_per_second)) + "/s"}</td><td>${v.tx_bytes_per_second == null ? "-" : bytesText(Math.round(v.tx_bytes_per_second)) + "/s"}</td></tr>`).join("");
   const ports = ((t.ports || {}).rows || []).slice(0,100).map(p => `<tr><td>${esc(p.source)}</td><td>${esc(p.protocol)}</td><td>${esc(p.port)}</td><td>${esc(p.address || p.target || "-")}</td></tr>`).join("");
-  const queries = [["inventory","系统信息"],["ports","端口详情"],["network","网络信息"],["rules","当前规则"],["logs","最近日志"]];
   const history = (t.history || []).slice(-20).map(r => `<tr><td>${fmtTime(r.time)}</td><td>${r.data.values?.cpu_percent ? Number(r.data.values.cpu_percent.mean).toFixed(1) + "%" : "-"}</td><td>${r.data.values?.memory_used_percent ? Number(r.data.values.memory_used_percent.mean).toFixed(1) + "%" : "-"}</td><td>${r.data.samples}</td></tr>`).join("");
-  const buttons = n.installed_agent === "active" && n.desired_mode === "active" ? queries.map(([kind,label]) => `<button class="small" data-action="node-query" data-kind="${kind}">${label}</button>`).join("") : "";
-  const diagnostics = n.installed_agent === "active" && n.desired_mode === "active" ? d.rules.map(r => `<button class="small" data-action="node-query" data-kind="diagnose" data-rule="${r.id}">诊断 ${esc(r.chain_remark)}</button><button class="small" data-action="node-query" data-kind="connections" data-rule="${r.id}">连接 ${esc(r.chain_remark)}</button>`).join("") : "";
-  return `<div class="panel"><h2>主动 Agent 采集</h2><p class="hint">最近采样 ${fmtTime(t.metrics_at)}；离线或切为被动后保留历史值，不代表实时状态。</p>
+  const diagnostic = n.installed_agent === "active" && n.desired_mode === "active" ? '<button class="small" data-action="node-diagnostics">诊断</button>' : '';
+  return `<div class="panel"><h2>主动 Agent 采集 ${diagnostic}</h2><p class="hint">最近采样 ${fmtTime(t.metrics_at)}；离线或切为被动后保留历史值，不代表实时状态。</p>
     <div class="kv-grid"><span>内核 / 架构</span><span>${esc(inv.kernel || "-")} / ${esc(inv.arch || "-")}</span>
     <span>CPU</span><span>${m.cpu_percent == null ? "-" : Number(m.cpu_percent).toFixed(1) + "%"}</span>
     <span>内存可用 / 总量</span><span>${bytesText(mem.MemAvailable)} / ${bytesText(mem.MemTotal)}</span>
@@ -686,7 +697,7 @@ function telemetryPanel(d) {
     <table><thead><tr><th>规则</th><th>协议</th><th>上行</th><th>下行</th><th>计数状态</th></tr></thead><tbody>${traffic || '<tr><td colspan="5">等待采集</td></tr>'}</tbody></table>
     ${detailsBlock(`network-${n.id}`, "网卡与端口", `<table><thead><tr><th>网卡</th><th>接收</th><th>发送</th><th>接收速率</th><th>发送速率</th></tr></thead><tbody>${net}</tbody></table><p>端口快照（最多显示 100 条）</p><table><thead><tr><th>来源</th><th>协议</th><th>端口</th><th>地址</th></tr></thead><tbody>${ports}</tbody></table>`)}
     ${detailsBlock(`history-${n.id}`, "最近 20 分钟（采样均值）", `<table><thead><tr><th>时间</th><th>CPU</th><th>内存使用率</th><th>样本数</th></tr></thead><tbody>${history}</tbody></table><p class="hint">缺失的时间段没有采样，不按零处理。</p>`)}
-    <div class="actions">${buttons}${diagnostics}</div></div>`;
+    </div>`;
 }
 
 // ------------------------------------------------------------ 转发
@@ -821,7 +832,7 @@ async function settingsPage(request) {
 
 let modalState = null;
 const modalValues = () => JSON.stringify([...document.querySelectorAll('#modal form input, #modal form select, #modal form textarea')]
-  .filter(el => !el.hasAttribute('data-ignore-dirty')).map(el => [el.name || el.id, el.type === 'checkbox' ? el.checked : el.value]));
+  .filter(el => !el.hasAttribute('data-ignore-dirty')).map(el => [el.name || el.id, ['checkbox','radio'].includes(el.type) ? el.checked : el.value]));
 const modalChanged = () => modalState && (modalState.dirty || modalValues() !== modalState.initial);
 
 function openModal(html, preserve = false) {
@@ -999,41 +1010,91 @@ function groupSelect(groups, selected) {
 
 function nodeAddressRow(a={}) {
   const id=a.id||('ip-'+(crypto.randomUUID?.()||`${Date.now()}-${Math.random().toString(16).slice(2)}`));
-  return `<div class="node-address-row" data-address-id="${esc(id)}">${[['name','名称'],['host','连接 IP'],['local','本机 IP（同上可留空）'],['device','网卡，如 eth0'],['gateway','网关（可选）']].map(([key,label])=>`<input data-address-field="${key}" value="${esc(a[key]||'')}" placeholder="${label}" aria-label="${label}" ${['name','host','device'].includes(key)?'required':''}>`).join('')}<button type="button" data-action="node-address-remove" aria-label="删除地址">×</button></div>`;
+  const field=(key,label,extra='')=>`<input data-address-field="${key}" value="${esc(a[key]||'')}" placeholder="${label}" aria-label="${label}" ${extra}>`;
+  return `<div class="node-address-row" data-address-id="${esc(id)}">
+    <div class="node-address-main"><label class="address-primary" title="设为主 IP"><input type="radio" name="primary_address" value="${esc(id)}" ${a.primary?'checked':''}><span data-primary-label>${a.primary?'主 IP':'副 IP'}</span></label>
+    ${field('host','IP 地址',`required data-previous="${esc(a.host||'')}" ${a.primary?'name="addr"':''}`)}${field('name','名称（选填)','maxlength="64"')}
+    <button type="button" class="small" data-action="node-address-remove" aria-label="删除地址" ${a.primary?'disabled':''}>×</button></div>
+    <details class="address-advanced"><summary>高级 <span class="muted" data-address-status></span></summary><div class="address-routing">
+    <label><span>本机 IP</span>${field('local','与 IP 地址相同','list="node-local-addresses"')}</label>
+    <label><span>网卡</span>${field('device','自动识别','list="node-devices"')}</label>
+    <label><span>网关</span>${field('gateway','自动识别')}</label></div><p class="hint">NAT 地址请选择对应的本机 IP；网卡和网关可手动指定。</p></details></div>`;
+}
+
+function syncAddressRows(form) {
+  const network=form._network||{}, candidates=network.addresses||[];
+  form.querySelectorAll('[data-address-id]').forEach(row=>{
+    const field=key=>row.querySelector(`[data-address-field="${key}"]`);
+    const primary=row.querySelector('[name=primary_address]').checked;
+    row.querySelector('[data-primary-label]').textContent=primary?'主 IP':'副 IP';
+    row.querySelector('[data-action=node-address-remove]').disabled=primary;
+    if(primary)field('host').name='addr';else field('host').removeAttribute('name');
+    const local=field('local').value.trim()||field('host').value.trim();
+    const matches=[...new Set(candidates.filter(n=>n.local===local).map(n=>n.device))];
+    if(network.complete!==false&&!field('device').value&&matches.length===1)field('device').value=matches[0];
+    row.querySelector('[data-address-status]').textContent=nodeAddressStatus({local,device:field('device').value},network);
+  });
+}
+
+function renderAddressCandidates(form) {
+  const network=form._network||{}, candidates=network.addresses||[];
+  form.querySelector('[data-address-candidates]').innerHTML=candidates.map((n,i)=>`<label class="address-candidate"><input type="checkbox" data-ignore-dirty value="${i}"><code>${esc(n.local)}</code><small class="muted">${esc(n.device)}</small></label>`).join('')||'<p class="hint">暂无已识别地址，请先同步 Agent，也可以手动添加。</p>';
+  form.querySelector('[data-address-sampled]').textContent=`最近识别 ${fmtTime(network.sampled_at)}`;
+  form.querySelector('#node-local-addresses').innerHTML=[...new Set(candidates.map(n=>n.local))].map(ip=>`<option value="${esc(ip)}">`).join('');
+  form.querySelector('#node-devices').innerHTML=[...new Set(candidates.map(n=>n.device))].map(dev=>`<option value="${esc(dev)}">`).join('');
+  syncAddressRows(form);
 }
 
 async function nodeForm(node) {
-  const page = pageVersion;
+  const page = pageVersion, session=modalState;
   const { groups } = await api("GET", "nodes");
-  if (page !== pageVersion) return;
+  if (page !== pageVersion || session!==modalState || modalState?.busy) return;
+  const addresses=node?.addresses?.length?node.addresses.map(a=>({...a})):[{host:node?.addr||'',primary:true}];
+  if(!addresses.some(a=>a.primary))addresses[0].primary=true;
   openModal(`
     <h2>${node ? "编辑节点" : "新增节点"}</h2>
     <form data-form="node" data-id="${node ? node.id : ""}" data-kind="forward">
       <label><span>名称</span><input name="name" value="${esc(node?.name)}" maxlength="64" required></label>
       ${groupSelect(groups, node?.group_id)}
-      <label><span>备注（选填，节点的说明）</span><textarea name="note" rows="3" maxlength="500">${esc(node?.note)}</textarea></label>
-      <label><span>入站地址（IPv4 或域名，其他节点通过它连接到该节点）</span>
-        <input name="addr" value="${esc(node?.addr)}" class="mono" required></label>
-      <details class="node-addresses"><summary>转发 IP 地址</summary><div data-address-list>${(node?.addresses||[]).map(nodeAddressRow).join('')}</div><button type="button" class="small" data-action="node-address-add">＋ 地址</button></details>
-      <label><span>允许的入站端口（端口或范围，多个用逗号分隔，如 10000-20000,30000）</span>
-        <input name="ports" value="${esc(node?.ports ?? "10000-65535")}" class="mono" required></label>
-      <label><span>质量探测 UDP 端口（默认 33445，0 停止全部探测；仅主动节点使用）</span><input name="quality_port" type="number" min="0" max="65535" value="${node?.quality_port ?? 33445}" required></label>
-      <p class="hint">请在防火墙／云安全组放行其他探测节点访问此端口。探测异常不影响现有转发。</p>
       <label><span>同步模式</span><select name="desired_mode" ${node?.first_seen && node.protocol_version < 2 ? "disabled" : ""}>
         <option value="active" ${node?.desired_mode !== "passive" ? "selected" : ""}>主动（长连接自动同步）</option>
         <option value="passive" ${node?.desired_mode === "passive" ? "selected" : ""}>被动（默认手动，可选远程唤醒）</option>
       </select></label>
-      <p class="hint">${node?.first_seen && node.protocol_version < 2 ? "请先升级 Agent 并同步一次，才能切换模式。" : "切换模式后需在本机运行 sudo ictl --sync 确认；被动转主动也需要本机操作。"}</p>
+      ${node?`<p class="hint">${node.first_seen && node.protocol_version < 2 ? '请先升级 Agent 并同步一次，才能切换模式。' : '切换模式后需在本机运行 sudo ictl --sync 确认。'}</p>`:''}
+      <section class="node-addresses"><h3>IP 地址</h3><div data-address-list>${addresses.map(nodeAddressRow).join('')}</div><div class="actions"><button type="button" class="small" data-action="node-address-add">＋ 副 IP</button>${node?.installed_agent==='active'&&node?.desired_mode==='active'?'<button type="button" class="small" data-action="node-address-refresh">刷新识别</button>':''}<small class="muted" data-address-sampled></small></div>
+      <details class="address-picker"><summary>从已识别地址添加</summary><div data-address-candidates></div><button type="button" class="small" data-action="node-address-pick">添加选中</button></details>
+      ${node?.src_ip?`<p class="hint">最近连接来源 ${esc(node.src_ip)}；NAT 环境可能与主 IP 不同。</p>`:''}
+      <datalist id="node-local-addresses"></datalist><datalist id="node-devices"></datalist><div data-error="addresses" class="form-error"></div></section>
+      <details class="node-options"><summary>更多设置</summary>
+      <label><span>备注</span><textarea name="note" rows="2" maxlength="500">${esc(node?.note)}</textarea></label>
+      <label><span>允许端口</span><input name="ports" value="${esc(node?.ports ?? '10000-65535')}" class="mono" required></label>
+      <label><span>质量探测 UDP 端口（0 关闭）</span><input name="quality_port" type="number" min="0" max="65535" value="${node?.quality_port ?? 33445}" required></label>
+      <div data-passive-options>
       <label><span>被动节点远程唤醒</span><select name="wake_enabled"><option value="0" ${!node?.wake_enabled ? 'selected' : ''}>关闭（默认）</option><option value="1" ${node?.wake_enabled ? 'selected' : ''}>开启：配置变化时自动唤醒</option></select></label>
       <label><span>唤醒 UDP 端口（与节点本地一致，0 为未设置）</span><input name="wake_port" type="number" min="0" max="65535" value="${node?.wake_port ?? 0}" required></label>
-      <p class="hint">先在节点运行 sudo ictl，设置 Server 出口 IP 白名单及监听端口。面板开关不会开启节点监听。30 秒未收到成功回执时提示手动同步；程序升级和模式切换仍需本机操作。</p>
-      ${node ? `<p class="hint">修改入站地址会重新生成密钥。</p>` : ""}
+      <p class="hint">先在节点运行 sudo ictl 设置白名单及端口。30 秒未确认时等待手动同步。</p></div></details>
       <div class="form-error"></div>
       <div class="form-actions">
         <button type="button" data-action="modal-close">取消</button>
         <button class="primary">保存</button>
       </div>
     </form>`);
+  const form=$('#modal form');
+  form._network=node?.network||{};
+  const mode=()=>{form.querySelector('[data-passive-options]').hidden=form.elements.desired_mode.value!=='passive';};
+  form.addEventListener('change',event=>{
+    const input=event.target, row=input.closest('[data-address-id]');
+    if(row&&['host','local'].includes(input.dataset.addressField)){
+      const local=row.querySelector('[data-address-field=local]');
+      if(input.dataset.addressField==='local'||!local.value||local.value===input.dataset.previous){
+        if(input.dataset.addressField==='host'){local.value='';input.dataset.previous=input.value.trim();}
+        row.querySelector('[data-address-field=device]').value='';
+      }
+    }
+    syncAddressRows(form);mode();
+  });
+  renderAddressCandidates(form);mode();
+  modalState.initial=modalValues();
 }
 
 function groupForm(kind, group) {
@@ -1165,22 +1226,28 @@ const FORMS = {
 
   async node(form, data) {
     const id = form.dataset.id;
-    const addresses=[...form.querySelectorAll('[data-address-id]')].map(row=>Object.fromEntries([['id',row.dataset.addressId],...[...row.querySelectorAll('[data-address-field]')].map(input=>[input.dataset.addressField,input.value.trim()])]));
+    const addresses=[...form.querySelectorAll('[data-address-id]')].map(row=>Object.fromEntries([['id',row.dataset.addressId],['primary',row.querySelector('[name=primary_address]').checked],...[...row.querySelectorAll('[data-address-field]')].map(input=>[input.dataset.addressField,input.value.trim()])]));
+    data.addr=addresses.find(a=>a.primary)?.host;
     if (!id) {
       const r = await api("POST", "nodes", { addresses, name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
       closeModal();
       location.hash = `#/nodes/${r.id}`;
       return;
     }
-    const r = await api("PATCH", `nodes/${id}`, { addresses, name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
+    await api("PATCH", `nodes/${id}`, { addresses, name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
     closeModal();
-    if (r.key) {
-      const ups = r.upstream.length ? `<p>以下节点需要同步规则：${r.upstream.map(esc).join("、")}</p>` : "";
-      keyModal("入站地址已修改，密钥已重新生成", r.key, ups);
-    } else {
-      toast("已保存");
-    }
+    toast("已保存");
     refresh();
+  },
+
+  async 'node-diagnostic'(form, data) {
+    const session=modalState, resultBox=form.querySelector('[data-diagnostic-result]');
+    resultBox.hidden=true;
+    const result=await api('POST',`nodes/${form.dataset.id}/query`,{kind:data.kind,rule_id:Number(data.rule_id||0)});
+    if(session!==modalState||!form.isConnected)return;
+    if(result.error)throw new Error(result.error);
+    resultBox.textContent=JSON.stringify(result.data||result,null,2);
+    resultBox.hidden=false;
   },
 
   async group(form, data) {
@@ -1239,6 +1306,20 @@ const ACTIONS = {
 
   "node-new": () => nodeForm(),
   "node-edit": () => nodeForm(currentNode),
+  async 'node-diagnostics'() {
+    const page=pageVersion, id=currentNode.id, session=modalState;
+    const d=await api('GET',`nodes/${id}`);
+    if(page!==pageVersion||currentNode?.id!==id||session!==modalState||modalState?.busy)return;
+    const queries=[['inventory','系统信息'],['ports','端口详情'],['network','网络信息'],['rules','当前规则'],['logs','最近日志'],['diagnose','转发诊断'],['connections','转发连接']];
+    openModal(`<h2>节点诊断</h2><form data-form="node-diagnostic" data-id="${id}"><label><span>检查项目</span><select name="kind" data-ignore-dirty>${plainOptions(queries)}</select></label><label data-diagnostic-rule hidden><span>转发规则</span><select name="rule_id" data-ignore-dirty>${plainOptions(d.rules.map(r=>[r.id,`${r.chain_remark} · ${r.port}`]))}</select></label><pre class="diagnostic-result" data-diagnostic-result hidden></pre><div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">关闭</button><button class="primary">检查</button></div></form>`);
+    const form=$('#modal form');
+    form.elements.kind.addEventListener('change',()=>{
+      const needsRule=['diagnose','connections'].includes(form.elements.kind.value);
+      form.querySelector('[data-diagnostic-rule]').hidden=!needsRule;
+      form.elements.rule_id.required=needsRule;
+      form.querySelector('button.primary').disabled=needsRule&&!d.rules.length;
+    });
+  },
   async "node-query"(el) {
     const id = currentNode.id, page = pageVersion;
     openModal('<h2>节点查询</h2><p role="status">查询中…</p><button data-action="modal-close">关闭</button>');
@@ -1869,6 +1950,41 @@ if (document.readyState === 'loading') document.addEventListener('DOMContentLoad
 else route();
 
 Object.assign(ACTIONS, {
-  'node-address-add':()=>$('#modal [data-address-list]').insertAdjacentHTML('beforeend',nodeAddressRow()),
-  'node-address-remove':el=>el.closest('[data-address-id]').remove(),
+  'node-address-add':()=>{
+    const form=$('#modal form');
+    if(form.querySelectorAll('[data-address-id]').length>=33)return toast('最多添加 32 个副 IP',true);
+    form.querySelector('[data-address-list]').insertAdjacentHTML('beforeend',nodeAddressRow());
+    syncAddressRows(form);
+    form.querySelector('[data-address-id]:last-child [data-address-field=host]').focus();
+  },
+  'node-address-remove':el=>{
+    const row=el.closest('[data-address-id]');
+    if(!row.querySelector('[name=primary_address]').checked)row.remove();
+  },
+  'node-address-pick':()=>{
+    const form=$('#modal form'), candidates=form._network?.addresses||[];
+    for(const choice of form.querySelectorAll('[data-address-candidates] input:checked')){
+      const a=candidates[Number(choice.value)];
+      if(!a)continue;
+      const exists=[...form.querySelectorAll('[data-address-id]')].some(row=>row.querySelector('[data-address-field=host]').value===a.local&&row.querySelector('[data-address-field=device]').value===a.device);
+      if(!exists&&form.querySelectorAll('[data-address-id]').length<33)
+        form.querySelector('[data-address-list]').insertAdjacentHTML('beforeend',nodeAddressRow({host:a.local,local:a.local,device:a.device}));
+      choice.checked=false;
+    }
+    syncAddressRows(form);
+  },
+  async 'node-address-refresh'(button) {
+    const form=button.closest('form'), session=modalState;
+    button.disabled=true;
+    try{
+      const result=await api('POST',`nodes/${form.dataset.id}/query`,{kind:'inventory'});
+      if(result.error)throw new Error(result.error);
+      const d=await api('GET',`nodes/${form.dataset.id}`);
+      if(session!==modalState||!form.isConnected)return;
+      form._network=d.node.network||{};
+      renderAddressCandidates(form);
+      toast('已刷新识别信息');
+    }catch(err){if(session===modalState)toast(err.message,true);}
+    finally{if(button.isConnected)button.disabled=false;}
+  },
 });

@@ -111,7 +111,7 @@ def snapshot(graph):
              for b in result['vertices'] if b['kind']=='target'}
     result['ports'] = {k: v for k, v in result.get('ports', {}).items() if k in pairs}
     used = node_addresses.references(result)
-    result['address_book'] = {vid: {ident: {k: v for k, v in address.items() if k != 'name'}
+    result['address_book'] = {vid: {ident: node_addresses.routing(address)
         for ident, address in addresses.items() if ident in used.get(vid, set())}
         for vid, addresses in result.get('address_book', {}).items() if vid in used}
     return result
@@ -148,13 +148,15 @@ def validate_bindings(c, raw, graph, complete):
         if v.get('node_id'):
             graph['address_book'][v['id']] = {a['id']: a for a in node_addresses.listing(c, database.get_node(c, v['node_id']))}
             if complete and not v['disabled'] and not graph['address_book'][v['id']]:
-                fail('请先在节点编辑页填写转发 IP、网卡和所需网关', 'vertex:' + v['id'])
+                fail('请先在节点编辑页设置 IP 地址', 'vertex:' + v['id'])
         if v['kind'] == 'entry' and not v.get('address') and len(graph['address_book'][v['id']]) == 1:
             v['address'] = next(iter(graph['address_book'][v['id']]))
         if v['kind'] in ('entry', 'target') and v['disabled']:
             fail('入口和目标不能禁用，请从画布移除', 'vertex:' + v['id'])
         if v['kind'] == 'entry' and complete and v.get('address') not in graph['address_book'][v['id']]:
             fail('请选择入口接收地址', 'vertex:' + v['id'])
+        if v['kind'] == 'entry' and complete and not node_addresses.ready(graph['address_book'][v['id']][v['address']]):
+            fail('入口地址待识别，请先同步 Agent 或在地址高级设置中选择本机地址、网卡', 'vertex:' + v['id'])
     for source, target in connections(graph):
         key = node_addresses.edge_key(source, target)
         mapping = bindings.get(key, {})
@@ -174,7 +176,10 @@ def validate_bindings(c, raw, graph, complete):
                         name = database.get_node(c, v['node_id'])['name']
                         direction = '发出' if side == 'from' else '接收'
                         fail(f'请点击「{name}」的{direction} IP 连接点', 'vertex:' + v['id'])
-                else: clean[side][v['id']] = ident
+                else:
+                    if complete and not v['disabled'] and not node_addresses.ready(available[ident]):
+                        fail(f"地址 {available[ident]['host']} 待识别，请先同步 Agent 或补全地址高级设置", 'vertex:' + v['id'])
+                    clean[side][v['id']] = ident
         graph['bindings'][key] = clean
 
 
@@ -385,7 +390,7 @@ def validate(c, raw, complete=True):
     return result
 
 
-def find_path(graph, *, entry=None, target=None, required=(), prefix=(), allowed=None, shuffle=False, preferred=()):
+def find_path(graph, *, entry=None, target=None, required=(), prefix=(), allowed=None, shuffle=False, preferred=(), first_hop=...):
     """Bounded DFS, pruning branches that cannot reach the remaining waypoints."""
     graph = flatten(graph)
     vertices = {v["id"]: v for v in graph["vertices"]}
@@ -412,6 +417,8 @@ def find_path(graph, *, entry=None, target=None, required=(), prefix=(), allowed
         if visits > MAX_VISITS: fail("路径组合过多，请简化拓扑")
         v = vertices[i]; nid = v.get("node_id")
         if i not in reachable[target] or i in path or v.get("disabled") or (nid and nid in nodes): return None
+        if first_hop is not ... and v['kind'] in ('node', 'target') and not any(vertices[p]['kind'] == 'node' for p in path):
+            if (i if v['kind'] == 'node' else None) != first_hop: return None
         if any(i not in reachable[r] for r in required.difference(path)): return None
         if allowed is not None and not allowed(v): return None
         if len(path) < len(prefix) and prefix[len(path)] != i: return None
@@ -430,21 +437,60 @@ def find_path(graph, *, entry=None, target=None, required=(), prefix=(), allowed
     return walk(entry or target, [], set())
 
 
-def entry_paths(graph, entry, *, prefix=(), required=(), preferred=None, allowed=None, direct=False):
-    """Find the reachable target paths, preserving each configuration's route."""
+def entry_hop(graph, path):
+    """The first forwarding node; direct targets and legacy bypasses use None."""
+    nodes = {v['id'] for v in graph['vertices'] if v['kind'] == 'node'}
+    return next((i for i in path[1:] if i in nodes), None)
+
+
+def entry_paths(graph, entry, *, prefix=(), required=(), preferred=None, allowed=None, direct=False, first_hop=...):
+    """Select routes with one first hop, retaining unaffected downstream paths."""
     graph = flatten(graph)
+    vertices = {v['id']: v for v in graph['vertices']}
     targets = [v['id'] for v in graph['vertices'] if v['kind'] == 'target']
     preferred = preferred or {}
     # Older clients can still send the terminal target in their selection.
     if prefix and prefix[-1] in targets:
         prefix, direct = prefix[:-1], True
-    result = []
-    for target in targets:
-        path = find_path(graph, entry=entry, target=target,
-                         prefix=[*prefix, target] if direct else prefix,
-                         required=required, preferred=preferred.get(target, ()), allowed=allowed)
-        if path: result.append(path)
-    return result
+    constrained = len(prefix) > 1 or bool(required) or direct
+    # Only visit possible first forwarding nodes. A legacy direct component is
+    # transparent; multiple direct targets belong to the same no-relay route.
+    adjacency = {i: [] for i in vertices}
+    for a, b in expanded_edges(graph): adjacency[a].append(b)
+    hops, seen, queue = [], {entry}, list(adjacency.get(entry, ()))
+    for i in queue:
+        if i in seen: continue
+        seen.add(i)
+        if vertices[i]['kind'] == 'direct': queue.extend(adjacency[i])
+        else:
+            hop = i if vertices[i]['kind'] == 'node' else None
+            if hop not in hops: hops.append(hop)
+    current_hops = [entry_hop(graph, p) for p in preferred.values() if p]
+    hops.sort(key=lambda hop: -current_hops.count(hop))
+    if first_hop is not ...: hops = [hop for hop in hops if hop == first_hop]
+    for hop in hops:
+        selected = {}
+        for target in targets:
+            path = find_path(graph, entry=entry, target=target,
+                             prefix=[*prefix, target] if direct else prefix,
+                             required=required, preferred=preferred.get(target, ()),
+                             allowed=allowed, first_hop=hop)
+            if path: selected[target] = path
+        if not selected: continue
+        for target in targets:
+            if target in selected: continue
+            old = preferred.get(target, [])
+            if constrained and old and entry_hop(graph, old) == hop and find_path(graph, entry=entry, target=target, prefix=old) == old:
+                continue
+            # Changing the first hop also moves targets outside the selected
+            # downstream branch. Never leave them on another first hop.
+            path = find_path(graph, entry=entry, target=target, preferred=old,
+                             allowed=allowed, first_hop=hop)
+            if not path: break
+            selected[target] = path
+        else:
+            return [selected[t] for t in targets if t in selected]
+    return []
 
 
 def check_path(graph, path):

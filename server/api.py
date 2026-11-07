@@ -15,6 +15,17 @@ import settings
 import subscriptions
 
 
+def source_address(peer, forwarded=None):
+    """Use the last proxy hop under the same trust rule for HTTP and WebSocket."""
+    try:
+        ip = ipaddress.ip_address(peer)
+        if forwarded and (ip.is_private or ip.is_loopback):
+            return str(ipaddress.ip_address(forwarded.split(',')[-1].strip()))
+    except ValueError:
+        pass
+    return peer
+
+
 class Request:
     """Framework-independent HTTP request/response adapter; business actions live in Resources."""
 
@@ -94,13 +105,7 @@ class Request:
     def source_ip(self):
         """真实来源 IP。直连来源为本机或内网（反向代理、Docker 网桥）时才信任 X-Forwarded-For，
         公网客户端直连时自带的该请求头会被忽略，无法伪造。"""
-        ip = self.client_address[0]
-        xff = self.headers.get("X-Forwarded-For")
-        if xff:
-            peer = ipaddress.ip_address(ip)
-            if peer.is_private or peer.is_loopback:
-                ip = xff.split(",")[-1].strip()
-        return ip
+        return source_address(self.client_address[0], self.headers.get("X-Forwarded-For"))
 
     def static(self, name):
         if name not in settings.STATIC:

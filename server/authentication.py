@@ -51,7 +51,7 @@ def api_login(self, conn, body):
         fails = LOGIN_FAILS.get(ip)
         if fails and fails[1] > now:
             return self.send_json(429, {"error": f"尝试次数过多，请 {int(fails[1] - now) + 1} 秒后再试"})
-    user_ok = hmac.compare_digest(str(body.get("username", "")), database.setting(conn, "admin_user"))
+    user_ok = hmac.compare_digest(str(body.get("username", "")).encode(), database.setting(conn, "admin_user").encode())
     pass_ok = security.verify_password(str(body.get("password", "")), database.setting(conn, "admin_hash"))
     if not (user_ok and pass_ok):
         with LOGIN_FAILS_LOCK:

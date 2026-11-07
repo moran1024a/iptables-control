@@ -326,6 +326,7 @@ def init_db():
                 node_addresses.migrate(conn)
             topology.migrate_nodes(conn)
             migrate_config_names(conn)
+            node_addresses.migrate_primary(conn)
             with conn:
                 ensure_active_windows(conn)
             return conn
@@ -343,6 +344,7 @@ def init_db():
         node_addresses.migrate(conn)
     topology.migrate_nodes(conn)
     migrate_config_names(conn)
+    node_addresses.migrate_primary(conn)
     return conn
 
 

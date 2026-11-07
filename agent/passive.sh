@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.5.1-rc.1"
+VERSION="0.5.1"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/lib/ictl/passive.sh"
@@ -164,6 +164,7 @@ route_policy_owned() (
 )
 route_prepare_profile() {
   local local_ip="$1" device="$2" gateway="$3" key="$1,$2,$3" path existing routes line prefix resolved_gw='-' current own_rule=''
+  local prior_routes wanted=$'default 32767\n' metric
   route_numbers "$key" || return 1
   path="$LIB/routing/$ROUTE_TABLE"
   ip -o -4 address show dev "$device" | awk '$3=="inet" {split($4,a,"/");print a[1]}' | grep -Fxq "$local_ip" || { echo "地址 $local_ip 未绑定在网卡 $device" >&2; return 1; }
@@ -177,6 +178,7 @@ route_prepare_profile() {
     if [ -n "$routes" ] && grep -v 'proto 242' <<< "$routes" | grep -q .; then echo '路由表含有其他工具的规则' >&2; return 1; fi
   elif [ -n "$routes" ]; then echo '路由表被占用' >&2; return 1
   fi
+  prior_routes="$routes"
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     route_policy_owned "$line" || { echo '策略路由优先级冲突' >&2; return 1; }
@@ -188,6 +190,7 @@ route_prepare_profile() {
   while read -r prefix line; do
     [ -n "$prefix" ] && [ "$prefix" != default ] || continue
     ip -4 route replace "$prefix" dev "$device" src "$local_ip" table "$ROUTE_TABLE" proto 242 || return 1
+    wanted+="$prefix 0"$'\n'
   done <<< "$routes"
   if [ "$gateway" = - ]; then
     routes="$(ip -N -4 route show default dev "$device")" || return 1
@@ -203,7 +206,16 @@ route_prepare_profile() {
   ip -4 route replace unreachable default metric 32767 table "$ROUTE_TABLE" proto 242 || return 1
   if [ "$gateway" != - ]; then
     ip -4 route replace default via "$gateway" dev "$device" src "$local_ip" metric 10 table "$ROUTE_TABLE" proto 242 || return 1
+    wanted+=$'default 10\n'
   fi
+  # Remove withdrawn routes only after their replacements are in place.
+  while read -r prefix line; do
+    [ -n "$prefix" ] || continue
+    case "$prefix" in unreachable|7) prefix="${line%% *}" ;; esac
+    metric="$(awk 'BEGIN{m=0}{for(i=1;i<NF;i++)if($i=="metric")m=$(i+1)}END{print m}' <<< "$line")"
+    grep -Fxq "$prefix $metric" <<< "$wanted" && continue
+    ip -4 route del "$prefix" metric "$metric" table "$ROUTE_TABLE" proto 242 || return 1
+  done <<< "$prior_routes"
   [ -n "$own_rule" ] || ip -4 rule add priority "$ROUTE_PRIORITY" fwmark "$ROUTE_MARK/0xffffffff" table "$ROUTE_TABLE" protocol 242 || return 1
   current="$(cat "/proc/sys/net/ipv4/conf/$device/rp_filter")" || return 1
   if [ "$current" = 1 ] || { [ "$current" = 0 ] && [ "$(cat /proc/sys/net/ipv4/conf/all/rp_filter)" = 1 ]; }; then
@@ -903,10 +915,20 @@ ensure_service_policy() {
   systemctl daemon-reload
 }
 
+network_inventory() {
+  local addresses
+  addresses="$(ip -o -4 address show 2>/dev/null)" || return 0
+  awk '$3 == "inet" {dev=$2; sub(/@.*/, "", dev); sub(/:$/, "", dev);
+    if (dev == "lo" || dev !~ /^[A-Za-z0-9_.:-]+$/ || length(dev)>15) next;
+    count++; if(count<=96) {if(rows!="") rows=rows ";"; rows=rows dev "," $4}}
+    END {printf "network_addresses=%s\nnetwork_complete=%d\n", rows, count<=96}' <<< "$addresses"
+}
+
 request_text() {
   printf 'wake_id=%s\n' "${WAKE_ID:-}"
   printf 'agent_kind=passive\nt=%s\nv=%s\nstate=%s\nerr=%s\nagent=%s\nau=%s\nproto=2\nsource=%s\nphase=%s\nop=%s\ngeneration=%s\nmode=%s\n' \
     "$(date +%s)" "$R_V" "$1" "$R_ERR" "$VERSION" "$AUTO_UPDATE" "$SOURCE" "$PHASE" "$OP" "$R_GEN" "$MODE"
+  network_inventory
 }
 
 response_field() { sed -n "s/^$1=//p" <<< "$RESPONSE"; }

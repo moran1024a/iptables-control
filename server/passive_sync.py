@@ -46,6 +46,8 @@ def handle(self):
             if node:
                 if fields.get("manage"):
                     out = agent_v3.manage(conn, node, fields)
+                    if fields.get('manage') in ('prepare', 'commit'):
+                        conn.execute('UPDATE nodes SET src_ip=? WHERE id=?', (self.source_ip(), node['id']))
                 else:
                     out = node_sync.sync_report(conn, node, fields, self.source_ip())
             else:

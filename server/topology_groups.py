@@ -34,7 +34,7 @@ def config_group(c, link):
     return c.execute('SELECT group_id FROM links WHERE id=?', (root_id(c, link['id']),)).fetchone()[0]
 
 
-def path_map(graph, values):
+def path_map(graph, values, *, expand=False):
     if not isinstance(values, list) or len(values) > 64:
         topology.fail('无效的路径列表', 'path')
     result = {}
@@ -43,12 +43,22 @@ def path_map(graph, values):
         pair = (path[0], path[-1])
         if pair in result: topology.fail('同一入口与目标只能选择一条路径', 'path')
         result[pair] = path
-    edges = set(topology.connections(graph))
-    for path in list(result.values()):
-        for target in (v['id'] for v in graph['vertices'] if v['kind'] == 'target' and not v['disabled']):
-            if (path[-2], target) in edges:
-                result.setdefault((path[0], target), [*path[:-1], target])
+    # Only the legacy single-path shortcut implies the other direct targets.
+    # An explicit list is an exact selection, including retries of failed pairs.
+    if expand:
+        edges = set(topology.connections(graph))
+        for path in list(result.values()):
+            for target in (v['id'] for v in graph['vertices'] if v['kind'] == 'target' and not v['disabled']):
+                if (path[-2], target) in edges:
+                    result.setdefault((path[0], target), [*path[:-1], target])
     return result
+
+
+def check_entry_hop(graph, paths, entry):
+    hops = {topology.entry_hop(graph, path) for path in paths if path}
+    if len(hops) > 1:
+        topology.fail('同一入口只能使用一个首跳，请同时切换该入口的所有目标', 'vertex:'+entry)
+    return next(iter(hops), ...)
 
 
 def preview(c, graph, body):
@@ -83,7 +93,7 @@ def preview(c, graph, body):
         preferred = current.get(a, {})
         selected = topology.entry_paths(graph, a, prefix=prefix, required=required, preferred=preferred, allowed=allowed)
         if not selected:
-            skipped.append(dict(entry=a, count=len(targets), targets=targets, reason='没有符合选择的可用路径'))
+            skipped.append(dict(entry=a, count=len(targets), targets=targets, reason='没有符合选择且能覆盖全部目标的统一首跳'))
             continue
         choices = set()
         if prefix:
@@ -116,7 +126,7 @@ def switch(c, body, ident, graph, group):
     import pools
     if not group or topology.snapshot(json.loads(group['applied_graph'] or '{}')) != topology.snapshot(graph):
         raise errors.UserError('运行拓扑已变化，请重新选择', status=409)
-    requested = path_map(graph, body.get('paths', [body['path']] if body.get('path') else []))
+    requested = path_map(graph, body.get('paths', [body['path']] if body.get('path') else []), expand='paths' not in body)
     if not requested: topology.fail('请先选择完整路径', 'path')
     available = {(m['entry'], m['target']): m for m in members(c, ident)}
     changed, skipped, unchanged, cleared = [], [], [], False
@@ -126,6 +136,10 @@ def switch(c, body, ident, graph, group):
             with database.atomic(c):
                 if any(m['entry'] == entry and m['job'] for m in available.values()):
                     raise errors.UserError('此入口正在同步，请等待确认', status=409)
+                final_paths = {pair: (pools.runtime_plan(m) or {}).get('graph_path', [])
+                               for pair, m in available.items() if pair[0] == entry}
+                final_paths.update({pair: path for pair, path in requested.items() if pair[0] == entry})
+                check_entry_hop(graph, final_paths.values(), entry)
                 for pair, path in requested.items():
                     if pair[0] != entry: continue
                     member = available.get(pair)
@@ -231,7 +245,7 @@ def save(c, body, ident=None):
     previous_canvas = canvas(c, ident) if ident else None
     if body.get('switch_only'):
         return switch(c, body, ident, graph, previous_canvas)
-    requested = path_map(graph, body.get('paths', [body['path']] if body.get('path') else []))
+    requested = path_map(graph, body.get('paths', [body['path']] if body.get('path') else []), expand='paths' not in body)
     graph = topology.arrange(graph)
     if not ident:
         ident = pools.link_save(c, dict(name=name, group_id=group_id, plan=dict(entry=None, target=None, stages=[]), apply=False))['id']
@@ -249,13 +263,19 @@ def save(c, body, ident=None):
     for entry in entries:
         preferred = {pair[1]: (pools.runtime_plan(m) or {}).get('graph_path', [])
                      for pair, m in existing.items() if pair[0] == entry['id']}
-        selected = topology.entry_paths(graph, entry['id'], preferred=preferred, allowed=topology.ready_path(c, graph, None))
+        first_hop = check_entry_hop(graph, [p for pair, p in requested.items() if pair[0] == entry['id']], entry['id'])
+        selected = topology.entry_paths(graph, entry['id'], preferred=preferred,
+                                        allowed=topology.ready_path(c, graph, None), first_hop=first_hop)
         chosen_paths = {path[-1]: path for path in selected}
+        chosen_paths.update({pair[1]: p for pair, p in requested.items() if pair[0] == entry['id']})
+        if any(target['id'] not in chosen_paths for target in targets):
+            topology.fail('没有能覆盖全部目标的统一首跳，请检查连线和节点状态', 'vertex:'+entry['id'])
+        check_entry_hop(graph, chosen_paths.values(), entry['id'])
         for target in targets:
             pair = (entry['id'], target['id']); wanted.add(pair)
             projection = project(graph, *pair)
             member = existing.get(pair)
-            chosen = requested.get(pair) or chosen_paths.get(target['id'])
+            chosen = chosen_paths.get(target['id'])
             if not chosen: topology.fail('没有可用的完整路径，请检查节点状态', 'vertex:'+pair[0])
             topology.ready_path(c, projection, chosen)
             if member is None:
@@ -382,6 +402,9 @@ def decorate(c, link, result, cache=None):
                             failed_path=(failed or {}).get('graph_path', []),
                             port=(applied or {}).get('port'), connection=connection))
     result['configurations'] = configs
+    result['entry_conflicts'] = [entry for entry in dict.fromkeys(c['entry'] for c in configs)
+        if len({topology.entry_hop(result['active_graph'] or result['graph'], c['active_path'])
+                for c in configs if c['entry'] == entry and c['active_path']}) > 1]
     # Compatibility for single-path consumers; the canvas reads configurations.
     result['active_path'] = next((x['active_path'] for x in configs if x['active_path']), [])
     result['graph_path'] = result['active_path']
@@ -432,7 +455,7 @@ def action(c, body, ident):
                                          retried_nodes=retried_nodes)
                         elif member['state']=='error' and member['failure_scope'] and not member['job']:
                             plan = json.loads(member['failure_scope'])
-                            failed_entries.setdefault(member['entry'], plan['graph_path'])
+                            failed_entries.setdefault(member['entry'], []).append(plan['graph_path'])
                             continue
                         elif not member['job'] and member['applied'] and sync['retry'] and sync['nodes']:
                             resync_nodes.update(n['id'] for n in sync['nodes'])
@@ -446,9 +469,9 @@ def action(c, body, ident):
             count = len(retried)
             if failed_entries:
                 group = canvas(c, ident)
-                for entry, path in failed_entries.items():
+                for entry, paths in failed_entries.items():
                     try:
-                        result = switch(c, dict(path=path), ident, json.loads(group['applied_graph']), group)
+                        result = switch(c, dict(paths=paths), ident, json.loads(group['applied_graph']), group)
                         count += result['changed']
                         skipped.extend(result['skipped'])
                     except errors.UserError as exc:

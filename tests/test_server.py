@@ -17,6 +17,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'server'))
 import agent_files
+import api
 import database
 import errors
 import forwarding
@@ -66,13 +67,38 @@ class Fixture:
 
 
 class ServerTests(Fixture, unittest.TestCase):
+    def panel_request(self, route, body, token='audit-session'):
+        payload = json.dumps(body).encode()
+        panel = database.setting(self.db, 'panel_path')
+        request = api.Request('POST', panel + '/api/' + route,
+            [('Content-Type', 'application/json'), ('Content-Length', str(len(payload))),
+             ('Cookie', settings.SESSION_COOKIE + '=' + token)], payload, '127.0.0.1', panel_path=panel)
+        request.route('POST')
+        return request.response
+
+    def test_panel_order_dispatches_resource_kind_and_persists_order(self):
+        a, b = self.node(), self.node('B')
+        with self.db:
+            database.set_setting(self.db, 'must_change', '0')
+            self.db.execute('INSERT INTO sessions VALUES (?, ?)',
+                (hashlib.sha256(b'audit-session').hexdigest(), int(time.time()) + 86400))
+        for kind in settings.KINDS:
+            with self.subTest(kind=kind):
+                groups = [r[0] for r in self.db.execute('SELECT id FROM item_groups WHERE kind=?', (kind,))]
+                code, data, _ = self.panel_request(kind + '/order', dict(groups=groups, ids=[b, a] if kind=='nodes' else []))
+                self.assertEqual(code, 200, data)
+        self.assertEqual([r['id'] for r in self.db.execute(database.ordered('nodes'))], [b, a])
+
+    def test_unicode_login_name_returns_authentication_error(self):
+        self.assertEqual(self.panel_request('login', dict(username='管理员', password='incorrect'))[0], 401)
+
     def test_versions_are_independent(self):
         agent_files.load_agent()
         self.assertEqual(agent_files.AGENT[0], '0.2.1')
         self.assertEqual(agent_files.agent_update('0.2.1', 1), 'same')
         self.assertEqual(agent_files.agent_update('0.2.0', 1), 'pending')
         self.assertEqual(agent_files.agent_update('0.1.7', 1), 'pending')
-        self.assertEqual(settings.VERSION, '0.5.1-rc.1')
+        self.assertEqual(settings.VERSION, '0.5.1')
 
     def test_route_allocates_no_ports(self):
         a, b = self.node(), self.node('B')

@@ -112,6 +112,8 @@ def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observ
             return agent_files.AGENT[2]
         raise errors.UserError("没有可用更新")
     if observe:
+        import node_addresses
+        node_addresses.receive_network(conn, node['id'], fields)
         node_state.record_report(conn, node, now, health, err, skew)
         conn.execute(
             "UPDATE nodes SET first_seen=COALESCE(first_seen,?),last_seen=?,src_ip=?,\n        agent=?,skew=?,health=?,auto_update=?,protocol_version=MAX(protocol_version,?) WHERE id=?",

@@ -97,8 +97,7 @@ class Resources:
             else 0
         )
         conn.execute("UPDATE nodes SET quality_port=? WHERE id=?", (quality_port, cur.lastrowid))
-        if "addresses" in body:
-            node_addresses.save(conn, database.get_node(conn, cur.lastrowid), body["addresses"])
+        node_addresses.save(conn, database.get_node(conn, cur.lastrowid), body.get("addresses", []), addr=addr)
         self.set_wake(conn, body, database.get_node(conn, cur.lastrowid), mode)
         return {"id": cur.lastrowid}
 
@@ -155,6 +154,7 @@ class Resources:
             "telemetry": agent_v3.telemetry(conn, node_id),
             "node": {
                 **self.node_brief(conn, n, now),
+                "network": node_addresses.network(conn, node_id),
                 "bar": node_state.node_bar(conn, n, now),
                 "key": n["key"],
                 "first_seen": n["first_seen"],
@@ -180,8 +180,6 @@ class Resources:
     @node_sync.track_mutation
     def api_node_edit(self, conn, body, node_id):
         n = database.get_node(conn, node_id)
-        if "addresses" in body:
-            node_addresses.save(conn, n, body["addresses"])
         table = database.node_table(n["kind"])
         if "heartbeat_interval" in body or "tunnel_heartbeat" in body:
             raise errors.UserError("新版只支持主动／被动同步模式")
@@ -190,6 +188,16 @@ class Resources:
         name = validation.check_remark(body["name"], "name", "名称") if "name" in body else n["name"]
         note = validation.check_note(body["note"]) if "note" in body else n["note"]
         addr = validation.check_host(body["addr"], "addr") if "addr" in body else n["addr"]
+        if "addresses" in body:
+            addr = node_addresses.save(conn, n, body["addresses"], addr=addr if "addr" in body else None)
+        elif addr != n["addr"]:
+            addresses = node_addresses.listing(conn, n)
+            if not addresses:
+                addresses = node_addresses.primary_values([], addr)
+            else:
+                primary = next(a for a in addresses if a.get('primary'))
+                primary.update(host=addr, local='', device='', gateway='')
+            addr = node_addresses.save(conn, n, addresses, addr=addr)
         ranges = (
             validation.parse_ports(body["ports"]) if "ports" in body else validation.parse_ports(n["ports"])
         )
@@ -252,16 +260,14 @@ class Resources:
         if group_id != n["group_id"]:
             database.move_group(conn, table, node_id, group_id)
         if addr != n["addr"]:
-            key = security.new_key()
-            conn.execute(f"UPDATE {table} SET key = ? WHERE id = ?", (key, node_id))
-            lifecycle.add_event(conn, node_id, f"入站地址 {n['addr']} → {addr}，已重新生成密钥")
+            lifecycle.add_event(conn, node_id, f"主地址 {n['addr']} → {addr}")
             for r in conn.execute(
-                "SELECT h.chain_id, h.node_id FROM hops h\n                       JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1\n                       WHERE h2.node_id = ?",
+                "SELECT h.chain_id, h.node_id FROM hops h\n                       JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1\n                       WHERE h2.node_id = ? AND NOT EXISTS (SELECT 1 FROM rule_routes rr WHERE rr.rule_id=h.id)",
                 (node_id,),
             ).fetchall():
                 lifecycle.mark_pending(conn, r["chain_id"], [r["node_id"]])
             pools.refresh_links(conn, node=node_id)
-        return {"key": key, "upstream": node_state.upstream_nodes(conn, node_id) if key else []}
+        return {"key": key, "upstream": node_state.upstream_nodes(conn, node_id) if addr != n['addr'] else []}
 
     @node_sync.track_mutation
     def api_node_rekey(self, conn, body, node_id):

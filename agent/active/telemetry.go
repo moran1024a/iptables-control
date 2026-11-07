@@ -253,8 +253,12 @@ func (a *Agent) inventory() M {
 	}
 	if ifaces, e := net.Interfaces(); e == nil {
 		rows := []M{}
+		complete := true
 		for _, i := range ifaces {
-			addrs, _ := i.Addrs()
+			addrs, err := i.Addrs()
+			if err != nil {
+				complete = false
+			}
 			addresses := []string{}
 			for _, v := range addrs {
 				addresses = append(addresses, v.String())
@@ -262,6 +266,7 @@ func (a *Agent) inventory() M {
 			rows = append(rows, M{"name": i.Name, "mtu": i.MTU, "addresses": addresses, "flags": i.Flags.String()})
 		}
 		result["interfaces"] = rows
+		result["network_complete"] = complete
 	}
 	return result
 }
@@ -394,8 +399,22 @@ func (a *Agent) queryContext(parent context.Context, body M) M {
 			out["note"] = "UDP 无响应不能判断故障，本次仅解析地址"
 			break
 		}
+		dialer := routeDialer("tcp-connect-v1")
+		if r.Route != "" {
+			route, err := parseRoute(r.Route)
+			if err != nil {
+				e = err
+				break
+			}
+			dialer = routeDialer("tcp-connect-v1", route.Out)
+		}
+		destination := ips[0].String()
+		if net.ParseIP(r.IP) != nil {
+			destination = r.IP
+		}
+		out["resolved_ip"] = destination
 		start = time.Now()
-		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort(ips[0].String(), strconv.Itoa(r.TargetPort)))
+		conn, err := dialer.DialContext(ctx, "tcp4", net.JoinHostPort(destination, strconv.Itoa(r.TargetPort)))
 		out["tcp_connect_ms"] = float64(time.Since(start).Microseconds()) / 1000
 		if err != nil {
 			e = err

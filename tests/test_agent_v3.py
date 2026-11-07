@@ -20,6 +20,7 @@ from unittest.mock import patch
 from aiohttp.test_utils import TestClient, TestServer
 from test_server import Fixture
 import agent_v3
+import node_addresses
 import transport
 
 
@@ -156,6 +157,13 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
         ack=await ws.receive_json(timeout=3)
         self.assertEqual(ack['result'],'confirmed')
         self.assertEqual((await ws.receive_json(timeout=3))['type'],'ready')
+        query=asyncio.create_task(self.app['hub'].query(nid,dict(kind='inventory')))
+        request=await ws.receive_json(timeout=3)
+        self.assertEqual(request['type'],'query')
+        await ws.send_json(dict(type='query_result',session=session,id=request['id'],data=dict(
+            network_complete=True,interfaces=[dict(name='ens3',addresses=['192.0.2.1/24'])])))
+        self.assertEqual((await query).status,200)
+        self.assertEqual(node_addresses.listing(self.db,database.get_node(self.db,nid))[0]['device'],'ens3')
         response=await self.client.get(http_harness.Handler.panel_path+'/api/me')
         self.assertEqual(response.status,401)
         self.call('api_node_edit',{'desired_mode':'passive'},nid)

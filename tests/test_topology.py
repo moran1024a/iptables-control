@@ -343,6 +343,13 @@ window.addEventListener('unhandledrejection',e=>fetch('/panel/test-result',{meth
  assert(!document.querySelector('.graph-port'),'runtime exposes editing pins');
  assert(document.querySelectorAll('[data-graph-line]').length===7,'legacy connections were not expanded to node edges');
  assert(!document.querySelector('.graph-pool'),'runtime still contains a pool');
+ const flowNode=poolView.nodes.find(n=>n.id===poolView.link.hops[0].node_id),flowStatus=flowNode.status;
+ assert(document.querySelector('.graph-route-flow'),'healthy path has no flow animation');
+ flowNode.status='offline';drawGraph();
+ assert(!document.querySelector('.graph-route-flow'),'offline path still shows flowing traffic');
+ assert(document.querySelector('.graph-route-line'),'offline path lost its confirmed route');
+ flowNode.status=flowStatus;drawGraph();
+ assert(document.querySelector('.graph-route-flow'),'recovered path animation did not resume');
  const wireClear=(source,target,barriers)=>{
   const boxes=new Map([source,target,...barriers].map(b=>[b.id,b]));
   const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d',graphCurve(source,target,boxes));
@@ -602,10 +609,25 @@ window.addEventListener('unhandledrejection',e=>fetch('/panel/test-result',{meth
    assert(start.y>=mid.y+62&&start.y<=mid.y+86&&end.y>=dest.y+62&&end.y<=dest.y+86,'lane anchor left its IP row');
  }
  graphRouteCache=null;
- // A branch reaching one target remains selectable; other configurations keep their routes.
+ // A first hop reaching only one target must not split an entry's traffic.
  click('[data-action=link-edit]');
  graphSession.graph.edges=graphSession.graph.edges.filter(([a,b])=>a!==extra.id||b!==t2.id);
  graphTouch();await ACTIONS['graph-publish']();await wait(()=>!graphBusy&&!graphSession);
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ const beforeRejected=JSON.stringify(poolView.link.configurations);
+ click(`[data-graph-node="${extra.id}"] .graph-node-body`);await wait(()=>!graphBusy&&!graphSession);
+ assert(JSON.stringify(poolView.link.configurations)===beforeRejected,'invalid first hop changed configurations');
+ assert(document.querySelector('#toast').textContent.includes('统一首跳'),'missing first-hop rejection reason');
+ click(`[data-graph-node="${e1.id}"] .graph-node-body`);await wait(()=>!graphBusy&&graphSession?.kind==='choose');
+ assert(!graphSession.options.includes(extra.id),'unreachable first hop was offered');
+ document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+ // The same branch is valid downstream of a common first hop.
+ click('[data-action=link-edit]');
+ graphSession.graph.edges=graphSession.graph.edges.filter(([a,b])=>a!==e2.id||b!==m2.id);
+ graphConnect(m2.id,'out','private');graphConnect(extra.id,'in','public');
+ graphTouch();await ACTIONS['graph-publish']();await wait(()=>!graphBusy&&!graphSession);
+ await fetch('/panel/test-ack',{method:'POST'});await refresh();
+ click(`[data-graph-node="${m2.id}"] .graph-node-body`);await wait(()=>!graphBusy&&!graphSession);
  await fetch('/panel/test-ack',{method:'POST'});await refresh();
  const partialBefore=structuredClone(poolView.link.configurations);
  click(`[data-graph-node="${extra.id}"] .graph-node-body`);await wait(()=>!graphBusy&&!graphSession);
@@ -621,7 +643,9 @@ window.addEventListener('unhandledrejection',e=>fetch('/panel/test-result',{meth
  assert(document.querySelector(`.graph-route-line.graph-nearby[data-route-entry="${e1.id}"][data-graph-to="${t1.id}"]`),'hover did not highlight the reachable target');
  assert(!document.querySelector(`.graph-route-line.graph-nearby[data-route-entry="${e1.id}"][data-graph-to="${t2.id}"]`),'hover highlighted another target path');
  click(`[data-graph-node="${e1.id}"] .graph-node-body`);await wait(()=>!graphBusy&&graphSession?.kind==='choose');
- assert(graphSession.options.includes(extra.id),'partial target branch is missing from next-hop choices');
+ assert(!graphSession.options.includes(extra.id),'partial target branch was offered as a first hop');
+ click(`[data-graph-node="${m2.id}"] .graph-node-body`);await wait(()=>!graphBusy&&graphSession?.prefix.at(-1)===m2.id);
+ assert(graphSession.options.includes(extra.id),'downstream branch is missing from next-hop choices');
  click(`[data-graph-node="${extra.id}"] .graph-node-body`);await wait(()=>!graphBusy&&!graphSession);
  assert(document.querySelector('#modal').hidden,'partial target branch required an extra confirmation');
  // Renaming a configuration changes only its display/export name.

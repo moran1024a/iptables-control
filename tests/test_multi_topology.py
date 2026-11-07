@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import time
 import unittest
+from unittest import mock
 
 from test_server import Fixture
 import test_pools
@@ -540,6 +541,25 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
             'n/c':{'from':{'n':'private'},'to':{}},'n/d':{'from':{'n':'private'},'to':{}}})
         return graph
 
+    def with_first_hop(self, graph=None, entries=('a',)):
+        graph = topology.flatten(graph or self.separate_branch())
+        nid = self.node('共同首跳', ports='10000-10100'); self.ids.append(nid)
+        with self.db:
+            self.db.execute("UPDATE nodes SET installed_agent='active',agent='0.5.1',protocol_version=2,first_seen=1,last_seen=?,state='ok' WHERE id=?", (int(time.time()), nid))
+            node_addresses.save(self.db, database.get_node(self.db, nid), [dict(id='public', host=f'192.0.2.{nid}', device='eth0')])
+        self.ack(nid)
+        graph['vertices'].append(dict(id='first', kind='node', node_id=nid))
+        for entry in entries:
+            for source, target in list(graph['edges']):
+                if source != entry: continue
+                graph['edges'].remove([source, target])
+                binding = graph['bindings'].pop(source+'/'+target)
+                if ['first', target] not in graph['edges']: graph['edges'].append(['first', target])
+                graph['bindings']['first/'+target] = {'from': {'first':'public'}, 'to':binding['to']}
+            graph['edges'].append([entry, 'first'])
+            graph['bindings'][entry+'/first'] = {'from':{entry:'public'}, 'to':{'first':'public'}}
+        return graph
+
     def test_entries_need_no_common_middle_path(self):
         graph=self.separate_branch()
         graph['edges'].remove(['a','pool'])
@@ -577,7 +597,7 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
         self.assertTrue(response['complete'])
         self.assertEqual([p['path'] for p in response['paths']],[['a','n','c'],['a','n','d']])
         self.assertEqual(before,self.get(root))
-        self.switch_paths(root,[['a','n','d']]);self.finish(root)
+        self.switch_paths(root,[p['path'] for p in response['paths']]);self.finish(root)
         self.assertEqual([c['active_path'] for c in self.get(root)['configurations']],
             [['a','n','c'],['a','n','d'],['b','m','c'],['b','m','d']])
 
@@ -622,7 +642,7 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
             graph['edges'].append(['a',target])
             graph['bindings']['a/'+target]={'from':{'a':'public'},'to':{}}
         root=self.save(graph);self.finish(root)
-        self.switch_paths(root,[['a','c'],['b','n','d']])
+        self.switch_paths(root,[['a','c'],['a','d'],['b','n','c'],['b','n','d']])
         self.ack(self.ids[3],False);self.tick()
         for _ in range(4):
             self.ack(self.ids[0]);self.ack(self.ids[2]);self.tick()
@@ -645,7 +665,7 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
     def test_runtime_cancel_waits_for_entry_and_rejects_stale_request(self):
         root=self.save();self.finish(root)
         revision=self.get(root)['revision']
-        self.switch_paths(root,[['a','n','d']]);self.ack(self.ids[3]);self.tick()
+        self.switch_paths(root,[['a','n','c'],['a','n','d']]);self.ack(self.ids[3]);self.tick()
         self.call('api_link_action',dict(action='cancel',revision=self.get(root)['revision']),root)
         config=next(c for c in self.get(root)['configurations'] if c['entry']=='a' and c['target']=='d')
         self.assertEqual(config['active_path'],['a','m','d'])
@@ -657,11 +677,11 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
 
     def test_retry_can_join_an_existing_switch_without_stalling(self):
         root=self.save();self.finish(root)
-        self.switch_paths(root,[['a','n','c']])
+        self.switch_paths(root,[['a','n','c'],['a','n','d']])
         self.ack(self.ids[3],False);self.tick()
         failed=next(c for c in self.get(root)['configurations'] if c['entry']=='a' and c['target']=='c')
         self.ack(self.ids[3]);self.tick()
-        self.switch_paths(root,[['b','n','d']])
+        self.switch_paths(root,[['b','n','c'],['b','n','d']])
         self.ack(self.ids[3]);self.tick()  # N is ready; B is still awaiting its ingress receipt.
         self.call('api_link_action',dict(action='retry',revision=self.get(root)['revision']),root)
         batch=json.loads(self.db.execute('SELECT members FROM link_batches').fetchone()[0])
@@ -672,9 +692,9 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
 
     def test_selecting_current_path_discards_a_failed_switch(self):
         root=self.save();self.finish(root)
-        self.switch_paths(root,[['a','n','c']]);self.ack(self.ids[3],False);self.tick()
+        self.switch_paths(root,[['a','n','c'],['a','n','d']]);self.ack(self.ids[3],False);self.tick()
         self.assertTrue(self.get(root)['configurations'][0]['failed_path'])
-        self.switch_paths(root,[['a','m','c']])
+        self.switch_paths(root,[['a','m','c'],['a','m','d']])
         self.assertFalse(self.get(root)['configurations'][0]['failed_path'])
         self.call('api_link_action',dict(action='retry',revision=self.get(root)['revision']),root)
         self.assertFalse(self.get(root)['job'])
@@ -807,6 +827,44 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
             self.call('api_graph_save',dict(name=info['name'],graph=graph,path=['a','m','c'],
                 revision=info['revision'],apply=True,switch_only=True),root)
 
+    def test_promoting_primary_address_keeps_live_paths_rules_and_credentials(self):
+        root=self.save();self.finish(root)
+        before=self.get(root)
+        nodes={nid:dict(database.get_node(self.db,nid)) for nid in self.ids}
+        rules={nid:forwarding.node_rules(self.db,node) for nid,node in nodes.items()}
+        values=node_addresses.listing(self.db,nodes[self.ids[2]])
+        for a in values:a['primary']=a['id']=='private'
+        self.call('api_node_edit',dict(addresses=values),self.ids[2])
+        after=self.get(root)
+        self.assertFalse(after['pending_changes'])
+        self.assertEqual(after['active_graph'],before['active_graph'])
+        self.assertFalse(self.db.execute('SELECT 1 FROM link_batches').fetchone())
+        self.assertEqual(database.get_node(self.db,self.ids[2])['addr'],values[1]['host'])
+        for nid,node in nodes.items():
+            now=database.get_node(self.db,nid)
+            self.assertEqual(now['key'],node['key'])
+            self.assertEqual(now['desired_generation'],node['desired_generation'])
+            self.assertEqual(forwarding.node_rules(self.db,now),rules[nid])
+        self.switch_paths(root,[['a','n','c']]);self.finish(root)
+
+    def test_unresolved_bound_address_waits_for_inventory_before_publish(self):
+        nid=self.ids[2]
+        values=node_addresses.listing(self.db,database.get_node(self.db,nid))
+        values[0]['device']=''
+        values[1]['device']=''
+        self.call('api_node_edit',dict(addresses=values),nid)
+        root=self.call('api_graph_save',dict(name='draft',graph=self.graph,apply=False))['id']
+        with self.assertRaisesRegex(errors.UserError,'待识别'):
+            self.save(ident=root)
+        import agent_v3
+        with self.db:
+            agent_v3.save_snapshot(self.db,nid,'inventory',dict(interfaces=[dict(name='eth0',addresses=[f'192.0.2.{nid}/24'])]))
+        values=node_addresses.listing(self.db,database.get_node(self.db,nid))
+        values[1]['device']='eth1'
+        self.call('api_node_edit',dict(addresses=values),nid)
+        self.save(ident=root);self.finish(root)
+        self.assertFalse(self.get(root)['pending_changes'])
+
     def test_failed_new_target_remains_protected_and_dangling_canvas_can_be_opened(self):
         root=self.save();self.finish(root)
         target=self.target(host='203.0.113.99')
@@ -862,28 +920,28 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM rule_routes').fetchone()[0],0)
 
     def test_partial_target_branch_switches_only_reachable_configurations(self):
-        graph = self.separate_branch()
+        graph = self.with_first_hop()
         graph['edges'].remove(['n','d'])
-        root = self.save(graph); self.finish(root)
+        root = self.save(graph, path=['a','first','m','c']); self.finish(root)
         before = self.get(root)
         configs={c['id']:c for c in before['configurations']}
         selected=next(c for c in configs.values() if c['entry']=='a' and c['target']=='c')
         untouched={m['id']:dict(m) for m in topology_groups.members(self.db,root) if m['id']!=selected['id']}
         rules={lid:pools.rows(self.db,lid) for lid in untouched}
         response = topology.preview(self.db, dict(id=root, graph=before['active_graph'], required=['n']))
-        self.assertEqual([p['path'] for p in response['paths']],[['a','n','c']])
+        self.assertEqual([p['path'] for p in response['paths']],[['a','first','n','c']])
         self.assertEqual(sum(s['count'] for s in response['skipped']),3)
-        choices = topology.preview(self.db, dict(id=root, graph=before['active_graph'], prefix=['a']))
+        choices = topology.preview(self.db, dict(id=root, graph=before['active_graph'], prefix=['a','first']))
         self.assertIn('n', choices['options'])
-        terminal=topology.preview(self.db,dict(id=root,graph=before['active_graph'],prefix=['a','n']))
+        terminal=topology.preview(self.db,dict(id=root,graph=before['active_graph'],prefix=['a','first','n']))
         self.assertTrue(terminal['complete'])
-        self.assertEqual([p['path'] for p in terminal['paths']],[['a','n','c']])
+        self.assertEqual([p['path'] for p in terminal['paths']],[['a','first','n','c']])
         self.assertEqual(self.get(root), before)
         result=self.switch_paths(root,[p['path'] for p in response['paths']])
         self.assertEqual(result['changed'],1)
         self.finish(root)
         after=self.get(root)
-        self.assertEqual(next(c for c in after['configurations'] if c['id']==selected['id'])['active_path'],['a','n','c'])
+        self.assertEqual(next(c for c in after['configurations'] if c['id']==selected['id'])['active_path'],['a','first','n','c'])
         for c in after['configurations']:
             self.assertEqual((c['id'],c['port'],c['name']),(configs[c['id']]['id'],configs[c['id']]['port'],configs[c['id']]['name']))
         for m in topology_groups.members(self.db,root):
@@ -892,25 +950,25 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
                 self.assertEqual(pools.rows(self.db,m['id']),rules[m['id']])
         # Publishing again must preserve each target's selected route.
         response=topology.preview(self.db,dict(id=root,graph=after['active_graph'],prefix=['a']))
-        self.assertEqual({p['target']:p['path'] for p in response['paths']}, {'c':['a','n','c'],'d':['a','m','d']})
+        self.assertEqual({p['target']:p['path'] for p in response['paths']}, {'c':['a','first','n','c'],'d':['a','first','m','d']})
         self.call('api_graph_save',dict(name=after['name'],graph=after['active_graph'],revision=after['revision'],apply=True),root)
         self.finish(root)
         self.assertEqual([c['active_path'] for c in self.get(root)['configurations']],[c['active_path'] for c in after['configurations']])
         with self.assertRaises(errors.UserError):
-            self.switch_paths(root, [['a','m','c'], ['a','n','d']])
+            self.switch_paths(root, [['a','first','m','c'], ['a','first','n','d']])
         # Truly disconnected entry/target pairs still cannot be published.
-        graph['edges'].remove(['pool','c'])
+        graph['edges'].remove(['m','c'])
         with self.assertRaisesRegex(errors.UserError, '无法到达目标'):
             topology.validate(self.db, graph)
 
     def test_exclusive_targets_need_no_common_final_node(self):
-        graph=topology.flatten(self.graph)
+        graph=self.with_first_hop(self.graph, entries=('a','b'))
         graph['edges'].remove(['m','c']);graph['edges'].remove(['n','d'])
-        root=self.save(graph,path=['a','n','c']);self.finish(root)
+        root=self.save(graph,path=['a','first','n','c']);self.finish(root)
         configs=self.get(root)['configurations']
         self.assertEqual(len(configs),4)
         for c in configs:
-            self.assertEqual(c['active_path'],[c['entry'],'n' if c['target']=='c' else 'm',c['target']])
+            self.assertEqual(c['active_path'],[c['entry'],'first','n' if c['target']=='c' else 'm',c['target']])
 
     def test_target_gateway_is_followed_only_for_its_target(self):
         graph=topology.flatten(self.graph)
@@ -924,28 +982,28 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
             self.assertTrue(p['unchanged'])
 
     def test_partial_target_failure_and_retry_leave_other_targets_unchanged(self):
-        graph=self.separate_branch();graph['edges'].remove(['n','d'])
-        root=self.save(graph);self.finish(root)
+        graph=self.with_first_hop();graph['edges'].remove(['n','d'])
+        root=self.save(graph,path=['a','first','m','c']);self.finish(root)
         original={c['id']:c['active_path'] for c in self.get(root)['configurations']}
-        self.switch_paths(root,[['a','n','c']]);self.ack(self.ids[3],False);self.tick()
+        self.switch_paths(root,[['a','first','n','c']]);self.ack(self.ids[3],False);self.tick()
         failed=self.get(root)['configurations']
         self.assertEqual({c['id']:c['active_path'] for c in failed},original)
         self.assertEqual([(c['entry'],c['target']) for c in failed if c['failed_path']],[('a','c')])
-        self.ack(self.ids[3])
+        for nid in self.ids: self.ack(nid)
         self.call('api_link_action',dict(action='retry',revision=self.get(root)['revision']),root)
         self.finish(root)
         for c in self.get(root)['configurations']:
-            expected=['a','n','c'] if (c['entry'],c['target'])==('a','c') else original[c['id']]
+            expected=['a','first','n','c'] if (c['entry'],c['target'])==('a','c') else original[c['id']]
             self.assertEqual(c['active_path'],expected)
 
     def test_pending_entry_does_not_block_other_entry_switch_or_confirmation(self):
         root = self.save(); self.finish(root)
-        self.switch_paths(root, [['a','n','c']]); self.ack(self.ids[3]); self.tick()
+        self.switch_paths(root, [['a','n','c'], ['a','n','d']]); self.ack(self.ids[3]); self.tick()
         info = self.get(root)
         response = topology.preview(self.db, dict(id=root, graph=info['active_graph'], required=['n']))
         self.assertEqual({p['entry'] for p in response['paths']}, {'b'})
         self.assertEqual({p['entry'] for p in response['skipped']}, {'a'})
-        result = self.switch_paths(root, [['b','n','d']])
+        result = self.switch_paths(root, [['b','n','c'], ['b','n','d']])
         self.assertEqual(result['changed'], 2)
         self.ack(self.ids[3]); self.tick()
         self.ack(self.ids[1]); self.tick()
@@ -964,7 +1022,7 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
             'alias/d':{'from':{'alias':'public'},'to':{}}})
         root = self.save(graph); self.finish(root)
         before = self.get(root)
-        self.switch_paths(root, [['a','alias','c']])
+        self.switch_paths(root, [['a','alias','c'], ['a','alias','d']])
         self.assertTrue(all(c['active_path'][1]=='m' for c in self.get(root)['configurations']))
         rows = [m for m in topology_groups.members(self.db,root) if m['entry']=='a']
         self.assertEqual(sum(bool(json.loads(m['job']).get('metadata_only')) for m in rows), 1)
@@ -979,24 +1037,135 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
             self.assertEqual(len(pools.rows(self.db,m['id'])), 2)
 
     def test_distinct_target_paths_still_allow_only_one_path_per_configuration(self):
-        root = self.save(); self.finish(root)
-        result=self.switch_paths(root, [['a','m','c'], ['a','n','d']])
+        root = self.save(self.with_first_hop(),path=['a','first','m','c']); self.finish(root)
+        result=self.switch_paths(root, [['a','first','m','c'], ['a','first','n','d']])
         self.assertEqual(result['changed'],1)
         self.finish(root)
         paths={(c['entry'],c['target']):c['active_path'] for c in self.get(root)['configurations']}
-        self.assertEqual(paths[('a','c')],['a','m','c'])
-        self.assertEqual(paths[('a','d')],['a','n','d'])
+        self.assertEqual(paths[('a','c')],['a','first','m','c'])
+        self.assertEqual(paths[('a','d')],['a','first','n','d'])
         before = self.get(root)
         with self.assertRaisesRegex(errors.UserError, '只能选择一条路径'):
-            self.switch_paths(root, [['a','m','c'], ['a','n','c']])
+            self.switch_paths(root, [['a','first','m','c'], ['a','first','n','c']])
         self.assertEqual(self.get(root), before)
+
+    def test_explicit_switch_does_not_expand_to_other_targets(self):
+        root = self.save(self.with_first_hop(),path=['a','first','m','c']); self.finish(root)
+        result = self.switch_paths(root, [['a','first','n','c']])
+        self.assertEqual(result['changed'], 1)
+        self.finish(root)
+        paths = {(c['entry'], c['target']): c['active_path'] for c in self.get(root)['configurations']}
+        self.assertEqual(paths[('a', 'c')], ['a','first','n','c'])
+        self.assertEqual(paths[('a', 'd')], ['a','first','m','d'])
+
+    def test_switch_rejects_split_first_hops_without_changing_rules(self):
+        root = self.save(); self.finish(root)
+        before = self.get(root)
+        rules = {n:forwarding.node_rules(self.db, database.get_node(self.db, n)) for n in self.ids}
+        for paths in ([['a','n','c']], [['a','m','c'], ['a','n','d']]):
+            result = self.switch_paths(root, paths)
+            self.assertEqual(result['changed'], 0)
+            self.assertIn('同一入口只能使用一个首跳', result['skipped'][0]['reason'])
+            self.assertEqual(self.get(root), before)
+            self.assertEqual(rules, {n:forwarding.node_rules(self.db, database.get_node(self.db, n)) for n in self.ids})
+        with self.assertRaisesRegex(errors.UserError, '同一入口只能使用一个首跳'):
+            self.call('api_graph_save', dict(name=before['name'], graph=before['active_graph'],
+                revision=before['revision'], apply=True, paths=[['a','m','c'],['a','n','d']]), root)
+        self.assertEqual(self.get(root), before)
+
+    def test_unusable_first_hop_is_not_offered_or_published(self):
+        graph = self.separate_branch(); graph['edges'].remove(['n','d'])
+        root = self.save(graph); self.finish(root)
+        graph = self.get(root)['active_graph']
+        before = self.get(root)
+        preview = topology.preview(self.db, dict(id=root, graph=graph, prefix=['a']))
+        self.assertEqual(preview['options'], ['m'])
+        for selection in (dict(required=['n']), dict(prefix=['a','n'])):
+            preview = topology.preview(self.db, dict(id=root, graph=graph, **selection))
+            self.assertEqual(preview['paths'], [])
+            self.assertIn('统一首跳', preview['skipped'][0]['reason'])
+        with self.assertRaisesRegex(errors.UserError, '统一首跳'):
+            self.save(graph, path=['a','n','c'], ident=root)
+        self.assertEqual(self.get(root), before)
+        # Each target is reachable on its own, but no first hop covers both.
+        graph['edges'].remove(['m','c'])
+        graph['edges'].append(['b','n'])
+        graph['bindings']['b/n'] = {'from':{'b':'public'},'to':{'n':'public'}}
+        with self.assertRaisesRegex(errors.UserError, '统一首跳'):
+            self.save(graph, path=['a','n','c'])
+
+    def test_publish_uses_requested_first_hop_for_unlisted_targets(self):
+        graph = topology.flatten(self.graph)
+        graph['edges'].remove(['n','d']); graph['edges'].append(['n','m'])
+        graph['bindings']['n/m'] = {'from':{'n':'private'},'to':{'m':'public'}}
+        root = self.save(graph, path=['a','n','c']); self.finish(root)
+        paths = {c['target']:c['active_path'] for c in self.get(root)['configurations'] if c['entry']=='a'}
+        self.assertEqual(paths, {'c':['a','n','c'], 'd':['a','n','m','d']})
+
+    def test_full_preview_finds_common_hop_when_old_downstream_is_offline(self):
+        graph = self.with_first_hop(self.graph)
+        graph['edges'] = [[e, n] for e in ('a','b') for n in ('m','n')] + [
+            ['m','c'],['m','first'],['first','d'],['n','c'],['n','d']]
+        graph['bindings'] = {a+'/'+b:{'from':{a:'public'},'to':{b:'public'} if b not in ('c','d') else {}}
+                             for a, b in graph['edges']}
+        root = self.save(graph); self.finish(root)
+        with self.db:
+            self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?', (int(time.time())-3600, self.ids[-1]))
+        info = self.get(root)
+        preview = topology.preview(self.db, dict(id=root, graph=info['active_graph']))
+        self.assertEqual(preview['skipped'], [])
+        self.assertEqual(len(preview['paths']), 4)
+        self.assertEqual({p['path'][1] for p in preview['paths']}, {'n'})
+
+    def test_new_first_hop_also_moves_targets_outside_clicked_branch(self):
+        graph = self.with_first_hop()
+        graph['edges'] = [['a','m'],['b','m'],['m','c'],['m','d'],
+                          ['a','first'],['first','n'],['first','d'],['n','c']]
+        graph['bindings']['a/m'] = {'from':{'a':'public'},'to':{'m':'public'}}
+        graph['bindings']['first/d'] = {'from':{'first':'public'},'to':{}}
+        root = self.save(graph); self.finish(root)
+        preview = topology.preview(self.db, dict(id=root,graph=self.get(root)['active_graph'],required=['n']))
+        self.assertEqual([p['path'] for p in preview['paths']], [['a','first','n','c'],['a','first','d']])
+        result = self.switch_paths(root, [p['path'] for p in preview['paths']])
+        self.assertEqual(result['changed'], 2)
+        self.finish(root)
+        self.assertEqual({c['active_path'][1] for c in self.get(root)['configurations'] if c['entry']=='a'}, {'first'})
+
+    def test_legacy_split_is_reported_and_repaired_only_after_confirmation(self):
+        root = self.save(); self.finish(root)
+        with mock.patch.object(topology_groups, 'check_entry_hop'):
+            self.switch_paths(root, [['a','n','c']])
+        self.finish(root)
+        before = self.get(root)
+        self.assertEqual(before['entry_conflicts'], ['a'])
+        preview = topology.preview(self.db, dict(id=root, graph=before['active_graph'], required=['n']))
+        self.assertEqual(self.get(root), before)
+        result = self.switch_paths(root, [p['path'] for p in preview['paths'] if p['entry']=='a'])
+        self.assertEqual(result['changed'], 1)
+        self.assertEqual(self.get(root)['entry_conflicts'], ['a'])
+        self.finish(root)
+        self.assertEqual(self.get(root)['entry_conflicts'], [])
+        self.assertEqual({c['active_path'][1] for c in self.get(root)['configurations'] if c['entry']=='a'}, {'n'})
+
+    def test_retry_preserves_each_failed_target_path(self):
+        root = self.save(self.with_first_hop(),path=['a','first','m','c']); self.finish(root)
+        self.switch_paths(root, [['a','first','m','c'], ['a','first','n','d']]); self.finish(root)
+        wanted = [['a','first','n','c'], ['a','first','m','d']]
+        self.switch_paths(root, wanted)
+        self.ack(self.ids[3], False); self.tick()
+        failed = [c for c in self.get(root)['configurations'] if c['entry'] == 'a']
+        self.assertEqual([c['failed_path'] for c in failed], wanted)
+        for nid in self.ids: self.ack(nid)
+        self.call('api_link_action', dict(action='retry', revision=self.get(root)['revision']), root)
+        self.finish(root)
+        self.assertEqual([c['active_path'] for c in self.get(root)['configurations'] if c['entry'] == 'a'], wanted)
 
     def test_capacity_failure_rolls_back_entire_entry_request(self):
         root = self.save(); self.finish(root)
         with self.db:
             self.db.execute("UPDATE nodes SET ports='10100-10100' WHERE id=?", (self.ids[3],))
         before = {n: forwarding.node_rules(self.db,database.get_node(self.db,n)) for n in self.ids}
-        result = self.switch_paths(root, [['a','n','c']])
+        result = self.switch_paths(root, [['a','n','c'], ['a','n','d']])
         self.assertEqual(result['changed'], 0)
         self.assertEqual([s['entry'] for s in result['skipped']], ['a'])
         self.assertFalse(self.get(root)['job'])

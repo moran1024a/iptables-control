@@ -46,6 +46,14 @@ function graphLanePenalty(a,b,used) {
 function graphRuntimeLines(g,link,boxes) {
   const routes=graphRoutes(link),colors=graphEntryColors(g),entries=[...colors.keys()];
   if(graphSession?.kind==='choose'&&graphSession.prefix.length>1)routes.push({id:'preview',entry:graphSession.prefix[0],path:graphSession.prefix,pending:true});
+  const flowing=new Set();
+  for(const r of routes){
+    if(r.pending||r.state==='deleting'||!r.path.every(id=>{
+      const v=g.vertices.find(v=>v.id===id),node=poolView.nodes.find(n=>n.id===v?.node_id);
+      return v&&!v.disabled&&(!v.node_id||node&&!['offline','error','skew','deleting','new'].includes(node.status));
+    }))continue;
+    for(let i=1;i<r.path.length;i++)flowing.add(JSON.stringify([r.entry,r.path[i-1],r.path[i]]));
+  }
   const spans=new Map();
   const live=new Set(routes.filter(r=>!r.pending).flatMap(r=>r.path.slice(1).map((b,i)=>JSON.stringify([r.entry,r.path[i],b]))));
   for(const r of routes)for(let i=1;i<r.path.length;i++){
@@ -101,7 +109,7 @@ function graphRuntimeLines(g,link,boxes) {
   return graphRouteCache.list.map((r,i)=>{
     const muted=focus&&focus!==r.entry?' graph-route-muted':'',arrow=`graph-route-arrow-${i}`;
     const attrs=`data-graph-from="${esc(r.a)}" data-graph-to="${esc(r.b)}" data-route-entry="${esc(r.entry)}" style="--route-color:${colors.get(r.entry)};--route-stroke:${r.stroke};--route-halo:${r.halo}" d="${r.d}"`;
-    return `<g class="graph-route${muted}" data-runtime-route="${i}"><defs><marker id="${arrow}" viewBox="0 0 7 6" refX="7" refY="3" markerUnits="userSpaceOnUse" markerWidth="7" markerHeight="${r.arrowHeight}" preserveAspectRatio="none" orient="auto"><path d="M 0 0 L 7 3 L 0 6 Z" fill="context-stroke"/></marker></defs><path class="graph-route-halo" ${attrs}/><path class="graph-line graph-route-line ${r.pending?'graph-next':'graph-live'}" ${attrs} marker-end="url(#${arrow})"/>${!r.pending?`<path class="topology-flow graph-route-flow" ${attrs}/>`:''}</g>`;
+    return `<g class="graph-route${muted}" data-runtime-route="${i}"><defs><marker id="${arrow}" viewBox="0 0 7 6" refX="7" refY="3" markerUnits="userSpaceOnUse" markerWidth="7" markerHeight="${r.arrowHeight}" preserveAspectRatio="none" orient="auto"><path d="M 0 0 L 7 3 L 0 6 Z" fill="context-stroke"/></marker></defs><path class="graph-route-halo" ${attrs}/><path class="graph-line graph-route-line ${r.pending?'graph-next':'graph-live'}" ${attrs} marker-end="url(#${arrow})"/>${!r.pending&&flowing.has(JSON.stringify([r.entry,r.a,r.b]))?`<path class="topology-flow graph-route-flow" ${attrs}/>`:''}</g>`;
   }).join('');
 }
 
@@ -126,7 +134,7 @@ function graphQuickHint(id) {
       if(token!==graphHintRequest||graphSession||page!==pageVersion||poolView.link!==link||!hint?.isConnected)return;
       const changed=result.paths.filter(p=>!p.unchanged),entries=[...new Set(changed.map(p=>p.entry))],targets=[...new Set(changed.map(p=>p.target))],g=poolView.link.active_graph;
       const names=ids=>ids.map(id=>graphName(g.vertices.find(v=>v.id===id))).join('、');
-      if(hint)hint.textContent=changed.length?`可切换 ${changed.length} 个配置：${names(entries)} → ${names(targets)}`:'没有需要切换的可用配置';
+      if(hint)hint.textContent=changed.length?`可切换 ${changed.length} 个配置：${names(entries)} → ${names(targets)}`:result.paths.length?'已使用当前路径':result.skipped?.[0]?.reason||'没有可切换的配置';
     }catch(_){/* Hover is optional; clicking still performs authoritative validation. */}
   },180);
 }

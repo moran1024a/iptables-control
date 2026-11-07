@@ -163,6 +163,9 @@ def refresh_links(c, node=None, target=None):
     for row in c.execute("SELECT * FROM links WHERE managed=1 AND state!='deleting'").fetchall():
         link = dict(row)
         plan = json.loads(link["plan"])
+        # Explicit IP paths retain their address IDs when the node's default changes.
+        if node is not None and plan.get('graph', {}).get('version') == 2:
+            continue
         path = [
             r[0]
             for r in c.execute("SELECT node_id FROM hops WHERE chain_id=? ORDER BY seq", (link["chain_id"],))
@@ -580,7 +583,7 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
     for index, nid in enumerate(path):
         n = database.get_node(c, nid)
         if routes and agent_v3.newer("0.5.1-rc.1", n["agent"] or "0.0.0"):
-            raise errors.UserError(f"请先将节点 {n['name']} 升级到 0.5.1-rc.1，以支持指定 IP 转发")
+            raise errors.UserError(f"请先更新节点 {n['name']} 的 Agent，以支持指定 IP 转发")
         if n["deleting"] or n["manual_required"]:
             raise errors.UserError(f"{n['name']} 正在删除或等待模式确认")
         if (

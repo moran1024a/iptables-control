@@ -192,7 +192,7 @@ function graphNodeAddresses(g,v,editing) {
   const edge=editing&&graphSession.edge!=null?g.edges[graphSession.edge]:null;
   const incoming=graphPortAddress(g,v,'in',edge),outgoing=graphPortAddress(g,v,'out',edge);
   const rows=addresses.length?addresses:[{id:'',name:v.kind==='target'?'':v.kind==='direct'?'direct':'主 IP',host:node?.addr||target?.host||''}];
-  return rows.map((a,i)=>`<div class="graph-ip-row"><span class="graph-ip-name">${esc(a.name)}</span><code title="${esc(a.host)}">${esc(a.host)}${target?.port?':'+target.port:''}</code>${editing?`${v.kind==='target'?graphPort(v.id,'in','',74):graphPort(v.id,'in',a.id,74+i*24,v.kind==='entry',a.id===incoming)}${v.kind==='target'?'':graphPort(v.id,'out',a.id,74+i*24,false,a.id===outgoing)}`:`<span class="graph-ip-role">${a.id&&a.id===incoming?'入':''}${a.id&&a.id===outgoing?' 出':''}</span>`}</div>`).join('');
+  return rows.map((a,i)=>`<div class="graph-ip-row"><span class="graph-ip-name">${esc(a.name||(a.primary?'主 IP':'IP'))}</span><code title="${esc(a.host)}">${esc(a.host)}${target?.port?':'+target.port:''}</code>${editing?`${v.kind==='target'?graphPort(v.id,'in','',74):graphPort(v.id,'in',a.id,74+i*24,v.kind==='entry',a.id===incoming)}${v.kind==='target'?'':graphPort(v.id,'out',a.id,74+i*24,false,a.id===outgoing)}`:`<span class="graph-ip-role">${a.id&&a.id===incoming?'入':''}${a.id&&a.id===outgoing?' 出':''}</span>`}</div>`).join('');
 }
 function graphCanvas(raw, l) {
   const g=graphDisplay(raw),editing=graphSession?.kind==='edit',choosing=graphSession?.kind==='choose';
@@ -251,6 +251,7 @@ function drawGraph() {
     actions='<button data-action="graph-exit" data-graph-mutate>取消选路</button><button class="primary" data-action="graph-autocomplete" data-graph-mutate>自动补全</button>';
     controls=`<div class="graph-selection" data-key="graph-controls">${esc(graphName(g.vertices.find(v=>v.id===s.prefix[0])))} · 点击下一跳</div>`;
   }else actions=`${linkState(l)}<a class="button" href="#/quality/links/${l.id}">网络质量</a><button data-action="link-edit" data-graph-mutate ${l.job||l.state==='deleting'?'disabled':''}>编辑</button><button class="danger" data-action="link-delete" data-graph-mutate ${l.job||l.state==='deleting'?'disabled':''}>删除</button>`;
+  if(!s&&l.entry_conflicts?.length)controls=`<div class="graph-notice" data-key="entry-conflicts">${esc(l.entry_conflicts.map(id=>graphName(g.vertices.find(v=>v.id===id))).join('、'))}：首跳尚未统一，请点击入口重新选路。</div>`;
   render(`<a class="back" href="#/routes">← 链路</a>${poolHead(title,actions)}<section class="panel topology-panel${topologyViews.get(s?.id||l?.id||'new')?.fullscreen?' is-fullscreen':''}"><div class="graph-fullscreen-actions">${actions}</div>${s?.error?`<div class="graph-error" data-key="graph-error" role="alert">${esc(s.error)}${s.conflict&&s.id?'<button class="small" data-action="graph-reload">重新载入</button>':''}</div>`:''}${controls}${graphCanvas(g,l)}${!s?'<div class="graph-route-hint" data-key="graph-hint" data-route-hint></div>':''}${!s?syncFeedback(l):''}</section>${!s?`<div class="graph-summary"><span>${g.vertices.filter(v=>v.kind==='entry').length} 个入口 · ${g.vertices.filter(v=>v.kind==='target').length} 个目标</span><a href="#/configs">查看配置${l.configurations?' · '+l.configurations.length:''} →</a></div>${l.draft?'<div class="graph-notice">有未完成的编辑 <button data-action="link-edit" data-graph-mutate>继续编辑</button></div>':''}${graphRouteStatus(g,l)}${detailsBlock('graph-events-'+l.id,'切换记录',l.events.map(e=>`<p>${esc(fmtTime(e.ts))} ${esc(e.message)}</p>`).join('')||'暂无记录')}`:''}`);
   if(s?.kind==='edit'){
     app.querySelectorAll('[data-graph-field]').forEach(el=>{el.value=s[el.dataset.graphField]??'';el.setAttribute('aria-invalid',String(s.errorField===el.dataset.graphField));});
@@ -387,6 +388,7 @@ async function startGraphChoice(id,fromEditor=false) {
       prefix:vertex?.kind==='entry'?[id]:[],required:vertex&&vertex.kind!=='entry'?[id]:[]};
     const r=await graphPreview(s,s.prefix,true,!!editor);
     if(graphSession!==session||pageVersion!==page)return;
+    if(!r.paths.length)throw new Error(r.skipped?.[0]?.reason||'没有可切换的配置');
     s.graph=r.graph;s.plans=r.paths;s.skipped=r.skipped;s.options=r.options;s.complete=r.complete;
     if(editor){
       if(r.skipped.length)throw new Error(r.skipped[0].reason);

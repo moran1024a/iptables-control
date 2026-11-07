@@ -143,6 +143,7 @@ func (a *Agent) prepareProfile(p routeProfile) error {
 		return e
 	}
 	// Copy only connected routes belonging to this device. Never flush main.
+	wanted := map[string]bool{"default/32767": true}
 	connected, e := ipJSON("route", "show", "dev", p.Device, "scope", "link")
 	if e != nil {
 		return e
@@ -155,6 +156,7 @@ func (a *Agent) prepareProfile(p routeProfile) error {
 		if _, e = run(nil, "ip", "-4", "route", "replace", dst, "dev", p.Device, "src", p.Local, "table", table, "proto", "242"); e != nil {
 			return e
 		}
+		wanted[dst+"/0"] = true
 	}
 	gateway := p.Gateway
 	if gateway == "-" {
@@ -180,6 +182,18 @@ func (a *Agent) prepareProfile(p routeProfile) error {
 	if gateway != "-" {
 		if _, e = run(nil, "ip", "-4", "route", "replace", "default", "via", gateway, "dev", p.Device, "src", p.Local, "metric", "10", "table", table, "proto", "242"); e != nil {
 			return e
+		}
+		wanted["default/10"] = true
+	}
+	// Reconcile withdrawals as well as additions. Install replacements first so
+	// an unchanged route never disappears while this profile carries traffic.
+	for _, r := range routes {
+		dst, _ := r["dst"].(string)
+		metric := strconv.Itoa(int(number(r["metric"])))
+		if !wanted[dst+"/"+metric] {
+			if _, e = run(nil, "ip", "-4", "route", "del", dst, "metric", metric, "table", table, "proto", "242"); e != nil {
+				return e
+			}
 		}
 	}
 	if !existingRule {

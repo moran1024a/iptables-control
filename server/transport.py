@@ -75,6 +75,8 @@ class Hub:
         try:
             await session["send"]({"type": "query", "id": op, "query": body})
             result = await asyncio.wait_for(future, 32 if kind == "diagnose" else 12)
+            if kind == 'inventory' and isinstance(result.get('data'), dict) and 'interfaces' in result['data']:
+                await self.database(lambda c: agent_v3.save_snapshot(c, nid, 'inventory', result['data']))
             return web.json_response(result)
         except asyncio.TimeoutError:
             return web.json_response({"error": "查询超时，请重试"}, status=504)
@@ -120,7 +122,7 @@ class Hub:
             "auto_update": bool(hello.get("auto_update")),
             "generation": hello.get("generation", 0),
             "hash": hello.get("hash", ""),
-            "source_ip": request.remote or "",
+            "source_ip": api.source_address(request.remote or "", request.headers.get('X-Forwarded-For')),
             "state": "ok",
         }
         await self.database(

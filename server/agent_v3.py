@@ -9,6 +9,7 @@ import database
 import errors
 import forwarding
 import node_sync
+import node_addresses
 import settings
 
 SCHEMA = """
@@ -218,6 +219,8 @@ def save_snapshot(conn, nid, kind, data):
     now = int(time.time())
     conn.execute("INSERT OR IGNORE INTO node_snapshots(node_id) VALUES (?)", (nid,))
     conn.execute(f"UPDATE node_snapshots SET {kind}=?,{kind}_at=? WHERE node_id=?", (encoded, now, nid))
+    if kind == "inventory":
+        node_addresses.refresh_pending(conn, nid)
     if kind == "metrics":
         values = {k: data[k] for k in ("cpu_percent", "agent_rss") if type(data.get(k)) in (int, float)}
         mem = data.get("memory", {})
@@ -339,6 +342,8 @@ def manage(conn, node, data):
     if not str(data.get("t", "")).isdigit() or abs(now - int(data["t"])) > settings.MAX_SKEW:
         raise errors.UserError("节点时间不正确")
     action = data.get("manage")
+    if action in ("prepare", "commit", "failed"):
+        node_addresses.receive_network(conn, node['id'], data)
     if action == "asset":
         path, _ = artifact(data.get("name"))
         return path.read_bytes()

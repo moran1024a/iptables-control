@@ -85,10 +85,28 @@ except OSError:pass
 else:raise AssertionError('accepted traffic on the wrong local address')
 ''')
         agent('--apply-file',str(snapshot),'--generation','1');check()
+        if len(sys.argv) > 2:
+            result=run('env','ICTL_ROUTING_KERNEL=1',str(Path(sys.argv[2]).resolve()),
+                       '-test.run','^TestDiagnosticRouteKernel$','-test.v')
+            assert 'PASS' in result, result
         shared=[r for r in json.loads(run('ip','-j','-4','rule','show')) if r['priority']==24860]
         assert len(shared)==2 and len({r['fwmark'] for r in shared})==2,shared
         # Reapplying must accept our existing profile journals and routes.
         agent('--apply-file',str(snapshot),'--generation','1');check()
+        def withdraw_routes(apply):
+            run('ip','route','add','203.0.113.0/24','dev','client')
+            run('ip','route','add','default','via','192.0.2.2','dev','client','metric','500')
+            apply()
+            run('ip','route','del','203.0.113.0/24','dev','client')
+            run('ip','route','del','default','via','192.0.2.2','dev','client','metric','500')
+            apply()
+            for path in (root/'routing').glob('[0-9]*'):
+                if ',client,' not in path.read_text(): continue
+                routes=json.loads(run('ip','-N','-j','-4','route','show','table',path.name))
+                assert not any(r.get('dst')=='203.0.113.0/24' or r.get('gateway')=='192.0.2.2' for r in routes), routes
+                assert any(str(r.get('type')) in ('unreachable', '7') for r in routes), routes
+            check()
+        withdraw_routes(lambda: agent('--apply-file',str(snapshot),'--generation','1'))
         agent('--clear')
         assert not list((root/'routing').glob('[0-9]*'))
         passive=str(Path(__file__).resolve().parents[1]/'agent/passive.sh')
@@ -105,6 +123,7 @@ local_apply
         shared=[r for r in json.loads(run('ip','-j','-4','rule','show')) if r['priority']==24860]
         assert len(shared)==2 and len({r['fwmark'] for r in shared})==2,shared
         run('bash','-c',script,'test',passive,str(root));check()
+        withdraw_routes(lambda: run('bash','-c',script,'test',passive,str(root)))
         run('bash','-c',script+'\nremove_rules','test',passive,str(root))
         assert not list((root/'routing').glob('[0-9]*'))
         rules=json.loads(run('ip','-j','-4','rule','show'))

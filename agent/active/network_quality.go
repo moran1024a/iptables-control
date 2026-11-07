@@ -121,7 +121,7 @@ func validICMPReply(b, request []byte) bool {
 		icmpChecksum(b) == 0 && bytes.Equal(b[4:], request[4:])
 }
 
-func probeNetworkQuality(ctx context.Context, host string, port int, key []byte, protocol string, profiles ...routeProfile) M {
+func routeDialer(protocol string, profiles ...routeProfile) *net.Dialer {
 	dialer := &net.Dialer{}
 	if len(profiles) > 0 {
 		p := profiles[0]
@@ -142,6 +142,11 @@ func probeNetworkQuality(ctx context.Context, host string, port int, key []byte,
 			return err
 		}
 	}
+	return dialer
+}
+
+func probeNetworkQuality(ctx context.Context, host string, port int, key []byte, protocol string, profiles ...routeProfile) M {
+	dialer := routeDialer(protocol, profiles...)
 	result := M{"status": "error"}
 	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()

@@ -983,6 +983,18 @@ button.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
 }
 
 .node-addresses { margin:12px 0; }
-.node-address-row { display:grid;grid-template-columns:1fr 1.5fr 1.5fr 1fr 1.5fr auto;gap:6px;margin:8px 0; }
+.node-address-row { border:1px solid var(--border);border-radius:6px;padding:8px;margin:8px 0; }
 .node-address-row input { min-width:0;width:100%; }
-@media(max-width:700px){.node-address-row{grid-template-columns:1fr 1fr}}
+.node-address-main { display:grid;grid-template-columns:68px minmax(100px,1.4fr) minmax(90px,1fr) auto;gap:8px;align-items:center; }
+.node-address-main .address-primary { display:flex;align-items:center;gap:5px;margin:0;white-space:nowrap; }
+.node-address-row input[type=radio],.address-candidate input { width:auto;margin:0; }
+.address-advanced { margin:6px 0 0;padding:3px 0;border:0;box-shadow:none;background:none; }
+.address-advanced summary { font-size:12px;cursor:pointer; }
+.address-routing { display:grid;grid-template-columns:1.4fr 1fr 1.4fr;gap:8px;margin-top:8px; }
+.address-routing label { margin:0; }
+.address-picker { margin-top:8px; }
+.address-candidate { display:flex;gap:8px;align-items:center;margin:6px 0; }
+.node-address-summary > div { display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:5px 0; }
+.node-options { margin:8px 0; }
+.diagnostic-result { white-space:pre-wrap;overflow-wrap:anywhere;max-height:50vh;overflow:auto; }
+@media(max-width:600px){.node-address-main{grid-template-columns:64px minmax(120px,1fr) auto}.node-address-main [data-address-field=name]{grid-column:2;grid-row:2}.node-address-main button{grid-column:3;grid-row:1}.address-routing{grid-template-columns:1fr}}

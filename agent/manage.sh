@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.5.1-rc.1"
+VERSION="0.5.1"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -20,10 +20,20 @@ read_identity() {
   derive_keys
 }
 field() { sed -n "s/^$1=//p" <<< "$REPLY"; }
+network_inventory() {
+  local addresses
+  addresses="$(ip -o -4 address show 2>/dev/null)" || return 0
+  awk '$3 == "inet" {dev=$2; sub(/@.*/, "", dev); sub(/:$/, "", dev);
+    if (dev == "lo" || dev !~ /^[A-Za-z0-9_.:-]+$/ || length(dev)>15) next;
+    count++; if(count<=96) {if(rows!="") rows=rows ";"; rows=rows dev "," $4}}
+    END {printf "network_addresses=%s\nnetwork_complete=%d\n", rows, count<=96}' <<< "$addresses"
+}
 rpc() {
   local action="$1" code
-  code="$(printf 't=%s\nmanage=%s\nop=%s\ntarget=%s\narch=%s\nagent=%s\n%s\n' \
-    "$(date +%s)" "$action" "$OP" "$TARGET" "$ARCH" "$NEW_VERSION" "${2:-}" | send_request "$WORK/response" 120)"
+  code="$({ printf 't=%s\nmanage=%s\nop=%s\ntarget=%s\narch=%s\nagent=%s\n%s\n' \
+    "$(date +%s)" "$action" "$OP" "$TARGET" "$ARCH" "$NEW_VERSION" "${2:-}"
+    case "$action" in prepare|commit|failed) network_inventory ;; esac
+  } | send_request "$WORK/response" 120)"
   [ "$code" = 200 ] || { die "服务端操作失败（$code），请检查接入、时间和服务端日志"; return 1; }
   REPLY="$(cat "$WORK/response")"
   [[ "$REPLY" == proto=2* ]] || { die '服务端协议不兼容'; return 1; }
