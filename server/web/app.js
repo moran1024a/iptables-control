@@ -301,6 +301,13 @@ async function route() {
     history.replaceState(null, '', location.pathname + location.search + renderedHash);
     return;
   }
+  if (typeof graphChanged === "function" && graphChanged()) {
+    if (graphBusy || !(await confirmBox("离开拓扑？", "未保存的编辑或选路将被丢弃。", "离开"))) {
+      history.replaceState(null, '', location.pathname + location.search + renderedHash);
+      return;
+    }
+  }
+  if (typeof graphSession !== "undefined") graphSession = null;
   renderedHash = location.hash;
   leaveView();
   const version = pageVersion;
@@ -330,9 +337,10 @@ async function route() {
   if (page === "nodes" && id) return show((request) => nodeDetail(Number(id), request), true);
   if (page === "nodes") return show(nodeList, true);
   if (page === "configs" || page === "chains") return show(configSummary, true);
-  if (page === "routes" && id) return show((request) => linkDetail(Number(id), request), true);
+  if (page === "routes" && id === "new") return show(graphNew, false);
+  if (page === "routes" && id) return show((request) => graphDetail(Number(id), request), true);
   if (page === "routes") return show(linkList, true);
-  if (page === "pools") return show(poolList, true);
+  if (page === "pools") { location.hash = "#/routes"; return; }
   if (page === "targets") return show(targetList, true);
   if (page === "subscriptions") return show(subscriptionList, true);
   if (page === "settings") return show(settingsPage, false);
@@ -922,7 +930,7 @@ document.addEventListener('click', e => {
 document.addEventListener('toggle', e => {
   if(e.target.matches?.('.resource-picker[open]'))e.target.querySelector('input').focus();
 }, true);
-window.addEventListener('beforeunload', e => { if(modalChanged() || modalState?.busy || sortChanged() || sortBusy) {e.preventDefault();e.returnValue='';} });
+window.addEventListener('beforeunload', e => { if(modalChanged() || modalState?.busy || sortChanged() || sortBusy || (typeof graphChanged === "function" && graphChanged())) {e.preventDefault();e.returnValue='';} });
 
 function confirmBox(title, text, okLabel = "确定", danger = false) {
   if (modalState?.busy) return Promise.resolve(false);

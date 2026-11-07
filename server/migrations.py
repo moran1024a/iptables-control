@@ -17,6 +17,7 @@ import security
 import settings
 import subscriptions
 import wake
+import topology
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS item_groups (
@@ -319,6 +320,7 @@ def init_db():
             migrate_v044(conn)
             migrate_v047(conn)
             migrate_v047_rc2(conn)
+            topology.migrate(conn)
             with conn:
                 ensure_active_windows(conn)
             return conn
@@ -331,6 +333,7 @@ def init_db():
     migrate_v044(conn)
     migrate_v047(conn)
     migrate_v047_rc2(conn)
+    topology.migrate(conn)
     return conn
 
 

@@ -39,7 +39,7 @@ def sections(c, link, nodes):
     by_node = {h["node_id"]: h for h in hops}
     live_rules = {r["id"]: r for r in pools.rows(c, link["id"])} if link["managed"] else {}
     stages = [
-        (st["id"], st["node_id"] if st["kind"] == "node" else selected.get(st["id"])) for st in plan["stages"]
+        (st.get("legacy_section", st["id"]), st["node_id"] if st["kind"] == "node" else selected.get(st["id"])) for st in plan["stages"]
     ]
     actual = [n for _, n in stages if n]
     expected = ([plan["entry"]] if plan["entry"] else []) + actual

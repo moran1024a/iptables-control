@@ -14,6 +14,7 @@ import settings
 import target_config
 import validation
 import wake
+import topology
 
 OFFLINE_AFTER = 60
 WAIT_SECONDS = 30
@@ -52,7 +53,8 @@ def pending_plan(link, c=None):
     desired = json.loads(link["plan"])
     if desired.get("port") is None:
         desired["port"] = current["port"]
-    if desired != current:
+    comparison = (desired.get("graph") != current.get("graph") or desired.get("port") != current.get("port")) if "graph" in desired and "graph" in current else desired != current
+    if comparison:
         return True
     if c is not None and link["managed"]:
         target = database.get_target(c, desired["target"])
@@ -155,6 +157,9 @@ def refresh_links(c, node=None, target=None):
         if node is not None and node in path or (target is not None and plan["target"] == target):
             if pending_plan(link):
                 raise errors.UserError(f"链路「{link['name']}」有未生效的方案，请先重试或编辑确认", status=409)
+            if "graph" in plan and runtime_plan(link):
+                current = runtime_plan(link)
+                plan = topology.compile_plan(current["graph"], current["graph_path"], current["port"])
             begin(c, link, plan, json.loads(link["selected"]), path, "资源地址更新")
 
 
@@ -199,7 +204,9 @@ def protected(c, link, stage, node):
 
 
 def node_references(c, nid):
-    names = ["池：" + p["name"] for p in c.execute("SELECT * FROM pools") if nid in json.loads(p["members"])]
+    archived = topology.archived_pools(c)
+    names = ["池：" + p["name"] for p in c.execute("SELECT * FROM pools") if p["id"] not in archived and nid in json.loads(p["members"])]
+    names.extend(topology.references(c, nid))
     for link in c.execute("SELECT * FROM links"):
         plans = [json.loads(link["plan"])] + ([runtime_plan(link)] if link["applied"] else [])
         if any(plan["entry"] == nid or any(x["kind"] == "node" and x["node_id"] == nid for x in plan["stages"]) for plan in plans):
@@ -280,6 +287,8 @@ def pool_delete(c, ident):
 
 
 def validate_plan(c, raw, old=None):
+    if isinstance(raw, dict) and "graph" in raw:
+        return topology.compile_plan(topology.validate(c, raw["graph"]), raw.get("graph_path"), raw.get("port"))
     if (
         not isinstance(raw, dict)
         or not isinstance(raw.get("stages", []), list)
@@ -384,6 +393,12 @@ def ready(n, now):
 def choose(c, link, plan, prefer_current=False, forced=None, now=None):
     now = int(time.time()) if now is None else now
     nodes = {n["id"]: n for n in c.execute("SELECT * FROM nodes")}
+    if "graph" in plan:
+        path = plan["graph_path"]
+        topology.check_path(plan["graph"], path)
+        topology.ready_path(c, plan["graph"], path)
+        vertices = {v["id"]: v for v in plan["graph"]["vertices"]}
+        return ({st["id"]: st["node_id"] for st in plan["stages"]}, [vertices[i]["node_id"] for i in path if vertices[i].get("node_id")])
     current = json.loads(link["selected"])
     failed = json.loads(link["failures"]) if link["failure_scope"] in ("", dump(plan)) else []
     options = []
@@ -514,6 +529,11 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
         c.execute("UPDATE chains SET target_id=?,remark=? WHERE id=?", (target["id"], link["name"], cid))
         applied_plan = {**plan, "port": old_hops[0]["port"] if old_hops else plan["port"]}
         save_applied(c, link["id"], applied_plan, target)
+        desired = json.loads(link["plan"])
+        if "graph" in plan and (update_plan or desired.get("graph") == plan["graph"]):
+            # A different graph branch can compile to identical kernel rules.
+            # Keep retry/edit metadata on that confirmed branch as well.
+            c.execute("UPDATE links SET plan=? WHERE id=?", (dump(applied_plan), link["id"]))
         return
     new = []
     for index, nid in enumerate(path):
@@ -521,7 +541,7 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
         if n["deleting"] or n["manual_required"]:
             raise errors.UserError(f"{n['name']} 正在删除或等待模式确认")
         if (
-            any((x["kind"] == "pool" for x in plan["stages"]))
+            ("graph" in plan or any((x["kind"] == "pool" for x in plan["stages"])))
             and n["desired_mode"] == "passive"
             and agent_v3.newer("0.4.0-rc.4", n["agent"] or "0.0.0")
         ):
@@ -868,6 +888,8 @@ def progress(c, link, now):
         plan["port"] = job["new"][0]["port"]
     save_applied(c, link["id"], plan, job.get("target_snapshot"))
     desired = plan if job.get("update_plan", True) else json.loads(link["plan"])
+    if "graph" in plan and desired.get("graph") == plan["graph"]:
+        desired = plan
     c.execute(
         "UPDATE links SET selected=?,plan=?,job=NULL,state='active',error='',failures='[]',failure_scope='',revision=revision+1 WHERE id=?",
         (dump(job["selected"]), dump(desired), link["id"]),
@@ -916,6 +938,9 @@ def tick(c, now=None, allow_failover=True):
         plan, selected = (runtime_plan(link), json.loads(link["selected"]))
         if plan is None:
             continue
+        if "graph" in plan:
+            topology.failover(c, link, now)
+            continue
         lost = []
         for stage in plan["stages"]:
             nid = selected.get(stage["id"]) if stage["kind"] == "pool" else None
@@ -956,7 +981,7 @@ def display_state(c, link):
                     f"节点 {n['name']}："
                     + (
                         n["err"]
-                        or ("失联；池成员持续失联 60 秒后尝试灾备" if status == "offline" else "状态异常")
+                        or ("失联；持续失联 60 秒后尝试灾备" if status == "offline" else "状态异常")
                     ),
                 )
             if status != "synced":
@@ -1065,6 +1090,7 @@ def detail(c, link):
         result["connection"] = target_config.connection(
             target, first["addr"], first["port"], database.config_name(c, link["name"], link["group_id"])
         )
+    topology.decorate(c, link, result)
     return result
 
 
@@ -1106,6 +1132,12 @@ def quality_paths(c, only=None):
         if only is not None and link["id"] != only:
             continue
         plan = runtime_plan(link) or json.loads(link["plan"])
+        if "graph" in plan:
+            graph = plan["graph"]
+            vertices = {v["id"]: v for v in graph["vertices"]}
+            paths["links", link["id"]] = list(dict.fromkeys(v["node_id"] for v in graph["vertices"] if v.get("node_id")))
+            edges.update(topology.probe_edges(graph))
+            continue
         stages = [[plan["entry"]]] if plan["entry"] else []
         for x in plan["stages"]:
             stages.append(

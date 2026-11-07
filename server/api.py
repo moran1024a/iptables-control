@@ -115,7 +115,8 @@ class Request:
             if method != "GET" and (not self.headers.get("Content-Type", "").startswith("application/json")):
                 self.close_connection = True
                 return self.send_json(400, {"error": "请求格式错误"})
-            body = self.read_json() if method != "GET" else {}
+            limit = 1024 * 1024 if route == "topology-preview" or route == "topology" or re.fullmatch(r"topology/\d+", route) else settings.MAX_API_BODY
+            body = self.read_json(limit) if method != "GET" else {}
             if route == "login" and method == "POST":
                 return authentication.api_login(self, conn, body)
             session = authentication.auth(self, conn)
@@ -164,6 +165,12 @@ class Request:
                 handler = {"GET": self.resources.api_routes, "POST": self.resources.api_route_save}.get(
                     method
                 )
+            elif parts == ["topology"]:
+                handler = {"POST": self.resources.api_graph_save}.get(method)
+            elif len(parts) == 2 and parts[0] == "topology" and parts[1].isdigit():
+                handler = {"POST": self.resources.api_graph_save}.get(method)
+            elif parts == ["topology-preview"]:
+                handler = {"POST": self.resources.api_graph_preview}.get(method)
             elif parts in (["pools"], ["links"]):
                 handler = {
                     "GET": self.resources.api_pool_list,
@@ -260,8 +267,8 @@ class Request:
             raise errors.UserError("请求过大")
         return length
 
-    def read_json(self):
-        length = self.body_length(settings.MAX_API_BODY)
+    def read_json(self, limit=settings.MAX_API_BODY):
+        length = self.body_length(limit)
         if length == 0:
             return {}
         try:

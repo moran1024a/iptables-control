@@ -11,6 +11,7 @@ import network_quality
 import node_state
 import node_sync
 import pools
+import topology
 import security
 import settings
 import subscriptions
@@ -212,8 +213,9 @@ class Resources:
             raise errors.UserError("模式必须为主动或被动", "desired_mode")
         if mode != n["desired_mode"] and mode == "passive":
             refs = [
-                p["name"] for p in conn.execute("SELECT * FROM pools") if node_id in json.loads(p["members"])
+                p["name"] for p in conn.execute("SELECT * FROM pools") if p["id"] not in topology.archived_pools(conn) and node_id in json.loads(p["members"])
             ]
+            refs.extend(topology.references(conn, node_id, pools_only=True))
             if refs:
                 raise errors.UserError("请先将节点从池中移除：" + "、".join(refs), "desired_mode")
         if mode != n["desired_mode"] and n["first_seen"] and (n["protocol_version"] < 2):
@@ -438,6 +440,13 @@ class Resources:
         )
         conn.execute("DELETE FROM item_groups WHERE id = ?", (group_id,))
         return {}
+
+    @node_sync.track_mutation
+    def api_graph_save(self, conn, body, ident=None):
+        return topology.save(conn, body, ident)
+
+    def api_graph_preview(self, conn, body):
+        return topology.preview(conn, body)
 
     def api_pool_list(self, conn, body):
         return pools.listing(conn)
@@ -698,6 +707,9 @@ class Resources:
     @node_sync.track_mutation
     def api_target_del(self, conn, body, target_id):
         database.get_target(conn, target_id)
+        for row in conn.execute("SELECT draft FROM link_graphs WHERE draft IS NOT NULL"):
+            if any(v.get("target_id") == target_id for v in json.loads(row[0])["graph"]["vertices"]):
+                raise errors.UserError("目标仍被拓扑草稿引用，请先解除引用")
         if any(
             (json.loads(l["plan"])["target"] == target_id for l in conn.execute("SELECT plan FROM links"))
         ):

@@ -3,8 +3,8 @@
 import json
 import os
 
-VERSION = "0.4.7"
-DATABASE_VERSION = 406
+VERSION = "0.5.0-rc.5"
+DATABASE_VERSION = 500
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -38,6 +38,7 @@ NOT_FOUND = "404 page not found\n"
 STATIC = {
     "index.html": "text/html; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
+    "topology.js": "text/javascript; charset=utf-8",
     "pools.js": "text/javascript; charset=utf-8",
     "subscriptions.js": "text/javascript; charset=utf-8",
     "style.css": "text/css; charset=utf-8",

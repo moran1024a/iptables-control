@@ -892,3 +892,63 @@ body.canvas-fullscreen { overflow:hidden; }
   .member-tags > button { min-height:32px; }
   .plain-title { min-height:0 !important; padding:4px 0; }
 }
+
+/* Canvas topology: world coordinates shared by cards, pool bounds and edges. */
+.view-enter > .topology-panel { animation:fade .25s ease both; }
+.graph-viewport { height:clamp(400px,65vh,760px); }
+.graph-node { position:absolute; z-index:3; width:180px; height:60px; border:1px solid var(--border); border-radius:9px; background:var(--card); box-shadow:var(--shadow); }
+.graph-node-body { display:flex; flex-direction:column; align-items:flex-start; justify-content:center; gap:2px; width:100%; height:100%; padding:6px 12px; border:0; background:transparent; text-align:left; color:var(--text); }
+.graph-node-body strong { display:block; max-width:100%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:13px; line-height:1.35; flex-shrink:0; }
+.graph-node-body small,.graph-node-body span { font-size:10px; line-height:1.2; flex-shrink:0; color:var(--muted); }
+.graph-node.on-route { border-color:var(--green); }
+.graph-node.on-route .graph-node-body span { color:var(--green); }
+.graph-node.graph-option { border-color:var(--blue); box-shadow:0 0 0 3px var(--primary-soft); }
+.graph-node.graph-chosen { border-color:var(--yellow); }
+.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
+.graph-node-body { border-radius:inherit; transition:background .15s; }
+.graph-node.graph-selected { outline:2px solid var(--blue); outline-offset:2px; }
+.graph-node.graph-invalid { outline:2px solid var(--red); }
+.graph-pool.graph-invalid { outline:2px solid var(--red); }
+.graph-node.graph-disabled { opacity:.5; border-style:dashed; }
+.graph-pool { position:absolute; border:1px dashed var(--border); background:color-mix(in srgb,var(--blue) 4%,var(--bg)); border-radius:14px; }
+.graph-pool-title { position:absolute; top:4px; left:8px; max-width:calc(100% - 16px); border:0; background:transparent; font-size:12px; font-weight:600; padding:4px 8px; overflow:hidden; text-overflow:ellipsis; }
+.graph-pool-body { position:absolute; inset:0; width:100%; height:100%; padding:0; border:0; border-radius:inherit; background:transparent; color:var(--text); text-align:left; }
+.graph-pool-empty { display:block; text-align:center; color:var(--muted); font-size:12px; pointer-events:none; }
+.graph-pool.graph-selected { border-color:var(--blue); outline:2px solid var(--primary-soft); }
+.graph-pool.graph-drop-target { border-color:var(--green); outline:2px solid var(--green); background:color-mix(in srgb,var(--green) 8%,var(--bg)); }
+.graph-pool.graph-drop-blocked { border-color:var(--red); outline:2px solid var(--red); }
+.graph-pool .graph-resize { position:absolute; z-index:4; right:0; bottom:0; width:24px; height:24px; min-height:24px; padding:0; border:0; background:transparent; cursor:nwse-resize; }
+.graph-resize::after { content:""; position:absolute; right:5px; bottom:5px; width:8px; height:8px; border-right:2px solid var(--blue); border-bottom:2px solid var(--blue); }
+[data-graph-drag] { cursor:grab; touch-action:none; user-select:none; }
+[data-graph-drag]:active { cursor:grabbing; }
+.graph-node.is-dragging { z-index:6; pointer-events:none; }
+.graph-port { position:absolute; z-index:4; padding:0; border:0; background:transparent; color:var(--blue); line-height:32px; border-radius:50%; font-size:12px; }
+.graph-node .graph-port,.graph-pool .graph-port { top:calc(50% - 16px); width:32px; height:32px; min-height:32px; touch-action:none; }
+.graph-port.in { left:-16px; }.graph-port.out { right:-16px; }
+.graph-port:hover { color:var(--green); }
+.graph-port.graph-link-source,.graph-port.graph-link-target { color:var(--green); background:color-mix(in srgb,var(--green) 12%,transparent); }
+.graph-wire { stroke:var(--blue); stroke-width:1.5; stroke-dasharray:5 4; pointer-events:none; }
+.graph-history { display:flex; gap:4px; }
+.topology-panel:has(.graph-viewport) .topology-legend { flex-wrap:wrap; gap:8px; }
+.topology-panel:has(.graph-viewport) .topology-toolbar button { white-space:nowrap; }
+.graph-meta [aria-invalid="true"] { border-color:var(--red); }
+.graph-fullscreen-actions { display:none; }
+.is-fullscreen .graph-fullscreen-actions { display:flex; justify-content:flex-end; gap:8px; margin-bottom:10px; }
+.graph-line { stroke:var(--muted); stroke-width:1; opacity:.55; transition:opacity .15s,stroke .15s; }
+.graph-focus [data-graph-from]:not(.graph-nearby) { opacity:.1; }
+.graph-line.graph-nearby:not(.graph-live):not(.graph-next) { stroke:var(--blue); stroke-width:1.5; opacity:.9; }
+.graph-line.graph-live { stroke:var(--green); stroke-width:1.6; opacity:1; }
+.graph-line.graph-next { stroke:var(--yellow); stroke-width:2; stroke-dasharray:6 5; opacity:1; }
+.graph-line.graph-selected-line { stroke:var(--blue); stroke-width:2; opacity:1; }
+.graph-hit { pointer-events:stroke; cursor:pointer; stroke:transparent; stroke-width:12; }
+.graph-meta,.graph-editor-tools,.graph-inspector { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:10px; }
+.graph-meta input,.graph-meta select { width:auto; flex:1; min-width:120px; }
+.graph-editor-tools input,.graph-editor-tools select { width:auto; max-width:230px; }
+.graph-inspector { min-height:36px; font-size:12px; }.graph-inspector select,.graph-inspector input:not([type=checkbox]) { width:auto; max-width:220px; }
+.graph-inspector .inline-check { display:flex; flex-direction:row; align-items:center; gap:6px; margin:0; }
+.graph-inspector .inline-check input { width:auto; }
+.graph-error,.graph-notice,.graph-selection { padding:10px 12px; margin:0 0 12px; border:1px solid var(--border); border-radius:8px; font-size:13px; }
+.graph-error { color:var(--red); }.graph-notice { color:var(--muted); }.graph-selection { color:var(--blue); }
+.graph-error button { margin-left:10px; }
+.graph-selection { overflow-wrap:anywhere; }
+@media(max-width:600px) { .graph-editor-tools select { max-width:55%; }.graph-viewport { height:60vh; }.graph-meta input { min-width:100px; }.graph-editor-hint { display:none; } }

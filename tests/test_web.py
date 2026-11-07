@@ -470,7 +470,7 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
             setup='const qualityHistories='+json.dumps(histories)+';\n'+setup
             html=(ROOT/'server/web/index.html').read_text().replace('<script src="app.js"></script>',
                 '<pre id="result">RUNNING</pre><script>'+setup+'</script><script>'+(ROOT/'server/web/app.js').read_text()+'</script><script>'+(ROOT/'server/web/pools.js').read_text()+'</script><script>'+(ROOT/'server/web/subscriptions.js').read_text()+'</script><script>'+exercise+'</script>')
-            html=html.replace('<script src="pools.js"></script>','').replace('<script src="subscriptions.js"></script>','')
+            html=html.replace('<script src="topology.js"></script>','').replace('<script src="pools.js"></script>','').replace('<script src="subscriptions.js"></script>','')
             html=html.replace('<link rel="stylesheet" href="style.css">','<style>'+(ROOT/'server/web/style.css').read_text()+'</style>')
             # Let actual frames run and report completion over local HTTP;
             # this does not depend on a browser debugging port or virtual time.

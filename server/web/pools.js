@@ -181,10 +181,12 @@ for(const event of ['mouseover','mouseout','focusin','focusout']) document.addEv
 const topologyViews = new Map();
 let topologyBinding = null;
 
-function releaseTopology() {
+function releaseTopology(preserve = false) {
   topologyBinding?.observer.disconnect();
-  if (topologyBinding) topologyBinding.view.fullscreen = false;
-  document.body.classList.remove('canvas-fullscreen');
+  if (!preserve) {
+    if (topologyBinding) topologyBinding.view.fullscreen = false;
+    document.body.classList.remove('canvas-fullscreen');
+  }
   topologyBinding = null;
 }
 
@@ -231,7 +233,7 @@ function mountTopology(id) {
     fit();
   };
   if (topologyBinding?.viewport !== viewport) {
-    releaseTopology();
+    releaseTopology(topologyBinding?.view === view);
     const points = new Map();
     const position = e => { const r=viewport.getBoundingClientRect();return {x:e.clientX-r.left-viewport.clientLeft,y:e.clientY-r.top-viewport.clientTop}; };
     const midpoint = values => ({x:values.reduce((a,p)=>a+p.x,0)/values.length,y:values.reduce((a,p)=>a+p.y,0)/values.length});
@@ -266,8 +268,10 @@ function mountTopology(id) {
     };
     const observer=new ResizeObserver(()=>view.auto?fit():apply());
     observer.observe(viewport);
-    topologyBinding={viewport,observer,fit,zoom,focusCurrent,fullscreen,view};
+    topologyBinding={viewport,observer,fit,zoom,focusCurrent,fullscreen,view,apply};
   }
+  viewport.closest('.topology-panel').classList.toggle('is-fullscreen',!!view.fullscreen);
+  document.body.classList.toggle('canvas-fullscreen',!!view.fullscreen);
   if(view.auto) fit(); else apply();
 }
 

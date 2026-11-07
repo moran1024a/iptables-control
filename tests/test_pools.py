@@ -28,7 +28,9 @@ class PoolTests(Fixture, unittest.TestCase):
             self.db.execute('UPDATE links SET applied=NULL WHERE id=?', (lid,))
             self.db.execute('PRAGMA user_version=405')
         self.db.close(); self.db = migrations.init_db()
-        self.assertEqual(self.get(lid)['applied_plan'], before['plan'])
+        migrated = self.get(lid)['applied_plan']
+        self.assertEqual({k:v for k,v in migrated.items() if k not in ('graph','graph_path')}, before['plan'])
+        self.assertEqual(migrated['graph_path'], ['entry', 'pool-a-'+str(self.a), 'target'])
         self.ack(self.b, False); self.tick()
         with self.db:
             self.db.execute('UPDATE links SET applied=NULL WHERE id=?', (lid,))

@@ -9,6 +9,7 @@ import time
 import link_quality
 import network_quality as q
 import probe_store as store
+import pools
 
 
 class Monitor:
@@ -55,6 +56,10 @@ class Monitor:
             for a, b in zip(ids, ids[1:])
             if a != b
         }
+        for link in c.execute("SELECT * FROM links WHERE state NOT IN ('draft','deleting')"):
+            plan = pools.runtime_plan(link)
+            if plan and "graph" in plan:
+                edges.update(("links", link["id"], a, b) for a,b in pools.quality_paths(c, link["id"])[1])
         for (scope, ident, a, b), expiry in self.extra.copy().items():
             if expiry > now and a in routes.get((scope, ident), []) and b in routes[(scope, ident)]:
                 edges.add((scope, ident, a, b))

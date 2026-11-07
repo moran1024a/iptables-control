@@ -39,6 +39,7 @@ jobs:
           python3 -m unittest discover -s tests
           node --check server/web/app.js
           node --check server/web/pools.js
+          node --check server/web/topology.js
           node --check server/web/subscriptions.js
           for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
           mkdir -p dist
