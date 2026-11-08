@@ -12,6 +12,9 @@ import settings
 
 LOGIN_FAILS = {}
 LOGIN_FAILS_LOCK = threading.Lock()
+LOGIN_PENDING = 0
+LOGIN_CONCURRENCY = 16
+LOGIN_SOURCES = 4096
 
 
 def session_cookie(self, token, max_age):
@@ -45,23 +48,46 @@ def auth(self, conn):
 
 
 def api_login(self, conn, body):
+    global LOGIN_PENDING
     ip = self.source_ip()
     now = time.time()
     with LOGIN_FAILS_LOCK:
+        for address, item in list(LOGIN_FAILS.items()):
+            if not item["pending"] and item["expires"] <= now:
+                del LOGIN_FAILS[address]
         fails = LOGIN_FAILS.get(ip)
-        if fails and fails[1] > now:
-            return self.send_json(429, {"error": f"尝试次数过多，请 {int(fails[1] - now) + 1} 秒后再试"})
-    user_ok = hmac.compare_digest(str(body.get("username", "")).encode(), database.setting(conn, "admin_user").encode())
-    pass_ok = security.verify_password(str(body.get("password", "")), database.setting(conn, "admin_hash"))
-    if not (user_ok and pass_ok):
+        if fails and fails["locked_until"] > now:
+            return self.send_json(429, {"error": f"尝试次数过多，请 {int(fails['locked_until'] - now) + 1} 秒后再试"})
+        if (LOGIN_PENDING >= LOGIN_CONCURRENCY
+                or fails and fails["failures"] + fails["pending"] >= settings.LOGIN_MAX_FAILS
+                or fails is None and len(LOGIN_FAILS) >= LOGIN_SOURCES):
+            return self.send_json(429, {"error": "登录尝试过多，请稍后再试"})
+        if fails is None:
+            fails = LOGIN_FAILS[ip] = dict(failures=0, pending=0, locked_until=0, expires=now + settings.LOGIN_LOCK)
+        fails["pending"] += 1
+        LOGIN_PENDING += 1
+    authenticated = False
+    try:
+        user_ok = hmac.compare_digest(str(body.get("username", "")).encode(), database.setting(conn, "admin_user").encode())
+        pass_ok = security.verify_password(str(body.get("password", "")), database.setting(conn, "admin_hash"))
+        authenticated = user_ok and pass_ok
+    finally:
+        # Reserve and settle attempts under the same lock, including failed hashes.
         with LOGIN_FAILS_LOCK:
-            fails = LOGIN_FAILS.setdefault(ip, [0, 0])
-            fails[0] += 1
-            if fails[0] >= settings.LOGIN_MAX_FAILS:
-                LOGIN_FAILS[ip] = [0, now + settings.LOGIN_LOCK]
+            LOGIN_PENDING -= 1
+            fails["pending"] -= 1
+            fails["expires"] = time.time() + settings.LOGIN_LOCK
+            if authenticated:
+                fails["failures"] = 0
+                fails["locked_until"] = 0
+                if not fails["pending"]:
+                    LOGIN_FAILS.pop(ip, None)
+            else:
+                fails["failures"] += 1
+                if fails["failures"] >= settings.LOGIN_MAX_FAILS:
+                    fails["locked_until"] = fails["expires"]
+    if not authenticated:
         return self.send_json(401, {"error": "用户名或密码错误"})
-    with LOGIN_FAILS_LOCK:
-        LOGIN_FAILS.pop(ip, None)
     token = secrets.token_urlsafe(32)
     with database.atomic(conn):
         conn.execute(

@@ -85,19 +85,25 @@ class FailoverTests(Fixture, unittest.TestCase):
         self.prime()
         self.assertEqual(self.desired(), [f'v{self.e}', f'v{self.c}', f't{self.t}'])
 
-    def test_pending_receipts_block_a_second_choice(self):
+    def test_lost_candidate_during_preparation_allows_another_choice(self):
         self.network()
         self.prime()
         self.tick(self.now)
         chosen = self.config()['desired']
         self.assertTrue(self.db.execute('SELECT 1 FROM jobs').fetchone())
         self.dead.add(self.b)
+        self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?', (self.now-61, self.b))
+        self.db.commit()
         for _ in range(10):
             self.step()
             self.tick(self.now)
-        self.assertEqual(self.config()['desired'], chosen)
-        self.assertEqual(len(json.loads(self.config()['failover'])['attempts']), 1)
-        self.assertEqual(self.config()['state'], 'waiting')
+            for nid in self.ids:
+                node = database.get_node(self.db,nid)
+                if nid not in self.dead and node['applied_generation'] != node['desired_generation']:
+                    self.ack(nid)
+        self.assertNotEqual(self.config()['desired'], chosen)
+        self.assertIn(f'v{self.c}', self.desired())
+        self.assertNotIn(f'v{self.b}', self.desired())
 
     def test_explicit_failure_can_wait_then_try_another_candidate(self):
         self.network()

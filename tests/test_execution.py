@@ -7,6 +7,64 @@ import configurations, database, errors, execution, forwarding, node_addresses
 
 
 class ExecutionTests(Fixture, unittest.TestCase):
+    def test_active_prepare_timeout_keeps_original_rules_and_reserves_ports(self):
+        a, b, c = [self.node(x) for x in 'ABC']
+        self.ready(a, b, c)
+        target = self.target()
+        ident = self.save(self.graph([a, b], target))
+        self.settle()
+        before = configurations.members(self.db, ident)[0]
+        self.save(self.graph([a, c], target), ident)
+        now = int(time.time())
+        self.tick(now)
+        job = json.loads(self.db.execute('SELECT payload FROM jobs').fetchone()[0])
+        self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?', (now-61, c))
+        self.db.commit()
+        self.tick(now+61)
+        after = configurations.members(self.db, ident)[0]
+        self.assertEqual(after['applied'], before['applied'])
+        self.assertEqual(after['state'], 'error')
+        self.assertTrue(execution.applied_rules_present(self.db, after))
+        self.assertFalse(self.db.execute('SELECT 1 FROM jobs').fetchone())
+        self.assertTrue(self.db.execute('SELECT 1 FROM retired_ports WHERE node_id=? AND port=?', (c, job['new'][1]['port'])).fetchone())
+
+    def test_commit_timeout_waits_for_rollback_receipt_before_retiring_downstream(self):
+        a, b, c = [self.node(x) for x in 'ABC']
+        self.ready(a, b, c)
+        target = self.target()
+        ident = self.save(self.graph([a, b], target))
+        self.settle()
+        before = configurations.members(self.db, ident)[0]
+        self.save(self.graph([a, c], target), ident)
+        now = int(time.time())
+        self.tick(now)
+        self.ack(c)
+        self.tick(now+1)
+        self.assertEqual(self.db.execute('SELECT phase FROM jobs').fetchone()[0], 'commit')
+        self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?', (now-61, a))
+        self.db.commit()
+        self.tick(now+62)
+        self.assertEqual(self.db.execute('SELECT phase FROM jobs').fetchone()[0], 'rollback')
+        for nid in (b, c):
+            self.assertTrue(self.db.execute('SELECT 1 FROM rules WHERE node_id=?', (nid,)).fetchone())
+        self.assertEqual(configurations.members(self.db, ident)[0]['applied'], before['applied'])
+        self.ack(a)
+        self.tick(now+63)
+        self.assertFalse(self.db.execute('SELECT 1 FROM jobs').fetchone())
+        self.assertTrue(execution.applied_rules_present(self.db, configurations.members(self.db, ident)[0]))
+        self.assertFalse(self.db.execute('SELECT 1 FROM rules WHERE node_id=?', (c,)).fetchone())
+
+    def test_passive_preparation_keeps_waiting_for_manual_sync(self):
+        a, b = self.node(), self.node()
+        self.ready(a)
+        self.ready(b, mode='passive')
+        ident = self.save(self.graph([a,b]))
+        now = int(time.time())
+        self.tick(now)
+        self.tick(now+3600)
+        self.assertEqual(self.db.execute('SELECT phase FROM jobs').fetchone()[0], 'prepare')
+        self.assertEqual(configurations.members(self.db,ident)[0]['state'], 'waiting')
+
     def test_view_keeps_confirmed_ip_and_replaced_node_until_ack(self):
         a, b, c = [self.node(x) for x in "ABC"]
         values = node_addresses.listing(self.db, database.get_node(self.db, b))

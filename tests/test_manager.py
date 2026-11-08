@@ -1,5 +1,6 @@
 """Manager transactions with relocated paths and fake service/kernel tools."""
 import os
+import fcntl
 from pathlib import Path
 import re
 import subprocess
@@ -65,6 +66,31 @@ fetch_component() { if [ "$1" = manage.sh ]; then cp "$CASE_ROOT/manager" "$3"; 
         (self.root/'unit').write_text('old unit')
         p=self.root/'pkg/active';p.write_bytes((self.root/'target').read_bytes());p.chmod(0o755)
         (self.root/'lib/active').mkdir();(self.root/'lib/active/enabled').write_text('confirmed')
+
+    def test_idle_menu_and_status_do_not_lock_sync_but_actions_do(self):
+        (self.root/'pkg/control.sh').write_text('derive_keys() { :; }\n')
+        (self.root/'etc/agent.conf').write_text('URL=https://test.invalid/sync\nKEY='+'ab'*32+'\nAUTO_UPDATE=1\n')
+        (self.root/'bin/id').write_text('#!/bin/sh\necho 0\n')
+        (self.root/'bin/id').chmod(0o755)
+        process = subprocess.Popen(['bash',str(self.root/'manager')], env=self.env,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            while True:
+                line = process.stdout.readline()
+                self.assertTrue(line, 'menu exited before displaying choices')
+                if line.startswith('0)'):
+                    break
+            with (self.root/'run/ictl-manager.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                status = subprocess.run(['bash',str(self.root/'manager'),'--status'],env=self.env,text=True,capture_output=True,timeout=5)
+                self.assertEqual(status.returncode,0,status.stderr)
+                _, error = process.communicate('1\n',timeout=5)
+                self.assertNotEqual(process.returncode,0)
+                self.assertIn('另一项安装或同步正在执行',error)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
 
     def test_install_and_both_directions(self):
         for kind in ('active','passive','active'):

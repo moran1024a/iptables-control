@@ -15,7 +15,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="0.6.0-rc.3"
+VERSION="0.6.0-rc.4"
 REGISTRY="ghcr.io"
 MIRROR_REGISTRY="ghcr.nju.edu.cn"
 REPO="moran1024a/ictl-server"
@@ -127,6 +127,52 @@ docker run --rm --network none --entrypoint python3 "$IMAGE" /app/ictl-server.py
 DATA_MOUNT="$VOLUME:/data"
 OLD_NAME="" BACKUP="" RESTORE_NEEDED=0
 if docker container inspect "$NAME" >/dev/null 2>&1; then
+  # This installer owns a standard container. Refuse custom deployments before
+  # stopping anything rather than silently losing Compose/network/runtime options.
+  {
+    docker container inspect "$NAME"
+    docker image inspect "$(docker container inspect -f '{{.Image}}' "$NAME")"
+  } | docker run --rm -i --network none --entrypoint python3 "$IMAGE" -c '
+import json, sys
+raw = sys.stdin.read()
+old, end = json.JSONDecoder().raw_decode(raw)
+base = json.loads(raw[end:].strip())[0]
+old = old[0]
+config, host = old["Config"], old["HostConfig"]
+reasons = []
+for key in ("Env", "Entrypoint", "Cmd", "User", "WorkingDir", "Labels", "Healthcheck", "StopSignal"):
+    actual, expected = config.get(key), base["Config"].get(key)
+    if key == "Env":
+        actual, expected = sorted(actual or []), sorted(expected or [])
+    if (actual or None) != (expected or None):
+        reasons.append(key)
+networks = old.get("NetworkSettings", {}).get("Networks", {})
+if host.get("NetworkMode", "default") not in ("default", "bridge") or set(networks) != {"bridge"}:
+    reasons.append("网络")
+mounts = old.get("Mounts", [])
+if len(mounts) != 1 or mounts[0].get("Destination") != "/data":
+    reasons.append("额外挂载")
+ports = host.get("PortBindings") or {}
+if set(ports) != {"8730/tcp"} or len(ports["8730/tcp"] or []) != 1:
+    reasons.append("端口映射")
+if host.get("RestartPolicy", {}).get("Name") != "unless-stopped":
+    reasons.append("重启策略")
+for key in ("Memory", "MemoryReservation", "MemorySwap", "NanoCpus", "CpuShares", "CpuQuota", "CpuPeriod",
+            "CpusetCpus", "CpusetMems", "PidsLimit", "Privileged", "ReadonlyRootfs", "AutoRemove",
+            "CapAdd", "CapDrop", "Devices", "DeviceRequests", "DeviceCgroupRules", "SecurityOpt", "Sysctls", "Ulimits",
+            "Dns", "DnsOptions", "DnsSearch", "ExtraHosts", "Links", "VolumesFrom", "Tmpfs",
+            "PidMode", "UTSMode", "UsernsMode", "CgroupParent", "GroupAdd", "Init", "OomKillDisable"):
+    if host.get(key):
+        reasons.append(key)
+for key, defaults in (("Runtime", (None, "", "runc")), ("IpcMode", (None, "", "private")),
+                      ("ShmSize", (None, 67108864)), ("MemorySwappiness", (None, -1))):
+    if host.get(key) not in defaults:
+        reasons.append(key)
+if host.get("LogConfig", {}).get("Config"):
+    reasons.append("日志选项")
+if reasons:
+    sys.exit("检测到自定义容器设置（" + "、".join(reasons) + "）；请沿用原 Docker Compose 或部署命令升级。原服务未停止。")
+'
   mount="$(docker container inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}}|{{.Name}}|{{.Source}}|{{.RW}}{{end}}{{end}}' "$NAME")"
   IFS='|' read -r mount_type mount_name mount_source mount_rw <<< "$mount"
   [ "$mount_rw" = true ] || die "原容器 /data 不是可写挂载，未停止服务"

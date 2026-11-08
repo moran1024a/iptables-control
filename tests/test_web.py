@@ -105,10 +105,14 @@ class CanvasBrowserTests(unittest.TestCase):
             ]
             fixture.ready(a, b, c, d, e)
             t, u = fixture.target(), fixture.target("203.0.113.10")
+            fixture.call("api_target_save", dict(addresses=[dict(
+                id="extra", name="备用出口", host="203.0.113.11", port=8443
+            )]), u)
             graph = fixture.graph([a, c], t)
             second = fixture.graph([b, d], u)
             graph["vertices"] += second["vertices"]
             graph["edges"] += second["edges"] + [[f"v{a}", f"v{d}"]]
+            graph["bindings"] = {f"v{d}/t{u}": {"to": {f"t{u}": "extra"}}}
             ident = fixture.save(graph)
             fixture.settle()
             with fixture.db:

@@ -10,6 +10,10 @@ const graphName = v => {
   const name=resourceName(v.kind==='target'?canvasView.targets:canvasView.nodes,v.target_id||v.node_id);
   return name;
 };
+const graphLabel = v => {
+  const node=v?.node_id&&canvasView.nodes.find(n=>n.id===v.node_id);
+  return node?nodeLabel(node):esc(graphName(v));
+};
 const graphCurrent = () => graphSession?.graph || canvasView.link.view_graph || canvasView.link.graph;
 const graphPairs = path => new Set((path||[]).slice(1).map((b,i)=>`${path[i]}/${b}`));
 
@@ -242,7 +246,8 @@ function graphCanvas(raw, l) {
     const unavailable=false;
     const badge=editing?(graphSession.connectTarget===v.id?'选择接收 IP':v.kind==='entry'&&!v.address?'选择入口 IP':''):candidate?'选下一跳':chosen.has(v.id)?'已选':current?graphEntryMarks(g,l,v.id):'';
     const tag=!editing&&v.kind==='target'?'div':'button';
-    return `<div class="graph-node ${v.kind==='direct'?'graph-direct':''} ${current?'on-route':''} ${candidate?'graph-option':''} ${chosen.has(v.id)?'graph-chosen':''} ${selected?'graph-selected':''} ${unavailable?'graph-disabled':''} ${graphSession?.errorField===`vertex:${v.id}`?'graph-invalid':''}" data-key="graph-node-${esc(v.id)}" data-graph-node="${esc(v.id)}" ${current?'data-current':''} style="left:${v.x-world.x}px;top:${v.y-world.y}px;width:${graphWidth(v)}px;height:${graphHeight(v,g)}px"><${tag} class="graph-node-body" ${tag==='button'?`data-action="graph-select" data-id="${esc(v.id)}"`:''} ${editing?'data-graph-drag="node"':unavailable?'disabled':''}><small>${v.runtime_only?'旧路径':v.kind==='direct'?'direct':v.kind==='entry'?'入口':v.kind==='target'?'目标':n?.mode==='passive'?'被动节点':'节点'}<span>${badge}</span></small><strong title="${esc(graphName(v))}">${v.kind==='direct'?graphWeight(v.weight):esc(graphName(v))}${v.node_id?`<em class="graph-weight" title="全局权重">${graphWeight(n?.weight??v.weight)}</em>`:''}</strong></${tag}>${graphNodeAddresses(g,v,editing)}</div>`;
+    const role=v.runtime_only?'旧路径':v.kind==='direct'?'direct':v.kind==='entry'?'入口':v.kind==='target'?'目标':n?.mode==='passive'?'被动节点':'节点';
+    return `<div class="graph-node ${v.kind==='direct'?'graph-direct':''} ${current?'on-route':''} ${candidate?'graph-option':''} ${chosen.has(v.id)?'graph-chosen':''} ${selected?'graph-selected':''} ${unavailable?'graph-disabled':''} ${graphSession?.errorField===`vertex:${v.id}`?'graph-invalid':''}" data-key="graph-node-${esc(v.id)}" data-graph-node="${esc(v.id)}" ${current?'data-current':''} style="left:${v.x-world.x}px;top:${v.y-world.y}px;width:${graphWidth(v)}px;height:${graphHeight(v,g)}px"><${tag} class="graph-node-body" ${tag==='button'?`data-action="graph-select" data-id="${esc(v.id)}"`:''} ${editing?'data-graph-drag="node"':unavailable?'disabled':''}><small><span class="graph-node-meta"><span>${role}</span>${nodeTags(n?.tags,2,false)}</span><span class="graph-node-badge">${badge}</span></small><strong title="${esc(n?nodeNameText(n):graphName(v))}">${v.kind==='direct'?graphWeight(v.weight):esc(graphName(v))}${v.node_id?`<em class="graph-weight" title="全局权重">${graphWeight(n?.weight??v.weight)}</em>`:''}</strong></${tag}>${graphNodeAddresses(g,v,editing)}</div>`;
   }).join('');
   const order=({a,b,i})=>(active.has(`${a}/${b}`)?1:0)+(pending.has(`${a}/${b}`)?2:0)+(editing&&graphSession?.edge===i?4:0);
   const editorRoutes=graphConnectionRoutes(g,boxes,editing);
@@ -288,15 +293,15 @@ function graphInspector() {
   if(!v&&!e)return '';
   const choices=v?.kind==='target'?canvasView.targets:canvasView.nodes;
   const groups=v?.kind==='target'?canvasView.target_groups||[]:canvasView.node_groups||[];
-  const resourceOptions=v?nodeOptions(choices,groups,v.target_id||v.node_id,n=>esc(n.name)+(n.tags?.length?' · '+esc(n.tags.map(t=>t.name).join(' / ')):'')):'';
+  const resourceOptions=v?nodeOptions(choices,groups,v.target_id||v.node_id):'';
   const addressFields=e?e.map((id,i)=>{
     const node=g.vertices.find(v=>v.id===id),side=i?'in':'out';
     return node.kind!=='direct'?`<label class="graph-address-field">${i?'接收地址':'发出 IP'}<select data-graph-binding="${side}" data-id="${esc(id)}" aria-label="${i?'接收 IP':'发出 IP'}">${graphAddressOptions(node,graphPortAddress(g,node,side,e),side)}</select></label>`:'';
   }).join(''):'';
   const entryAddress=v?.kind==='entry'?`<label class="graph-address-field">入口接收 IP<select data-graph-listen="${esc(v.id)}" aria-label="入口接收 IP">${graphAddressOptions(v,v.address)}</select></label>`:'';
-  const pending=v&&s.connectTarget===v.id?`<label class="graph-address-field">连接到 ${esc(graphName(v))}<select data-graph-connect-ip="${esc(v.id)}" aria-label="选择接收 IP">${graphAddressOptions(v,'')}</select></label>`:'';
+  const pending=v&&s.connectTarget===v.id?`<label class="graph-address-field">连接到 ${graphLabel(v)}<select data-graph-connect-ip="${esc(v.id)}" aria-label="选择接收 IP">${graphAddressOptions(v,'')}</select></label>`:'';
   const direct=v?.kind==='direct';
-  const content=pending||(v?`${direct?`<span>direct</span><label class="graph-address-field">权重<input type="number" data-direct-weight min="-100000" max="100000" step="1" required value="${v.weight??''}" aria-label="direct 权重"></label>`:`<select data-graph-resource aria-label="更换节点">${resourceOptions}</select>`}${entryAddress}${graphEntryPort(v,g)}<button class="small danger" data-action="graph-remove">${direct?'移除 direct':'删除'}</button>`:`<span>${e.map(id=>esc(graphName(g.vertices.find(v=>v.id===id)))).join(' → ')}</span>${addressFields}${e.every(id=>g.vertices.find(v=>v.id===id)?.kind!=='direct')?'<button class="small" data-action="graph-insert-direct">＋ direct</button>':''}<button class="small danger" data-action="graph-remove-edge">删除连线</button>`);
+  const content=pending||(v?`${direct?`<span>direct</span><label class="graph-address-field">权重<input type="number" data-direct-weight min="-100000" max="100000" step="1" required value="${v.weight??''}" aria-label="direct 权重"></label>`:`<select data-graph-resource aria-label="更换节点">${resourceOptions}</select>`}${entryAddress}${graphEntryPort(v,g)}<button class="small danger" data-action="graph-remove">${direct?'移除 direct':'删除'}</button>`:`<span>${e.map(id=>graphLabel(g.vertices.find(v=>v.id===id))).join(' → ')}</span>${addressFields}${e.every(id=>g.vertices.find(v=>v.id===id)?.kind!=='direct')?'<button class="small" data-action="graph-insert-direct">＋ direct</button>':''}<button class="small danger" data-action="graph-remove-edge">删除连线</button>`);
   return `<div class="graph-inspector" data-key="inspector-${esc(v?.id||e.join('/'))}">${content}<button class="small" data-action="graph-deselect" aria-label="关闭">×</button></div>`;
 }
 function graphLibrary() {
@@ -318,7 +323,7 @@ function drawGraph() {
     controls=graphEditorControls();
   }else if(s?.kind==='choose'){
     actions='<button data-action="graph-exit" data-graph-mutate>取消选路</button><button class="primary" data-action="graph-autocomplete" data-graph-mutate>自动补全</button>';
-    controls=`<div class="graph-selection" data-key="graph-controls">${esc(graphName(g.vertices.find(v=>v.id===s.prefix[0])))} · 点击下一跳</div>`;
+    controls=`<div class="graph-selection" data-key="graph-controls">${graphLabel(g.vertices.find(v=>v.id===s.prefix[0]))} · 点击下一跳</div>`;
   }else actions=`${linkState(l)}<button data-action="link-failover" data-graph-mutate aria-pressed="${!!l.failover_enabled}" ${l.state==='deleting'?'disabled':''}>自动灾备${l.failover_enabled?'：开':'：关'}</button><a class="button" href="#/quality/topologies/${l.id}">网络质量</a><button data-action="link-edit" data-graph-mutate ${l.state==='deleting'?'disabled':''}>编辑</button><button class="danger" data-action="link-delete" data-graph-mutate ${l.state==='deleting'?'disabled':''}>删除</button>`;
   render(`<a class="back" href="#/routes">← 链路</a>${pageHead(title,actions)}<section class="panel topology-panel${topologyViews.get(s?.id||l?.id||'new')?.fullscreen?' is-fullscreen':''}"><div class="graph-fullscreen-actions">${actions}</div>${s?.error?`<div class="graph-error" data-key="graph-error" role="alert">${esc(s.error)}${s.conflict&&s.id?'<button class="small" data-action="graph-reload">重新载入</button>':''}</div>`:''}${controls}${graphCanvas(g,l)}${!s?'<div class="graph-route-hint" data-key="graph-hint" data-route-hint></div>':''}${!s?syncFeedback(l):''}</section>${!s?`<div class="graph-summary"><span>${g.vertices.filter(v=>v.kind==='entry'&&!v.runtime_only).length} 个入口 · ${g.vertices.filter(v=>v.kind==='target'&&!v.runtime_only).length} 个目标</span><a href="#/configs">查看配置${l.configurations?' · '+l.configurations.length:''} →</a></div>${graphRouteStatus(g,l)}${detailsBlock('graph-events-'+l.id,'切换记录',l.events.map(e=>`<p>${esc(fmtTime(e.ts))} ${esc(e.message)}</p>`).join('')||'暂无记录')}`:''}`);
   if(s?.kind==='edit'){

@@ -21,7 +21,7 @@ function graphEntryColors(g) {
 
 function graphEntryLegend(g) {
   const colors=graphEntryColors(g);
-  return g.vertices.filter(v=>v.kind==='entry'&&!v.runtime_only).map(v=>`<button class="graph-entry-chip" data-action="graph-select" data-id="${esc(v.id)}" data-entry="${esc(v.id)}" style="--route-color:${colors.get(v.id)}" title="从 ${esc(graphName(v))} 选择线路"><i></i>${esc(graphName(v))}</button>`).join('');
+  return g.vertices.filter(v=>v.kind==='entry'&&!v.runtime_only).map(v=>`<button class="graph-entry-chip" data-action="graph-select" data-id="${esc(v.id)}" data-entry="${esc(v.id)}" style="--route-color:${colors.get(v.id)}" title="从 ${esc(graphName(v))} 选择线路"><i></i>${graphLabel(v)}</button>`).join('');
 }
 
 function graphEntryMarks(g,link,id) {
@@ -166,8 +166,12 @@ function graphRuntimeLines(g,link,boxes) {
 
 function graphRouteStatus(g,link) {
   if(!link?.configurations?.length)return '';
-  const colors=graphEntryColors(g),name=id=>graphName(g.vertices.find(v=>v.id===id));
-  const rows=link.configurations.map(c=>`<div class="graph-route-status" data-config-route="${c.id}"><span><i class="graph-entry-dot" style="background:${colors.get(c.entry)}"></i>${esc(name(c.entry))} → ${esc(name(c.target))}</span><span class="graph-route-description" title="${esc(c.active_path.map(name).join(' → '))}">${esc(c.active_path.length?(c.active_path.slice(1,-1).map(name).join(' → ')||'direct'):'等待生效')}</span>${linkState(c)}${c.error||c.failover?.message?`<small>${esc(c.error||c.failover.message)}</small>`:''}</div>`).join('');
+  const colors=graphEntryColors(g),vertex=id=>g.vertices.find(v=>v.id===id),name=id=>graphName(vertex(id));
+  const rows=link.configurations.map(c=>{
+    const entry=c.active_path[0]||c.entry,target=c.active_path.at(-1)||c.target;
+    const path=c.active_path.length?(c.active_path.slice(1,-1).map(id=>graphLabel(vertex(id))).join(' → ')||'direct'):'等待生效';
+    return `<div class="graph-route-status" data-config-route="${c.id}"><span><i class="graph-entry-dot" style="background:${colors.get(c.entry)}"></i>${graphLabel(vertex(entry))} → ${targetLabel(name(target),c.target_address)}</span><span class="graph-route-description" title="${esc(c.active_path.map(name).join(' → '))}">${path}</span>${linkState(c)}${c.error||c.failover?.message?`<small>${esc(c.error||c.failover.message)}</small>`:''}</div>`;
+  }).join('');
   return detailsBlock('graph-paths-'+link.id,'路径状态',rows);
 }
 
@@ -184,8 +188,9 @@ function graphQuickHint(id) {
       const result=await api('POST','topology-preview',{id:link.id,graph:link.graph,required:[id]});
       if(token!==graphHintRequest||graphSession||page!==pageVersion||canvasView.link!==link||!hint?.isConnected)return;
       const changed=result.paths.filter(p=>!p.unchanged),entries=[...new Set(changed.map(p=>p.entry))],targets=[...new Set(changed.map(p=>p.target))],g=link.graph;
-      const names=ids=>ids.map(id=>graphName(g.vertices.find(v=>v.id===id))).join('、');
-      if(hint)hint.textContent=changed.length?`可切换 ${changed.length} 个配置：${names(entries)} → ${names(targets)}`:result.paths.length?'已使用当前路径':result.skipped?.[0]?.reason||'没有可切换的配置';
+      const names=ids=>ids.map(id=>graphLabel(g.vertices.find(v=>v.id===id))).join('、');
+      if(changed.length)hint.innerHTML=`可切换 ${changed.length} 个配置：${names(entries)} → ${names(targets)}`;
+      else hint.textContent=result.paths.length?'已使用当前路径':result.skipped?.[0]?.reason||'没有可切换的配置';
     }catch(_){/* Hover is optional; clicking still performs authoritative validation. */}
   },180);
 }

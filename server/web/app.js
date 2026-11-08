@@ -55,6 +55,17 @@ function nodeTags(tags=[],limit=2,expand=true) {
   if(!tags.length)return '';
   return `<span class="node-tags">${tags.slice(0,limit).map(tagBadge).join('')}${tags.length>limit?`<span class="tag-extra" hidden>${tags.slice(limit).map(tagBadge).join('')}</span><span class="tag-overflow" ${expand?'role="button" tabindex="0" data-action="tags-expand" aria-expanded="false"':''} title="${esc(tags.slice(limit).map(t=>t.name).join('、'))}">+${tags.length-limit}</span>`:''}</span>`;
 }
+function nodeNameText(node) {
+  return node.name+(node.tags?.length?' · '+node.tags.map(t=>t.name).join(' / '):'');
+}
+function nodeLabel(node) {
+  return `<span class="node-label"><span class="node-label-name" title="${esc(nodeNameText(node))}">${esc(node.name)}</span>${nodeTags(node.tags,2,false)}</span>`;
+}
+const targetAddressName = address => address&&address.id!=='main'?(address.name||`${address.host}:${address.port}`):'';
+function targetLabel(name,address) {
+  const extra=targetAddressName(address);
+  return `<span class="target-label">${esc(name)}${extra?` <span class="target-address" title="${esc(address.host)}:${address.port}">· ${esc(extra)}</span>`:''}</span>`;
+}
 
 const pad = (n) => String(n).padStart(2, "0");
 
@@ -512,7 +523,7 @@ function groupOptions(groups) {
 }
 
 // 节点下拉选项：先按分组、再按组内顺序；有多个分组时用分组标题分隔
-function nodeOptions(nodes, groups, selected, text = (n) => esc(n.name)) {
+function nodeOptions(nodes, groups, selected, text = (n) => esc(nodeNameText(n))) {
   const opt = (n) => `<option value="${n.id}" ${n.id === selected ? "selected" : ""}>${text(n)}</option>`;
   if (groups.length < 2) return nodes.map(opt).join("");
   return groups.map((g) => {
@@ -1200,7 +1211,7 @@ const ACTIONS = {
   },
 
   async "node-rekey"() {
-    const ok = await confirmBox("重置密钥", `重置后旧密钥立即失效，节点 <b>${esc(currentNode.name)}</b> 需要填入新密钥才能继续同步。`, "重置");
+    const ok = await confirmBox("重置密钥", `重置后旧密钥立即失效，节点 ${nodeLabel(currentNode)} 需要填入新密钥才能继续同步。`, "重置");
     if (!ok) return;
     const r = await api("POST", `nodes/${currentNode.id}/rekey`);
     keyModal("密钥已重置", r.key);
@@ -1211,10 +1222,10 @@ const ACTIONS = {
     const force = el.dataset.force === "1";
     const n = currentNode;
     const text = force
-      ? `节点 <b>${esc(n.name)}</b> 尚未确认清空规则。强制删除会直接删除记录，节点上的规则不会被清理。`
+      ? `节点 ${nodeLabel(n)} 尚未确认清空规则。强制删除会直接删除记录，节点上的规则不会被清理。`
       : n.status === "new"
-        ? `确定删除节点 <b>${esc(n.name)}</b>？`
-        : `将向节点 <b>${esc(n.name)}</b> 下发空配置，节点确认清空规则后自动删除。`;
+        ? `确定删除节点 ${nodeLabel(n)}？`
+        : `将向节点 ${nodeLabel(n)} 下发空配置，节点确认清空规则后自动删除。`;
     if (!(await confirmBox(force ? "强制删除节点" : "删除节点", text, "删除", true))) return;
     const r = await api("DELETE", `nodes/${n.id}${force ? "?force=1" : ""}`);
     if (r.deleted) {

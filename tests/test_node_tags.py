@@ -7,6 +7,24 @@ import node_tags
 
 
 class NodeTagTests(Fixture, unittest.TestCase):
+    def test_configuration_labels_follow_entry_tags_before_and_after_apply(self):
+        a, b = self.node('入口'), self.node('中转')
+        tag = self.call('api_tag_save', dict(name='香港'))['id']
+        self.call('api_node_edit', dict(tag_ids=[tag]), a)
+        ident = self.call('api_topology_save', dict(graph=self.graph([a, b]), name='跨区转发'))['id']
+        row = configurations.configs(self.db)['configs'][0]
+        self.assertEqual(row['topology_name'], '跨区转发')
+        self.assertEqual(row['entry_tags'], node_tags.listing(self.db, a))
+        self.assertEqual(row['target_address']['id'], 'main')
+        self.assertIsNone(row['connection'])
+        self.ready(a, b)
+        self.settle()
+        self.call('api_tag_save', dict(name='HK', color='#22a35a'), tag)
+        row = configurations.configs(self.db)['configs'][0]
+        self.assertEqual(row['state'], 'active')
+        self.assertEqual(row['entry_tags'][0]['name'], 'HK')
+        self.assertEqual(row['topology_id'], ident)
+
     def test_multi_tags_shared_rename_remove_and_no_agent_change(self):
         a, b = self.node(), self.node()
         one = self.call('api_tag_save', dict(name='香港', color='#3b82f6'))['id']

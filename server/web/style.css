@@ -657,8 +657,8 @@ main:has(.topology) { max-width:1200px; }
 .topology-toolbar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
 .topology-toolbar h2 { margin-bottom:2px; font-size:16px; }
 .topology-toolbar .hint { margin:0; }
-.topology-legend { display:flex; align-items:center; gap:16px; font-size:12px; color:var(--muted); }
-.topology-legend span::before { content:""; display:inline-block; width:22px; border-top:2px solid var(--border); margin-right:6px; vertical-align:middle; }
+.topology-legend { display:flex; align-items:center; flex-wrap:wrap; gap:4px 12px; min-width:0; font-size:12px; color:var(--muted); }
+.topology-legend :is(.legend-active,.legend-pending)::before { content:""; display:inline-block; width:22px; border-top:2px solid var(--border); margin-right:6px; vertical-align:middle; }
 .topology-legend .legend-active::before { border-color:var(--green); }
 .topology-legend .legend-pending::before { border-color:var(--yellow); border-top-style:dashed; }
 .topology { position:relative; height:clamp(320px,50vh,560px); overflow:hidden; touch-action:none; user-select:none; cursor:grab; border:1px solid var(--border); border-radius:12px; background-color:var(--bg); background-image:radial-gradient(var(--border) 1px,transparent 1px); background-size:16px 16px; }
@@ -829,6 +829,10 @@ body.canvas-fullscreen { overflow:hidden; }
 .node-weight b { color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
 .node-sort-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
 .node-tags,.tag-extra:not([hidden]) { display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px; vertical-align:middle; }
+.node-label { display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px; max-width:100%; vertical-align:middle; }
+.node-label-name { min-width:0; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.target-label { overflow-wrap:anywhere; }
+.target-address { color:var(--muted); }
 .node-tag { display:inline-block; max-width:110px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:1px 5px; font-size:10px; line-height:1.5; font-weight:500; border-radius:4px; color:var(--tag-color); background:color-mix(in srgb,var(--tag-color) 12%,var(--card)); border:1px solid color-mix(in srgb,var(--tag-color) 35%,transparent); }
 .node-card .title { display:flex; align-items:center; flex-wrap:wrap; gap:4px; max-width:65%; overflow:visible; white-space:normal; }
 .node-name { min-width:0; max-width:230px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -854,9 +858,10 @@ body.canvas-fullscreen { overflow:hidden; }
 .inline-summary > .sub { flex:1; min-width:150px; margin:0; }
 .inline-summary .member-tags { margin:0; }
 .config-id { flex:none; font-size:11px; font-variant-numeric:tabular-nums; }
-.config-summary .sub { display:flex; align-items:center; gap:8px; }
+.config-summary .sub { display:flex; align-items:center; flex-wrap:wrap; gap:4px 12px; flex-basis:100%; min-width:0; }
 .config-summary .sub code { flex:none; }
-.config-path { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.config-source { max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.config-path { display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px; min-width:0; max-width:100%; }
 .member-tags > span { max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .member-tags > button { padding:1px 6px; font-size:12px; }
 .route-summary { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -927,8 +932,13 @@ main:has(.graph-workspace) { max-width:1800px; }
 .graph-viewport { height:clamp(440px,70vh,900px); flex:1; min-width:0; border:1px solid var(--border); border-radius:10px; background-color:var(--bg); background-image:radial-gradient(var(--border) .8px,transparent .8px); background-size:18px 18px; }
 .graph-node { position:absolute; z-index:3; width:220px; border:1px solid var(--border); border-radius:9px; background:var(--card); box-shadow:0 2px 5px #00000008; }
 .graph-node-body { display:flex; flex-direction:column; justify-content:center; gap:6px; width:100%; height:61px; min-height:0; padding:10px 14px; border:0; background:transparent; text-align:left; color:var(--text); border-radius:8px 8px 0 0; }
-.graph-node-body small { display:flex; justify-content:space-between; width:100%; color:var(--muted); font-size:10px; line-height:1; }
-.graph-node-body small span { color:var(--green); }
+.graph-node-body small { display:flex; align-items:center; justify-content:space-between; gap:4px; width:100%; color:var(--muted); font-size:10px; line-height:1; }
+.graph-node-meta { display:inline-flex; align-items:center; gap:5px; min-width:0; }
+.graph-node-meta>span:first-child { flex:none; }
+.graph-node-meta .node-tags { flex-wrap:nowrap; gap:2px; min-width:0; }
+.graph-node-meta .node-tag { max-width:46px; padding:0 3px; }
+.graph-node-meta .tag-overflow { padding:0; flex:none; }
+.graph-node-badge { flex:none; color:var(--green); white-space:nowrap; }
 .graph-node-body strong { max-width:100%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:13px; line-height:1.3; }
 .graph-node-body .graph-weight { margin-left:8px; color:var(--muted); font:normal 11px monospace; }
 .graph-direct .graph-node-body { height:54px; border-radius:8px; padding:8px 12px; }
@@ -969,7 +979,7 @@ button.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
 .graph-hit { pointer-events:stroke; cursor:pointer; stroke:transparent; stroke-width:14; }
 .graph-wire { stroke:var(--blue); stroke-width:1.5; stroke-dasharray:5 4; pointer-events:none; }
 .graph-viewport .topology-flow { stroke-width:2; stroke-dasharray:3 25; opacity:.7; }
-.graph-entry-chip { display:inline-flex; align-items:center; gap:5px; padding:3px 6px!important; min-height:24px!important; border:0!important; background:transparent!important; font-size:11px; }
+.graph-entry-chip { display:inline-flex; align-items:center; gap:5px; padding:3px 6px!important; min-height:24px!important; max-width:100%; border:0!important; background:transparent!important; font-size:11px; }
 .graph-entry-chip i,.graph-entry-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--route-color); flex:none; }
 .graph-entry-dot + .graph-entry-dot { margin-left:4px; }
 .graph-route-halo { fill:none; stroke:var(--card); stroke-width:var(--route-halo,6); stroke-linejoin:round; }
@@ -980,7 +990,7 @@ button.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
 .graph-covered { display:none; }
 .graph-route-hint { min-height:20px; margin-top:5px; font-size:11px; color:var(--muted); }
 .graph-route-status { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:6px 0; border-top:1px solid var(--border); font-size:12px; }
-.graph-route-status>span:first-child { display:flex; align-items:center; gap:5px; }
+.graph-route-status>span:first-child { display:flex; align-items:center; flex-wrap:wrap; gap:5px; min-width:0; max-width:100%; }
 .graph-route-description { flex:1; min-width:100px; color:var(--muted); }
 .graph-route-status small { width:100%; color:var(--red); }
 @media(prefers-reduced-motion:reduce) { .graph-viewport .topology-flow { animation:none; } }

@@ -16,6 +16,9 @@ import topology
 import target_addresses
 import validation
 
+ACTIVE_SYNC_TIMEOUT = 300
+ACTIVE_OFFLINE_TIMEOUT = 60
+
 
 def dump(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -321,6 +324,20 @@ def failed(c, nodes):
     )
 
 
+def sync_timed_out(c, nodes, started, now):
+    """Only active, unconfirmed work expires; passive/manual waits stay explicit."""
+    for nid in nodes:
+        n = database.get_node(c, nid)
+        if n["desired_mode"] != "active" or n["manual_required"] or confirmed(c, [nid]):
+            continue
+        if now - started >= ACTIVE_SYNC_TIMEOUT:
+            return True
+        if (now - started >= ACTIVE_OFFLINE_TIMEOUT
+                and (n["last_seen"] is None or now - n["last_seen"] >= ACTIVE_OFFLINE_TIMEOUT)):
+            return True
+    return False
+
+
 def progress(c, config, row, now):
     ident = config["id"]
     phase = row["phase"]
@@ -333,20 +350,21 @@ def progress(c, config, row, now):
         or target
         and (target["host"], target["port"]) != (job["target"]["host"], job["target"]["port"])
     )
-    if phase == "prepare" and (superseded or failed(c, job["wait"])):
+    timed_out = sync_timed_out(c, job["wait"], row["started"], now)
+    if phase == "prepare" and (superseded or failed(c, job["wait"]) or timed_out):
         retire(c, ident, job["new"][1:])
         c.execute("DELETE FROM jobs WHERE configuration_id=?", (ident,))
         c.execute(
             "UPDATE configurations SET state=?,error=? WHERE id=?",
             (
                 "pending" if superseded else "error",
-                "" if superseded else "下游准备失败，保留原路径",
+                "" if superseded else "下游准备超时，保留原路径" if timed_out else "下游准备失败，保留原路径",
                 ident,
             ),
         )
         return
     if not confirmed(c, job["wait"]):
-        if phase == "commit" and failed(c, job["wait"]):
+        if phase == "commit" and (failed(c, job["wait"]) or timed_out):
             # Restore the previous ingress before retiring newly prepared rules.
             for r in job["new"][:1]:
                 c.execute("DELETE FROM rules WHERE id=?", (r["id"],))
@@ -358,10 +376,12 @@ def progress(c, config, row, now):
                 "UPDATE jobs SET phase=?,payload=?,started=? WHERE configuration_id=?",
                 ("rollback", dump(job), now, ident),
             )
+            c.execute("UPDATE configurations SET state='waiting',error='等待入口回退确认' WHERE id=?", (ident,))
+            return
         if now - row["started"] >= 30:
             c.execute(
-                "UPDATE configurations SET state='waiting',error='等待节点同步确认' WHERE id=?",
-                (ident,),
+                "UPDATE configurations SET state='waiting',error=? WHERE id=?",
+                ("等待入口回退确认" if phase == "rollback" else "等待节点同步确认", ident),
             )
         return
     if phase == "rollback":
@@ -369,7 +389,7 @@ def progress(c, config, row, now):
         c.execute("DELETE FROM jobs WHERE configuration_id=?", (ident,))
         c.execute(
             "UPDATE configurations SET state=?,error=? WHERE id=?",
-            ("pending" if superseded else "error", "入口更新失败，原路径已恢复", ident),
+            ("pending" if superseded else "error", "入口更新失败，原路径已恢复" if job["old"] else "入口更新失败，新配置已撤销", ident),
         )
         return
     if phase == "prepare":

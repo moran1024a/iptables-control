@@ -12,6 +12,7 @@ import execution
 import node_addresses
 import topology
 import wake
+import agent_v3
 
 OFFLINE = 60
 FAULT = 30
@@ -34,7 +35,8 @@ class Engine:
             seen = n["last_seen"]
             recent = seen is not None and 0 <= now-seen < 30
             runtime = n["runtime_state"] if 0 <= now-n["runtime_at"] < 30 else "unknown"
-            checked = runtime == "ok" or "forwarding_health" not in json.loads(n["capabilities"])
+            caps = agent_v3.node_capabilities(n)
+            checked = caps is not None and (runtime == "ok" or "forwarding_health" not in caps)
             state = "error" if recent and runtime == "error" else "ok" if recent and n["state"] == "ok" and checked else "unknown"
             old = self.observed.get(nid)
             # A changed boot or a gap in reports restarts the stability interval.

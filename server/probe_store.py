@@ -98,7 +98,7 @@ def pair_rows(c, pair, since):
     ]
 
 
-def link_rows(c, spec, since, now, interval=10):
+def link_rows(c, spec, since, now, interval=10, *, bucket=None):
     key = (spec["topology_id"], spec["section"], spec["protocol"])
     rows = []
     for b in c.execute(
@@ -113,10 +113,17 @@ def link_rows(c, spec, since, now, interval=10):
         if start >= end:
             continue
         if b["status"]:
-            samples = [
-                dict(slot=t, status=b["status"], rtt=None, error=b["note"], resolved_ip="")
-                for t in range(start, end, interval)
-            ]
+            # Unknown intervals contain no measurements. Keep their bounds/counts
+            # per chart bucket instead of materializing every ten-second slot.
+            samples = []
+            cursor = start
+            while cursor < end:
+                stop = min(end, (cursor // bucket + 1) * bucket) if bucket else cursor + interval
+                count = (stop - 1 - cursor) // interval + 1
+                last = cursor + (count - 1) * interval
+                samples.append(dict(slot=cursor, last_slot=last, count=count,
+                                    status=b["status"], rtt=None, error=b["note"], resolved_ip=""))
+                cursor = last + interval
         else:
             samples = [
                 dict(r)

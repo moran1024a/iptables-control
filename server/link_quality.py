@@ -1,9 +1,11 @@
 import hashlib
 import json
+import agent_v3
 import execution
 import configurations
 import topology
 import node_addresses
+import node_tags
 import target_addresses
 import probe_store
 
@@ -61,6 +63,11 @@ def config_sections(c, config, nodes):
         label = " → ".join([name(n) for n in path] + ([target_name] if terminal else []))
         if full and (not actual):
             label = "无中间节点 → " + target_name
+        labels = [dict(name=name(n), node_id=n) for n in path]
+        if full and not actual:
+            labels.append(dict(name="无中间节点"))
+        if terminal:
+            labels.append(dict(name=target_name, target_id=plan["target"]))
         probes = []
         for protocol in PROTOCOLS:
             spec = dict(
@@ -165,7 +172,7 @@ def config_sections(c, config, nodes):
                 shared["source_route"] = spec.get("source_route", "")
             spec.update(path_key=fingerprint(shared or identity), identity=shared, reason=reason)
             probes.append(spec)
-        result.append(dict(id=sid, kind=kind, label=label, probes=probes))
+        result.append(dict(id=sid, kind=kind, label=label, labels=labels, probes=probes))
     return result
 
 
@@ -183,7 +190,7 @@ def reason(monitor, spec, nodes):
         return ("unknown", "发起端不是已确认的主动节点")
     if not source["quality_port"]:
         return ("disabled", "节点已关闭质量探测")
-    caps = json.loads(source["capabilities"])
+    caps = agent_v3.node_capabilities(source) or ()
     cap = {
         "tcp-connect-v1": "network_quality_tcp",
         "icmp-echo-v1": "network_quality_icmp",
@@ -215,10 +222,10 @@ async def view(monitor, body, now):
     def read(c):
         link = configurations.get_topology(c, body["id"])
         nodes = {r["id"]: dict(r) for r in c.execute("SELECT * FROM nodes")}
+        members = {m["id"]: m for m in configurations.members(c, link["id"]) if not m["deleted"]}
         choices = [
             dict(id=m["id"], name=m["name"])
-            for m in configurations.members(c, link["id"])
-            if not m["deleted"]
+            for m in members.values()
         ]
         selected = body.get("configuration", choices[0]["id"] if choices else None)
         if selected is not None and (
@@ -227,12 +234,27 @@ async def view(monitor, body, now):
             import errors
 
             raise errors.UserError("请选择此链路中的配置", "configuration")
-        result = []
+        result, tags = [], {}
+        endpoint = None
+        if selected is not None:
+            config = members[selected]
+            plan = execution.runtime_plan(config) or json.loads(config["desired"])
+            target = execution.applied_target(c, config) if config["applied"] else target_addresses.resolve(c, plan)
+            endpoint = target_addresses.describe(c, plan, target)
         for section in sections(c, link, nodes, configuration=selected):
+            for item in section["labels"]:
+                if item.get("node_id") in nodes:
+                    nid = item["node_id"]
+                    if nid not in tags:
+                        tags[nid] = node_tags.listing(c, nid)
+                    item["tags"] = tags[nid]
+                if "target_id" in item:
+                    item["address"] = endpoint
             series = []
             for spec in section.pop("probes"):
                 rows = probe_store.link_rows(
-                    c, spec, now - max(body.get("range", 900), 300) - 300, now
+                    c, spec, now - max(body.get("range", 900), 300) - 300, now,
+                    bucket=q.HISTORY_STEPS[body.get("range", 900)],
                 )
                 why = reason(monitor, spec, nodes)
                 history = q.summarize(rows, body.get("range", 900), now)
@@ -262,4 +284,4 @@ async def view(monitor, body, now):
             configuration=selected,
         )
 
-    return await monitor.hub.database(read)
+    return await monitor.hub.database(read, readonly=True)

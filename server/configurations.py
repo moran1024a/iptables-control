@@ -292,9 +292,13 @@ def view(c, r):
         if any(s in ("error", "offline", "skew") for s in states):
             state = "error"
             error = "路径节点异常或离线"
+    plan = current or desired
+    target = (
+        execution.applied_target(c, r) if current else target_addresses.resolve(c, plan)
+    ) if plan and not r["deleted"] else None
     connection = (
         target_config.connection(
-            execution.applied_target(c, r), current["ingress_host"], current["port"], r["name"]
+            target, current["ingress_host"], current["port"], r["name"]
         )
         if current and not r["deleted"]
         else None
@@ -314,6 +318,7 @@ def view(c, r):
         pending_graph=desired["graph"] if desired and state != "active" else None,
         port=current.get("port") if current else desired.get("port") if desired else None,
         connection=connection,
+        target_address=target_addresses.describe(c, plan, target) if target else None,
         failover=json.loads(r["failover"]),
     )
 
@@ -504,8 +509,10 @@ def configs(c):
             dict(
                 v,
                 topology_id=r["topology_id"],
+                topology_name=parent["name"],
                 group_id=parent["group_id"],
                 entry_name=database.get_node(c, plan["entry"])["name"],
+                entry_tags=node_tags.listing(c, plan["entry"]),
                 target_name=target["name"],
             )
         )

@@ -25,6 +25,22 @@ import transport
 
 
 class V3Tests(Fixture, unittest.TestCase):
+    def test_corrupt_capabilities_cannot_stop_global_scheduling(self):
+        import execution, failover, network_quality
+        a, b = self.node(), self.node()
+        self.ready(a, b)
+        self.save(self.graph([a, b]))
+        now = int(time.time())
+        engine = failover.Engine(now - 60)
+        for value in ('["truncated', 'null', '"network_quality"', '{"network_quality":true}'):
+            with self.subTest(value=value), self.db:
+                self.db.execute('UPDATE nodes SET capabilities=? WHERE id=?', (value, a))
+                engine.tick(self.db, now)
+                execution.tick(self.db, now)
+                nodes = {n['id']:dict(n) for n in self.db.execute('SELECT * FROM nodes')}
+                self.assertNotIn(a, engine.health(nodes, now + 1)[1])
+                self.assertEqual(network_quality.stopped(nodes, dict(source=a,target=b,protocol='udp-echo-v1'))[0], 'unsupported')
+
     def test_upgrade_prepare_preserves_version_and_auto_update_until_commit(self):
         nid=self.node();self.ready(nid)
         with self.db:
@@ -139,6 +155,41 @@ class V3Tests(Fixture, unittest.TestCase):
 
 
 class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
+
+    async def test_invalid_hello_does_not_replace_connection_or_store_corrupt_data(self):
+        from aiohttp import WSMsgType
+        nid = self.node()
+        self.ready(nid)
+        valid, _, _ = await self.connect(nid)
+        session = self.app['hub'].sessions[nid]
+        for capabilities in (None, {}, 'network_quality', ['x'] * 300, ['x' * 4096]):
+            ws = await self.client.ws_connect(http_harness.Handler.sync_path+'/v3/ws',
+                headers={'Authorization':'Bearer '+database.get_node(self.db,nid)['key']})
+            await ws.send_json(dict(type='hello', protocol=3, capabilities=capabilities))
+            self.assertEqual((await ws.receive(timeout=3)).type, WSMsgType.CLOSE)
+            self.assertEqual(ws.close_code, 1008)
+            self.assertIs(self.app['hub'].sessions[nid], session)
+            self.assertIsNotNone(agent_v3.node_capabilities(database.get_node(self.db,nid)))
+            await ws.close()
+        await valid.close()
+
+    async def test_heartbeat_refreshes_liveness_without_acknowledging_rules(self):
+        nid = self.node()
+        self.ready(nid)
+        ws, session, _ = await self.connect(nid)
+        with self.db:
+            self.db.execute('UPDATE nodes SET last_seen=1,desired_generation=desired_generation+1 WHERE id=?', (nid,))
+        before = dict(database.get_node(self.db,nid))
+        await ws.send_json(dict(type='heartbeat', session=session))
+        for _ in range(100):
+            after = database.get_node(self.db,nid)
+            if after['last_seen'] > 1:
+                break
+            await asyncio.sleep(0.01)
+        self.assertGreater(after['last_seen'], 1)
+        for key in ('applied_generation', 'reported_v', 'runtime_at', 'state'):
+            self.assertEqual(after[key], before[key])
+        await ws.close()
 
     async def test_private_controls_and_artifacts_reject_missing_or_wrong_identity(self):
         nid = self.node()

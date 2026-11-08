@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"github.com/coder/websocket"
 	"net"
 	"net/http"
@@ -14,6 +15,68 @@ import (
 	"testing"
 	"time"
 )
+
+func TestHeartbeatWhileControlCommandsWaitForBusyWorker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	serverResult := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			serverResult <- err
+			return
+		}
+		defer ws.CloseNow()
+		for i := 0; i < 8; i++ {
+			data, _ := json.Marshal(M{"type": "ready", "sequence": i})
+			if err = ws.Write(ctx, websocket.MessageText, data); err != nil {
+				serverResult <- err
+				return
+			}
+		}
+		_, data, err := ws.Read(ctx)
+		if err == nil {
+			var message M
+			err = json.Unmarshal(data, &message)
+			if err == nil && message["type"] != "heartbeat" {
+				err = fmt.Errorf("unexpected heartbeat: %s", data)
+			}
+		}
+		serverResult <- err
+	}))
+	defer server.Close()
+	ws, _, err := websocket.Dial(ctx, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.CloseNow()
+	queue := make(chan M, 64)
+	done := make(chan error, 2)
+	go func() { done <- readControl(ctx, ws, queue) }()
+	go func() {
+		done <- keepControlAlive(ctx, ws, func(message M) error {
+			data, _ := json.Marshal(message)
+			return ws.Write(ctx, websocket.MessageText, data)
+		}, 20*time.Millisecond)
+	}()
+	// The application deliberately consumes no commands until liveness succeeds.
+	if err := <-serverResult; err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		select {
+		case message := <-queue:
+			if number(message["sequence"]) != uint64(i) {
+				t.Fatal("control messages reordered", message)
+			}
+		default:
+			t.Fatal("control command lost")
+		}
+	}
+	cancel()
+	<-done
+	<-done
+}
 
 func TestTLSControlAndDurablePause(t *testing.T) {
 	root := t.TempDir()

@@ -14,13 +14,25 @@ root=pathlib.Path(os.environ['MOCK_ROOT']);args=sys.argv[1:]
 state=root/'containers';data=json.loads(state.read_text())
 with (root/'docker.log').open('a') as f:f.write(' '.join(args[:4])+'\n')
 def save():state.write_text(json.dumps(data))
+def metadata(name):
+ config={'Env':['ICTL_DB=/data/ictl.db']}
+ result={'Image':'sha256:old-image','Config':config,
+         'HostConfig':{'NetworkMode':'default','RestartPolicy':{'Name':'unless-stopped'},'PortBindings':{'8730/tcp':[{'HostIp':'127.0.0.1','HostPort':'8730'}]}},
+         'NetworkSettings':{'Networks':{'bridge':{}}},'Mounts':[{'Destination':'/data'}]}
+ for section, values in data[name].get('custom',{}).items():
+  if isinstance(values,dict):result[section].update(values)
+  else:result[section]=values
+ return result
 if args[0] in ('info','pull'):sys.exit(0)
+if args[:2]==['image','inspect']:
+ print(json.dumps([{'Config':{'Env':['ICTL_DB=/data/ictl.db']}}]));sys.exit(0)
 if args[:2]==['container','inspect']:
  name=args[-1]
  if name not in data:sys.exit(1)
- if '-f' not in args:print('{}');sys.exit(0)
+ if '-f' not in args:print(json.dumps([metadata(name)]));sys.exit(0)
  fmt=args[args.index('-f')+1]
  if 'Config.Image' in fmt:print(data[name]['image'])
+ elif '.Image' in fmt:print('sha256:old-image')
  elif 'PortBindings' in fmt:print('127.0.0.1|8730')
  elif 'Mounts' in fmt:print('volume|ictl-data|unused|true')
  elif 'Config.Env' in fmt:print('ICTL_DB=/data/ictl.db')
@@ -100,6 +112,24 @@ class InstallerTests(unittest.TestCase):
     def test_missing_port_value_rejected(self):
         r=subprocess.run(['bash',str(ROOT/'deploy/install-server.sh'),'--port'],env=self.env,capture_output=True,text=True)
         self.assertNotEqual(r.returncode,0);self.assertIn('缺少参数',r.stderr)
+
+    def test_custom_container_is_never_stopped_or_recreated(self):
+        cases = [
+            {'NetworkSettings': {'Networks': {'proxy': {}}}},
+            {'Config': {'Env': ['ICTL_DB=/data/ictl.db', 'CUSTOM=value']}},
+            {'Mounts': [{'Destination': '/data'}, {'Destination': '/extra'}]},
+            {'HostConfig': {'Memory': 134217728}},
+        ]
+        for custom in cases:
+            with self.subTest(custom=custom):
+                data=json.loads((self.root/'containers').read_text())
+                data['ictl-server']['custom']=custom
+                (self.root/'containers').write_text(json.dumps(data))
+                r=self.run_install()
+                self.assertNotEqual(r.returncode,0)
+                self.assertIn('原服务未停止',r.stderr)
+                self.assert_old()
+                self.assertNotIn('stop ictl-server',(self.root/'docker.log').read_text())
 
 
 class AgentInstallerTests(unittest.TestCase):

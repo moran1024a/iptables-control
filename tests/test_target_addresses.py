@@ -50,6 +50,10 @@ class TargetAddressTests(Fixture, unittest.TestCase):
         item = self.call('api_targets')['targets'][0]
         self.assertEqual(target_config.import_uri(item['uri'])['host'], '192.0.2.50')
         self.assertEqual([a['id'] for a in item['addresses']], ['main', 'alternate'])
+        summaries = configurations.configs(self.db)['configs']
+        self.assertTrue(all(c['topology_name'] == 'network' and c['topology_id'] == ident for c in summaries))
+        self.assertEqual(summaries[0]['target_address'], dict(id='main', name='默认', host='192.0.2.50', port=23456))
+        self.assertEqual(summaries[1]['target_address'], dict(id='alternate', name='内网', host='10.0.0.4', port=8443))
 
     def test_address_edit_only_updates_users_and_preserves_confirmed_snapshot(self):
         ident, tid, graph = self.create_routes()
@@ -63,11 +67,28 @@ class TargetAddressTests(Fixture, unittest.TestCase):
         self.assertEqual(execution.applied_target(self.db, after[1])['host'], '10.0.0.4')
         self.assertEqual(target_addresses.resolve(self.db, json.loads(after[1]['desired']))['host'], '10.0.0.5')
         self.assertEqual(after[1]['applied'], config['applied'])
+        self.assertEqual(configurations.view(self.db, after[1])['target_address'],
+                         dict(id='alternate', name='内网', host='10.0.0.4', port=8443))
         self.settle()
         final = configurations.members(self.db, ident)
         self.assertEqual(json.loads(final[0]['applied'])['rules'], json.loads(other['applied'])['rules'])
         self.assertEqual(execution.applied_target(self.db, final[1])['host'], '10.0.0.5')
         self.assertEqual(json.loads(final[1]['applied'])['rules'][-1]['tport'], 9443)
+        self.assertEqual(configurations.view(self.db, final[1])['target_address'],
+                         dict(id='alternate', name='10.0.0.5:9443', host='10.0.0.5', port=9443))
+
+    def test_endpoint_label_and_source_rename_without_reapplying_rules(self):
+        ident, tid, graph = self.create_routes()
+        before = configurations.members(self.db, ident)[1]
+        self.call('api_target_save', dict(addresses=[dict(id='alternate', name='备用接入', host='10.0.0.4', port=8443)]), tid)
+        self.call('api_topology_save', dict(graph=graph, name='新链路名称',
+                                          revision=configurations.get_topology(self.db, ident)['revision']), ident)
+        row = configurations.members(self.db, ident)[1]
+        self.assertEqual(row['state'], 'active')
+        self.assertEqual(row['applied'], before['applied'])
+        summary = configurations.configs(self.db)['configs'][1]
+        self.assertEqual(summary['topology_name'], '新链路名称')
+        self.assertEqual(summary['target_address']['name'], '备用接入')
 
     def test_selected_address_survives_direct_and_cannot_be_deleted_while_used(self):
         ident, tid, graph = self.create_routes()

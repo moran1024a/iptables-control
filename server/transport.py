@@ -23,13 +23,13 @@ class Hub:
         self.passive_wake = wake.Monitor(self)
         self.execution = execution.Monitor(self)
 
-    async def database(self, fn):
+    async def database(self, fn, *, readonly=False):
 
         def run():
             conn = database.db()
             try:
                 with conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("BEGIN" if readonly else "BEGIN IMMEDIATE")
                     return fn(conn)
             finally:
                 conn.close()
@@ -109,6 +109,11 @@ class Hub:
         ):
             await ws.close(code=1008)
             return ws
+        try:
+            capabilities = agent_v3.validate_capabilities(hello.get("capabilities", []))
+        except errors.UserError:
+            await ws.close(code=1008, message=b"invalid capabilities")
+            return ws
         nid = node["id"]
         lock = asyncio.Lock()
         session = {
@@ -116,7 +121,7 @@ class Hub:
             "wake": asyncio.Event(),
             "ws": ws,
             "paused": False,
-            "quality_capable": "network_quality" in hello.get("capabilities", []),
+            "quality_capable": "network_quality" in capabilities,
         }
 
         async def send(message):
@@ -145,7 +150,7 @@ class Hub:
                 (
                     str(hello.get("installation_id", ""))[:64],
                     str(hello.get("boot_id", ""))[:64],
-                    json.dumps(hello.get("capabilities", []))[:4096],
+                    json.dumps(capabilities),
                     nid,
                 ),
             )
@@ -231,7 +236,13 @@ class Hub:
                 if session["paused"]:
                     receive = asyncio.create_task(ws.receive())
                     continue
-                if kind == "status":
+                if kind == "heartbeat":
+                    await self.database(lambda c: c.execute(
+                        "UPDATE nodes SET last_seen=? WHERE id=? AND key=? AND desired_mode='active' AND manual_required=0",
+                        (int(time.time()), nid, node["key"]),
+                    ))
+                    await reconcile()
+                elif kind == "status":
                     status.update(
                         {
                             k: data[k]

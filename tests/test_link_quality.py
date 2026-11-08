@@ -10,6 +10,47 @@ import configurations, database, link_quality, network_quality as q, probe_store
 
 
 class QualityTests(Fixture, unittest.TestCase):
+    def test_seven_day_unknown_history_is_bounded_and_keeps_measurements(self):
+        start, now = 1001, 1001 + q.RETENTION
+        spec = dict(scope='topologies', owner_id=1, topology_id=1, section='x', protocol='icmp-echo-v1',
+                    path_key='path', path_label='test', reason=('unknown', 'offline'))
+        probe_store.bind(self.db, [spec], start)
+        rows = probe_store.link_rows(self.db, spec, start, now, bucket=q.HISTORY_STEPS[q.RETENTION])
+        self.assertLess(len(rows), 340)
+        self.assertEqual(sum(r['count'] for r in rows), q.RETENTION // q.INTERVAL + 1)
+        history = q.summarize(rows, q.RETENTION, now)
+        self.assertEqual(history['latest']['slot'], now)
+        self.assertTrue(all(p['gap'] and p['status']=='unknown' for p in history['points']))
+        self.assertEqual(history['summary']['samples'], 0)
+        # A real measurement after the unknown period must not connect across it.
+        history = q.summarize(rows + [dict(slot=now+10, status='ok', rtt=23, error='', resolved_ip='192.0.2.1', path_key='path')], q.RETENTION, now+10)
+        self.assertFalse(history['points'][-1]['connect'])
+        self.assertEqual(history['points'][-1]['mean'], 23)
+
+    def test_quality_labels_show_current_tags_and_effective_target_address(self):
+        a, b = self.node('入口'), self.node('中转')
+        self.ready(a, b)
+        tag = self.call('api_tag_save', dict(name='区域 A'))['id']
+        self.call('api_node_edit', dict(tag_ids=[tag]), b)
+        t = self.target()
+        endpoint = dict(id='extra', name='备用接入', host='10.0.0.5', port=8443)
+        self.call('api_target_save', dict(addresses=[endpoint]), t)
+        graph = self.graph([a, b], t)
+        graph['bindings'] = {f'v{b}/t{t}': {'to': {f't{t}': 'extra'}}}
+        ident = self.save(graph)
+        self.settle()
+        monitor = self.monitor()
+        before = asyncio.run(link_quality.view(monitor, dict(id=ident), 1000))
+        self.assertEqual(before['sections'][0]['labels'][0]['tags'][0]['name'], '区域 A')
+        self.assertEqual(before['sections'][0]['labels'][-1]['address'], endpoint)
+        self.call('api_tag_save', dict(name='区域 B'), tag)
+        self.call('api_target_save', dict(addresses=[dict(endpoint, host='10.0.0.6', name='新接入')]), t)
+        after = asyncio.run(link_quality.view(monitor, dict(id=ident), 1001))
+        self.assertEqual(after['sections'][0]['labels'][0]['tags'][0]['name'], '区域 B')
+        self.assertEqual(after['sections'][0]['labels'][-1]['address'], endpoint)
+        self.assertEqual([s['path_key'] for s in before['sections'][0]['series']],
+                         [s['path_key'] for s in after['sections'][0]['series']])
+
     def monitor(self):
         sessions = {
             n["id"]: dict(
@@ -21,7 +62,7 @@ class QualityTests(Fixture, unittest.TestCase):
             for n in self.db.execute("SELECT * FROM nodes")
         }
 
-        async def db(fn):
+        async def db(fn, *, readonly=False):
             with self.db:
                 return fn(self.db)
 

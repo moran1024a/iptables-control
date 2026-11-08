@@ -21,6 +21,49 @@ import (
 	"github.com/coder/websocket"
 )
 
+// Control reads must keep draining ping/pong frames while rule operations run.
+func readControl(ctx context.Context, ws *websocket.Conn, receive chan<- M) error {
+	for {
+		_, b, err := ws.Read(ctx)
+		if err != nil {
+			return err
+		}
+		m, err := decodeJSON(b)
+		if err != nil {
+			return err
+		}
+		select {
+		case receive <- m:
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return errors.New("control queue full")
+		}
+	}
+}
+
+func keepControlAlive(ctx context.Context, ws *websocket.Conn, send func(M) error, interval time.Duration) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := ws.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				return err
+			}
+			// Liveness only: never claim a configuration or health check succeeded.
+			if err := send(M{"type": "heartbeat"}); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 func (a *Agent) session(ctx context.Context) error {
 	if a.stateMu == nil {
 		a.stateMu = &sync.Mutex{}
@@ -64,7 +107,7 @@ func (a *Agent) session(ctx context.Context) error {
 		return errors.New("无效握手响应")
 	}
 	session, _ = welcome["session"].(string)
-	receive := make(chan M, 1)
+	receive := make(chan M, 64)
 	fail := make(chan error, 1)
 	child, stop := context.WithCancel(ctx)
 	defer stop()
@@ -73,31 +116,14 @@ func (a *Agent) session(ctx context.Context) error {
 	qualityCtx, stopQuality := context.WithCancel(child)
 	defer stopQuality()
 	monitor := newQualityMonitor(qualityCtx, send)
-	go func() {
-		for {
-			_, b, e := ws.Read(child)
-			if e != nil {
-				select {
-				case fail <- e:
-				default:
-				}
-				return
-			}
-			m, e := decodeJSON(b)
-			if e != nil {
-				select {
-				case fail <- e:
-				default:
-				}
-				return
-			}
-			select {
-			case receive <- m:
-			case <-child.Done():
-				return
-			}
+	reportFailure := func(err error) {
+		select {
+		case fail <- err:
+		default:
 		}
-	}()
+	}
+	go func() { reportFailure(readControl(child, ws, receive)) }()
+	go func() { reportFailure(keepControlAlive(child, ws, send, 10*time.Second)) }()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	count := 0
@@ -213,12 +239,6 @@ func (a *Agent) session(ctx context.Context) error {
 				if !ready {
 					_ = send(M{"type": "status", "generation": a.config.Generation, "hash": a.config.Hash, "state": "ok"})
 					return nil
-				}
-				pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				e = ws.Ping(pingCtx)
-				cancel()
-				if e != nil {
-					return e
 				}
 				count++
 				state := "ok"

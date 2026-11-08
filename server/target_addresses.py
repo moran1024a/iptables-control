@@ -28,6 +28,23 @@ def resolve(c, plan, *, current=False):
     return dict(target, host=book[ident]["host"], port=book[ident]["port"])
 
 
+def describe(c, plan, target):
+    """Label the effective endpoint, retaining its snapshot while an edit is pending."""
+    ident = selected(plan)
+    snapshot = plan["graph"].get("address_book", {}).get(plan["graph_path"][-1], {}).get(ident, {})
+    address = next(
+        (a for a in listing(database.get_target(c, plan["target"]))
+         if a["id"] == ident and (a["host"], a["port"]) == (target["host"], target["port"])),
+        snapshot,
+    )
+    return dict(
+        id=ident,
+        name=address.get("name") or f"{target['host']}:{target['port']}",
+        host=target["host"],
+        port=target["port"],
+    )
+
+
 def save(c, target, values):
     if not isinstance(values, list) or len(values) > 32:
         raise errors.UserError("每个目标最多添加 32 个接入地址", "addresses")

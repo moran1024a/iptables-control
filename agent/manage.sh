@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.6.0-rc.1"
+VERSION="0.6.0-rc.4"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -378,15 +378,17 @@ main() {
   ARCH="$(uname -m)"; case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; esac
   read_identity || return 1
   mkdir -p "$WORK"
-  if [ "${ICTL_MANAGER_LOCK_HELD:-0}" != 1 ]; then
-    exec 8>/run/ictl-manager.lock
-    flock -n 8 || { die '另一项安装或同步正在执行'; return 1; }
-  fi
   local action="${1:-}" choice
   if [ -z "$action" ]; then
     printf 'ictl %s\n1) 同步更新／确认切换\n2) 本地状态\n3) 更新当前 Agent\n4) 卸载\n5) 被动节点远程唤醒设置\n6) 修改接入地址／密钥\n0) 退出\n' "$VERSION"
     read -r -p '请选择：' choice
     case "$choice" in 1) action=--sync ;; 2) action=--status ;; 3) action=--update ;; 4) action=--uninstall ;; 5) action=--wake-settings ;; 6) action=--credentials ;; *) return 0 ;; esac
+  fi
+  if [ "$action" != --status ] && [ "${ICTL_MANAGER_LOCK_HELD:-0}" != 1 ]; then
+    exec 8>/run/ictl-manager.lock
+    flock -n 8 || { die '另一项安装或同步正在执行'; return 1; }
+    # The menu may have remained open while another operation changed identity.
+    read_identity || return 1
   fi
   case "$action" in
     --credentials) credentials ;;

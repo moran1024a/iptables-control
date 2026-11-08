@@ -8,6 +8,7 @@ import link_quality
 import configurations
 import probe_store
 import settings
+import agent_v3
 
 INTERVAL = 10
 RETENTION = 7 * 86400
@@ -59,15 +60,11 @@ def stopped(nodes, pair):
             or n["manual_required"]
         ):
             return ("stopped", "仅已确认的主动节点参与探测")
-        if n["installed_agent"] != "active" or "network_quality" not in json.loads(
-            n["capabilities"]
-        ):
+        if n["installed_agent"] != "active" or "network_quality" not in (agent_v3.node_capabilities(n) or ()):
             return ("unsupported", "请升级两端主动 Agent")
         if not n["quality_port"]:
             return ("disabled", "节点已关闭质量探测")
-    if pair["protocol"] == "icmp-echo-v1" and "network_quality_icmp" not in json.loads(
-        nodes[pair["source"]]["capabilities"]
-    ):
+    if pair["protocol"] == "icmp-echo-v1" and "network_quality_icmp" not in (agent_v3.node_capabilities(nodes[pair["source"]]) or ()):
         return ("unsupported", "请升级发起节点的主动 Agent 以支持 ICMP")
     return None
 
@@ -139,16 +136,16 @@ def summarize(rows, seconds, now):
             points.append(
                 dict(
                     time=batch[0]["slot"] if batch else max(start, slot),
-                    end=min(batch[-1]["slot"] + INTERVAL * 2 if batch else slot + step, now + 1),
+                    end=min(batch[-1].get("last_slot", batch[-1]["slot"]) + INTERVAL * 2 if batch else slot + step, now + 1),
                     **aggregate(batch),
                     status=state["status"] if state else "missing",
                     error=state["error"] if state else "",
-                    failures=len(failures),
+                    failures=sum(r.get("count", 1) for r in failures),
                     resolved_ip=next(
                         (r["resolved_ip"] for r in reversed(batch) if r["resolved_ip"]), ""
                     ),
                     first_slot=batch[0]["slot"] if batch else None,
-                    last_slot=batch[-1]["slot"] if batch else None,
+                    last_slot=batch[-1].get("last_slot", batch[-1]["slot"]) if batch else None,
                     gap=bool(failures) or broken,
                     endpoint_change=len(endpoints) > 1,
                     connect=bool(
@@ -172,7 +169,7 @@ def summarize(rows, seconds, now):
                 previous["end"] = min(previous["end"], point["time"])
             previous = point
     recent = [r for r in rows if r["slot"] >= now - 300]
-    latest = rows[-1] if rows else None
+    latest = dict(rows[-1], slot=rows[-1].get("last_slot", rows[-1]["slot"])) if rows else None
     return dict(points=points, step=step, summary=aggregate(recent), latest=latest)
 
 

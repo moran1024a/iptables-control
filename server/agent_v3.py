@@ -13,6 +13,22 @@ import node_addresses
 import settings
 
 
+def validate_capabilities(value):
+    if (not isinstance(value, list) or len(value) > 32
+            or any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", item)
+                   for item in value)):
+        raise errors.UserError("无效的 Agent 能力列表")
+    return list(dict.fromkeys(value))
+
+
+def node_capabilities(node):
+    """Invalid stored reports are unavailable, never a scheduler-wide failure."""
+    try:
+        return set(validate_capabilities(json.loads(node["capabilities"])))
+    except (ValueError, TypeError, errors.UserError):
+        return None
+
+
 def fields(text):
     return dict((line.split("=", 1) for line in text.splitlines() if "=" in line))
 
