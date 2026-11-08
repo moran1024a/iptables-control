@@ -44,7 +44,9 @@ def backup_database(conn, path):
 
 
 def read_db():
-    conn = sqlite3.connect("file:" + os.path.abspath(settings.DB_PATH) + "?mode=ro", uri=True, timeout=10)
+    conn = sqlite3.connect(
+        "file:" + os.path.abspath(settings.DB_PATH) + "?mode=ro", uri=True, timeout=10
+    )
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -59,7 +61,9 @@ def set_setting(conn, k, v):
 
 
 def default_group(conn, kind):
-    return conn.execute("SELECT id FROM item_groups WHERE kind = ? AND builtin = 1", (kind,)).fetchone()[0]
+    return conn.execute(
+        "SELECT id FROM item_groups WHERE kind = ? AND builtin = 1", (kind,)
+    ).fetchone()[0]
 
 
 def get_groups(conn, kind):
@@ -77,7 +81,9 @@ def check_group(conn, kind, group_id):
         return default_group(conn, kind)
     if (
         isinstance(group_id, int)
-        and conn.execute("SELECT 1 FROM item_groups WHERE id = ? AND kind = ?", (group_id, kind)).fetchone()
+        and conn.execute(
+            "SELECT 1 FROM item_groups WHERE id = ? AND kind = ?", (group_id, kind)
+        ).fetchone()
     ):
         return group_id
     raise errors.UserError("分组不存在，请刷新后重试", "group_id")
@@ -97,18 +103,9 @@ def get_node(conn, node_id):
     return node
 
 
-def get_chain(conn, chain_id):
-    if type(chain_id) is not int or chain_id <= 0:
-        raise errors.UserError("无效的对象 ID", "chain_id")
-    chain = conn.execute("SELECT * FROM chains WHERE id = ?", (chain_id,)).fetchone()
-    if not chain:
-        raise errors.UserError("转发不存在", status=404)
-    return chain
-
-
 def node_table(kind):
     if kind != "forward":
-        raise errors.UserError("只支持 iptables 转发节点", "kind")
+        raise errors.UserError("只支持转发节点", "kind")
     return "nodes"
 
 
@@ -118,17 +115,6 @@ def move_group(conn, table, item_id, group_id):
         f"UPDATE {table} SET group_id = ?, sort =\n                 (SELECT COALESCE(MAX(sort), 0) + 1 FROM {table} WHERE group_id = ?)\n                 WHERE id = ?",
         (group_id, group_id, item_id),
     )
-    if table == 'links' and conn.execute("SELECT 1 FROM sqlite_master WHERE name='link_members'").fetchone():
-        conn.execute('UPDATE links SET group_id=? WHERE id IN (SELECT link_id FROM link_members WHERE root_id=?)', (group_id,item_id))
-
-
-def get_route(conn, route_id):
-    if type(route_id) is not int or route_id <= 0:
-        raise errors.UserError("无效的对象 ID", "route_id")
-    r = conn.execute("SELECT * FROM routes WHERE id = ?", (route_id,)).fetchone()
-    if not r:
-        raise errors.UserError("链路不存在", "route_id", 404)
-    return r
 
 
 def get_target(conn, target_id):

@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-VERSION=3.2.2
+VERSION=3.2.3
 SELF_PATH="$(readlink -f -- "$0")"
 
 error() { printf '错误：%s\n' "$*" >&2; }
@@ -577,8 +577,12 @@ def agent_ports():
                     or not re.fullmatch(r'[A-Za-z0-9.-]{1,253}', fields[3])
                     or any(not p.isdigit() or not 1 <= int(p) <= 65535 for p in (fields[2], fields[4]))):
                 raise ValueError('规则格式无效')
-            if len(fields) == 6 and not re.fullmatch(r'[A-Za-z0-9_.:-]+(?:,[A-Za-z0-9_.:-]+){5}', fields[5]):
-                raise ValueError('地址路由格式无效')
+            if len(fields) == 6:
+                route = fields[5]
+                pattern = (r'v2(?:,[A-Za-z0-9_.:-]+){4}' if route.startswith('v2,')
+                           else r'[A-Za-z0-9_.:-]+(?:,[A-Za-z0-9_.:-]+){5}')
+                if not re.fullmatch(pattern, route):
+                    raise ValueError('地址路由格式无效')
             for proto in ('tcp', 'udp') if fields[1] == 'both' else (fields[1],):
                 result.add((proto, str(int(fields[2]))))
         return result

@@ -4,9 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.5.3"
-LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
-GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
+VERSION="0.6.0-rc.1"
 BIN="/usr/local/lib/ictl/passive.sh"
 CONF_DIR="/etc/ictl"
 CONF="$CONF_DIR/agent.conf"
@@ -15,13 +13,11 @@ CONFIG="$LIB/config"
 APPLIED="$LIB/applied"
 RESOLVED="$LIB/resolved"
 STATE="$LIB/state"
-UPDATE_RETRY=600                  # 自动更新失败后的重试间隔（秒）
 LOCK="/run/ictl.lock"
 SERVICE_NAME="ictl-agent"
 SERVICE="/etc/systemd/system/$SERVICE_NAME.service"
 SYSCTL="/etc/sysctl.d/99-ictl.conf"
 SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-LEGACY_SCRIPTS=(/root/ictl.sh /ictl.sh)
 
 if [ -t 1 ]; then
   GREEN=$'\033[32m' YELLOW=$'\033[33m' RED=$'\033[31m' CYAN=$'\033[36m' BOLD=$'\033[1m' DIM=$'\033[2m' RESET=$'\033[0m'
@@ -56,7 +52,7 @@ need_root() {
 
 # ---------------------------------------------------------------- 配置与状态
 
-# AUTO_UPDATE 是否按服务端的更新信号自动更新（默认开启）
+# 自动更新开关由管理器维护，此处仅上报。
 URL="" KEY="" AUTO_UPDATE=1
 load_conf() {
   local k v
@@ -137,26 +133,16 @@ valid_ipv4() {
 
 # Explicit IPv4 routes; the profile journal is shared with the Go Agent.
 route_fields() {
-  local value="$1" extra listen source device gateway
-  R_LISTEN=""
-  if [[ "$value" = v2,* ]]; then
-    IFS=, read -r extra listen source device gateway extra <<< "$value"
-    [ "$(tr -cd ',' <<< "$value" | wc -c)" = 4 ] && [[ "$listen" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || return 1
-    if [ "$source,$device,$gateway" = '-,-,-' ]; then
-      R_IN="" R_OUT="" R_IDEV="" R_ODEV="" R_IGW="" R_OGW=""
-    else
-      [ "$source" != - ] && [ "$device" != - ] || return 1
-      route_fields "$source,$source,$device,$device,$gateway,$gateway" || return 1
-      R_IN="" R_IDEV="" R_IGW=""
-    fi
-    R_LISTEN="$listen"
-    return 0
+  local value="$1" tag listen source device gateway
+  R_LISTEN="" R_IN="" R_OUT="" R_IDEV="" R_ODEV="" R_IGW="" R_OGW=""
+  IFS=, read -r tag listen source device gateway <<< "$value"
+  [ "$tag" = v2 ] && [ "$(tr -cd ',' <<< "$value" | wc -c)" = 4 ] && [[ "$listen" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || return 1
+  if [ "$source,$device,$gateway" != '-,-,-' ]; then
+    [ "$device" != - ] && valid_ipv4 "$source" && [[ "$device" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
+    { [ "$gateway" = - ] || valid_ipv4 "$gateway"; } || return 1
+    R_OUT="$source" R_ODEV="$device" R_OGW="$gateway"
   fi
-  IFS=, read -r R_IN R_OUT R_IDEV R_ODEV R_IGW R_OGW extra <<< "$value"
-  [ -z "${extra:-}" ] && [ "$(tr -cd ',' <<< "$value" | wc -c)" = 5 ] || return 1
-  valid_ipv4 "$R_IN" && valid_ipv4 "$R_OUT" || return 1
-  [[ "$R_IDEV" =~ ^[A-Za-z0-9_.:-]{1,15}$ && "$R_ODEV" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
-  { [ "$R_IGW" = - ] || valid_ipv4 "$R_IGW"; } && { [ "$R_OGW" = - ] || valid_ipv4 "$R_OGW"; }
+  R_LISTEN="$listen"
 }
 route_numbers() {
   local hash
@@ -947,16 +933,6 @@ save_mode() {
   printf '%s\n' "$MODE" > "$MODE_FILE.tmp" && mv "$MODE_FILE.tmp" "$MODE_FILE"
 }
 
-ensure_service_policy() {
-  [ -f "$SERVICE" ] || return 0
-  if ! grep -qx 'Restart=on-failure' "$SERVICE"; then
-    sed 's/^Restart=.*/Restart=on-failure/' "$SERVICE" > "$SERVICE.tmp" &&
-      grep -qx 'Restart=on-failure' "$SERVICE.tmp" && mv "$SERVICE.tmp" "$SERVICE" || return 1
-  fi
-  # Retry a previous failed reload even when the file already has the new policy.
-  systemctl daemon-reload
-}
-
 network_inventory() {
   local addresses
   addresses="$(ip -o -4 address show 2>/dev/null)" || return 0
@@ -974,7 +950,7 @@ request_text() {
 }
 
 response_field() { sed -n "s/^$1=//p" <<< "$RESPONSE"; }
-RESPONSE="" NEW=0 UPD_TARGET="" UPD_HASH=""
+RESPONSE="" NEW=0
 exchange() {
   local file code
   file="$(mktemp /run/ictl.XXXXXX)" || return 1
@@ -1041,13 +1017,9 @@ apply_snapshot() {
   fi
   if [ "$R_STATE" = ok ]; then
     MODE="$mode" R_GEN="$generation" R_V="${config%%$'\n'*}"; R_V="${R_V#v=}"
-    if ! save_mode || ! ensure_service_policy; then
+    if ! save_mode; then
       R_STATE=error R_ERR="save mode/service policy failed"
-    elif [ "$SOURCE" = manual ] && [ "$MODE" = active ] && [ -f "$SERVICE" ]; then
-      # Type=simple starts before the daemon waits for our lock. Never stop while holding it.
-      systemctl start "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME" || {
-        R_STATE=error R_ERR="start active service failed"
-      }
+
     fi
   fi
   if [ "$R_STATE" != ok ]; then
@@ -1069,7 +1041,7 @@ cycle() {
   local request action config generation mode hash original_mode original_gen original_v
   mkdir -p "$LIB" || return 1
   load_state; load_mode || return 1
-  NEW=0 UPD_TARGET="" UPD_HASH="" CFG_ERR=""
+  NEW=0 CFG_ERR=""
   load_conf || { NET=noconf; return 1; }
   derive_keys
   # Retry a lost final receipt before requesting another snapshot.
@@ -1093,10 +1065,6 @@ cycle() {
     return 0
   fi
   [ "$action" != busy ] || return 0
-  if [[ "$RESPONSE" =~ (^|$'\n')update=([0-9][0-9A-Za-z.-]*)\ ([0-9a-f]{64})($|$'\n') ]]; then
-    UPD_TARGET="${BASH_REMATCH[2]}" UPD_HASH="${BASH_REMATCH[3]}"
-    # Upgrade first; re-enter this operation with the new program before applying.
-  fi
   if [ "$action" = blocked ]; then
     R_STATE=error R_ERR="$(response_field err)"
     BLOCK_GEN="$(response_field generation)" BLOCK_ERR="$R_ERR"
@@ -1146,38 +1114,6 @@ daemon() {
   with_lock local_apply_saved
 }
 
-# 服务端发来更新信号时，从服务端下载同版本的节点端脚本并校验哈希，替换后原地重启守护进程
-# （规则不变，转发不中断）。失败后 UPDATE_RETRY 秒内不再重试
-UPD_RETRY_AT=0
-auto_update() {
-  local f code new rc
-  [ "$AUTO_UPDATE" -eq 1 ] && version_gt "$UPD_TARGET" "$VERSION" || return 0
-  [ "$(date +%s)" -ge "$UPD_RETRY_AT" ] || return 0
-  UPD_RETRY_AT=$(($(date +%s) + UPDATE_RETRY))
-  mkdir -p "$(dirname "$BIN")" || return 1
-  f="$(mktemp "$BIN.download.XXXXXX")" || return 1
-  load_state
-  code="$(request_text "$R_STATE" | { printf 'get=agent\n'; cat; } | send_request "$f" 120)"
-  new="$(grep -m 1 '^VERSION=' "$f" 2>/dev/null | cut -d '"' -f 2)"
-  if [ "$code" != "200" ]; then
-    echo "ictl: 自动更新到 $UPD_TARGET 失败：下载失败（$code），$((UPDATE_RETRY / 60)) 分钟后重试"
-  elif [ "$(sha256_hex < "$f")" != "$UPD_HASH" ] || [ "$new" != "$UPD_TARGET" ] ||
-    ! grep -q '^# ictl 节点端' "$f" || ! bash -n "$f" 2>/dev/null; then
-    echo "ictl: 自动更新到 $UPD_TARGET 失败：文件校验失败，$((UPDATE_RETRY / 60)) 分钟后重试"
-  else
-    with_lock install_update "$f" "$new"
-    rc=$?
-    rm -f "$f"
-    [ "$rc" -eq 0 ] || return "$rc"
-    echo "ictl: 自动更新 $UPDATE_FROM → $new"
-    # 安装锁已释放，避免新守护进程继承锁或和手动重启相互等待。
-    exec "$BIN" "${1:---daemon}"
-    return 1
-  fi
-  rm -f "$f"
-  return 1
-}
-
 # 开机时先按本地缓存恢复规则
 local_apply_saved() {
   local previous flags actual
@@ -1220,360 +1156,6 @@ local_apply_saved() {
   if [ -n "$BLOCK_GEN" ]; then R_STATE=error R_ERR="$BLOCK_ERR"; fi
   save_state
   return "$rc"
-}
-
-# ---------------------------------------------------------------- 安装与卸载
-
-install_service() {
-  mkdir -p "$(dirname "$BIN")"
-  if [ "$SELF" != "$BIN" ]; then
-    # 先写临时文件再替换，避免改动正在运行的脚本
-    cp "$SELF" "$BIN.tmp" && mv "$BIN.tmp" "$BIN" || { err "无法复制脚本到 $BIN"; return 1; }
-  fi
-  chmod 755 "$BIN"
-  cat > "$SERVICE" <<EOF
-[Unit]
-Description=ictl agent
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=$BIN --daemon
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-  systemctl restart "$SERVICE_NAME"
-}
-
-# ---------------------------------------------------------------- 菜单
-
-print_net_result() {
-  case "$NET" in
-    ok) ok "已连接服务端" ;;
-    auth) err "认证失败：同步地址或密钥错误，或节点已在服务端删除" ;;
-    conn) err "无法连接服务端" ;;
-    bad) err "服务端响应校验失败：密钥不匹配，或响应被篡改" ;;
-    skew) err "本机时间与服务端相差 ${SKEW} 秒，服务端拒绝同步，请校准时间（如启用 NTP）" ;;
-    noconf) warn "尚未设置服务端地址和密钥" ;;
-  esac
-  if [ "$NET" = "ok" ]; then
-    if [ "$R_STATE" = "ok" ]; then
-      case "$CONFIRM" in
-        confirmed) ok "同步更新已确认（版本 ${R_V:-无}）" ;;
-        deleted) ok "清理已确认；节点已删除，后台同步已停止" ;;
-        changed) warn "本轮已应用，服务端仍有新变更，请再次同步" ;;
-        waiting) warn "已停止轮询，请手动同步更新以确认模式" ;;
-        unknown) warn "应用完成，服务端确认未完成／未知，请再次同步" ;;
-        *) note "本地规则版本 ${R_V:-无}；确认状态：${CONFIRM:-尚未确认}" ;;
-      esac
-    else
-      err "规则应用有问题：$R_ERR"
-    fi
-  fi
-}
-
-# 保存服务端地址和密钥，立即同步一次并安装服务；连接成功返回 0
-save_server() {
-  local url="$1" key="$2"
-  if [[ ! "$url" =~ ^https?://[^[:space:]]+$ ]]; then
-    err "地址格式应为 https://域名/路径"
-    return 1
-  fi
-  if [[ ! "$key" =~ ^[0-9a-f]{64}$ ]]; then
-    err "密钥格式不正确（应为 64 位十六进制）"
-    return 1
-  fi
-
-  load_conf
-  URL="$url" KEY="$key"
-  save_conf || { err "无法写入 $CONF"; return 1; }
-
-  if install_service; then
-    ok "已安装并启动服务 $SERVICE_NAME（开机自启）"
-  else
-    err "服务安装失败，请检查 systemctl status $SERVICE_NAME"
-    return 1
-  fi
-  sync_now
-}
-
-set_server() {
-  title "设置服务端地址和密钥"
-  local url key
-  load_conf
-  read -rp "  同步地址${URL:+ [$URL]}: " url || return
-  read -rsp "  密钥: " key || return
-  echo
-  save_server "${url:-$URL}" "$key"
-}
-
-# 命令行接入：ictl.sh --url <同步地址> --key <密钥>
-quick_setup() {
-  local url="" key=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --url)
-        [ $# -ge 2 ] && [[ "$2" != --* ]] || { err "--url 缺少参数"; return 1; }
-        url="$2"; shift 2 ;;
-      --key)
-        [ $# -ge 2 ] && [[ "$2" != --* ]] || { err "--key 缺少参数"; return 1; }
-        key="$2"; shift 2 ;;
-      --mirror) shift ;;   # 0.1.6 用于记住下载加速，现已不需要，保留以兼容旧命令
-      *) err "未知参数：$1"; exit 1 ;;
-    esac
-  done
-  title "ictl 节点端 $VERSION"
-  save_server "$url" "$key"
-}
-
-# $1 是否比 $2 新
-version_gt() {
-  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
-}
-
-# Run from the installed program, including its first start after an older updater replaced it.
-# Never source a candidate script or follow an existing link.
-cleanup_legacy_scripts() {
-  local path old temporary rc=0
-  [ "$SELF" = "$BIN" ] && [ -x "$BIN" ] || return 0
-  grep -Fxq "VERSION=\"$VERSION\"" "$BIN" || return 0
-  for path in "${LEGACY_SCRIPTS[@]}"; do
-    [ -f "$path" ] && [ ! -L "$path" ] && [ ! "$path" -ef "$BIN" ] || continue
-    grep -Fxq '# ictl 节点端：从服务端拉取转发规则，应用到 iptables 并上报结果' "$path" &&
-      grep -Fxq 'BIN="/usr/local/bin/ictl"' "$path" &&
-      grep -Fxq 'CONF_DIR="/etc/ictl"' "$path" || continue
-    old="$(grep -m 1 '^VERSION=' "$path" | cut -d '"' -f 2)"
-    [[ "$old" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && version_gt "$VERSION" "$old" || continue
-    bash -n "$path" 2>/dev/null || continue
-    temporary="$(mktemp -d "$(dirname "$path")/.ictl-link.XXXXXX")" || {
-      warn "无法整理旧脚本 $path，文件保持原样"; rc=1; continue
-    }
-    if ln -s "$BIN" "$temporary/ictl.sh" && mv -Tf "$temporary/ictl.sh" "$path"; then
-      note "旧脚本 $path（$old）已改为指向 $BIN"
-    else
-      warn "无法替换旧脚本 $path，请检查目录权限"; rc=1
-    fi
-    rm -f "$temporary/ictl.sh"
-    rmdir "$temporary" || rc=1
-  done
-  return "$rc"
-}
-
-# 必须在锁内重新比较已安装版本，防止下载期间其他进程更新后被旧版本覆盖。
-# 返回 2 表示无需安装；调用方在锁释放后再重启服务或 exec。
-UPDATE_FROM=""
-install_update() {
-  local tmp="$1" new="$2" current="$VERSION" installed
-  if [ -f "$BIN" ]; then
-    installed="$(grep -m 1 '^VERSION=' "$BIN" | cut -d '"' -f 2)"
-    if [[ ! "$installed" =~ ^[0-9][0-9A-Za-z.-]*$ ]]; then
-      err "无法读取已安装的节点端版本"
-      return 1
-    fi
-    version_gt "$installed" "$current" && current="$installed"
-  fi
-  UPDATE_FROM="$current"
-  if version_gt "$current" "$new"; then
-    warn "下载到的版本 $new 低于当前版本 $current（可能是下载缓存），未做改动"
-    return 2
-  fi
-  if [ -f "$BIN" ] && [ "$new" = "$current" ]; then
-    ok "已是最新版本 $current"
-    return 2
-  fi
-  if ! chmod 755 "$tmp" || ! mv "$tmp" "$BIN"; then
-    err "无法安装节点端到 $BIN"
-    return 1
-  fi
-}
-
-# 手动更新：从 GitHub Release 下载最新版本替换自身；参数 --mirror 时经加速代理下载。更新成功返回 0
-update_agent() {
-  title "更新节点端"
-  local tmp new rc url="$LATEST_URL?t=$(date +%s)"   # 时间戳避免拿到代理缓存的旧文件
-  [ "${1:-}" = "--mirror" ] && url="$GH_PROXY$url"
-  mkdir -p "$(dirname "$BIN")" || { err "无法创建节点端安装目录"; return 1; }
-  tmp="$(mktemp "$BIN.download.XXXXXX")" || { err "无法创建更新临时文件"; return 1; }
-  if ! curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$tmp"; then
-    rm -f "$tmp"
-    err "下载失败：$url"
-    [ "${1:-}" = "--mirror" ] || note "国内服务器可使用加速下载：sudo ictl --update --mirror"
-    return 1
-  fi
-  new="$(grep -m 1 '^VERSION=' "$tmp" | cut -d '"' -f 2)"
-  if [[ ! "$new" =~ ^[0-9][0-9A-Za-z.-]*$ ]] || ! grep -q '^# ictl 节点端' "$tmp" || ! bash -n "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    err "下载的文件无效"
-    return 1
-  fi
-  with_lock install_update "$tmp" "$new"
-  rc=$?
-  rm -f "$tmp"
-  [ "$rc" -eq 0 ] || return 1
-  if [ -f "$SERVICE" ] && ! systemctl restart "$SERVICE_NAME"; then
-    err "已安装 $new，但重启服务失败，请检查 systemctl status $SERVICE_NAME"
-    return 1
-  fi
-  ok "已更新：$UPDATE_FROM → $new"
-}
-
-# 菜单中切换自动更新
-toggle_auto_update() {
-  if ! load_conf; then
-    warn "请先设置服务端地址和密钥"
-    return
-  fi
-  AUTO_UPDATE=$((1 - AUTO_UPDATE))
-  save_conf || return
-  if [ "$AUTO_UPDATE" -eq 1 ]; then
-    ok "已开启自动更新（节点端版本低于服务端时，自动从服务端更新到服务端的版本）"
-  else
-    ok "已关闭自动更新"
-  fi
-}
-
-on_off() { [ "$1" -eq 1 ] && echo "已开启" || echo "已关闭"; }
-
-show_status() {
-  title "状态"
-  load_state
-  if load_conf; then
-    note "同步地址：$URL"
-    note "密钥：    ${KEY:0:6}…"
-    load_mode
-    note "同步模式：$MODE（模式在面板修改后需本机同步确认）"
-    note "自动更新：$(on_off "$AUTO_UPDATE")（被动模式仅在手动同步时检查）"
-  else
-    warn "尚未设置服务端地址和密钥"
-  fi
-  if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-    ok "服务运行中"
-  else
-    warn "服务未运行"
-  fi
-  if [ -n "$ST_TIME" ]; then
-    note "最后同步：$(date -d "@$ST_TIME" '+%F %T')"
-    print_net_result
-  fi
-
-  title "规则"
-  local id proto lport host tport shown=0
-  load_resolved
-  if [ -f "$CONFIG" ]; then
-    while read -r id proto lport host tport; do
-      [ -z "$tport" ] && continue
-      shown=1
-      if valid_ipv4 "$host"; then
-        printf '  %-6s %-5s %5s → %s:%s\n' "#$id" "$proto" "$lport" "$host" "$tport"
-      else
-        printf '  %-6s %-5s %5s → %s:%s (%s)\n' "#$id" "$proto" "$lport" "$host" "$tport" "${RCACHE[$host]:-未解析}"
-      fi
-    done < "$CONFIG"
-  fi
-  [ "$shown" -eq 1 ] || note "没有规则"
-
-  if [ "$shown" -eq 1 ]; then
-    title "命中计数（ICTL-PRE）"
-    iptables -t nat -L ICTL-PRE -n -v -x 2>/dev/null | sed 's/^/  /'
-  fi
-}
-
-sync_now() {
-  title "同步更新"
-  # Stop before acquiring the lock; a daemon may itself be waiting for it.
-  if [ -f "$SERVICE" ]; then systemctl stop "$SERVICE_NAME" || return 1; fi
-  with_lock ensure_service_policy || { err "更新服务重启策略失败"; return 1; }
-  with_lock cycle manual
-  local rc=$?
-  if [ "$rc" -eq 20 ]; then
-    auto_update --sync
-    rc=$?
-    [ "$rc" -ne 0 ] || rc=1
-  fi
-  load_mode || return 1
-  if [ "$MODE" = active ] && [ -f "$SERVICE" ]; then
-    systemctl start "$SERVICE_NAME" || { err "恢复主动服务失败"; return 1; }
-  fi
-  print_net_result
-  return "$rc"
-}
-
-# 服务停止后在锁内清理；规则清理失败时不删除配置、服务文件或程序，便于重试。
-uninstall_files() {
-  clean_legacy_persistence || { err "旧持久化规则清理失败，请检查 $LEGACY_PERSIST"; return 1; }
-  remove_rules || return 1
-  if [ -f "$SERVICE" ]; then
-    systemctl disable "$SERVICE_NAME" || { err "禁用服务失败"; return 1; }
-    rm -f "$SERVICE" || { err "删除服务文件失败"; return 1; }
-  fi
-  systemctl daemon-reload || { err "重新加载服务配置失败"; return 1; }
-  rm -rf "$CONF_DIR" "$LIB" "$SYSCTL" || { err "删除节点端配置失败"; return 1; }
-  rm -f "$BIN" || { err "删除节点端程序失败"; return 1; }
-  # 不删除仍可能被其他进程等待的锁文件，避免并发进程锁住不同的 inode。
-}
-
-# 卸载；参数 -y 跳过确认
-uninstall() {
-  title "卸载节点端"
-  local yn service_state
-  if [ "${1:-}" != "-y" ]; then
-    if ! read -rp "  将停止服务、删除所有 ictl 规则和文件，确认？[y/N]: " yn; then
-      echo
-      err "无法读取确认输入，非交互运行请使用：ictl --uninstall -y"
-      return 1
-    fi
-    [[ "$yn" =~ ^[yY]$ ]] || { note "已取消。"; return; }
-  fi
-
-  if ! service_state="$(systemctl show -p LoadState --value "$SERVICE_NAME" 2>&1)"; then
-    err "无法确认服务状态：$service_state"
-    return 1
-  fi
-  if [ "$service_state" != "not-found" ] && ! systemctl stop "$SERVICE_NAME"; then
-    err "停止服务失败，未继续卸载"
-    return 1
-  fi
-  # stop 必须在获取锁之前完成，否则服务可能正在等待同一把锁而无法退出。
-  if ! with_lock uninstall_files; then
-    err "卸载未完成；服务保持停止，请排除错误后重新运行卸载。"
-    return 1
-  fi
-  ok "已卸载。IPv4 转发的运行时设置保持不变，重启后恢复系统默认。"
-  note "该节点在服务端面板中仍会显示为离线，可在面板中删除（节点已失联时选择强制删除）。"
-  exit 0
-}
-
-menu() {
-  while true; do
-    load_conf
-    echo
-    printf '  %sictl 节点端%s %sv%s%s\n' "$BOLD$CYAN" "$RESET" "$DIM" "$VERSION" "$RESET"
-    echo "  1) 设置服务端地址和密钥"
-    echo "  2) 查看状态"
-    echo "  3) 同步更新"
-    echo "  4) 更新节点端程序"
-    echo "  5) 自动更新：$(on_off "$AUTO_UPDATE")（切换）"
-    echo "  6) 卸载"
-    echo "  0) 退出"
-    local choice
-    read -rp "  请选择: " choice || { echo; exit 0; }
-    case "$choice" in
-      1) set_server ;;
-      2) show_status ;;
-      3) sync_now ;;
-      4) update_agent && { note "请重新运行 sudo ictl"; exit 0; } ;;
-      5) toggle_auto_update ;;
-      6) uninstall ;;
-      0|q) exit 0 ;;
-      "") ;;
-      *) err "无效选择：$choice" ;;
-    esac
-  done
 }
 
 main() {

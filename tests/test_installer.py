@@ -56,8 +56,8 @@ class InstallerTests(unittest.TestCase):
         self.env={**os.environ,'PATH':str(self.root/'bin')+':'+os.environ['PATH'],'MOCK_ROOT':str(self.root)}
         for name,text in [('docker',DOCKER),('sleep','#!/bin/sh\nexit 0\n')]:
             p=self.root/'bin'/name;p.write_text(text);p.chmod(0o755)
-        (self.root/'containers').write_text(json.dumps({'ictl-server':{'image':'ghcr.io/moran1024a/ictl-server:0.2.1','running':True}}))
-        c=sqlite3.connect(self.root/'data/ictl.db');c.executescript("PRAGMA user_version=202; CREATE TABLE example(value TEXT);INSERT INTO example VALUES ('old');");c.close()
+        (self.root/'containers').write_text(json.dumps({'ictl-server':{'image':'ghcr.io/moran1024a/ictl-server:0.5.3','running':True}}))
+        c=sqlite3.connect(self.root/'data/ictl.db');c.executescript("PRAGMA user_version=504; CREATE TABLE example(value TEXT);INSERT INTO example VALUES ('old');");c.close()
 
     def tearDown(self):self.tmp.cleanup()
 
@@ -67,9 +67,9 @@ class InstallerTests(unittest.TestCase):
     def assert_old(self):
         containers=json.loads((self.root/'containers').read_text())
         self.assertEqual(list(containers),['ictl-server']);self.assertTrue(containers['ictl-server']['running'])
-        self.assertTrue(containers['ictl-server']['image'].endswith('0.2.1'))
+        self.assertTrue(containers['ictl-server']['image'].endswith('0.5.3'))
         c=sqlite3.connect(self.root/'data/ictl.db')
-        self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],202)
+        self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],504)
         self.assertEqual(c.execute('SELECT value FROM example').fetchone()[0],'old');c.close()
 
     def test_failed_new_container_recovers_old(self):
@@ -95,7 +95,7 @@ class InstallerTests(unittest.TestCase):
         version=json.loads((ROOT/'server/components.json').read_text())['server']
         self.assertEqual(containers['ictl-server']['image'],f'ghcr.io/moran1024a/ictl-server:{version}')
         backup=next((self.root/'data').glob('*.bak'));c=sqlite3.connect(backup)
-        self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],202);c.close()
+        self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],504);c.close()
 
     def test_missing_port_value_rejected(self):
         r=subprocess.run(['bash',str(ROOT/'deploy/install-server.sh'),'--port'],env=self.env,capture_output=True,text=True)

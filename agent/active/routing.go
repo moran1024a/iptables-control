@@ -32,28 +32,21 @@ func parseRoute(value string) (ruleRoute, error) {
 		return r, nil
 	}
 	p := strings.Split(value, ",")
-	if len(p) == 5 && p[0] == "v2" {
-		if len(p[1]) > 253 || !listenRE.MatchString(p[1]) {
-			return r, errors.New("无效的接收地址")
-		}
-		r.Listen = p[1]
-		if p[2] == "-" && p[3] == "-" && p[4] == "-" {
-			return r, nil
-		}
-		if p[2] == "-" || p[3] == "-" {
-			return r, errors.New("指定出口缺少源 IP 或网卡")
-		}
-		// Reuse the legacy profile validator; receiving itself has no local
-		// interface prerequisite. Only a selected source needs this profile.
-		legacy, err := parseRoute(strings.Join([]string{p[2], p[2], p[3], p[3], p[4], p[4]}, ","))
-		r.Out = legacy.Out
-		return r, err
-	}
-	if len(p) != 6 {
+	if len(p) != 5 || p[0] != "v2" {
 		return r, errors.New("无效的地址路由配置")
 	}
-	for _, i := range []int{0, 1, 4, 5} {
-		if i >= 4 && p[i] == "-" {
+	if len(p[1]) > 253 || !listenRE.MatchString(p[1]) {
+		return r, errors.New("无效的接收地址")
+	}
+	r.Listen = p[1]
+	if p[2] == "-" && p[3] == "-" && p[4] == "-" {
+		return r, nil
+	}
+	if p[3] == "-" || !deviceRE.MatchString(p[3]) {
+		return r, errors.New("无效的路由网卡")
+	}
+	for _, i := range []int{2, 4} {
+		if i == 4 && p[i] == "-" {
 			continue
 		}
 		ip := net.ParseIP(p[i])
@@ -61,11 +54,7 @@ func parseRoute(value string) (ruleRoute, error) {
 			return r, errors.New("路由需要有效的本地 IPv4 地址")
 		}
 	}
-	if !deviceRE.MatchString(p[2]) || !deviceRE.MatchString(p[3]) {
-		return r, errors.New("无效的路由网卡")
-	}
-	r.In = routeProfile{p[0], p[2], p[4]}
-	r.Out = routeProfile{p[1], p[3], p[5]}
+	r.Out = routeProfile{p[2], p[3], p[4]}
 	return r, nil
 }
 func (p routeProfile) enabled() bool { return p.Local != "" }

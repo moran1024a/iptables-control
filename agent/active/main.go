@@ -50,7 +50,7 @@ func (a *Agent) session(ctx context.Context) error {
 	a.stateMu.Lock()
 	current := a.config
 	a.stateMu.Unlock()
-	if e = send(M{"type": "hello", "protocol": 3, "version": version, "installation_id": a.installation, "boot_id": a.boot, "generation": current.Generation, "hash": current.Hash, "capabilities": []string{"address_routing", "nftables", "traffic", "metrics", "ports", "queries", "network_quality", "network_quality_icmp", "network_quality_tcp"}}); e != nil {
+	if e = send(M{"type": "hello", "protocol": 3, "version": version, "auto_update": a.autoUpdate, "installation_id": a.installation, "boot_id": a.boot, "generation": current.Generation, "hash": current.Hash, "capabilities": []string{"address_routing", "nftables", "traffic", "metrics", "ports", "queries", "network_quality", "network_quality_icmp", "network_quality_tcp"}}); e != nil {
 		return e
 	}
 	helloCtx, cancel := context.WithTimeout(ctx, 10*time.Second)

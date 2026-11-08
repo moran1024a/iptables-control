@@ -21,9 +21,8 @@ RUN apk add --no-cache openssl
 WORKDIR /app
 COPY server/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY server/*.py server/components.json ./
+COPY server/*.py server/components.json server/schema.sql ./
 COPY server/web ./web
-COPY agent/ictl.sh ./agent/ictl.sh
 COPY agent/passive.sh agent/manage.sh agent/control.sh agent/wake.sh ./agent/
 COPY --from=agent-build /out/ ./assets/
 

@@ -70,11 +70,11 @@ try:
         conf.write_text('URL=https://example.invalid/sync\nKEY='+'ab'*32+'\n')
         binary=str(Path(sys.argv[1]).resolve())
         def agent(*args): return run(binary,'--state-root',str(root),'--conf',str(conf),*args)
-        lines=['1 both 30123 198.51.100.2 30443 192.0.2.3,198.51.100.3,client,target,-,-',
-               '2 both 30124 198.51.100.2 30444 192.0.2.1,198.51.100.1,client,target,-,-',
-               '3 both 30125 203.0.113.9 30443 192.0.2.3,198.51.100.3,client,target,-,198.51.100.2',
-               '4 both 30126 198.51.100.2 30443 10.0.0.95,198.51.100.3,eth0,target,-,-',
-               '5 both 30127 198.51.100.2 30443 10.0.0.108,198.51.100.3,eth0,target,-,-',
+        lines=['1 both 30123 198.51.100.2 30443 v2,192.0.2.3,198.51.100.3,target,-',
+               '2 both 30124 198.51.100.2 30444 v2,192.0.2.1,198.51.100.1,target,-',
+               '3 both 30125 203.0.113.9 30443 v2,192.0.2.3,198.51.100.3,target,198.51.100.2',
+               '4 both 30126 10.0.0.1 30443 v2,192.0.2.3,10.0.0.95,eth0,-',
+               '5 both 30127 10.0.0.1 30443 v2,192.0.2.3,10.0.0.108,eth0,-',
                '6 both 30128 198.51.100.2 30443 v2,192.0.2.3,-,-,-',
                '7 both 30129 198.51.100.2 30443 v2,203.0.113.50,-,-,-',
                '8 both 30130 198.51.100.2 30443 v2,198.18.0.7,-,-,-',
@@ -117,16 +117,16 @@ for incoming,port in [('192.0.2.1',30123),('192.0.2.1',30128),('203.0.113.9',301
         # Reapplying must accept our existing profile journals and routes.
         agent('--apply-file',str(snapshot),'--generation','1');check()
         def withdraw_routes(apply):
-            run('ip','route','add','203.0.113.0/24','dev','client')
-            run('ip','route','add','default','via','192.0.2.2','dev','client','metric','500')
+            run('ip','route','add','203.0.113.0/24','dev','target')
+            run('ip','route','add','default','via','198.51.100.2','dev','target','metric','500')
             apply()
-            run('ip','route','del','203.0.113.0/24','dev','client')
-            run('ip','route','del','default','via','192.0.2.2','dev','client','metric','500')
+            run('ip','route','del','203.0.113.0/24','dev','target')
+            run('ip','route','del','default','via','198.51.100.2','dev','target','metric','500')
             apply()
             for path in (root/'routing').glob('[0-9]*'):
-                if ',client,' not in path.read_text(): continue
+                if ',target,-' not in path.read_text(): continue
                 routes=json.loads(run('ip','-N','-j','-4','route','show','table',path.name))
-                assert not any(r.get('dst')=='203.0.113.0/24' or r.get('gateway')=='192.0.2.2' for r in routes), routes
+                assert not any(r.get('dst')=='203.0.113.0/24' or r.get('gateway')=='198.51.100.2' and str(r.get('metric'))=='500' for r in routes), routes
                 assert any(str(r.get('type')) in ('unreachable', '7') for r in routes), routes
             check()
         withdraw_routes(lambda: agent('--apply-file',str(snapshot),'--generation','1'))

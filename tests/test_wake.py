@@ -33,14 +33,14 @@ class WakeTests(Fixture, unittest.TestCase):
         return self.report(nid, **data)['result']
 
     def setup_passive(self):
-        nid = self.node()
-        route = self.route([nid])
-        config = self.config(route, [10001])
-        self.call('api_node_edit', {'desired_mode': 'passive'}, nid)
-        self.assertEqual(self.ack(nid, self.report(nid)), 'confirmed')
-        with self.db:
-            self.db.execute("UPDATE nodes SET installed_agent='passive' WHERE id=?", (nid,))
-        return nid, config
+        nid=self.node()
+        self.ready(nid,mode='passive')
+        graph=self.graph([nid]);graph['ports']={f"v{nid}/{graph['vertices'][-1]['id']}":10001}
+        ident=self.save(graph);self.settle()
+        return nid,ident
+
+    def remove_config(self,ident):
+        self.call('api_topology_delete',{},ident);self.tick()
 
     def enable(self, nid):
         self.call('api_node_edit', {'wake_enabled': True, 'wake_port': 39001}, nid)
@@ -59,7 +59,10 @@ class WakeTests(Fixture, unittest.TestCase):
         self.enable(nid)
         self.call('api_node_edit', {'ports': '10000-40000'}, nid)
         with self.assertRaises(errors.UserError):
-            self.call('api_config_save', {'ports': [39001]}, config)
+            import json,configurations
+            graph=json.loads(configurations.get_topology(self.db,config)['graph'])
+            graph['ports']={key:39001 for key in graph['ports']}
+            self.save(graph,config)
         self.call('api_node_edit', {'wake_enabled': False}, nid)
         self.assertIsNone(wake.summary(self.db, database.get_node(self.db, nid)))
 
@@ -81,7 +84,7 @@ class WakeTests(Fixture, unittest.TestCase):
         self.assertEqual(restarted.due(self.db, start+100), [])
         self.call('api_node_edit', {'name': 'renamed'}, nid)
         self.assertEqual(wake.summary(self.db, node)['state'], 'timeout')
-        self.call('api_config_save', {'route_id': None}, config)
+        self.remove_config(config)
         self.assertEqual(wake.summary(self.db, node)['state'], 'waiting')
 
     def test_only_authorized_wake_can_fetch_no_mode_confirmation_or_upgrade(self):
@@ -115,7 +118,7 @@ class WakeTests(Fixture, unittest.TestCase):
         nid, config = self.setup_passive()
         self.enable(nid)
         old = self.begin_wake(nid)
-        self.call('api_config_save', {'route_id': None}, config)
+        self.remove_config(config)
         self.assertEqual(self.ack(nid, old, source='wake'), 'changed')
         self.assertEqual(wake.summary(self.db, database.get_node(self.db, nid))['state'], 'waiting')
         current = self.begin_wake(nid)
@@ -155,7 +158,6 @@ class PassiveWakeHTTPTests(AgentHarness, Fixture, unittest.TestCase):
 
     def test_bash_config_only_sync_over_real_authenticated_http(self):
         nid = self.node()
-        self.config(self.route([nid]), [10001])
         self.call('api_node_edit', {'desired_mode': 'passive'}, nid)
         key = database.get_node(self.db, nid)['key']
         (self.conf/'agent.conf').write_text(
@@ -163,6 +165,9 @@ class PassiveWakeHTTPTests(AgentHarness, Fixture, unittest.TestCase):
         self.assertShell('with_lock cycle manual; [ "$CONFIRM" = confirmed ]')
         with self.db:
             self.db.execute("UPDATE nodes SET installed_agent='passive' WHERE id=?", (nid,))
+        self.ready(nid,mode='passive')
+        graph=self.graph([nid]);graph['ports']={f"v{nid}/{graph['vertices'][-1]['id']}":10001}
+        self.save(graph);self.tick();self.tick()
         self.call('api_node_edit', {'wake_enabled': True, 'wake_port': 39001}, nid)
         token = self.db.execute('SELECT token FROM wake_jobs WHERE node_id=?', (nid,)).fetchone()[0]
         (self.conf/'wake.conf').write_text('ENABLED=1\nPORT=39001\nALLOW=127.0.0.1\n')

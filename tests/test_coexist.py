@@ -92,7 +92,7 @@ class CoexistTests(AgentHarness,unittest.TestCase):
         self.assertFalse(self.ipt.CONF.exists());self.assertFalse((self.root/'kernel.json').exists())
 
     def test_standalone_reserves_explicit_address_agent_ports(self):
-        (self.lib/'config').write_text('v=abc\n1 both 10001 192.0.2.1 443 10.0.0.1,10.0.0.2,eth0,eth1,-,-\n')
+        (self.lib/'config').write_text('v=abc\n1 both 10001 192.0.2.1 443 v2,10.0.0.1,10.0.0.2,eth1,-\n')
         with self.assertRaisesRegex(self.ipt.Failure,'Agent 保存的配置'):self.add()
         self.add(10002)
 
@@ -128,7 +128,7 @@ class CoexistTests(AgentHarness,unittest.TestCase):
         self.agent_apply()
 
     def test_orphan_nested_nat_and_multiport_rules_are_detected(self):
-        kernel={'nat':{'PREROUTING':['-j EXTERNAL'],'POSTROUTING':[],'EXTERNAL':['-p tcp -m multiport --dports 10000:10005,12345 -j DNAT --to-destination 192.0.2.9:80']},'filter':{'FORWARD':[]}}
+        kernel={'nat':{'PREROUTING':['-j EXTERNAL'],'POSTROUTING':[],'EXTERNAL':['-p tcp -m multiport --dports 10000:10005,12345 -j DNAT --to-destination 192.0.2.9:80']},'filter':{'FORWARD':[]},'mangle':{'PREROUTING':[]}}
         (self.root/'kernel.json').write_text(json.dumps(kernel))
         with self.assertRaisesRegex(self.ipt.Failure,'端口冲突'):self.add()
         self.assertShell("SOURCE=manual; ! with_lock apply_snapshot $'v=abc\\n1 both 10001 192.0.2.1 443' 2 active; [[ \"$R_ERR\" == '端口冲突：'* ]]")
@@ -220,7 +220,7 @@ class CoexistTests(AgentHarness,unittest.TestCase):
         self.agent_apply();self.add(10002)
         self.ipt.LEGACY_PERSIST.write_text(self.ipt.snapshot()['text'])
         config=self.ipt.CONF.read_bytes()
-        self.assertShell('with_lock uninstall_files')
+        self.assertShell('with_lock remove_rules && with_lock clean_legacy_persistence')
         kernel=self.kernel()
         self.assertNotIn('ICTL-PRE',kernel['nat']);self.assertIn('OTHER',kernel['nat'])
         self.assertEqual(len([r for r in kernel['nat']['PREROUTING'] if 'iptfm:' in r]),2)

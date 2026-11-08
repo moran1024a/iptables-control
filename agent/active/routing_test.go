@@ -61,8 +61,8 @@ func TestDiagnosticRouteKernel(t *testing.T) {
 	host, port, _ := net.SplitHostPort(listener.Addr().String())
 	n, _ := strconv.Atoi(port)
 	a := &Agent{config: Config{Rules: []Rule{{ID: 1, Host: host, TargetPort: n, Protocol: "tcp",
-		Route: "192.0.2.3,198.51.100.3,client,target,-,-"}}}}
-	for _, route := range []string{"192.0.2.3,198.51.100.3,client,target,-,-", "v2,198.18.0.7,198.51.100.3,target,-", "v2,198.18.0.7,-,-,-", ""} {
+		Route: "v2,192.0.2.3,198.51.100.3,target,-"}}}}
+	for _, route := range []string{"v2,192.0.2.3,198.51.100.3,target,-", "v2,198.18.0.7,198.51.100.3,target,-", "v2,198.18.0.7,-,-,-", ""} {
 		a.config.Rules[0].Route = route
 		result := a.query(M{"kind": "diagnose", "rule_id": 1})
 		if result["reachable"] != true {

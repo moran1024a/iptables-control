@@ -15,7 +15,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="0.5.3"
+VERSION="0.6.0-rc.1"
 REGISTRY="ghcr.io"
 MIRROR_REGISTRY="ghcr.nju.edu.cn"
 REPO="moran1024a/ictl-server"
@@ -174,9 +174,9 @@ for suffix in ("-wal", "-shm"):
 
 if [ -n "$OLD_NAME" ]; then
   case "$current" in
-    0.1.*|0.2.*) echo "升级会删除旧隧道记录及旧链路、转发配置；远端旧隧道服务请自行卸载。" ;;
-    0.3.*) echo "升级会保留节点、目标及其分组，清空旧链路、转发配置和运行历史；升级前自动备份数据库。" ;;
-    *) echo "升级前将备份数据库；0.4.x 的现有节点、目标、池和链路会保留。" ;;
+    0.5.3) echo "升级仅保留节点及其分组、账号和访问地址；清空目标、拓扑、配置、订阅和历史。旧规则在节点同步后清理。升级前自动备份数据库。" ;;
+    0.6.*) echo "升级前自动备份数据库。" ;;
+    *) die "请先升级到 0.5.3，再安装此版本。" ;;
   esac
   docker stop "$NAME" >/dev/null
   if ! docker rename "$NAME" "$OLD_NAME"; then

@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.5.1"
+VERSION="0.6.0-rc.1"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -212,7 +212,7 @@ sync_transaction() {
   if [ "$TARGET" = active ] && [[ "$URL" != https://* ]]; then die '主动 Agent 需要 HTTPS 同步地址'; return 1; fi
   FROM=none
   if [ -f "$LIB/agent-kind" ]; then read -r FROM < "$LIB/agent-kind"
-  elif [ -f "$UNIT" ] || [ -f "$LIB/config" ]; then FROM=legacy; fi
+  elif [ -f "$UNIT" ] || [ -f "$LIB/config" ]; then die '缺少 Agent 类型标识；请先升级到 0.5.3 后再迁移'; return 1; fi
   [ "${UPDATE_ONLY:-0}" != 1 ] || [ "$FROM" = "$TARGET" ] || { die '更新不能转换 Agent 类型；请使用 --sync 确认切换'; return 1; }
   rpc prepare || return 1
   OP="$(field op)" GEN="$(field generation)" HASH="$(field v)" NEW_VERSION="$(field version)"

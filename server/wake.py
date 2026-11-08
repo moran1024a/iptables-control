@@ -14,20 +14,6 @@ INTERVAL = 10
 ATTEMPTS = 3
 
 
-def migrate(conn):
-    if conn.execute("PRAGMA user_version").fetchone()[0] >= 402:
-        return
-    database.backup_database(conn, settings.DB_PATH + ".pre-0.4.0-rc.3.bak")
-    with conn:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("ALTER TABLE nodes ADD COLUMN wake_enabled INTEGER NOT NULL DEFAULT 0")
-        conn.execute("ALTER TABLE nodes ADD COLUMN wake_port INTEGER NOT NULL DEFAULT 0")
-        conn.execute(
-            "CREATE TABLE wake_jobs (\n            node_id INTEGER PRIMARY KEY, generation INTEGER NOT NULL, token TEXT NOT NULL,\n            started INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,\n            state TEXT NOT NULL DEFAULT 'waiting', error TEXT NOT NULL DEFAULT '')"
-        )
-        conn.execute("PRAGMA user_version=402")
-
-
 def eligible(node):
     return (
         node["wake_enabled"]
@@ -52,7 +38,8 @@ def queue(conn, node, now=None):
 
 def summary(conn, node):
     job = conn.execute(
-        "SELECT state,error,started,attempts,generation FROM wake_jobs WHERE node_id=?", (node["id"],)
+        "SELECT state,error,started,attempts,generation FROM wake_jobs WHERE node_id=?",
+        (node["id"],),
     ).fetchone()
     return dict(job) if job else None
 
@@ -90,17 +77,24 @@ class Monitor:
         outgoing = []
         for job in conn.execute("SELECT * FROM wake_jobs WHERE state='waiting'").fetchall():
             node = conn.execute("SELECT * FROM nodes WHERE id=?", (job["node_id"],)).fetchone()
-            if node is None or not eligible(node) or node["desired_generation"] != job["generation"]:
+            if (
+                node is None
+                or not eligible(node)
+                or node["desired_generation"] != job["generation"]
+            ):
                 conn.execute("DELETE FROM wake_jobs WHERE node_id=?", (job["node_id"],))
                 continue
             if now >= job["started"] + TIMEOUT:
                 error = "同步超时，等待手动同步"
                 conn.execute(
-                    "UPDATE wake_jobs SET state='timeout',error=? WHERE node_id=?", (error, node["id"])
+                    "UPDATE wake_jobs SET state='timeout',error=? WHERE node_id=?",
+                    (error, node["id"]),
                 )
                 lifecycle.add_event(conn, node["id"], error, now)
             elif job["attempts"] < ATTEMPTS and now >= job["started"] + job["attempts"] * INTERVAL:
-                conn.execute("UPDATE wake_jobs SET attempts=attempts+1 WHERE node_id=?", (node["id"],))
+                conn.execute(
+                    "UPDATE wake_jobs SET attempts=attempts+1 WHERE node_id=?", (node["id"],)
+                )
                 outgoing.append(
                     (
                         node["id"],
@@ -116,7 +110,9 @@ class Monitor:
         nid, host, port, data, token = item
         try:
             loop = asyncio.get_running_loop()
-            addresses = await asyncio.wait_for(loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM), 3)
+            addresses = await asyncio.wait_for(
+                loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM), 3
+            )
             sent, failure = (False, OSError("没有可用的节点地址"))
             for family, kind, proto, _, address in dict.fromkeys(addresses):
                 try:

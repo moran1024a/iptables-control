@@ -10,7 +10,7 @@ import lifecycle
 import database
 import errors
 import probes
-import pools
+import execution
 import settings
 import wake
 
@@ -21,7 +21,7 @@ class Hub:
         self.queries = {}
         self.quality = probes.Monitor(self)
         self.passive_wake = wake.Monitor(self)
-        self.pools = pools.Monitor(self)
+        self.execution = execution.Monitor(self)
 
     async def database(self, fn):
 
@@ -41,7 +41,9 @@ class Hub:
         if not auth.startswith("Bearer "):
             raise web.HTTPNotFound()
         key = auth[7:]
-        row = await self.database(lambda c: c.execute("SELECT * FROM nodes WHERE key=?", (key,)).fetchone())
+        row = await self.database(
+            lambda c: c.execute("SELECT * FROM nodes WHERE key=?", (key,)).fetchone()
+        )
         if row is None:
             raise web.HTTPNotFound()
         return dict(row)
@@ -75,8 +77,14 @@ class Hub:
         try:
             await session["send"]({"type": "query", "id": op, "query": body})
             result = await asyncio.wait_for(future, 32 if kind == "diagnose" else 12)
-            if kind == 'inventory' and isinstance(result.get('data'), dict) and 'interfaces' in result['data']:
-                await self.database(lambda c: agent_v3.save_snapshot(c, nid, 'inventory', result['data']))
+            if (
+                kind == "inventory"
+                and isinstance(result.get("data"), dict)
+                and "interfaces" in result["data"]
+            ):
+                await self.database(
+                    lambda c: agent_v3.save_snapshot(c, nid, "inventory", result["data"])
+                )
             return web.json_response(result)
         except asyncio.TimeoutError:
             return web.json_response({"error": "查询超时，请重试"}, status=504)
@@ -94,7 +102,11 @@ class Hub:
         except (ValueError, asyncio.TimeoutError, TypeError):
             await ws.close(code=1008)
             return ws
-        if not isinstance(hello, dict) or hello.get("type") != "hello" or hello.get("protocol") != 3:
+        if (
+            not isinstance(hello, dict)
+            or hello.get("type") != "hello"
+            or hello.get("protocol") != 3
+        ):
             await ws.close(code=1008)
             return ws
         nid = node["id"]
@@ -119,10 +131,12 @@ class Hub:
         await send({"type": "welcome", "heartbeat": 10, "timeout": 30})
         status = {
             "version": str(hello.get("version", ""))[:40],
-            "auto_update": bool(hello.get("auto_update")),
+            "auto_update": bool(hello.get("auto_update", node["auto_update"])),
             "generation": hello.get("generation", 0),
             "hash": hello.get("hash", ""),
-            "source_ip": api.source_address(request.remote or "", request.headers.get('X-Forwarded-For')),
+            "source_ip": api.source_address(
+                request.remote or "", request.headers.get("X-Forwarded-For")
+            ),
             "state": "ok",
         }
         await self.database(
@@ -147,17 +161,27 @@ class Hub:
                     return {"action": "revoked"}
                 if received:
                     agent_v3.packet(c, n, status=status, observe_only=True)
-                if n["desired_mode"] != "active" or n["manual_required"] or n["installed_agent"] != "active":
+                if (
+                    n["desired_mode"] != "active"
+                    or n["manual_required"]
+                    or n["installed_agent"] != "active"
+                ):
                     return {"action": "pause"}
                 if inflight is not None:
                     return {"action": "waiting"}
+                if status.get("auto_update") and agent_v3.newer(
+                    settings.COMPONENTS["active_agent"], status["version"]
+                ):
+                    return {"action": "update"}
                 if "held_ports" in status:
                     agent_v3.refresh_held_ports(c, n, status)
                 return agent_v3.packet(c, n, status=status, observe=False)
 
             result = await self.database(prepare)
             action = result.get("action")
-            if action == "apply":
+            if action == "update":
+                await send({"type": "update", "version": settings.COMPONENTS["active_agent"]})
+            elif action == "apply":
                 inflight = {k: result[k] for k in ("op", "generation", "hash")}
                 inflight["deadline"] = time.monotonic() + 600
                 await send({"type": "config", **result})
@@ -168,10 +192,6 @@ class Hub:
                 await send({"type": "blocked", "error": result.get("err", "")})
             elif action == "same":
                 await send({"type": "ready"})
-                if status.get("auto_update") and agent_v3.newer(
-                    settings.COMPONENTS["active_agent"], status["version"]
-                ):
-                    await send({"type": "update", "version": settings.COMPONENTS["active_agent"]})
 
         receive = wake = None
         try:
@@ -180,7 +200,9 @@ class Hub:
             wake = asyncio.create_task(session["wake"].wait())
             while not ws.closed and self.sessions.get(nid) is session:
                 timeout = max(0, inflight["deadline"] - time.monotonic()) if inflight else None
-                done, _ = await asyncio.wait((receive, wake), timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    (receive, wake), timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                )
                 if inflight and time.monotonic() >= inflight["deadline"]:
                     await ws.close(code=1011, message=b"configuration receipt timeout")
                     break
@@ -201,7 +223,9 @@ class Hub:
                 kind = data.get("type")
                 if kind == "quiesced":
                     await self.database(
-                        lambda c: c.execute("UPDATE nodes SET connection_state='paused' WHERE id=?", (nid,))
+                        lambda c: c.execute(
+                            "UPDATE nodes SET connection_state='paused' WHERE id=?", (nid,)
+                        )
                     )
                     break
                 if session["paused"]:
@@ -211,13 +235,22 @@ class Hub:
                     status.update(
                         {
                             k: data[k]
-                            for k in ("generation", "hash", "state", "error", "auto_update", "held_ports")
+                            for k in (
+                                "generation",
+                                "hash",
+                                "state",
+                                "error",
+                                "auto_update",
+                                "held_ports",
+                            )
                             if k in data
                         }
                     )
                     await reconcile(received=True)
                 elif kind == "apply_result":
-                    if not inflight or any(data.get(k) != inflight[k] for k in ("op", "generation", "hash")):
+                    if not inflight or any(
+                        data.get(k) != inflight[k] for k in ("op", "generation", "hash")
+                    ):
                         await send({"type": "apply_ack", "id": data.get("op"), "result": "expired"})
                         receive = asyncio.create_task(ws.receive())
                         continue
@@ -242,9 +275,13 @@ class Hub:
                     elif result.get("result") != "failed":
                         await reconcile()
                 elif kind in ("metrics", "inventory", "ports"):
-                    await self.database(lambda c: agent_v3.save_snapshot(c, nid, kind, data.get("data")))
+                    await self.database(
+                        lambda c: agent_v3.save_snapshot(c, nid, kind, data.get("data"))
+                    )
                 elif kind == "traffic":
-                    result = await self.database(lambda c: agent_v3.accept_traffic(c, nid, data.get("data")))
+                    result = await self.database(
+                        lambda c: agent_v3.accept_traffic(c, nid, data.get("data"))
+                    )
                     await send({"type": "traffic_ack", "id": data.get("id"), "data": result})
                 elif kind == "quality_listener":
                     if data.get("id") == session.get("quality_setup_id"):
@@ -280,7 +317,9 @@ class Hub:
 def create_app():
     conn = database.db()
     try:
-        panel_path, sync_path = database.setting(conn, "panel_path"), database.setting(conn, "sync_path")
+        panel_path, sync_path = database.setting(conn, "panel_path"), database.setting(
+            conn, "sync_path"
+        )
     finally:
         conn.close()
     hub = Hub()
@@ -294,7 +333,9 @@ def create_app():
             path, digest = agent_v3.artifact(request.match_info["name"])
         except errors.UserError as exc:
             raise web.HTTPNotFound(text=str(exc)) from exc
-        return web.FileResponse(path, headers={"X-Content-SHA256": digest, "Cache-Control": "no-store"})
+        return web.FileResponse(
+            path, headers={"X-Content-SHA256": digest, "Cache-Control": "no-store"}
+        )
 
     async def final_traffic(request):
         node = await hub.authenticate(request)
@@ -373,12 +414,12 @@ def create_app():
     async def start(_app):
         hub.quality.task = asyncio.create_task(hub.quality.run())
         hub.passive_wake.task = asyncio.create_task(hub.passive_wake.run())
-        hub.pools.task = asyncio.create_task(hub.pools.run())
+        hub.execution.task = asyncio.create_task(hub.execution.run())
 
     async def shutdown(_app):
-        if hub.pools.task:
-            hub.pools.task.cancel()
-            await asyncio.gather(hub.pools.task, return_exceptions=True)
+        if hub.execution.task:
+            hub.execution.task.cancel()
+            await asyncio.gather(hub.execution.task, return_exceptions=True)
         if hub.passive_wake.task:
             hub.passive_wake.task.cancel()
             await asyncio.gather(hub.passive_wake.task, return_exceptions=True)
@@ -386,7 +427,10 @@ def create_app():
             hub.quality.task.cancel()
             await asyncio.gather(hub.quality.task, return_exceptions=True)
         await asyncio.gather(
-            *(x["ws"].close(code=1001, message=b"server shutdown") for x in list(hub.sessions.values()))
+            *(
+                x["ws"].close(code=1001, message=b"server shutdown")
+                for x in list(hub.sessions.values())
+            )
         )
 
     app.router.add_get(prefix + "/ws", hub.websocket)

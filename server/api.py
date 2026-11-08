@@ -120,7 +120,7 @@ class Request:
             if method != "GET" and (not self.headers.get("Content-Type", "").startswith("application/json")):
                 self.close_connection = True
                 return self.send_json(400, {"error": "请求格式错误"})
-            limit = 1024 * 1024 if route == "topology-preview" or route == "topology" or re.fullmatch(r"topology/\d+", route) else settings.MAX_API_BODY
+            limit = 1024 * 1024 if route == "topology-preview" or route == "topologies" or re.fullmatch(r"topologies/\d+", route) else settings.MAX_API_BODY
             body = self.read_json(limit) if method != "GET" else {}
             if route == "login" and method == "POST":
                 return authentication.api_login(self, conn, body)
@@ -157,51 +157,19 @@ class Request:
                 }.get(method)
             elif len(parts) == 3 and parts[0] == "nodes" and parts[1].isdigit() and (parts[2] == "rekey"):
                 handler = {"POST": self.resources.api_node_rekey}.get(method)
-            elif parts in (["configs"], ["chains"]):
-                handler = {"GET": self.resources.api_configs, "POST": self.resources.api_config_save}.get(
-                    method
-                )
-            elif len(parts) == 2 and parts[0] in ("configs", "chains") and parts[1].isdigit():
-                handler = {
-                    "PATCH": self.resources.api_config_save,
-                    "DELETE": self.resources.api_chain_del,
-                }.get(method)
+            elif parts == ["configs"]:
+                handler = {"GET": self.resources.api_configs}.get(method)
             elif len(parts) == 3 and parts[0] == 'configs' and parts[1].isdigit() and parts[2] == 'name':
                 handler = {'PATCH': self.resources.api_config_rename}.get(method)
-            elif parts == ["routes"]:
-                handler = {"GET": self.resources.api_routes, "POST": self.resources.api_route_save}.get(
-                    method
-                )
-            elif parts == ["topology"]:
-                handler = {"POST": self.resources.api_graph_save}.get(method)
-            elif len(parts) == 2 and parts[0] == "topology" and parts[1].isdigit():
-                handler = {"POST": self.resources.api_graph_save}.get(method)
+            elif parts == ["topologies"]:
+                handler = {"GET": self.resources.api_topologies, "POST": self.resources.api_topology_save}.get(method)
             elif parts == ["topology-preview"]:
-                handler = {"POST": self.resources.api_graph_preview}.get(method)
-            elif parts in (["pools"], ["links"]):
-                handler = {
-                    "GET": self.resources.api_pool_list,
-                    "POST": self.resources.api_pool_save
-                    if parts[0] == "pools"
-                    else self.resources.api_link_save,
-                }.get(method)
-            elif len(parts) == 2 and parts[0] in ("pools", "links") and parts[1].isdigit():
-                handler = (
-                    {"PATCH": self.resources.api_pool_save, "DELETE": self.resources.api_pool_delete}
-                    if parts[0] == "pools"
-                    else {
-                        "GET": self.resources.api_link_get,
-                        "PATCH": self.resources.api_link_save,
-                        "DELETE": self.resources.api_link_delete,
-                    }
-                ).get(method)
-            elif len(parts) == 3 and parts[0] == "links" and parts[1].isdigit() and (parts[2] == "action"):
-                handler = {"POST": self.resources.api_link_action}.get(method)
-            elif len(parts) == 2 and parts[0] == "routes" and parts[1].isdigit():
-                handler = {
-                    "PATCH": self.resources.api_route_save,
-                    "DELETE": self.resources.api_route_del,
-                }.get(method)
+                handler = {"POST": self.resources.api_topology_preview}.get(method)
+            elif len(parts) == 2 and parts[0] == "topologies" and parts[1].isdigit():
+                handler = {"GET": self.resources.api_topology_get, "POST": self.resources.api_topology_save,
+                           "DELETE": self.resources.api_topology_delete}.get(method)
+            elif len(parts) == 3 and parts[0] == "topologies" and parts[1].isdigit() and parts[2] == "action":
+                handler = {"POST": self.resources.api_topology_action}.get(method)
             elif parts == ["targets"]:
                 handler = {"GET": self.resources.api_targets, "POST": self.resources.api_target_save}.get(
                     method

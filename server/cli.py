@@ -4,7 +4,6 @@ import os
 import shutil
 import sqlite3
 import sys
-import agent_files
 import database
 import errors
 import migrations
@@ -32,7 +31,6 @@ def cmd_serve(args):
     if sqlite3.sqlite_version_info < (3, 35, 0):
         raise errors.UserError("需要 SQLite 3.35 或以上版本")
     conn = migrations.init_db()
-    agent_files.load_agent()
 
     host, _, port = args.listen.rpartition(":")
     print(f"ictl-server {settings.VERSION} 监听 {args.listen}", flush=True)

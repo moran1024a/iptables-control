@@ -10,7 +10,6 @@ manifest = json.loads((root / "server/components.json").read_text())
 checks = [
     ("server/settings.py", r'^VERSION = "([^"]+)"', manifest["server"]),
     ("deploy/install-server.sh", r'^VERSION="([^"]+)"', manifest["server"]),
-    ("agent/ictl.sh", r'^VERSION="([^"]+)"', manifest["forward_agent"]),
     ("agent/passive.sh", r'^VERSION="([^"]+)"', manifest["passive_agent"]),
     ("agent/manage.sh", r'^VERSION="([^"]+)"', manifest["manager"]),
     ("agent/active/model.go", r'^const version = "([^"]+)"', manifest["active_agent"]),

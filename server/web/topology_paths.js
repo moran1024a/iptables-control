@@ -2,12 +2,10 @@
 let graphRouteCache=null,graphConnectionCache=null,graphHintRequest=0,graphHintTimer=null;
 
 function graphRoutes(link) {
-  if(link?.selection_mode==='independent')return (link.configurations||[]).flatMap(c=>[
-    {id:c.id,entry:c.entry,target:c.target,path:c.active_path||[],pending:false,state:c.state},
-    {id:c.id,entry:c.entry,target:c.target,path:c.pending_path||[],pending:true,state:c.state}
+  return (link?.configurations||[]).flatMap(c=>[
+    {id:c.id,entry:c.entry,target:c.target,path:c.active_path||[],graph:c.active_graph,pending:false,state:c.state},
+    {id:c.id,entry:c.entry,target:c.target,path:c.pending_path||[],graph:c.pending_graph,pending:true,state:c.state}
   ]).filter(r=>r.path.length>1);
-  return [link?.active_path||[],link?.job?.plan?.graph_path||[]].flatMap((path,i)=>
-    path.length>1?[{id:link.id,entry:path[0],target:path.at(-1),path,pending:!!i,state:link.state}]:[]);
 }
 
 function graphEntryColors(g) {
@@ -23,7 +21,7 @@ function graphEntryColors(g) {
 
 function graphEntryLegend(g) {
   const colors=graphEntryColors(g);
-  return g.vertices.filter(v=>v.kind==='entry').map(v=>`<button class="graph-entry-chip" data-action="graph-select" data-id="${esc(v.id)}" data-entry="${esc(v.id)}" style="--route-color:${colors.get(v.id)}" title="从 ${esc(graphName(v))} 选择线路"><i></i>${esc(graphName(v))}</button>`).join('');
+  return g.vertices.filter(v=>v.kind==='entry'&&!v.runtime_only).map(v=>`<button class="graph-entry-chip" data-action="graph-select" data-id="${esc(v.id)}" data-entry="${esc(v.id)}" style="--route-color:${colors.get(v.id)}" title="从 ${esc(graphName(v))} 选择线路"><i></i>${esc(graphName(v))}</button>`).join('');
 }
 
 function graphEntryMarks(g,link,id) {
@@ -90,21 +88,25 @@ function graphConnectionRoutes(g,boxes,editing=true) {
 
 function graphRuntimeLines(g,link,boxes) {
   const routes=graphRoutes(link),colors=graphEntryColors(g),entries=[...colors.keys()];
-  if(graphSession?.kind==='choose'&&graphSession.prefix.length>1)routes.push({id:'preview',entry:graphSession.prefix[0],path:graphSession.prefix,pending:true});
+  if(graphSession?.kind==='choose'&&graphSession.prefix.length>1)routes.push({id:'preview',entry:graphSession.prefix[0],path:graphSession.prefix,graph:graphSession.graph,pending:true});
   const flowing=new Set();
   for(const r of routes){
     if(r.pending||r.state==='deleting'||!r.path.every(id=>{
-      const v=g.vertices.find(v=>v.id===id),node=poolView.nodes.find(n=>n.id===v?.node_id);
+      const v=g.vertices.find(v=>v.id===id),node=canvasView.nodes.find(n=>n.id===v?.node_id);
       return v&&!v.disabled&&(!v.node_id||node&&!['offline','error','skew','deleting','new'].includes(node.status));
     }))continue;
     for(let i=1;i<r.path.length;i++)flowing.add(JSON.stringify([r.entry,r.path[i-1],r.path[i]]));
   }
   const spans=new Map();
-  const live=new Set(routes.filter(r=>!r.pending).flatMap(r=>r.path.slice(1).map((b,i)=>JSON.stringify([r.entry,r.path[i],b]))));
+  const binding=(r,a,b)=>{
+    const graph=r.graph||g;
+    return ['from','to'].map((side,i)=>graph.bindings?.[`${a}/${b}`]?.[side]?.[i?b:a]||'');
+  };
+  const live=new Set(routes.filter(r=>!r.pending).flatMap(r=>r.path.slice(1).map((b,i)=>JSON.stringify([r.entry,r.path[i],b,...binding(r,r.path[i],b)]))));
   for(const r of routes)for(let i=1;i<r.path.length;i++){
-    const a=r.path[i-1],b=r.path[i],key=JSON.stringify([r.entry,a,b,r.pending]);
-    if(r.pending&&live.has(JSON.stringify([r.entry,a,b])))continue;
-    if(boxes.has(a)&&boxes.has(b))spans.set(key,{a,b,entry:r.entry,pending:r.pending});
+    const a=r.path[i-1],b=r.path[i],addresses=binding(r,a,b),key=JSON.stringify([r.entry,a,b,...addresses,r.pending]);
+    if(r.pending&&live.has(JSON.stringify([r.entry,a,b,...addresses])))continue;
+    if(boxes.has(a)&&boxes.has(b))spans.set(key,{a,b,addresses,entry:r.entry,pending:r.pending});
   }
   const list=[...spans.values()].sort((a,b)=>entries.indexOf(a.entry)-entries.indexOf(b.entry)||Number(a.pending)-Number(b.pending)||a.a.localeCompare(b.a)||a.b.localeCompare(b.b));
   // Port rows use the live address inventory, not only the published snapshot.
@@ -117,7 +119,7 @@ function graphRuntimeLines(g,link,boxes) {
     for(const span of list){
       const edge=[span.a,span.b];
       for(const [side,id] of [['out',span.a],['in',span.b]]){
-        const vertex=g.vertices.find(v=>v.id===id),address=graphPortAddress(g,vertex,side,edge);
+        const address=span.addresses[side==='out'?0:1];
         const key=JSON.stringify([id,side,address]);
         if(!ports.has(key))ports.set(key,[]);
         ports.get(key).push({span,side,point:graphPortPoint(g,id,side,address,boxes)});
@@ -163,25 +165,25 @@ function graphRuntimeLines(g,link,boxes) {
 }
 
 function graphRouteStatus(g,link) {
-  if(link?.selection_mode!=='independent')return '';
+  if(!link?.configurations?.length)return '';
   const colors=graphEntryColors(g),name=id=>graphName(g.vertices.find(v=>v.id===id));
-  const rows=link.configurations.map(c=>`<div class="graph-route-status" data-config-route="${c.id}"><span><i class="graph-entry-dot" style="background:${colors.get(c.entry)}"></i>${esc(name(c.entry))} → ${esc(name(c.target))}</span><span class="graph-route-description" title="${esc(c.active_path.map(name).join(' → '))}">${esc(c.active_path.slice(1,-1).map(name).join(' → ')||'direct')}</span>${linkState(c)}${c.error?`<small>${esc(c.error)}</small>`:''}</div>`).join('');
+  const rows=link.configurations.map(c=>`<div class="graph-route-status" data-config-route="${c.id}"><span><i class="graph-entry-dot" style="background:${colors.get(c.entry)}"></i>${esc(name(c.entry))} → ${esc(name(c.target))}</span><span class="graph-route-description" title="${esc(c.active_path.map(name).join(' → '))}">${esc(c.active_path.length?(c.active_path.slice(1,-1).map(name).join(' → ')||'direct'):'等待生效')}</span>${linkState(c)}${c.error?`<small>${esc(c.error)}</small>`:''}</div>`).join('');
   return detailsBlock('graph-paths-'+link.id,'路径状态',rows);
 }
 
 function graphQuickHint(id) {
   clearTimeout(graphHintTimer);const token=++graphHintRequest;
-  if(rendering||graphSession||poolView.link?.selection_mode!=='independent'||poolView.link.job&&poolView.link.job.kind!=='switch')return;
+  if(rendering||graphSession||!canvasView.link||canvasView.link.state==='deleting')return;
   const hint=app.querySelector('[data-route-hint]');if(hint)hint.textContent='';
   if(!id)return;
-  const link=poolView.link,page=pageVersion;
-  const vertex=poolView.link.active_graph?.vertices.find(v=>v.id===id);
-  if(!vertex||!['node','direct'].includes(vertex.kind))return;
+  const link=canvasView.link,page=pageVersion;
+  const vertex=link.graph.vertices.find(v=>v.id===id);
+  if(!vertex||vertex.kind!=='node')return;
   graphHintTimer=setTimeout(async()=>{
     try{
-      const result=await api('POST','topology-preview',{id:poolView.link.id,graph:poolView.link.active_graph,required:[id]});
-      if(token!==graphHintRequest||graphSession||page!==pageVersion||poolView.link!==link||!hint?.isConnected)return;
-      const changed=result.paths.filter(p=>!p.unchanged),entries=[...new Set(changed.map(p=>p.entry))],targets=[...new Set(changed.map(p=>p.target))],g=poolView.link.active_graph;
+      const result=await api('POST','topology-preview',{id:link.id,graph:link.graph,required:[id]});
+      if(token!==graphHintRequest||graphSession||page!==pageVersion||canvasView.link!==link||!hint?.isConnected)return;
+      const changed=result.paths.filter(p=>!p.unchanged),entries=[...new Set(changed.map(p=>p.entry))],targets=[...new Set(changed.map(p=>p.target))],g=link.graph;
       const names=ids=>ids.map(id=>graphName(g.vertices.find(v=>v.id===id))).join('、');
       if(hint)hint.textContent=changed.length?`可切换 ${changed.length} 个配置：${names(entries)} → ${names(targets)}`:result.paths.length?'已使用当前路径':result.skipped?.[0]?.reason||'没有可切换的配置';
     }catch(_){/* Hover is optional; clicking still performs authoritative validation. */}

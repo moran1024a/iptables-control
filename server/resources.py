@@ -1,7 +1,6 @@
 import json
 import re
 import time
-import agent_files
 import agent_v3
 import database
 import errors
@@ -11,9 +10,9 @@ import network_quality
 import node_state
 import node_addresses
 import node_sync
-import pools
+import configurations
+import execution
 import topology
-import topology_groups
 import security
 import settings
 import subscriptions
@@ -64,7 +63,12 @@ class Resources:
             {**self.node_brief(conn, n, now), "bar": node_state.node_bar(conn, n, now)}
             for n in conn.execute(database.ordered(table)).fetchall()
         ]
-        return {"now": now, "kind": kind, "groups": database.get_groups(conn, table), "nodes": nodes}
+        return {
+            "now": now,
+            "kind": kind,
+            "groups": database.get_groups(conn, table),
+            "nodes": nodes,
+        }
 
     @node_sync.track_mutation
     def api_node_add(self, conn, body):
@@ -72,8 +76,6 @@ class Resources:
         note = validation.check_note(body.get("note"))
         addr = validation.check_host(body.get("addr"), "addr")
         ports = validation.format_ports(validation.parse_ports(body.get("ports", "10000-65535")))
-        if "heartbeat_interval" in body or "tunnel_heartbeat" in body:
-            raise errors.UserError("新版只支持主动／被动同步模式")
         kind = body.get("kind", "forward")
         table = database.node_table(kind)
         group_id = database.check_group(conn, table, body.get("group_id"))
@@ -89,7 +91,8 @@ class Resources:
             raise errors.UserError("模式必须为主动或被动", "desired_mode")
         if mode == "passive":
             conn.execute(
-                "UPDATE nodes SET desired_mode='passive',manual_required=1 WHERE id=?", (cur.lastrowid,)
+                "UPDATE nodes SET desired_mode='passive',manual_required=1 WHERE id=?",
+                (cur.lastrowid,),
             )
         quality_port = (
             validation.check_port(body.get("quality_port", network_quality.PORT), "quality_port")
@@ -97,7 +100,9 @@ class Resources:
             else 0
         )
         conn.execute("UPDATE nodes SET quality_port=? WHERE id=?", (quality_port, cur.lastrowid))
-        node_addresses.save(conn, database.get_node(conn, cur.lastrowid), body.get("addresses", []), addr=addr)
+        node_addresses.save(
+            conn, database.get_node(conn, cur.lastrowid), body.get("addresses", []), addr=addr
+        )
         self.set_wake(conn, body, database.get_node(conn, cur.lastrowid), mode)
         return {"id": cur.lastrowid}
 
@@ -115,28 +120,22 @@ class Resources:
             if port in forwarding.reserved(conn, node["id"]):
                 raise errors.UserError("唤醒端口已被链路占用或等待清理", "wake_port")
             if conn.execute(
-                "SELECT 1 FROM hops WHERE node_id=? AND port=? UNION ALL SELECT 1 FROM retired_ports WHERE node_id=? AND port=?",
+                "SELECT 1 FROM rules WHERE node_id=? AND port=? UNION ALL SELECT 1 FROM retired_ports WHERE node_id=? AND port=?",
                 (node["id"], port, node["id"], port),
             ).fetchone():
                 raise errors.UserError("唤醒端口已被转发配置占用或正在等待释放", "wake_port")
         conn.execute(
-            "UPDATE nodes SET wake_enabled=?,wake_port=? WHERE id=?", (int(enabled), port, node["id"])
+            "UPDATE nodes SET wake_enabled=?,wake_port=? WHERE id=?",
+            (int(enabled), port, node["id"]),
         )
 
     def api_node_get(self, conn, body, node_id):
         now = int(time.time())
         n = database.get_node(conn, node_id)
-        chain_sort = {r["id"]: i for i, r in enumerate(conn.execute(database.ordered("chains")))}
-        rules = sorted(forwarding.node_rule_rows(conn, n), key=lambda r: (chain_sort[r["chain_id"]], r["id"]))
-        chains = conn.execute(
-            database.ordered("chains", "WHERE t.id IN (SELECT chain_id FROM hops WHERE node_id = ?)"),
-            (node_id,),
-        ).fetchall()
-        names = {r['chain_id']: r['config_name'] for r in conn.execute(
-            "SELECT chain_id,config_name FROM links WHERE chain_id IS NOT NULL AND config_name<>''")}
-        for rule in rules:
-            rule['chain_remark'] = names.get(rule['chain_id'], rule['chain_remark'])
-        group = conn.execute("SELECT name FROM item_groups WHERE id = ?", (n["group_id"],)).fetchone()
+        rules = forwarding.node_rule_rows(conn, n)
+        group = conn.execute(
+            "SELECT name FROM item_groups WHERE id = ?", (n["group_id"],)
+        ).fetchone()
         events = conn.execute(
             "SELECT ts, text FROM events WHERE node_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
             (node_id, settings.EVENTS_SHOWN),
@@ -145,10 +144,9 @@ class Resources:
             "now": now,
             "sync_path": database.setting(conn, "sync_path"),
             "public_url": database.setting(conn, "public_url", ""),
-            "agent_url": settings.AGENT_URL,
             "version": settings.VERSION,
             "forward_version": settings.COMPONENTS.get(
-                n["installed_agent"] + "_agent", settings.FORWARD_VERSION
+                n["desired_mode"] + "_agent", settings.VERSION
             ),
             "installer_url": f"https://github.com/{settings.REPO}/releases/download/v{settings.VERSION}/install-agent.sh",
             "telemetry": agent_v3.telemetry(conn, node_id),
@@ -166,14 +164,18 @@ class Resources:
                 "state": n["state"],
                 "err": n["err"],
                 "group": group["name"],
-                "agent_update": agent_files.agent_update(n["agent"], n["auto_update"])
-                if n["installed_agent"] == "legacy"
-                else "pending"
-                if agent_v3.newer(settings.COMPONENTS[n["installed_agent"] + "_agent"], n["agent"])
-                else "same",
+                "agent_update": (
+                    "pending"
+                    if agent_v3.newer(
+                        settings.COMPONENTS[n["desired_mode"] + "_agent"], n["agent"] or "0.0.0"
+                    )
+                    else "same"
+                ),
             },
             "rules": rules,
-            "chains": [{"id": c["id"], "remark": names.get(c['id'], c["remark"])} for c in chains],
+            "configs": [
+                dict(id=r["configuration_id"], name=r["configuration_name"]) for r in rules
+            ],
             "events": [dict(e) for e in events],
         }
 
@@ -181,33 +183,39 @@ class Resources:
     def api_node_edit(self, conn, body, node_id):
         n = database.get_node(conn, node_id)
         table = database.node_table(n["kind"])
-        if "heartbeat_interval" in body or "tunnel_heartbeat" in body:
-            raise errors.UserError("新版只支持主动／被动同步模式")
         if "kind" in body and body["kind"] != n["kind"]:
             raise errors.UserError("节点类型不能修改", "kind")
-        name = validation.check_remark(body["name"], "name", "名称") if "name" in body else n["name"]
+        name = (
+            validation.check_remark(body["name"], "name", "名称") if "name" in body else n["name"]
+        )
         note = validation.check_note(body["note"]) if "note" in body else n["note"]
         addr = validation.check_host(body["addr"], "addr") if "addr" in body else n["addr"]
         if "addresses" in body:
-            addr = node_addresses.save(conn, n, body["addresses"], addr=addr if "addr" in body else None)
+            addr = node_addresses.save(
+                conn, n, body["addresses"], addr=addr if "addr" in body else None
+            )
         elif addr != n["addr"]:
             addresses = node_addresses.listing(conn, n)
             if not addresses:
                 addresses = node_addresses.primary_values([], addr)
             else:
-                primary = next(a for a in addresses if a.get('primary'))
-                primary.update(host=addr, local='', device='', gateway='')
+                primary = next(a for a in addresses if a.get("primary"))
+                primary.update(host=addr, local="", device="", gateway="")
             addr = node_addresses.save(conn, n, addresses, addr=addr)
         ranges = (
-            validation.parse_ports(body["ports"]) if "ports" in body else validation.parse_ports(n["ports"])
+            validation.parse_ports(body["ports"])
+            if "ports" in body
+            else validation.parse_ports(n["ports"])
         )
         group_id = (
-            database.check_group(conn, table, body["group_id"]) if "group_id" in body else n["group_id"]
+            database.check_group(conn, table, body["group_id"])
+            if "group_id" in body
+            else n["group_id"]
         )
         outside = [
             r
             for r in conn.execute(
-                "SELECT c.remark, h.port FROM hops h JOIN chains c ON c.id = h.chain_id\n               WHERE h.node_id = ? ORDER BY h.port",
+                "SELECT c.name AS remark, r.port FROM rules r JOIN configurations c ON c.id=r.configuration_id WHERE r.node_id=? ORDER BY r.port",
                 (node_id,),
             )
             if not validation.in_ports(r["port"], ranges)
@@ -223,24 +231,19 @@ class Resources:
                 f"以下转发使用的端口不在新的允许范围内：{used}。请先修改这些转发。", "ports"
             )
         mode = body.get("desired_mode", n["desired_mode"])
-        extra_ports = [p for p in forwarding.reserved(conn, node_id) if not validation.in_ports(p, ranges)]
+        extra_ports = [
+            p for p in forwarding.reserved(conn, node_id) if not validation.in_ports(p, ranges)
+        ]
         if extra_ports:
             raise errors.UserError(
                 "链路使用或待清理的端口不在新范围内：" + ",".join(map(str, extra_ports)), "ports"
             )
         if mode not in ("active", "passive"):
             raise errors.UserError("模式必须为主动或被动", "desired_mode")
-        if mode != n["desired_mode"] and mode == "passive":
-            refs = [
-                p["name"] for p in conn.execute("SELECT * FROM pools") if p["id"] not in topology.archived_pools(conn) and node_id in json.loads(p["members"])
-            ]
-            refs.extend(topology.references(conn, node_id, pools_only=True))
-            if refs:
-                raise errors.UserError("请先将节点从池中移除：" + "、".join(refs), "desired_mode")
-        if mode != n["desired_mode"] and n["first_seen"] and (n["protocol_version"] < 2):
-            raise errors.UserError("请先升级节点 Agent 并完成一次同步，再切换模式", "desired_mode")
         quality_port = body.get("quality_port", n["quality_port"])
-        quality_port = validation.check_port(quality_port, "quality_port") if quality_port != 0 else 0
+        quality_port = (
+            validation.check_port(quality_port, "quality_port") if quality_port != 0 else 0
+        )
         if (
             quality_port
             and quality_port != n["quality_port"]
@@ -251,7 +254,9 @@ class Resources:
         self.set_wake(conn, body, n, mode)
         key = None
         if mode != n["desired_mode"]:
-            conn.execute("UPDATE nodes SET desired_mode=?,manual_required=1 WHERE id=?", (mode, node_id))
+            conn.execute(
+                "UPDATE nodes SET desired_mode=?,manual_required=1 WHERE id=?", (mode, node_id)
+            )
             lifecycle.add_event(conn, node_id, "同步模式已修改，等待本机手动同步确认")
         conn.execute(
             f"UPDATE {table} SET name = ?, note = ?, addr = ?, ports = ? WHERE id = ?",
@@ -261,13 +266,10 @@ class Resources:
             database.move_group(conn, table, node_id, group_id)
         if addr != n["addr"]:
             lifecycle.add_event(conn, node_id, f"主地址 {n['addr']} → {addr}")
-            for r in conn.execute(
-                "SELECT h.chain_id, h.node_id FROM hops h\n                       JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1\n                       WHERE h2.node_id = ? AND NOT EXISTS (SELECT 1 FROM rule_routes rr WHERE rr.rule_id=h.id)",
-                (node_id,),
-            ).fetchall():
-                lifecycle.mark_pending(conn, r["chain_id"], [r["node_id"]])
-            pools.refresh_links(conn, node=node_id)
-        return {"key": key, "upstream": node_state.upstream_nodes(conn, node_id) if addr != n['addr'] else []}
+        return {
+            "key": key,
+            "upstream": node_state.upstream_nodes(conn, node_id) if addr != n["addr"] else [],
+        }
 
     @node_sync.track_mutation
     def api_node_rekey(self, conn, body, node_id):
@@ -281,21 +283,14 @@ class Resources:
     def api_node_del(self, conn, body, node_id):
         n = database.get_node(conn, node_id)
         table = database.node_table(n["kind"])
-        pool_refs = pools.node_references(conn, node_id)
-        if pool_refs:
-            raise errors.UserError("节点仍被引用：" + "、".join(pool_refs), status=409)
-        used = [
-            r[0]
-            for r in conn.execute(
-                "SELECT DISTINCT c.remark FROM hops h JOIN chains c ON c.id = h.chain_id\n               WHERE h.node_id = ? ORDER BY c.id",
-                (node_id,),
-            )
-        ]
-        for r in conn.execute("SELECT name, node_ids FROM routes"):
-            if node_id in json.loads(r["node_ids"]):
-                used.append("链路：" + r["name"])
+        used = topology.references(conn, node_id)
         if used:
-            raise errors.UserError(f"节点仍被转发使用：{'、'.join(used)}。请先删除或修改这些转发。")
+            raise errors.UserError("节点仍被引用：" + "、".join(used), status=409)
+        if conn.execute(
+            "SELECT 1 FROM rules WHERE node_id=? UNION SELECT 1 FROM retirements WHERE node_id=?",
+            (node_id, node_id),
+        ).fetchone():
+            raise errors.UserError("节点仍有待清理的转发，请完成同步后删除", status=409)
         force = self.query.get("force") == ["1"]
         if force or not n["first_seen"]:
             lifecycle.delete_node(conn, node_id)
@@ -305,92 +300,6 @@ class Resources:
             lifecycle.add_event(conn, node_id, "开始删除，等待节点清空规则")
         return {"deleted": False}
 
-    def api_chains(self, conn, body):
-        now = int(time.time())
-        nodes = {n["id"]: n for n in conn.execute("SELECT * FROM nodes").fetchall()}
-        status = {nid: node_state.node_status(conn, n, now) for nid, n in nodes.items()}
-        node_info = lambda nid: {
-            "node_id": nid,
-            "name": nodes[nid]["name"],
-            "status": status[nid],
-            "desired_mode": nodes[nid]["desired_mode"],
-            "err": nodes[nid]["err"],
-            "wake_enabled": bool(nodes[nid]["wake_enabled"]),
-            "wake": wake.summary(conn, nodes[nid]),
-        }
-        chains = []
-        for c in conn.execute(database.ordered("chains")).fetchall():
-            hops = [
-                {**node_info(h["node_id"]), "addr": nodes[h["node_id"]]["addr"], "port": h["port"]}
-                for h in conn.execute("SELECT * FROM hops WHERE chain_id = ? ORDER BY seq", (c["id"],))
-            ]
-            pending = [
-                node_info(r["node_id"])
-                for r in conn.execute(
-                    "SELECT node_id FROM chain_pending WHERE chain_id = ? ORDER BY node_id", (c["id"],)
-                )
-            ]
-            target = database.get_target(conn, c["target_id"])
-            chains.append(
-                {
-                    "id": c["id"],
-                    "remark": c["remark"],
-                    "target_host": target["host"],
-                    "target_port": target["port"],
-                    "deleting": bool(c["deleting"]),
-                    "group_id": c["group_id"],
-                    "hops": hops,
-                    "pending": pending,
-                }
-            )
-        node_list = [
-            {"id": n["id"], "name": n["name"], "group_id": n["group_id"]}
-            for n in conn.execute(database.ordered("nodes")).fetchall()
-        ]
-        return {
-            "chains": chains,
-            "groups": database.get_groups(conn, "chains"),
-            "nodes": node_list,
-            "node_groups": database.get_groups(conn, "nodes"),
-        }
-
-    @node_sync.track_mutation
-    def api_chain_del(self, conn, body, chain_id):
-        chain = database.get_chain(conn, chain_id)
-        link = conn.execute("SELECT id FROM links WHERE chain_id=? AND managed=1", (chain_id,)).fetchone()
-        if link:
-            if conn.execute('SELECT 1 FROM link_members WHERE link_id=?', (link['id'],)).fetchone():
-                raise errors.UserError('请在拓扑中移除对应入口或目标')
-            return pools.delete_link(conn, link["id"])
-        force = self.query.get("force") == ["1"]
-        if force:
-            for h in conn.execute(
-                "SELECT node_id, port FROM hops WHERE chain_id = ?", (chain_id,)
-            ).fetchall():
-                forwarding.reserve_removed(conn, h["node_id"], h["port"])
-            lifecycle.delete_chain(conn, chain_id)
-            return {"deleted": True}
-        conn.execute(
-            "DELETE FROM chain_pending WHERE chain_id = ? AND node_id NOT IN\n                        (SELECT id FROM nodes WHERE first_seen IS NOT NULL)",
-            (chain_id,),
-        )
-        if not chain["deleting"]:
-            conn.execute("UPDATE chains SET deleting = 1 WHERE id = ?", (chain_id,))
-            lifecycle.mark_pending(
-                conn,
-                chain_id,
-                [
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT h.node_id FROM hops h JOIN nodes n ON n.id = h.node_id\n                   WHERE h.chain_id = ? AND n.first_seen IS NOT NULL",
-                        (chain_id,),
-                    )
-                ],
-            )
-        lifecycle.finish_deleted_chains(conn)
-        deleted = not conn.execute("SELECT 1 FROM chains WHERE id = ?", (chain_id,)).fetchone()
-        return {"deleted": deleted}
-
     def api_subscriptions(self, conn, body):
         return subscriptions.listing(conn)
 
@@ -398,16 +307,17 @@ class Resources:
         return subscriptions.save(conn, body, ident)
 
     def api_subscription_delete(self, conn, body, ident):
-        pools.get(conn, "subscriptions", ident)
+        subscriptions.get(conn, ident)
         conn.execute("DELETE FROM subscriptions WHERE id=?", (ident,))
         return {"deleted": True}
 
     def api_order(self, conn, body, kind):
         """保存顺序：groups 为分组顺序，ids 为全部对象按显示顺序排列（只能在组内调整，不改变所属分组）。"""
         groups, ids = (body.get("groups"), body.get("ids"))
-        existing_groups = {r[0] for r in conn.execute("SELECT id FROM item_groups WHERE kind = ?", (kind,))}
-        query = f'SELECT id FROM {kind}'
-        if kind == 'links': query += ' WHERE id NOT IN (SELECT link_id FROM link_members WHERE link_id<>root_id)'
+        existing_groups = {
+            r[0] for r in conn.execute("SELECT id FROM item_groups WHERE kind = ?", (kind,))
+        }
+        query = f"SELECT id FROM {kind}"
         existing = {r[0] for r in conn.execute(query)}
         if (
             not isinstance(groups, list)
@@ -462,236 +372,16 @@ class Resources:
         conn.execute("DELETE FROM item_groups WHERE id = ?", (group_id,))
         return {}
 
-    @node_sync.track_mutation
-    def api_graph_save(self, conn, body, ident=None):
-        if ident and topology_groups.root_id(conn, ident) != ident:
-            raise errors.UserError("请编辑完整拓扑，不能单独修改入口与目标组合")
-        return topology.save(conn, body, ident)
-
-    def api_graph_preview(self, conn, body):
-        return topology.preview(conn, body)
-
-    def api_pool_list(self, conn, body):
-        return pools.listing(conn)
-
-    def api_link_get(self, conn, body, ident):
-        ident = topology_groups.root_id(conn, ident)
-        cache = {}
-        result = pools.view_resources(conn, cache)
-        result["link"] = pools.detail(conn, pools.get(conn, "links", ident), cache)
-        return result
-
-    @node_sync.track_mutation
-    def api_pool_save(self, conn, body, ident=None):
-        return pools.pool_save(conn, body, ident)
-
-    @node_sync.track_mutation
-    def api_pool_delete(self, conn, body, ident):
-        return pools.pool_delete(conn, ident)
-
-    @node_sync.track_mutation
-    def api_link_save(self, conn, body, ident=None):
-        if ident and (topology_groups.canvas(conn, ident) or topology_groups.root_id(conn, ident) != ident):
-            raise errors.UserError('请在拓扑画布中编辑此链路')
-        return pools.link_save(conn, body, ident)
-
-    @node_sync.track_mutation
-    def api_link_delete(self, conn, body, ident):
-        if topology_groups.root_id(conn, ident) != ident:
-            raise errors.UserError('请在拓扑中移除对应入口或目标')
-        return topology_groups.delete(conn, ident)
-
-    @node_sync.track_mutation
-    def api_link_action(self, conn, body, ident):
-        if topology_groups.root_id(conn, ident) != ident:
-            raise errors.UserError("请操作完整拓扑")
-        if topology_groups.canvas(conn, ident):
-            return topology_groups.action(conn, body, ident)
-        return pools.action(conn, body, ident)
-
-    def api_routes(self, conn, body):
-        result = []
-        for r in conn.execute(database.ordered("routes")):
-            ids = json.loads(r["node_ids"])
-            refs = [
-                dict(c)
-                for c in conn.execute(
-                    "SELECT id, remark FROM chains WHERE route_id = ? ORDER BY id", (r["id"],)
-                )
-            ]
-            result.append(
-                {
-                    "id": r["id"],
-                    "name": r["name"],
-                    "group_id": r["group_id"],
-                    "node_ids": ids,
-                    "configs": refs,
-                    "nodes": [{"id": nid, "name": database.get_node(conn, nid)["name"]} for nid in ids],
-                }
-            )
-        return {"routes": result, "groups": database.get_groups(conn, "routes")}
-
-    @node_sync.track_mutation
-    def api_route_save(self, conn, body, route_id=None):
-        old = database.get_route(conn, route_id) if route_id is not None else None
-        name = validation.check_remark(body.get("name", old["name"] if old else None), "name", "名称")
-        ids = body.get("node_ids", json.loads(old["node_ids"]) if old else None)
-        if not isinstance(ids, list) or not 1 <= len(ids) <= 32 or any((type(n) is not int for n in ids)):
-            raise errors.UserError("链路需要 1-32 个有序的转发节点", "node_ids")
-        for nid in ids:
-            n = database.get_node(conn, nid)
-            if n["kind"] != "forward" or n["deleting"]:
-                raise errors.UserError("链路只能使用未删除的转发节点", "node_ids")
-        group_id = database.check_group(
-            conn, "routes", body.get("group_id", old["group_id"] if old else None)
-        )
-        refs = conn.execute(
-            "SELECT * FROM chains WHERE route_id = ? AND deleting = 0 ORDER BY id", (route_id,)
-        ).fetchall()
-        if old:
-            conn.execute(
-                "UPDATE routes SET name = ?, node_ids = ? WHERE id = ?", (name, json.dumps(ids), route_id)
-            )
-            if group_id != old["group_id"]:
-                database.move_group(conn, "routes", route_id, group_id)
-        else:
-            route_id = conn.execute(
-                "INSERT INTO routes(name, node_ids, group_id, sort) VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM routes))",
-                (name, json.dumps(ids), group_id),
-            ).lastrowid
-        if old and ids != json.loads(old["node_ids"]):
-            for c in refs:
-                before = [
-                    r[0] for r in conn.execute("SELECT node_id FROM hops WHERE chain_id = ?", (c["id"],))
-                ]
-                pairs, _ = forwarding.route_hops(conn, database.get_route(conn, route_id), c["id"])
-                forwarding.apply_config_hops(conn, c["id"], pairs)
-            pools.sync_legacy(conn)
-        return {"id": route_id, "affected": len(refs)}
-
-    @node_sync.track_mutation
-    def api_route_del(self, conn, body, route_id):
-        database.get_route(conn, route_id)
-        if conn.execute("SELECT 1 FROM chains WHERE route_id = ?", (route_id,)).fetchone():
-            raise errors.UserError("链路仍被配置引用，请先删除或修改引用它的配置")
-        conn.execute("DELETE FROM routes WHERE id = ?", (route_id,))
-        return {"deleted": True}
-
-    def api_configs(self, conn, body):
-        data = self.api_chains(conn, body)
-        for c in data["chains"]:
-            row = database.get_chain(conn, c["id"])
-            t = database.get_target(conn, row["target_id"])
-            link = conn.execute("SELECT * FROM links WHERE chain_id=?", (c["id"],)).fetchone()
-            if link and link["applied"]:
-                t = pools.applied_target(conn, link)
-            c.update(
-                route_id=row["route_id"],
-                route_name=database.get_route(conn, row["route_id"])["name"] if row["route_id"] else None,
-                target_id=t["id"],
-                target_name=t["name"],
-                connection=None,
-            )
-            if not c["deleting"]:
-                first = c["hops"][0] if c["hops"] else {"addr": t["host"], "port": t["port"]}
-                name = topology_groups.config_name(conn, link) if link else c["remark"]
-                host = node_addresses.ingress_host(conn, link, first["addr"]) if link else first["addr"]
-                c["connection"] = target_config.connection(t, host, first["port"], name)
-            c["status"] = (
-                "deleting"
-                if c["deleting"]
-                else "error"
-                if any((n["status"] == "error" for n in c["hops"] + c["pending"]))
-                else "applying"
-                if c["pending"]
-                else "saved"
-                if not c["hops"]
-                else "applied"
-            )
-            if link:
-                link = dict(link)
-                root_id = topology_groups.root_id(conn, link['id'])
-                parent = conn.execute('SELECT group_id FROM links WHERE id=?', (root_id,)).fetchone()
-                link["state"], link["error"] = pools.display_state(conn, link)
-                c.update(
-                    link_id=root_id,
-                    configuration_id=link['id'],
-                    configuration_code=topology_groups.config_code(link['id']),
-                    remark=topology_groups.config_name(conn, link),
-                    link_state=link["state"],
-                    link_error=link["error"],
-                    group_id=parent['group_id'],
-                    link_sync=pools.sync_status(conn, link),
-                )
-                if link["state"] in ("preparing", "switching", "pending", "waiting", "error"):
-                    c["status"] = "error" if link["state"] in ("waiting", "error") else "applying"
-                if not c["hops"] and link["state"] in ("preparing", "switching", "waiting"):
-                    c["connection"] = None
-        order = topology_groups.config_order(conn)
-        data["chains"].sort(key=lambda c: order(c.get('configuration_id', c.get('link_id'))))
-        data["groups"] = database.get_groups(conn, "links")
-        return data
-
-    def api_config_rename(self, conn, body, chain_id):
-        chain = database.get_chain(conn, chain_id)
-        link = conn.execute('SELECT * FROM links WHERE chain_id=?', (chain_id,)).fetchone()
-        if not link or chain['deleting'] or link['state'] == 'deleting':
-            raise errors.UserError('配置已删除或正在删除，请刷新后重试', status=409)
-        name = validation.check_remark(body.get('name'), 'name', '配置名称')
-        if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
-            raise errors.UserError('配置名称不能包含控制字符', 'name')
-        if body.get('previous_name') != topology_groups.config_name(conn, link):
-            raise errors.UserError('配置名称已变化，请关闭后重新打开', status=409)
-        conn.execute('UPDATE links SET config_name=? WHERE id=?', (name, link['id']))
-        return dict(id=chain_id, configuration_id=link['id'], name=name)
-
-    @node_sync.track_mutation
-    def api_config_save(self, conn, body, chain_id=None):
-        old = database.get_chain(conn, chain_id) if chain_id is not None else None
-        if old and conn.execute("SELECT 1 FROM links WHERE chain_id=? AND managed=1", (chain_id,)).fetchone():
-            raise errors.UserError("请在链路详情中编辑此配置", status=409)
-        if old and old["deleting"]:
-            raise errors.UserError("配置正在删除，不能修改")
-        if any((k in body for k in ("target_host", "target_port", "tunnel_id", "target_type"))):
-            raise errors.UserError("配置只能引用目标对象", "target_id")
-        remark = validation.check_remark(body.get("remark", old["remark"] if old else None))
-        route_id = body.get("route_id", old["route_id"] if old else None)
-        route = database.get_route(conn, route_id) if route_id is not None else None
-        target = database.get_target(conn, body.get("target_id", old["target_id"] if old else None))
-        if route is None and body.get("ports") not in (None, []):
-            raise errors.UserError("直连目标不分配转发端口", "ports")
-        pairs, assigned = (
-            forwarding.route_hops(conn, route, chain_id, body.get("ports")) if route else ([], [])
-        )
-        group_id = database.check_group(
-            conn, "chains", body.get("group_id", old["group_id"] if old else None)
-        )
-        if old:
-            conn.execute(
-                "UPDATE chains SET remark=?,route_id=?,target_id=? WHERE id=?",
-                (remark, route_id, target["id"], chain_id),
-            )
-            if group_id != old["group_id"]:
-                database.move_group(conn, "chains", chain_id, group_id)
-        else:
-            chain_id = conn.execute(
-                "INSERT INTO chains(remark,route_id,target_id,group_id,sort)\n                VALUES (?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM chains))",
-                (remark, route_id, target["id"], group_id),
-            ).lastrowid
-        forwarding.apply_config_hops(conn, chain_id, pairs)
-        pools.sync_legacy(conn)
-        if 'remark' in body:
-            conn.execute('UPDATE links SET config_name=? WHERE chain_id=?', (remark, chain_id))
-        return {"id": chain_id, "assigned": assigned}
-
     def api_targets(self, conn, body):
         targets = []
         for t in conn.execute(database.ordered("targets")):
             refs = [
-                dict(c)
-                for c in conn.execute(
-                    "SELECT c.id,COALESCE(NULLIF(l.config_name,''),c.remark) AS remark "
-                    "FROM chains c LEFT JOIN links l ON l.chain_id=c.id WHERE c.target_id=? ORDER BY c.id", (t["id"],)
+                dict(id=r["id"], remark=r["name"])
+                for r in conn.execute("SELECT id,name,desired,applied FROM configurations")
+                if any(
+                    json.loads(r[k]).get("plan", json.loads(r[k])).get("target") == t["id"]
+                    for k in ("desired", "applied")
+                    if r[k]
                 )
             ]
             targets.append(
@@ -749,7 +439,10 @@ class Resources:
             if group_id != old["group_id"]:
                 database.move_group(conn, "targets", target_id, group_id)
             if host != old["host"] or port != old["port"]:
-                pools.refresh_links(conn, target=target_id)
+                conn.execute(
+                    "UPDATE configurations SET state='pending',error='' WHERE deleted=0 AND json_extract(desired,'$.target')=?",
+                    (target_id,),
+                )
         else:
             target_id = conn.execute(
                 "INSERT INTO targets(name,host,port,type,params,group_id,sort)\n                VALUES (?,?,?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM targets))",
@@ -761,10 +454,10 @@ class Resources:
     def api_target_del(self, conn, body, target_id):
         database.get_target(conn, target_id)
         for name, doc in topology.documents(conn):
-            if doc.get('target') == target_id or any(v.get('target_id') == target_id for v in doc.get('graph', {}).get('vertices', [])):
+            if doc.get("target") == target_id or any(
+                v.get("target_id") == target_id for v in doc.get("graph", {}).get("vertices", [])
+            ):
                 raise errors.UserError(f"目标仍被链路「{name}」引用，请先解除引用")
-        if conn.execute("SELECT 1 FROM chains WHERE target_id=?", (target_id,)).fetchone():
-            raise errors.UserError("目标仍被配置引用，请先解除引用")
         conn.execute("DELETE FROM targets WHERE id=?", (target_id,))
         return {"deleted": True}
 
@@ -779,8 +472,47 @@ class Resources:
         }
 
     def api_settings_save(self, conn, body):
-        url = str(body.get("public_url", database.setting(conn, "public_url", ""))).strip().rstrip("/")
-        if url and (not re.fullmatch("https?://(?:[A-Za-z0-9.-]+|\\[[0-9a-fA-F:]+\\])(?::[0-9]{1,5})?", url)):
+        url = (
+            str(body.get("public_url", database.setting(conn, "public_url", "")))
+            .strip()
+            .rstrip("/")
+        )
+        if url and (
+            not re.fullmatch("https?://(?:[A-Za-z0-9.-]+|\\[[0-9a-fA-F:]+\\])(?::[0-9]{1,5})?", url)
+        ):
             raise errors.UserError("格式应为 http(s)://域名或IP[:端口]，不带路径", "public_url")
         database.set_setting(conn, "public_url", url)
         return {"public_url": url}
+
+    def api_topologies(self, conn, body):
+        return configurations.listing(conn)
+
+    def api_topology_get(self, conn, body, ident):
+        return dict(configurations.resources(conn), link=configurations.detail(conn, ident))
+
+    def api_topology_save(self, conn, body, ident=None):
+        return configurations.save_topology(conn, body, ident)
+
+    def api_topology_preview(self, conn, body):
+        return configurations.preview(conn, body)
+
+    def api_topology_delete(self, conn, body, ident):
+        return configurations.delete(conn, ident)
+
+    def api_topology_action(self, conn, body, ident):
+        return configurations.action(conn, body, ident)
+
+    def api_configs(self, conn, body):
+        return configurations.configs(conn)
+
+    def api_config_rename(self, conn, body, ident):
+        config = execution.get(conn, ident)
+        if config["deleted"]:
+            raise errors.UserError("配置正在删除", status=409)
+        name = validation.check_remark(body.get("name"), "name", "配置名称")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+            raise errors.UserError("配置名称不能包含控制字符", "name")
+        if body.get("previous_name") != config["name"]:
+            raise errors.UserError("配置名称已变化，请重新打开", status=409)
+        conn.execute("UPDATE configurations SET name=? WHERE id=?", (name, ident))
+        return dict(id=ident, name=name)

@@ -1,6 +1,5 @@
 import re
 import time
-import agent_files
 import database
 import errors
 import forwarding
@@ -16,7 +15,10 @@ def mutation_snapshot(conn):
         out[n["id"]] = (
             dict(n),
             forwarding.node_rule_rows(conn, n),
-            {r[0] for r in conn.execute("SELECT port FROM retired_ports WHERE node_id=?", (n["id"],))},
+            {
+                r[0]
+                for r in conn.execute("SELECT port FROM retired_ports WHERE node_id=?", (n["id"],))
+            },
         )
     return out
 
@@ -45,23 +47,18 @@ def finish_mutation(conn, before):
             or any((n[k] != old.get(k, n[k]) for k in ("key", "desired_mode", "deleting")))
         )
         if changed:
-            conn.execute("UPDATE nodes SET desired_generation=desired_generation+1 WHERE id=?", (nid,))
+            conn.execute(
+                "UPDATE nodes SET desired_generation=desired_generation+1 WHERE id=?", (nid,)
+            )
             notified = True
         if changed or any((n[k] != old.get(k, n[k]) for k in ("wake_enabled", "wake_port"))):
             wake.queue(conn, database.get_node(conn, nid))
-        for cid in {r["chain_id"] for r in old_rows + rows}:
-            if [key(r) for r in old_rows if r["chain_id"] == cid] != [
-                key(r) for r in rows if r["chain_id"] == cid
-            ]:
-                if conn.execute("SELECT 1 FROM chains WHERE id=?", (cid,)).fetchone():
-                    lifecycle.mark_pending(conn, cid, [nid])
     return notified
 
 
 def clear_pending(conn, node):
     conn.execute("DELETE FROM retired_ports WHERE node_id=?", (node["id"],))
-    conn.execute("DELETE FROM chain_pending WHERE node_id=?", (node["id"],))
-    lifecycle.finish_deleted_chains(conn)
+    conn.execute("DELETE FROM migration_nodes WHERE node_id=?", (node["id"],))
 
 
 def retry_nodes(conn, node_ids):
@@ -94,56 +91,32 @@ def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observ
         and node_state.port_error(node["err"])
     ):
         health, err = ("error", node["err"])
-    if proto and (source not in ("manual", "auto", "wake") or phase not in ("begin", "poll", "ack", "asset")):
+    if proto and (
+        source not in ("manual", "auto", "wake") or phase not in ("begin", "poll", "ack", "asset")
+    ):
         raise errors.UserError("无效同步阶段")
     if source == "wake" and phase != "ack" and (not wake.authorized(conn, node, fields)):
         return "proto=2\naction=pause\nmode=passive\n"
     au = {"0": 0, "1": 1}.get(fields.get("au"))
-    if fields.get("get") == "agent":
-        if (
-            agent_files.AGENT
-            and au
-            and (
-                not node["manual_required"]
-                and node["desired_mode"] == "active"
-                or (proto and source == "manual")
-            )
-        ):
-            return agent_files.AGENT[2]
-        raise errors.UserError("没有可用更新")
     if observe:
         import node_addresses
-        node_addresses.receive_network(conn, node['id'], fields)
+
+        node_addresses.receive_network(conn, node["id"], fields)
         node_state.record_report(conn, node, now, health, err, skew)
         conn.execute(
-            "UPDATE nodes SET first_seen=COALESCE(first_seen,?),last_seen=?,src_ip=?,\n        agent=?,skew=?,health=?,auto_update=?,protocol_version=MAX(protocol_version,?) WHERE id=?",
+            "UPDATE nodes SET first_seen=COALESCE(first_seen,?),last_seen=?,src_ip=COALESCE(NULLIF(?,''),src_ip),\n        agent=?,skew=?,health=?,auto_update=?,protocol_version=MAX(protocol_version,?) WHERE id=?",
             (now, now, source_ip, agent, skew, health, au, 2 if proto else 1, node["id"]),
         )
         if proto and fields.get("mode") in ("active", "passive"):
-            conn.execute("UPDATE nodes SET reported_mode=? WHERE id=?", (fields["mode"], node["id"]))
+            conn.execute(
+                "UPDATE nodes SET reported_mode=? WHERE id=?", (fields["mode"], node["id"])
+            )
     if observe_only:
         return "proto=2\n"
     lines = forwarding.node_rules(conn, node)
     want = forwarding.rules_version(lines)
-    update = (
-        f"update={agent_files.AGENT[0]} {agent_files.AGENT[1]}\n"
-        if source != "wake" and agent_files.agent_update(agent, au) == "pending"
-        else ""
-    )
     if not proto:
-        if node["protocol_version"] >= 2 or node["manual_required"] or node["desired_mode"] != "active":
-            return "same\n" + update
-        v = fields.get("v", "")
-        conn.execute("UPDATE nodes SET reported_v=?,state=?,err=? WHERE id=?", (v, state, err, node["id"]))
-        if v == want and state == "ok":
-            conn.execute("UPDATE nodes SET applied_generation=desired_generation WHERE id=?", (node["id"],))
-            clear_pending(conn, node)
-            if node["deleting"]:
-                lifecycle.delete_node(conn, node["id"])
-                return "same\n"
-        return (
-            "same\n" if v == want and state != "init" else "\n".join([f"v={want}"] + lines) + "\n"
-        ) + update
+        raise errors.UserError("请安装当前主动或被动 Agent")
     if source == "auto" and (node["desired_mode"] == "passive" or node["manual_required"]):
         return "proto=2\naction=pause\nmode=passive\n"
     opid = fields.get("op", "")
@@ -182,9 +155,11 @@ def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observ
             node["id"],
             {"manual": "手动", "auto": "自动", "wake": "远程唤醒"}[source]
             + "同步："
-            + {"confirmed": "确认成功", "changed": "已应用旧快照，仍有新变更", "failed": "失败：" + err}[
-                result
-            ],
+            + {
+                "confirmed": "确认成功",
+                "changed": "已应用旧快照，仍有新变更",
+                "failed": "失败：" + err,
+            }[result],
             now,
         )
         wake.receipt(conn, node, op["generation"], result, err)
@@ -228,7 +203,7 @@ def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observ
         and (op["mode"] == node["desired_mode"])
         and (op["hash"] == want)
     ):
-        return f"proto=2\naction=blocked\ngeneration={op['generation']}\nerr={node['err']}\n" + update
+        return f"proto=2\naction=blocked\ngeneration={op['generation']}\nerr={node['err']}\n"
     if op and op["op"] == opid:
         if op["expires"] < now or op["source"] != source:
             return "proto=2\nresult=expired\n"
@@ -241,7 +216,7 @@ def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observ
             and (not node_state.port_error(node["err"]))
         ):
             conn.execute("UPDATE nodes SET state='ok',err='' WHERE id=?", (node["id"],))
-            return "proto=2\naction=same\n" + update
+            return "proto=2\naction=same\n"
         op = {
             "op": opid,
             "source": source,
@@ -253,7 +228,16 @@ def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observ
         }
         conn.execute(
             "INSERT OR REPLACE INTO sync_ops(node_id,op,source,generation,mode,hash,rules,expires)\n            VALUES (?,?,?,?,?,?,?,?)",
-            (node["id"], opid, source, op["generation"], op["mode"], want, op["rules"], op["expires"]),
+            (
+                node["id"],
+                opid,
+                source,
+                op["generation"],
+                op["mode"],
+                want,
+                op["rules"],
+                op["expires"],
+            ),
         )
         if source == "manual":
             conn.execute(
@@ -265,7 +249,4 @@ def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observ
                 (now, node["id"]),
             )
             lifecycle.add_event(conn, node["id"], "手动同步开始", now)
-    return (
-        f"proto=2\naction=apply\nop={opid}\ngeneration={op['generation']}\nmode={op['mode']}\nv={op['hash']}\n{op['rules']}\n"
-        + update
-    )
+    return f"proto=2\naction=apply\nop={opid}\ngeneration={op['generation']}\nmode={op['mode']}\nv={op['hash']}\n{op['rules']}\n"

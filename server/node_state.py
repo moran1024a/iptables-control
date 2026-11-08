@@ -32,9 +32,7 @@ def node_status(conn, node, now):
         )
     if not node["first_seen"]:
         return "new"
-    if node["last_seen"] is None or now - node["last_seen"] > (
-        30 if node["installed_agent"] == "active" else settings.OFFLINE_AFTER
-    ):
+    if node["last_seen"] is None or now - node["last_seen"] > settings.OFFLINE_AFTER:
         return "offline"
     if node["skew"] is not None and abs(node["skew"]) > settings.MAX_SKEW:
         return "skew"
@@ -68,10 +66,12 @@ def node_bar(conn, node, now):
                 for w in range(start, now // settings.WINDOW + 1)
             ],
             "counts": [
-                activity.get(w, {}).get("manual_count", 0) for w in range(start, now // settings.WINDOW + 1)
+                activity.get(w, {}).get("manual_count", 0)
+                for w in range(start, now // settings.WINDOW + 1)
             ],
             "times": [
-                activity.get(w, {}).get("last_activity") for w in range(start, now // settings.WINDOW + 1)
+                activity.get(w, {}).get("last_activity")
+                for w in range(start, now // settings.WINDOW + 1)
             ],
         }
     cur = now // settings.ACTIVE_WINDOW
@@ -79,7 +79,8 @@ def node_bar(conn, node, now):
     levels = {
         r[0]: r[1]
         for r in conn.execute(
-            "SELECT win, level FROM active_windows WHERE node_id = ? AND win >= ?", (node["id"], start)
+            "SELECT win, level FROM active_windows WHERE node_id = ? AND win >= ?",
+            (node["id"], start),
         )
     }
     recording_since = int(database.setting(conn, "active_window_start", "0"))
@@ -97,7 +98,11 @@ def node_bar(conn, node, now):
             bar.append("none")
         else:
             bar.append("lost")
-    return {"start": start * settings.ACTIVE_WINDOW, "window": settings.ACTIVE_WINDOW, "levels": bar}
+    return {
+        "start": start * settings.ACTIVE_WINDOW,
+        "window": settings.ACTIVE_WINDOW,
+        "levels": bar,
+    }
 
 
 def duration(sec):
@@ -119,7 +124,9 @@ def record_report(conn, node, now, health, err, skew):
         and node["last_seen"] is not None
         and (now - node["last_seen"] > settings.OFFLINE_AFTER)
     ):
-        lifecycle.add_event(conn, node["id"], f"失联 {duration(now - node['last_seen'])} 后恢复", now)
+        lifecycle.add_event(
+            conn, node["id"], f"失联 {duration(now - node['last_seen'])} 后恢复", now
+        )
     prev = node["health"] or "ok"
     if health != prev:
         text = f"{settings.HEALTH[prev]} → {settings.HEALTH[health]}"
@@ -135,11 +142,12 @@ def record_report(conn, node, now, health, err, skew):
 
 
 def upstream_nodes(conn, node_id):
-    """以该节点为下一跳的节点名称。"""
-    return [
-        r[0]
-        for r in conn.execute(
-            "SELECT DISTINCT n.name FROM hops h\n           JOIN hops h2 ON h2.chain_id = h.chain_id AND h2.seq = h.seq + 1\n           JOIN nodes n ON n.id = h.node_id\n           WHERE h2.node_id = ? ORDER BY n.id",
-            (node_id,),
-        )
-    ]
+    import json
+
+    found = set()
+    for r in conn.execute("SELECT applied FROM configurations WHERE applied IS NOT NULL"):
+        rules = json.loads(r[0])["rules"]
+        for a, b in zip(rules, rules[1:]):
+            if b["node_id"] == node_id:
+                found.add(database.get_node(conn, a["node_id"])["name"])
+    return sorted(found)

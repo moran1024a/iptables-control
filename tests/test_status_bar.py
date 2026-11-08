@@ -63,34 +63,6 @@ class StatusBarTests(Fixture, unittest.TestCase):
         self.call('api_node_edit', {'desired_mode': 'passive'}, nid)
         self.assertEqual(node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 61), bar)
 
-    def test_existing_300_history_is_retained_without_inventing_fine_samples(self):
-        nid = self.node()
-        with self.db:
-            self.db.execute('DROP TABLE active_windows')
-            self.db.execute("DELETE FROM settings WHERE k='active_window_start'")
-            self.db.execute('UPDATE nodes SET first_seen=?,last_seen=? WHERE id=?',
-                            (self.NOW - 1000, self.NOW - 1, nid))
-            self.db.execute('INSERT INTO windows VALUES (?,?,1,2,?)',
-                            (nid, self.NOW // 60 - 1, self.NOW - 1))
-        old = [tuple(r) for r in self.db.execute('SELECT * FROM windows')]
-        self.db.close()
-        with patch.object(time, 'time', return_value=self.NOW + 7):
-            self.db = migrations.init_db()
-        bar = node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 8)
-        self.assertEqual(set(bar['levels']), {'none'})
-        self.assertEqual([tuple(r) for r in self.db.execute('SELECT * FROM windows')], old)
-        self.report(nid, 21)
-        bar = node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 61)
-        self.assertEqual(bar['levels'][-4:], ['none', 'ok', 'lost', 'none'])
-        rows = [tuple(r) for r in self.db.execute('SELECT * FROM active_windows')]
-        self.db.close()
-        self.db = migrations.init_db()
-        self.assertEqual(database.setting(self.db, 'active_window_start'), str(self.NOW + 7))
-        self.assertEqual([tuple(r) for r in self.db.execute('SELECT * FROM active_windows')], rows)
-        self.call('api_node_edit', {'desired_mode': 'passive'}, nid)
-        bar = node_state.node_bar(self.db, database.get_node(self.db, nid), self.NOW + 61)
-        self.assertEqual(sum(bar['counts']), 2)
-        self.assertEqual(bar['levels'].count('ok'), 1)
 
     def test_retention_and_node_deletion_cover_both_resolutions(self):
         nid = self.node()

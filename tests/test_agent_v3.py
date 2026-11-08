@@ -25,6 +25,25 @@ import transport
 
 
 class V3Tests(Fixture, unittest.TestCase):
+    def test_upgrade_prepare_preserves_version_and_auto_update_until_commit(self):
+        nid=self.node();self.ready(nid)
+        with self.db:
+            self.db.execute("UPDATE nodes SET agent='0.5.3',auto_update=1 WHERE id=?",(nid,))
+        component=Path(self.temp.name)/'asset';component.write_text('test')
+        def manage(**kw):
+            with self.db:
+                return agent_v3.fields(agent_v3.manage(self.db,database.get_node(self.db,nid),{'t':str(int(time.time())),**kw}))
+        with patch.object(agent_v3,'artifact',return_value=(component,'f'*64)):
+            prepared=manage(manage='prepare',target='active',arch='amd64')
+        n=database.get_node(self.db,nid)
+        self.assertEqual((n['agent'],n['auto_update']),('0.5.3',1))
+        import execution
+        with self.assertRaisesRegex(errors.UserError,'等待 Agent 升级'):
+            execution.ready(self.db,nid,int(time.time()))
+        self.assertEqual(manage(manage='commit',op=prepared['op'],target='active',agent=settings.VERSION)['result'],'confirmed')
+        n=database.get_node(self.db,nid)
+        self.assertEqual((n['agent'],n['auto_update']),(settings.VERSION,1))
+
     def test_aborted_download_releases_manual_sync_without_confirming_mode(self):
         nid=self.node()
         component=Path(self.temp.name)/'asset'; component.write_text('test')
@@ -36,7 +55,7 @@ class V3Tests(Fixture, unittest.TestCase):
         self.assertTrue(self.db.execute("SELECT 1 FROM sync_ops WHERE source='manual'").fetchone())
         self.assertEqual(manage(manage='abort',op=prepared['op'])['result'],'aborted')
         self.assertFalse(self.db.execute("SELECT 1 FROM sync_ops WHERE source='manual'").fetchone())
-        self.assertEqual(database.get_node(self.db,nid)['installed_agent'],'legacy')
+        self.assertEqual(database.get_node(self.db,nid)['installed_agent'],'unknown')
         self.assertFalse(database.get_node(self.db,nid)['manual_required'])
         with self.assertRaises(errors.UserError):
             manage(manage='commit',op=prepared['op'],target='active')
@@ -65,7 +84,7 @@ class V3Tests(Fixture, unittest.TestCase):
         with patch.object(agent_v3,'artifact',return_value=(component,'f'*64)):
             prepared=manage(manage='prepare',target='passive',arch='portable')
         n=database.get_node(self.db,nid)
-        self.assertEqual(n['installed_agent'],'legacy')
+        self.assertEqual(n['installed_agent'],'unknown')
         self.assertEqual(n['manual_required'],1)
         ack=manage(manage='commit',op=prepared['op'],target='passive',agent=settings.VERSION)
         self.assertEqual(ack['result'],'confirmed')
@@ -97,37 +116,26 @@ class V3Tests(Fixture, unittest.TestCase):
 
 
 class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
-    async def test_updates_are_coalesced_and_stale_receipts_do_not_replace_inflight(self):
+
+    async def test_private_controls_and_artifacts_reject_missing_or_wrong_identity(self):
         nid = self.node()
-        cid = self.config(self.route([nid]), [10001])
-        with self.db:
-            self.db.execute("UPDATE nodes SET installed_agent='active' WHERE id=?", (nid,))
-        ws, session, first = await self.connect(nid)
-        self.call('api_config_save', dict(ports=[10002]), cid)
-        self.call('api_config_save', dict(ports=[10003]), cid)
-        with self.db:
-            self.db.execute('UPDATE nodes SET last_seen=1 WHERE id=?', (nid,))
-        self.app['hub'].notify()
-        await asyncio.sleep(.05)
-        self.assertEqual(self.db.execute('SELECT op FROM sync_ops WHERE node_id=?', (nid,)).fetchone()[0], first['op'])
-        self.assertEqual(database.get_node(self.db, nid)['last_seen'], 1)
-
-        async def receipt(config):
-            await ws.send_json(dict(type='apply_result', session=session, op=config['op'],
-                                   generation=config['generation'], hash=config['hash'], ok=True, held_ports=[]))
-            return await ws.receive_json(timeout=3)
-
-        self.assertEqual((await receipt(first))['result'], 'changed')
-        latest = await ws.receive_json(timeout=3)
-        self.assertEqual(latest['generation'], database.get_node(self.db, nid)['desired_generation'])
-        self.assertEqual(latest['rules'][0]['port'], 10003)
-        self.assertEqual((await receipt(first))['result'], 'expired')
-        self.assertEqual(self.db.execute('SELECT op FROM sync_ops WHERE node_id=?', (nid,)).fetchone()[0], latest['op'])
-        self.assertEqual((await receipt(latest))['result'], 'confirmed')
-        self.assertEqual((await ws.receive_json(timeout=3))['type'], 'ready')
-        n = database.get_node(self.db, nid)
-        self.assertEqual(n['applied_generation'], n['desired_generation'])
-        await ws.close()
+        panel, sync = http_harness.Handler.panel_path, http_harness.Handler.sync_path
+        for path in ('topologies', 'quality', f'nodes/{nid}/query'):
+            response = await self.client.post(panel + '/api/' + path, json={})
+            self.assertEqual(response.status, 401)
+        for headers in ({}, {'Authorization': 'Bearer ' + 'ff' * 32}):
+            for path in ('ws', 'artifacts/manage.sh'):
+                response = await self.client.get(sync + '/v3/' + path, headers=headers)
+                self.assertEqual(response.status, 404)
+            response = await self.client.post(sync + '/v3/traffic', json=[], headers=headers)
+            self.assertEqual(response.status, 404)
+        # A correctly encrypted body with a forged MAC must not update node state.
+        node = database.get_node(self.db, nid)
+        ek, _ = security.derive(node['key'])
+        body = security.aes(ek, f't={int(time.time())}\nstate=ok\nproto=2\n'.encode())[8:]
+        response = await self.client.post(sync, data=base64.b64encode(body + bytes(32)))
+        self.assertEqual(response.status, 404)
+        self.assertIsNone(database.get_node(self.db, nid)['last_seen'])
 
     async def asyncSetUp(self):
         http_harness.Handler.sync_path=database.setting(self.db,'sync_path')
@@ -175,9 +183,9 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_quality_api_authentication_scope_and_cookie_renewal(self):
         a, b = self.node(), self.node('B')
-        rid = self.route([a, b])
+        rid = self.save(self.graph([a, b]))
         path = http_harness.Handler.panel_path + '/api/quality'
-        payload = dict(scope='routes', id=rid)
+        payload = dict(scope='topologies', id=rid,source=a,target=b)
         response = await self.client.post(path, json=payload)
         self.assertEqual(response.status, 401)
         token = 'quality-session'
@@ -195,9 +203,7 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn('Set-Cookie', response.headers)
         response = await self.client.post(path, json={**payload, 'source': a, 'target': 999}, headers=headers)
         self.assertEqual(response.status, 400)
-        cid = self.config(rid, [10001, 10002])
-        lid = self.db.execute('SELECT id FROM links WHERE chain_id=?', (cid,)).fetchone()[0]
-        response = await self.client.post(path, json=dict(scope='links', id=lid, configuration=999), headers=headers)
+        response = await self.client.post(path, json=dict(scope='topologies', id=rid, configuration=999), headers=headers)
         self.assertEqual(response.status, 400)
         self.assertEqual((await response.json())['field'], 'configuration')
 
@@ -211,12 +217,24 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.app['hub'].sessions),70)
         await asyncio.gather(*(ws.close() for ws,_,_ in connections))
 
-    async def test_encrypted_legacy_sync_still_works(self):
+    async def test_encrypted_legacy_sync_is_rejected(self):
         nid=self.node()
         node=database.get_node(self.db,nid)
         ek,mk=security.derive(node['key'])
         body=security.aes(ek,('t='+str(int(time.time()))+'\nstate=init\nagent=0.2.1\n').encode())[8:]
         raw=body+security.mac(mk,body)
         response=await self.client.post(http_harness.Handler.sync_path,data=base64.b64encode(raw),headers={'Content-Type':'text/plain'})
-        self.assertEqual(response.status,200)
-        self.assertGreater(len(await response.read()),32)
+        self.assertEqual(response.status,404)
+
+    async def test_update_is_sent_before_broken_forwarding_and_preserves_observation(self):
+        nid=self.node()
+        with self.db:self.db.execute("UPDATE nodes SET installed_agent='active',state='error',err='端口冲突：TCP 10001',auto_update=1 WHERE id=?",(nid,))
+        n=database.get_node(self.db,nid)
+        ws=await self.client.ws_connect(http_harness.Handler.sync_path+'/v3/ws',headers={'Authorization':'Bearer '+n['key']})
+        # The released 0.5.3 Agent does not include auto_update in its hello.
+        await ws.send_json(dict(type='hello',protocol=3,version='0.5.3',generation=0,hash='',installation_id='a'*32))
+        await ws.receive_json(timeout=3)
+        message=await ws.receive_json(timeout=3)
+        self.assertEqual((message['type'],message['version']),('update',settings.COMPONENTS['active_agent']))
+        n=database.get_node(self.db,nid);self.assertEqual(n['agent'],'0.5.3');self.assertTrue(n['last_seen']);self.assertEqual(n['auto_update'],1)
+        await ws.close()

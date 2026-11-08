@@ -16,7 +16,6 @@ const STATUS = {
 const AGENT_UPDATE = {
   pending: "等待节点自动更新",
   disabled: "节点已关闭自动更新，可在节点上运行 <code>sudo ictl --update</code> 更新",
-  legacy: "该版本节点端每 6 小时自行检查更新，也可在节点上运行 <code>sudo ictl --update</code> 立即更新",
   unavailable: "服务端缺少同版本的节点端脚本，无法自动更新，可在节点上运行 <code>sudo ictl --update</code> 更新",
   newer: "节点端版本高于目标版本",
 };
@@ -35,13 +34,13 @@ let viewRequest = 0;              // 同一页面只接受最新一次刷新
 let refreshTimer = null;
 let currentNode = null;           // 详情页的节点
 let list = null;                  // 当前列表页：{kind, data, draw}，搜索和筛选时用已有数据重绘
-let sortMode = null;              // 正在排序的列表："nodes" / "chains"
+let sortMode = null;              // 当前排序列表
 let sortInitial = null, sortBusy = false;
 const sortValues = () => JSON.stringify(['.sort-group','.sort-card'].map(selector => [...app.querySelectorAll(selector)].map(el => el.dataset.id)));
 const sortChanged = () => sortMode && sortInitial !== null && sortValues() !== sortInitial;
 const openDetails = new Set();    // 已展开的折叠区，刷新后保持
 const revealedKeys = new Set();   // 已显示密钥的节点
-const filters = { nodes: {}, routes: {}, targets: {}, chains: {}, links: {}, configs: {} };   // 搜索和筛选条件，刷新页面后清空
+const filters = { nodes: {}, targets: {}, topologies: {}, configs: {} };   // 搜索和筛选条件，刷新页面后清空
 const collapsed = new Set(JSON.parse(localStorage.getItem("ictl-collapsed") || "[]"));   // 已折叠的分组
 
 function esc(s) {
@@ -336,18 +335,17 @@ async function route() {
   const [page, id, detailId] = (location.hash || "#/nodes").replace(/^#\/?/, "").split("/");
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === page));
 
-  if (page === "quality" && ["routes", "configs", "links"].includes(id) && /^\d+$/.test(detailId || "")) {
+  if (page === "quality" && id === "topologies" && /^\d+$/.test(detailId || "")) {
     const view = (request) => qualityPage(id, Number(detailId), request);
     view.refreshMS = 10000;
     return show(view, true);
   }
   if (page === "nodes" && id) return show((request) => nodeDetail(Number(id), request), true);
   if (page === "nodes") return show(nodeList, true);
-  if (page === "configs" || page === "chains") return show(configSummary, true);
+  if (page === "configs") return show(configSummary, true);
   if (page === "routes" && id === "new") return show(graphNew, false);
   if (page === "routes" && id) return show((request) => graphDetail(Number(id), request), true);
   if (page === "routes") return show(linkList, true);
-  if (page === "pools") { location.hash = "#/routes"; return; }
   if (page === "targets") return show(targetList, true);
   if (page === "subscriptions") return show(subscriptionList, true);
   if (page === "settings") return show(settingsPage, false);
@@ -407,7 +405,7 @@ function showChangeAccount() {
 
 // ------------------------------------------------------------ 节点列表
 
-const KIND_LABEL = { nodes: "节点", routes: "链路", targets: "目标", chains: "配置", links: "链路", configs: "配置" };
+const KIND_LABEL = { nodes: "节点", targets: "目标", topologies: "链路", configs: "配置" };
 
 // 列表页标题栏：排序模式下显示「取消 / 完成」；搜索或筛选时不能排序
 function listHead(kind, total, shown, newAction, newLabel, extraActions = "") {
@@ -591,12 +589,12 @@ async function nodeDetail(id, request) {
   const url = syncAddress(d.public_url, d.sync_path);
   const shown = revealedKeys.has(id);
   const quote = (value) => "'" + String(value).replaceAll("'", "'\\''") + "'";
-  const install = (key) => `(f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL ${quote(d.installer_url || d.agent_url)} -o "$f" && sudo bash "$f" --url ${quote(url)} --key ${quote(key)}${d.installer_url ? ` --kind ${quote(n.desired_mode)}` : ""})`;
+  const install = (key) => `(f=$(mktemp) && trap 'rm -f "$f"' EXIT && curl -fsSL ${quote(d.installer_url)} -o "$f" && sudo bash "$f" --url ${quote(url)} --key ${quote(key)}${d.installer_url ? ` --kind ${quote(n.desired_mode)}` : ""})`;
 
   const rules = d.rules.length
     ? `<table><thead><tr><th>入站端口</th><th>转发到</th><th>所属转发</th></tr></thead><tbody>${d.rules.map((r) => `
         <tr><td class="mono">${r.port}</td><td class="mono">${esc(r.host)}:${r.tport}</td>
-        <td><a href="#/configs">${esc(r.chain_remark)}</a></td></tr>`).join("")}</tbody></table>`
+        <td><a href="#/configs">${esc(r.configuration_name)}</a></td></tr>`).join("")}</tbody></table>`
     : `<div class="muted">${n.status === "deleting" ? "正在删除，已下发空配置" : "没有转发规则"}</div>`;
 
   const skew = n.skew == null ? "-" : `${n.skew > 0 ? "+" : ""}${n.skew} 秒`;
@@ -606,7 +604,7 @@ async function nodeDetail(id, request) {
     <span>时差</span><span>${skew}</span>
     <span>节点端版本</span><span>${esc(n.agent || "-")}${AGENT_UPDATE[n.agent_update]
       ? `<span class="muted">（目标转发 Agent 为 ${esc(d.forward_version)}，${(n.desired_mode === "passive" && n.agent_update === "pending") ? "等待本机手动同步时更新" : AGENT_UPDATE[n.agent_update]}）</span>` : ""}</span>
-    <span>已安装组件</span><span>${esc(n.installed_agent || "legacy")} / ${esc(n.backend || "iptables")}</span>
+    <span>已安装组件</span><span>${esc(n.installed_agent || "unknown")} / ${esc(n.backend || "iptables")}</span>
     <span>管理连接</span><span>${esc(n.connection_state || "旧版轮询")}</span>
     <span>确认进度</span><span>${n.applied_generation} / ${n.desired_generation}</span>
     <span>已应用版本</span><span class="mono">${esc(n.reported_v || "-")}</span>
@@ -614,7 +612,7 @@ async function nodeDetail(id, request) {
     <span>上报状态</span><span>${esc(n.state || "-")}</span>
     <span>错误信息</span><span>${esc(n.err || "-")}</span>
     <span>首次连接</span><span>${fmtTime(n.first_seen)}</span>
-    <span>使用该节点的转发</span><span>${d.chains.map((c) => esc(c.remark)).join("、") || "-"}</span>
+    <span>使用该节点的转发</span><span>${d.configs.map((c) => esc(c.name)).join("、") || "-"}</span>
   </div>`;
 
   const events = d.events.length
@@ -629,7 +627,7 @@ async function nodeDetail(id, request) {
     </div>
     ${n.note ? `<div class="panel note-full"><h2>备注</h2><div>${esc(n.note)}</div></div>` : ""}
     <div class="detail-grid"><div class="panel">${bar(n.bar)}
-      ${n.installed_agent === "legacy" || !n.installed_agent ? `<p class="t-yellow">此节点尚未迁移，请在节点执行下方一键接入命令。</p>` : ""}
+      ${n.installed_agent === "unknown" || !n.installed_agent ? `<p class="t-yellow">此节点尚未安装，请在节点执行下方一键接入命令。</p>` : ""}
       ${n.desired_mode === "passive" || n.manual_required ? `<p class="hint">本机运行 <code>sudo ictl --sync</code> 或菜单「同步更新」。等待状态会持续到当前变更确认成功。白条上的绿色表示手动同步活动或远程同步成功，执行结果见下方事件。</p>` : ""}
       ${n.desired_mode === "passive" ? `<p class="hint">已同步表示最近一次确认结果，不表示实时在线；被动模式不自动轮询。</p>` : ""}
       ${n.desired_mode === "passive" ? `<p class="hint">远程唤醒：${n.wake_enabled ? `已开启，UDP ${n.wake_port}。${n.wake?.state === 'waiting' ? '正在等待同步确认，超过 30 秒转为等待手动同步。' : n.wake?.state === 'confirmed' ? '最近一次同步已确认。' : '请确保节点本地已配置白名单和相同端口。'}` : '未开启，配置变更需要本机手动同步。'}</p>` : ""}
@@ -684,7 +682,7 @@ function nodeAddressPanel(n) {
 function telemetryPanel(d) {
   const n = d.node, t = d.telemetry || {}, m = t.metrics || {}, inv = t.inventory || {};
   if (n.installed_agent !== "active" && !(t.traffic || []).length) return "";
-  const names = new Map(d.rules.map(r => [r.id, r.chain_remark]));
+  const names = new Map(d.rules.map(r => [r.id, r.configuration_name]));
   const traffic = (t.traffic || []).map(r => `<tr><td>${esc(names.get(r.rule_id) || `历史规则 ${r.rule_id}`)}</td><td>${esc(r.protocol)}</td><td title="${esc(r.up)} 字节">${bytesText(r.up)}</td><td title="${esc(r.down)} 字节">${bytesText(r.down)}</td><td>${esc(r.quality)}</td></tr>`).join("");
   const mem = m.memory || {};
   const net = Object.entries(m.interfaces || {}).map(([name,v]) => `<tr><td>${esc(name)}</td><td>${bytesText(v.rx_bytes)}</td><td>${bytesText(v.tx_bytes)}</td><td>${v.rx_bytes_per_second == null ? "-" : bytesText(Math.round(v.rx_bytes_per_second)) + "/s"}</td><td>${v.tx_bytes_per_second == null ? "-" : bytesText(Math.round(v.tx_bytes_per_second)) + "/s"}</td></tr>`).join("");
@@ -708,95 +706,6 @@ function telemetryPanel(d) {
 // ------------------------------------------------------------ 转发
 
 // 等待确认的节点，附带离线、异常等状态
-function pendingLine(c) {
-  if (!c.pending.length) return "";
-  const who = c.pending.map((p) => {
-    const note = ["synced", "syncing"].includes(p.status) ? "" : `<span class="muted">（${STATUS[p.status]?.[0] || p.status}）</span>`;
-    const passiveNote = p.wake_enabled && p.wake?.state === 'waiting' ? '等待自动同步' : '需本机同步';
-    return `<span class="who" title="${esc(p.wake?.error || p.err || '')}">${dot(p.status)}${esc(p.name)}${note}${p.desired_mode === "passive" ? `<span class="muted">（${passiveNote}）</span>` : ""}</span>`;
-  });
-  return `<div class="pending">等待确认：${who.join("")}</div>`;
-}
-
-function chainStatus(c) {
-  return c.status || (c.deleting ? "deleting" : c.pending.length ? "applying" : "applied");
-}
-
-async function chainList(request) {
-  const data = await api("GET", "configs");
-  if (request !== viewRequest) return;
-  list = { kind: "chains", data, draw: drawChains };
-  drawChains();
-}
-
-function drawChains() {
-  const d = list.data;
-  if (sortMode === "chains") {
-    return render(listHead("chains", d.chains.length, d.chains.length) + sortList("chains", d.chains, (c) =>
-      `<div class="title">${esc(c.remark)}</div>
-       <div class="sub">${c.hops.length ? c.hops.map((h) => esc(h.name)).join(" → ") + " → " : "直连目标 · "}<span class="mono">${esc(c.target_host)}:${c.target_port}</span></div>`));
-  }
-  const f = filters.chains;
-  const items = d.chains.filter((c) =>
-    (!f.q || has(c.remark, f.q)) &&
-    (!f.entry || c.hops[0]?.node_id === Number(f.entry)) &&
-    (!f.via || c.hops.some((h) => h.node_id === Number(f.via))) &&
-    (!f.target || has(`${c.target_host}:${c.target_port}`, f.target)) &&
-    (!f.status || chainStatus(c) === f.status) &&
-    (!f.group || c.group_id === Number(f.group)));
-  const card = (c) => {
-    const path = c.hops.map((h) => `<span class="hop">${dot(h.status)}${esc(h.name)}:${h.port}</span>`);
-    path.push(`<span class="hop mono">${esc(c.target_host)}:${c.target_port}</span>`);
-    const first = c.hops[0];
-    const entry = c.connection ? `${c.connection.host}:${c.connection.port}` : first ? `${first.addr}:${first.port}` : "";
-    const entryLine = entry ? `<div class="entry"><span class="muted">入口</span><code>${esc(entry)}</code>${c.deleting
-      ? "" : `<button class="small" data-action="copy" data-text="${esc(entry)}">复制</button>`}</div>` : "";
-    let badge, actions;
-    if (c.deleting) {
-      badge = `<span class="badge removing"><i class="spinner"></i>删除中…</span>`;
-      actions = `<button class="small danger" data-action="chain-delete" data-id="${c.id}" data-force="1">强制删除</button>`;
-    } else {
-      badge = c.status === "saved" ? `<span class="badge">已保存</span>`
-        : c.status === "error" ? `<span class="badge removing">异常</span>` : c.pending.length
-        ? `<span class="badge applying"><i class="spinner"></i>等待中…</span>`
-        : `<span class="badge applied">✓ 已应用</span>`;
-      actions = `<button class="small" data-action="chain-edit" data-id="${c.id}">编辑</button>
-        <button class="small danger" data-action="chain-delete" data-id="${c.id}">删除</button>`;
-    }
-    return `
-      <div class="card${c.deleting ? " dim" : ""}" data-key="chain-${c.id}">
-        <div class="card-head">
-          <div class="title">${esc(c.remark)}</div>
-          <div class="chain-side">${badge}<div class="chain-actions">${actions}</div></div>
-        </div>
-        ${entryLine}
-        <div class="sub">${c.route_id ? `链路：${esc(c.route_name)}` : "直连目标"} · 目标：${esc(c.target_name)}</div>
-        ${c.connection && c.connection.protocol !== "endpoint" ? `<div class="entry"><span class="muted">连接信息</span><button class="small" data-action="connection" data-id="${c.id}">查看 / 复制</button>${c.connection.tcp_only ? `<span class="hint">SOCKS5 链路仅支持 TCP</span>` : ""}</div>` : ""}
-        <div class="path">${path.join(`<span class="arrow">→</span>`)}</div>
-        ${c.hops.length > 1 && !c.deleting ? `<a class="quality-link" href="#/quality/configs/${c.id}">网络质量与趋势 →</a>` : ""}
-        ${pendingLine(c)}
-      </div>`;
-  };
-  const summary = (cs) =>
-    countText(cs.filter((c) => chainStatus(c) === "applying").length, "下发中", "t-yellow") +
-    countText(cs.filter((c) => c.deleting).length, "删除中", "t-red");
-  const tools = d.chains.length ? filterBar("chains", [
-    filterInput("q", "搜索别名", "search"),
-    filterSelect("entry", "全部入口节点", nodeOptions(d.nodes, d.node_groups)),
-    filterSelect("via", "经过任意节点", nodeOptions(d.nodes, d.node_groups)),
-    filterInput("target", "目标地址"),
-    filterSelect("status", "全部状态", plainOptions([["applied", "已应用"], ["saved", "已保存"], ["applying", "下发中"], ["error", "异常"], ["deleting", "删除中"]])),
-    d.groups.length > 1 ? filterSelect("group", "全部分组", groupOptions(d.groups)) : "",
-  ]) : "";
-  let body = groupedList("chains", items, card, summary);
-  if (!items.length && isFiltering("chains")) body = emptyState("⌕", "没有匹配的配置。");
-  else if (!d.chains.length && d.groups.length === 1) body = emptyState("⇄", "还没有配置，选择链路组合或直连目标。");
-  render(listHead("chains", d.chains.length, items.length, "chain-new", "新增配置") + tools + body);
-  syncFilters();
-}
-
-// ------------------------------------------------------------ 设置
-
 async function settingsPage(request) {
   const s = await api("GET", "settings");
   if (request !== viewRequest) return;
@@ -828,7 +737,6 @@ async function settingsPage(request) {
         <span>服务端</span><span>${esc(s.version)}</span>
         <span>主动 Agent</span><span>${esc(s.components.active_agent || "-")}</span>
         <span>被动 Agent</span><span>${esc(s.components.passive_agent || "-")}</span>
-        <span>旧版兼容 Agent</span><span>${esc(s.components.forward_agent)}</span>
       </div>
     </div>`);
 }
@@ -999,7 +907,7 @@ function confirmBox(title, text, okLabel = "确定", danger = false) {
 function keyModal(title, key, extra = "") {
   openModal(`
     <h2>${esc(title)}</h2>
-    <p>${currentNode?.installed_agent === "legacy" ? "旧版节点在 sudo ictl 菜单 1 中更新接入密钥。" : "在节点运行 <code>sudo ictl --credentials</code> 更新接入密钥（需要 0.4.3 或更新的管理器）。"}</p>
+    <p>在节点运行 <code>sudo ictl --credentials</code> 更新接入密钥。</p>
     <div class="key-box"><code>${esc(key)}</code><button class="small" data-action="copy" data-text="${esc(key)}">复制</button></div>
     ${extra}
     <div class="form-actions"><button type="button" class="primary" data-action="modal-close">完成</button></div>`);
@@ -1059,11 +967,11 @@ async function nodeForm(node) {
     <form data-form="node" data-id="${node ? node.id : ""}" data-kind="forward">
       <label><span>名称</span><input name="name" value="${esc(node?.name)}" maxlength="64" required></label>
       ${groupSelect(groups, node?.group_id)}
-      <label><span>同步模式</span><select name="desired_mode" ${node?.first_seen && node.protocol_version < 2 ? "disabled" : ""}>
+      <label><span>同步模式</span><select name="desired_mode" >
         <option value="active" ${node?.desired_mode !== "passive" ? "selected" : ""}>主动（长连接自动同步）</option>
         <option value="passive" ${node?.desired_mode === "passive" ? "selected" : ""}>被动（默认手动，可选远程唤醒）</option>
       </select></label>
-      ${node?`<p class="hint">${node.first_seen && node.protocol_version < 2 ? '请先升级 Agent 并同步一次，才能切换模式。' : '切换模式后需在本机运行 sudo ictl --sync 确认。'}</p>`:''}
+      ${node?`<p class="hint">切换模式后需在本机运行 sudo ictl --sync 确认。</p>`:''}
       <section class="node-addresses"><h3>IP 地址</h3><p class="hint">填写其他节点能连接到的地址。</p><div data-address-list>${addresses.map(nodeAddressRow).join('')}</div><button type="button" class="small" data-action="node-address-add">＋ 副 IP</button>
       <datalist id="node-local-addresses"></datalist><datalist id="node-devices"></datalist><div data-error="addresses" class="form-error"></div></section>
       <details class="node-options"><summary>更多设置</summary>
@@ -1110,60 +1018,6 @@ function groupForm(kind, group) {
       </div>
     </form>`);
 }
-
-function hopRow(nodes, groups, hop = {}) {
-  const options = nodeOptions(nodes, groups, hop.node_id, (n) => `${esc(n.name)}（${esc(n.addr)} · 端口 ${esc(n.ports)}）`);
-  return `
-    <div class="hop-row">
-      <span class="hop-no"></span>
-      <select name="hop-node"><option value="">选择节点</option>${options}</select>
-      <input name="hop-port" value="${hop.port ?? ""}" placeholder="留空自动分配" inputmode="numeric">
-      <button type="button" data-action="hop-up" title="上移">↑</button>
-      <button type="button" data-action="hop-down" title="下移">↓</button>
-      <button type="button" data-action="hop-del" title="删除">✕</button>
-    </div>`;
-}
-
-function renumberHops() {
-  document.querySelectorAll("#modal .hop-row").forEach((r, i) => ($(".hop-no", r).textContent = `${i + 1}`));
-}
-
-async function chainForm(chain) {
-  const page = pageVersion;
-  const [d, rd, td] = await Promise.all([api("GET", "nodes"), api("GET", "routes"), api("GET", "targets")]);
-  if (page !== pageVersion) return;
-  const routes = rd.routes;
-  const targets = td.targets;
-  if (!targets.length) return toast("请先在目标页面添加目标", true);
-  const selectedRoute = chain ? chain.route_id : routes[0]?.id || null;
-  openModal(`
-    <h2>${chain ? "编辑配置" : "新增配置"}</h2>
-    <form data-form="chain" data-id="${chain?.id || ""}">
-      <label><span>名称</span><input name="remark" value="${esc(chain?.remark)}" maxlength="64" required></label>
-      ${groupSelect(list.data.groups, chain?.group_id)}
-      <label><span>链路模板</span><select name="route_id"><option value="" ${selectedRoute === null ? "selected" : ""}>无链路（直连目标）</option>${routes.map(r => `<option value="${r.id}" ${r.id === selectedRoute ? "selected" : ""}>${esc(r.name)}</option>`).join("")}</select></label>
-      <div id="config-ports"></div>
-      <label><span>目标</span><select name="target_id" required><option value="">请选择目标</option>${targets.map(t => `<option value="${t.id}" ${t.id === chain?.target_id ? "selected" : ""}>${esc(t.name)} · ${esc(t.host)}:${t.port}</option>`).join("")}</select></label>
-      <div class="form-error"></div>
-      <div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div>
-    </form>`);
-  const form = $("#modal form");
-  const updatePorts = () => {
-    const r = routes.find(r => r.id === Number(form.elements.route_id.value));
-    if (!r) { $("#config-ports", form).innerHTML = ""; return; }
-    const old = r.id === chain?.route_id ? [...chain.hops] : [];
-    $("#config-ports", form).innerHTML = `<p class="hint">各跳端口属于此配置；留空自动分配。链路修改会自动更新引用它的配置。</p>` + r.node_ids.map((nid, i) => {
-      const n = d.nodes.find(n => n.id === nid);
-      const index = old.findIndex(h => h.node_id === nid);
-      const previous = index >= 0 ? old.splice(index, 1)[0].port : "";
-      return `<label><span>${i + 1}. ${esc(n.name)}（允许 ${esc(n.ports)}）</span><input name="config_port" value="${previous}" type="number" min="1" max="65535" placeholder="自动分配"></label>`;
-    }).join("");
-  };
-  form.elements.route_id.addEventListener("change", updatePorts);
-  updatePorts();
-}
-
-// ------------------------------------------------------------ 表单处理
 
 function clearFormErrors(form) {
   form.querySelectorAll(".invalid").forEach((el) => el.classList.remove("invalid"));
@@ -1263,15 +1117,7 @@ const FORMS = {
     refresh();
   },
 
-  async chain(form, data) {
-    const id = form.dataset.id;
-    const ports = [...form.querySelectorAll("[name=config_port]")].map(input => input.value);
-    const body = { remark: data.remark, route_id: data.route_id ? Number(data.route_id) : null, target_id: Number(data.target_id), ports, group_id: groupId(data) };
-    const r = await api(id ? "PATCH" : "POST", id ? `configs/${id}` : "configs", body);
-    closeModal();
-    toast(r.assigned.length ? `已保存，自动分配端口：${r.assigned.join("、")}` : "配置已保存");
-    refresh();
-  },
+
 };
 
 document.addEventListener("submit", async (e) => {
@@ -1293,8 +1139,6 @@ document.addEventListener("submit", async (e) => {
 
 // ------------------------------------------------------------ 按钮操作
 
-const chainById = (id) => list.data.chains.find((c) => c.id === Number(id));
-
 const ACTIONS = {
   copy: (el) => copy(el.dataset.text),
   "modal-close": () => requestCloseModal(),
@@ -1312,7 +1156,7 @@ const ACTIONS = {
     const d=await api('GET',`nodes/${id}`);
     if(page!==pageVersion||currentNode?.id!==id||session!==modalState||modalState?.busy)return;
     const queries=[['inventory','系统信息'],['ports','端口详情'],['network','网络信息'],['rules','当前规则'],['logs','最近日志'],['diagnose','转发诊断'],['connections','转发连接']];
-    openModal(`<h2>节点诊断</h2><form data-form="node-diagnostic" data-id="${id}"><label><span>检查项目</span><select name="kind" data-ignore-dirty>${plainOptions(queries)}</select></label><label data-diagnostic-rule hidden><span>转发规则</span><select name="rule_id" data-ignore-dirty>${plainOptions(d.rules.map(r=>[r.id,`${r.chain_remark} · ${r.port}`]))}</select></label><pre class="diagnostic-result" data-diagnostic-result hidden></pre><div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">关闭</button><button class="primary">检查</button></div></form>`);
+    openModal(`<h2>节点诊断</h2><form data-form="node-diagnostic" data-id="${id}"><label><span>检查项目</span><select name="kind" data-ignore-dirty>${plainOptions(queries)}</select></label><label data-diagnostic-rule hidden><span>转发规则</span><select name="rule_id" data-ignore-dirty>${plainOptions(d.rules.map(r=>[r.id,`${r.configuration_name} · ${r.port}`]))}</select></label><pre class="diagnostic-result" data-diagnostic-result hidden></pre><div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">关闭</button><button class="primary">检查</button></div></form>`);
     const form=$('#modal form');
     form.elements.kind.addEventListener('change',()=>{
       const needsRule=['diagnose','connections'].includes(form.elements.kind.value);
@@ -1342,7 +1186,7 @@ const ACTIONS = {
   },
 
   async "node-rekey"() {
-    const ok = await confirmBox("重置密钥", `重置后旧密钥立即失效，节点 <b>${esc(currentNode.name)}</b> 需要填入新密钥才能继续同步。${currentNode.installed_agent !== "legacy" ? "请先将节点管理器更新到 0.4.3，再执行此操作。" : ""}`, "重置");
+    const ok = await confirmBox("重置密钥", `重置后旧密钥立即失效，节点 <b>${esc(currentNode.name)}</b> 需要填入新密钥才能继续同步。`, "重置");
     if (!ok) return;
     const r = await api("POST", `nodes/${currentNode.id}/rekey`);
     keyModal("密钥已重置", r.key);
@@ -1437,42 +1281,7 @@ const ACTIONS = {
     }
   },
 
-  "chain-new": () => chainForm(),
-  "chain-edit": (el) => chainForm(chainById(el.dataset.id)),
 
-  async "chain-delete"(el) {
-    const c = chainById(el.dataset.id);
-    const force = el.dataset.force === "1";
-    const text = force
-      ? `直接删除配置 <b>${esc(c.remark)}</b> 的记录。尚未确认的节点恢复连接后，会在同步时自动清除对应规则。`
-      : c.route_id || c.pending.length
-        ? `将通知相关节点移除配置 <b>${esc(c.remark)}</b> 的转发规则，所有节点确认后自动删除。`
-        : `删除直连配置 <b>${esc(c.remark)}</b>？目标监听及其他引用配置会保留。`;
-    if (!(await confirmBox(force ? "强制删除配置" : "删除配置", text, "删除", true))) return;
-    const r = await api("DELETE", `configs/${c.id}${force ? "?force=1" : ""}`);
-    toast(r.deleted ? "已删除" : "已通知节点，确认后自动删除");
-    refresh();
-  },
-
-  "hop-add"(el) {
-    const form = el.closest("form");
-    $("#hop-list").insertAdjacentHTML("beforeend", form.hopTemplate());
-    renumberHops();
-  },
-  "hop-up"(el) {
-    const row = el.closest(".hop-row");
-    if (row.previousElementSibling) row.parentNode.insertBefore(row, row.previousElementSibling);
-    renumberHops();
-  },
-  "hop-down"(el) {
-    const row = el.closest(".hop-row");
-    if (row.nextElementSibling) row.parentNode.insertBefore(row.nextElementSibling, row);
-    renumberHops();
-  },
-  "hop-del"(el) {
-    if (document.querySelectorAll("#modal .hop-row").length > 1) el.closest(".hop-row").remove();
-    renumberHops();
-  },
 };
 
 document.addEventListener("click", (e) => {
@@ -1589,22 +1398,6 @@ document.addEventListener("change", (e) => {
 });
 
 // ------------------------------------------------------------ 链路与目标
-
-async function routeList(request) {
-  const data = await api("GET", "routes");
-  if (request !== viewRequest) return;
-  list = {kind: "routes", data, draw: drawRoutes};
-  drawRoutes();
-}
-
-function drawRoutes() {
-  const d = list.data;
-  const card = r => `<div class="card" data-key="route-${r.id}"><div class="card-head"><div class="title">${esc(r.name)}</div><div class="actions"><button class="small" data-action="route-edit" data-id="${r.id}">编辑</button><button class="small danger" data-action="route-delete" data-id="${r.id}">删除</button></div></div>
-      <div class="path">${r.nodes.map(n => `<a href="#/nodes/${n.id}">${esc(n.name)}</a>`).join('<span class="arrow">→</span>')}</div>
-      ${r.nodes.length > 1 ? `<a class="quality-link" href="#/quality/routes/${r.id}">网络质量与趋势 →</a>` : ""}
-      <div class="sub">${r.configs.length ? `被 ${r.configs.length} 个配置引用：${r.configs.map(c => esc(c.remark)).join("、")}` : "尚未被配置使用"}</div></div>`;
-  drawManagedList("routes", d.routes, card, "route-new", "新增链路", "链路保存转发节点顺序，不分配端口。修改后会自动更新所有引用配置。");
-}
 
 const qualityViews = new Map();
 let qualityResizeObserver = null;
@@ -1793,51 +1586,7 @@ function resizeQualityPlot(plot, width) {
   if (plot.qualityTime != null) showQualityPoint(plot,plot.qualityTime);
 }
 
-async function qualityPage(scope, id, request) {
-  if(scope==='links')return linkQualityPage(id,request);
-  const key = `${scope}/${id}`, selection = qualityViews.get(key) || {range: 900};
-  let d;
-  try { d = await api("POST", "quality", {scope, id, ...selection}); }
-  catch (err) {
-    if (request !== viewRequest || err.status === 401 || err.status === 403) return;
-    if (err.status === 400 && selection.source != null) {
-      qualityViews.set(key, {range: selection.range});
-      return qualityPage(scope, id, request);
-    }
-    if (err.status === 404) leaveView();
-    else releaseQuality();
-    render(`<h1>网络质量</h1><p class="t-red">${esc(err.message)}</p><a href="#/${scope}">返回列表</a>`);
-    return;
-  }
-  if (request !== viewRequest) return;
-  if (!d.pair) return render(`<h1>网络质量</h1><p>至少需要两个节点。</p><a href="#/${scope === "links" ? "routes/" + id : scope}">返回列表</a>`);
-  qualityViews.set(key, {range: selection.range, source: d.pair.source, target: d.pair.target});
-  const options = value => d.nodes.map(n => `<option value="${n.id}" ${n.id === value ? "selected" : ""}>${esc(n.name)}${n.mode === "passive" ? "（被动）" : ""}</option>`).join("");
-  const notes = d.series.filter(s => s.note || s.latest?.error).map(s => `${QUALITY_PROTOCOLS[s.protocol][0]}：${esc(s.note || s.latest.error)}`);
-  renderQuality(`<div class="list-head"><h1>网络质量</h1><a href="#/${scope === "links" ? "routes/" + id : scope}">返回列表</a></div>
-    <div class="panel quality-controls" data-quality="${key}">
-      <label><span>发起节点</span><select name="quality-source">${options(d.pair.source)}</select></label>
-      <span class="quality-arrow">→</span><label><span>接收节点</span><select name="quality-target">${options(d.pair.target)}</select></label>
-      <label><span>时间范围</span><select name="quality-range">${QUALITY_RANGES.map(([n,label]) => `<option value="${n}" ${n === selection.range ? "selected" : ""}>最近 ${label}</option>`).join("")}</select></label>
-    </div>
-    <div class="panel quality-card" data-key="quality-${scope}-${id}"><div class="quality-heading"><h2>往返延迟 <span class="count">ms</span></h2>${qualityLegend(d.series)}</div>
-      ${qualityChart(d.series,d.now,selection.range)}
-      ${qualityTable(d.series,d.now)}
-      ${notes.length ? `<p class="hint">${notes.join("；")}</p>` : ""}
-    </div>
-    <p class="hint">${d.adjacent ? "后台持续采集" : "查看期间采集非相邻节点的直达网络"}，每种协议默认 10 秒一次，共享节点限速。历史保留 7 天。底部 × 表示异常或未知。</p>`,[{series:d.series,now:d.now,seconds:selection.range}]);
-
-}
-
-document.addEventListener("change", e => {
-  const box = e.target.closest?.("[data-quality]");
-  if (!box) return;
-  const source = Number(box.querySelector('[name="quality-source"]').value);
-  const target = Number(box.querySelector('[name="quality-target"]').value);
-  if (source === target) { toast("请选择两个不同节点", true); return; }
-  qualityViews.set(box.dataset.quality, {source, target, range: Number(box.querySelector('[name="quality-range"]').value)});
-  refresh();
-});
+async function qualityPage(scope,id,request){return linkQualityPage(id,request);}
 
 // 各列表共用交互方式，数据、分组 ID、筛选与折叠状态按 kind 分开。
 function drawManagedList(kind, rows, card, newAction, newLabel, hint, extraActions = "") {
@@ -1852,22 +1601,6 @@ function drawManagedList(kind, rows, card, newAction, newLabel, hint, extraActio
     : groupedList(kind, items, card, () => "");
   render(listHead(kind, rows.length, items.length, newAction, newLabel, extraActions) + (hint?`<p class="hint">${hint}</p>`:'') + controls + body);
   syncFilters();
-}
-
-async function routeForm(r) {
-  const page = pageVersion;
-  const d = await api("GET", "nodes");
-  if (page !== pageVersion) return;
-  const nodes = d.nodes.filter(n => n.kind === "forward" && n.status !== "deleting");
-  if (!nodes.length) return toast("请先添加转发节点", true);
-  const row = id => `<div class="hop-row route-hop"><span class="hop-no"></span><select name="route-node" required><option value="">选择节点</option>${nodeOptions(nodes, d.groups, id)}</select><button type="button" data-action="hop-up">↑</button><button type="button" data-action="hop-down">↓</button><button type="button" data-action="hop-del">✕</button></div>`;
-  openModal(`<h2>${r ? "编辑链路" : "新增链路"}</h2><form data-form="route" data-id="${r?.id || ""}">
-    <label><span>名称</span><input name="name" value="${esc(r?.name)}" maxlength="64" required></label>
-    ${groupSelect(list.data.groups, r?.group_id)}
-    <div id="hop-list">${(r?.node_ids || [null]).map(row).join("")}</div><button type="button" class="small" data-action="hop-add">添加一跳</button>
-    ${r?.configs.length ? `<p class="t-yellow">保存会自动更新 ${r.configs.length} 个配置：${r.configs.map(c => esc(c.remark)).join("、")}。调整入口节点会改变连接地址。</p>` : ""}
-    <div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
-  $("#modal form").hopTemplate = () => row(null); renumberHops();
 }
 
 const PROTOCOLS = {shadowsocks: "Shadowsocks", "vless-reality": "VLESS Reality", endpoint: "IP／域名＋端口"};
@@ -1904,23 +1637,9 @@ Object.assign(FORMS, {
     await api(id ? "PATCH" : "POST", id ? `targets/${id}` : "targets", body);
     closeModal(); toast("已保存，可在配置中选择此目标"); refresh();
   },
-  async route(form, data) {
-    const id = form.dataset.id;
-    const body = {name: data.name, group_id: groupId(data), node_ids: [...form.querySelectorAll("[name=route-node]")].map(s => Number(s.value))};
-    const r = await api(id ? "PATCH" : "POST", id ? `routes/${id}` : "routes", body);
-    closeModal(); toast(r.affected ? `已保存，自动更新 ${r.affected} 个引用配置` : "链路已保存"); refresh();
-  },
 
 });
 Object.assign(ACTIONS, {
-  "route-new": () => routeForm(),
-  "route-edit": el => routeForm(list.data.routes.find(r => r.id === Number(el.dataset.id))),
-  async "route-delete"(el) {
-    const r = list.data.routes.find(r => r.id === Number(el.dataset.id));
-    if (r.configs.length) return toast("此链路仍被配置引用，请先解除引用", true);
-    if (!(await confirmBox("删除链路", `删除 <b>${esc(r.name)}</b>？`, "删除", true))) return;
-    await api("DELETE", `routes/${r.id}`); toast("已删除"); refresh();
-  },
   "target-new": () => targetForm(),
   "target-import": () => targetForm(null, true),
   "target-edit": el => targetForm(list.data.targets.find(t => t.id === Number(el.dataset.id))),
@@ -1930,14 +1649,7 @@ Object.assign(ACTIONS, {
     if (!(await confirmBox("删除目标", `删除 <b>${esc(t.name)}</b> 的记录？`, "删除", true))) return;
     await api("DELETE", `targets/${t.id}`); toast("已删除"); refresh();
   },
-  connection(el) {
-    const c = chainById(el.dataset.id), x = c.connection;
-    openModal(`<h2>${esc(c.remark)} · 连接信息</h2><div class="kv-grid"><span>协议</span><span>${esc(PROTOCOLS[x.protocol] || x.protocol)}</span><span>地址</span><code>${esc(x.host)}:${x.port}</code>${x.username ? `<span>用户名</span><code>${esc(x.username)}</code>` : ""}${x.password ? `<span>密码</span><code>${esc(x.password)}</code>` : ""}</div>
-      <label><span>连接链接</span><textarea readonly rows="4">${esc(x.uri)}</textarea></label>
-      ${x.tcp_only ? `<p class="hint">此 SOCKS5 链路仅支持 TCP，链接导入支持取决于客户端。</p>` : ""}
-      <p class="hint">${chainStatus(c) === "saved" ? "外部目标连接信息已保存；尚未进行连通性检测。" : chainStatus(c) === "applied" ? "配置已应用；尚未进行连通性检测。" : "配置尚未全部应用，请等待节点确认。"}</p>
-      <div class="form-actions"><button data-action="modal-close">关闭</button><button class="primary" data-action="copy" data-text="${esc(x.uri)}">复制链接</button></div>`);
-  }
+
 });
 
 // ------------------------------------------------------------ 启动

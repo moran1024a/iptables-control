@@ -35,51 +35,9 @@ class ImportTests(Fixture, unittest.TestCase):
     def imported(self, uri=None, **kw):
         return self.call('api_target_save', dict(uri=uri or ss_uri(), **kw))['id']
 
-    def direct(self, tid, route=None, **kw):
-        return self.call('api_config_save', dict(remark='external', route_id=route,
-                         target_id=tid, **kw))['id']
 
-    def test_import_needs_no_agent_and_preserves_external_service(self):
-        tid = self.imported()
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM nodes').fetchone()[0], 0)
-        tunnel = self.call('api_targets')['targets'][0]
-        c = self.direct(tid)
-        data = self.call('api_configs')['chains'][0]
-        self.assertEqual(data['status'], 'saved')
-        self.assertEqual((data['connection']['host'], data['connection']['port']), ('192.0.2.50', 23456))
-        self.assertFalse(data['pending'])
-        self.assertFalse(data['hops'])
-        with self.assertRaises(errors.UserError):
-            self.call('api_target_del', {}, tid)
-        self.assertTrue(self.call('api_chain_del', {}, c)['deleted'])
-        self.assertIsNotNone(database.get_target(self.db, tid))
-        self.assertTrue(self.call('api_target_del', {}, tid)['deleted'])
-        self.assertFalse(self.db.execute('SELECT * FROM retired_ports').fetchall())
 
-    def test_shared_external_endpoint_uses_independent_credentials(self):
-        a, b = self.imported(), self.imported(ss_uri(key=b'b' * 16))
-        self.direct(a); self.direct(b)
-        records = self.call('api_configs')['chains']
-        self.assertNotEqual(records[0]['connection']['password'], records[1]['connection']['password'])
 
-    def test_endpoint_edits_update_all_configs_and_wait_for_forward_ack(self):
-        nid = self.node(); route = self.route([nid]); tid = self.imported()
-        direct = self.direct(tid); routed = self.direct(tid, route, ports=[10001])
-        self.db.execute('DELETE FROM chain_pending'); self.db.commit()
-        old_hops = [tuple(r) for r in self.db.execute('SELECT * FROM hops')]
-        self.call('api_target_save', {'uri': ss_uri('other.example.com', 34567)}, tid)
-        configs = {c['id']: c for c in self.call('api_configs')['chains']}
-        self.assertEqual(configs[direct]['connection']['host'], 'other.example.com')
-        self.assertEqual(configs[direct]['status'], 'saved')
-        self.assertEqual(configs[routed]['status'], 'applying')
-        self.assertEqual(configs[routed]['connection']['host'], '192.0.2.1')
-        self.assertEqual(configs[routed]['connection']['port'], 10001)
-        self.assertIn('other.example.com 34567', forwarding.node_rules(self.db, database.get_node(self.db, nid))[0])
-        self.assertEqual([tuple(r) for r in self.db.execute('SELECT * FROM hops')], old_hops)
-        self.db.execute('DELETE FROM chain_pending'); self.db.commit()
-        self.call('api_target_save', {'uri': ss_uri('other.example.com', 34567, b'z' * 16)}, tid)
-        self.assertFalse(self.db.execute('SELECT * FROM chain_pending').fetchall())
-        self.assertEqual(self.call('api_configs')['chains'][0]['connection']['password'], base64.b64encode(b'z'*16).decode())
 
     def test_target_groups_work(self):
         tid = self.imported()
@@ -135,7 +93,7 @@ class ImportTests(Fixture, unittest.TestCase):
         self.imported(ss_uri().replace('%3D%3D@', '%3D%3D%3A' + quote(password, safe='') + '@'))
 
     def test_invalid_import_is_atomic_and_keeps_existing_references(self):
-        tid = self.imported(); self.direct(tid)
+        tid = self.imported(); self.save(self.graph([self.node()],tid))
         before = tuple(database.get_target(self.db, tid))
         invalid = ['vmess://abc', 'https://example.com', ss_uri().replace('23456', '0'),
                    ss_uri().replace('23456', '65536'), ss_uri().replace('192.0.2.50', '[::1]'),

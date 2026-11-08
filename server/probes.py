@@ -9,7 +9,6 @@ import time
 import link_quality
 import network_quality as q
 import probe_store as store
-import pools
 
 
 class Monitor:
@@ -39,7 +38,9 @@ class Monitor:
             return None
         target = self.hub.sessions[pair["target"]]
         listener = target.get("quality_listener", {})
-        if listener.get("port") != pair["port"] or listener.get("id") != target.get("quality_setup_id"):
+        if listener.get("port") != pair["port"] or listener.get("id") != target.get(
+            "quality_setup_id"
+        ):
             return ("waiting", "等待探测端口就绪")
         if listener.get("error"):
             return ("error", listener["error"])
@@ -48,21 +49,11 @@ class Monitor:
     def plan(self, c, now):
         nodes = {r["id"]: dict(r) for r in c.execute("SELECT * FROM nodes")}
         routes = q.paths(c)
-        linked = {r[0] for r in c.execute("SELECT chain_id FROM links WHERE chain_id IS NOT NULL")}
         edges = {
             (scope, ident, a, b)
-            for (scope, ident), ids in routes.items()
-            if scope == "routes" or (scope == "configs" and ident not in linked)
-            for a, b in zip(ids, ids[1:])
-            if a != b
+            for (scope, ident, a, b), expiry in self.extra.items()
+            if expiry > now and a in routes.get((scope, ident), []) and b in routes[(scope, ident)]
         }
-        for link in c.execute("SELECT * FROM links WHERE state NOT IN ('draft','deleting')"):
-            plan = pools.runtime_plan(link)
-            if plan and "graph" in plan and not plan.get("routing"):
-                edges.update(("links", link["id"], a, b) for a,b in pools.quality_paths(c, link["id"])[1])
-        for (scope, ident, a, b), expiry in self.extra.copy().items():
-            if expiry > now and a in routes.get((scope, ident), []) and b in routes[(scope, ident)]:
-                edges.add((scope, ident, a, b))
         demands = []
         for scope, ident, a, b in sorted(edges):
             if a not in nodes or b not in nodes:
@@ -89,11 +80,13 @@ class Monitor:
                         pair=pair,
                     )
                 )
-        for link in c.execute("SELECT * FROM links l WHERE state NOT IN ('draft','deleting') AND NOT EXISTS (SELECT 1 FROM link_members m WHERE m.link_id=l.id AND m.root_id<>l.id)"):
-            for section in link_quality.sections(c, link, nodes):
+        for topo in c.execute("SELECT * FROM topologies WHERE deleted=0"):
+            for section in link_quality.sections(c, topo, nodes):
                 for spec in section["probes"]:
                     spec.update(
-                        scope="links", owner_id=link["id"], reason=link_quality.reason(self, spec, nodes)
+                        scope="topologies",
+                        owner_id=topo["id"],
+                        reason=link_quality.reason(self, spec, nodes),
                     )
                     demands.append(spec)
         return nodes, demands
@@ -118,7 +111,9 @@ class Monitor:
                 continue
             port = nodes[nid]["quality_port"] if nid in needed else 0
             listener = session.get("quality_listener")
-            retry = (not listener or listener.get("error")) and now - session.get("quality_setup_at", 0) >= 30
+            retry = (not listener or listener.get("error")) and now - session.get(
+                "quality_setup_at", 0
+            ) >= 30
             if session.get("quality_port") == port and not retry:
                 continue
             session.update(
@@ -151,7 +146,10 @@ class Monitor:
             target = self.hub.sessions.get(spec["target"])
             if target is not task["target_session"]:
                 return False
-            if spec["protocol"] == "udp-echo-v1" and target.get("quality_setup_id") != task["setup_id"]:
+            if (
+                spec["protocol"] == "udp-echo-v1"
+                and target.get("quality_setup_id") != task["setup_id"]
+            ):
                 return False
         return True
 
@@ -187,8 +185,15 @@ class Monitor:
             elif now - task["at"] >= 8:
                 self.pending.pop(op, None)
                 await self.hub.database(
-                    lambda c: store.record(c, task["task_id"], task["at"], "error", error="探测结果未返回",
-                                           epoch=task["epoch"], previous_slot=task["previous_slot"])
+                    lambda c: store.record(
+                        c,
+                        task["task_id"],
+                        task["at"],
+                        "error",
+                        error="探测结果未返回",
+                        epoch=task["epoch"],
+                        previous_slot=task["previous_slot"],
+                    )
                 )
         busy = {t["task_id"] for t in self.pending.values()}
         self.budget = {n: t for n, t in self.budget.items() if t >= now - 1}
@@ -206,11 +211,16 @@ class Monitor:
             self.last[task_id] = now
             source = self.hub.sessions[spec["source"]]
             target = self.hub.sessions.get(spec["target"])
-            session_key = (source.get("id", id(source)), target.get("id", id(target)) if target else None,
-                           target.get("quality_setup_id") if target else None)
+            session_key = (
+                source.get("id", id(source)),
+                target.get("id", id(target)) if target else None,
+                target.get("quality_setup_id") if target else None,
+            )
             stream = self.streams.get(task_id)
             if stream is None or stream["session"] != session_key:
-                stream = self.streams[task_id] = dict(epoch=secrets.token_hex(16), previous=None, session=session_key)
+                stream = self.streams[task_id] = dict(
+                    epoch=secrets.token_hex(16), previous=None, session=session_key
+                )
             op = secrets.token_hex(16)
             self.pending[op] = dict(
                 task_id=task_id,
@@ -219,7 +229,8 @@ class Monitor:
                 session=source,
                 target_session=target,
                 setup_id=target.get("quality_setup_id") if target else None,
-                epoch=stream["epoch"], previous_slot=stream["previous"],
+                epoch=stream["epoch"],
+                previous_slot=stream["previous"],
             )
             stream["previous"] = now
             message = dict(
@@ -239,8 +250,15 @@ class Monitor:
             except (ConnectionError, asyncio.TimeoutError):
                 failed = self.pending.pop(op)
                 await self.hub.database(
-                    lambda c: store.record(c, task_id, now, "error", error="探测指令发送失败",
-                                           epoch=failed["epoch"], previous_slot=failed["previous_slot"])
+                    lambda c: store.record(
+                        c,
+                        task_id,
+                        now,
+                        "error",
+                        error="探测指令发送失败",
+                        epoch=failed["epoch"],
+                        previous_slot=failed["previous_slot"],
+                    )
                 )
 
     async def result(self, nid, session, data):
@@ -270,7 +288,8 @@ class Monitor:
                     rtt if status == "ok" else None,
                     data.get("error", ""),
                     data.get("resolved_ip", ""),
-                    epoch=task["epoch"], previous_slot=task["previous_slot"],
+                    epoch=task["epoch"],
+                    previous_slot=task["previous_slot"],
                 )
 
         await self.hub.database(save)

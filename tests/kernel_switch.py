@@ -1,4 +1,4 @@
-"""Run via sudo unshare -nm python3 tests/kernel_pool_switch.py ACTIVE_BINARY.
+"""Run via sudo unshare -nm python3 tests/kernel_switch.py ACTIVE_BINARY.
 
 Exercises a persistent UDP client through both forwarding backends. All network
 and mount changes are confined to disposable namespaces, all files to /tmp.
@@ -72,7 +72,7 @@ try:
     run('iptables', '-t', 'nat', '-A', 'PREROUTING', '-p', 'udp', '--dport', '30124', '-j', 'DNAT', '--to-destination', '198.51.100.2:30443')
     run('iptables', '-t', 'nat', '-A', 'POSTROUTING', '-p', 'udp', '-d', '198.51.100.2', '--dport', '30443', '-m', 'conntrack', '--ctorigdstport', '30124', '-j', 'MASQUERADE')
     other = client(30124); probe(other, 'A')
-    with tempfile.TemporaryDirectory(prefix='ictl-pool-kernel-') as temp:
+    with tempfile.TemporaryDirectory(prefix='ictl-switch-kernel-') as temp:
         root = Path(temp); conf = root/'identity'
         conf.write_text('URL=https://example.invalid/sync\nKEY=' + 'ab'*32 + '\n')
         binary = str(Path(sys.argv[1]).resolve())

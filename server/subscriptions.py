@@ -3,22 +3,17 @@ import json
 import secrets
 import database
 import errors
-import pools
-import topology_groups
+import execution
+import configurations as configs
 import target_config
 import validation
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS subscriptions (
- id INTEGER PRIMARY KEY, name TEXT NOT NULL, token TEXT NOT NULL UNIQUE,
- enabled INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS subscription_links (
- subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
- link_id INTEGER NOT NULL REFERENCES links(id) ON DELETE CASCADE,
- PRIMARY KEY(subscription_id,link_id)
-);
-"""
+
+def get(c, ident):
+    row = c.execute("SELECT * FROM subscriptions WHERE id=?", (ident,)).fetchone()
+    if row is None:
+        raise errors.UserError("订阅不存在", status=404)
+    return row
 
 
 def clash_proxy(target, connection, name):
@@ -32,7 +27,9 @@ def clash_proxy(target, connection, name):
         out.update(type="ss", cipher=p["method"], password=p["password"])
         if q.get("plugin"):
             plugin, *options = q["plugin"].split(";")
-            opts = dict((part.split("=", 1) if "=" in part else (part, True) for part in options if part))
+            opts = dict(
+                (part.split("=", 1) if "=" in part else (part, True) for part in options if part)
+            )
             if plugin in ("obfs-local", "simple-obfs") and set(opts) <= {"obfs", "obfs-host"}:
                 if opts.get("obfs") not in ("http", "tls"):
                     raise ValueError("无效的 obfs 模式")
@@ -123,24 +120,25 @@ def clash_proxy(target, connection, name):
 
 def configurations(c):
     result = []
-    order = topology_groups.config_order(c)
-    for link in sorted(c.execute(database.ordered("links")).fetchall(), key=lambda row: order(row["id"])):
-        if not link["chain_id"]:
-            continue
-        chain = database.get_chain(c, link["chain_id"])
-        target = database.get_target(c, chain["target_id"])
-        if link["applied"]:
-            target = pools.applied_target(c, link)
-        info = pools.detail(c, link)
-        connection = info["connection"] if link["state"] != "deleting" else None
-        error = ("配置正在删除" if link["state"] == "deleting" else "配置尚未生效") if not connection else ""
+    for row in sorted(
+        [dict(r) for r in c.execute("SELECT * FROM configurations WHERE deleted=0")],
+        key=configs.order(c),
+    ):
+        view = configs.view(c, row)
+        target = (
+            execution.applied_target(c, row)
+            if row["applied"]
+            else database.get_target(c, json.loads(row["desired"])["target"])
+        )
+        connection = view["connection"]
+        error = "配置尚未生效" if not connection else ""
         if target["type"] == "endpoint":
             error = "仅有地址和端口，缺少代理协议"
         item = dict(
-            id=link["id"],
-            name=topology_groups.config_name(c, link),
-            code=topology_groups.config_code(link['id']),
-            group_id=topology_groups.config_group(c, link),
+            id=row["id"],
+            name=row["name"],
+            code=configs.code(row["id"]),
+            group_id=configs.get_topology(c, row["topology_id"])["group_id"],
             connection=connection,
             target=dict(target),
             error=error,
@@ -148,7 +146,7 @@ def configurations(c):
         )
         if not error:
             try:
-                clash_proxy(target, connection, link["name"])
+                clash_proxy(target, connection, row["name"])
             except ValueError as exc:
                 item["clash_error"] = str(exc)
         result.append(item)
@@ -161,14 +159,17 @@ def listing(c):
     for row in c.execute("SELECT * FROM subscriptions ORDER BY id"):
         ids = [
             r[0]
-            for r in c.execute("SELECT link_id FROM subscription_links WHERE subscription_id=?", (row["id"],))
+            for r in c.execute(
+                "SELECT configuration_id FROM subscription_configurations WHERE subscription_id=?",
+                (row["id"],),
+            )
         ]
         selected = [x for x in configs if x["id"] in ids]
         rows.append(
             dict(
                 row,
                 enabled=bool(row["enabled"]),
-                link_ids=ids,
+                configuration_ids=ids,
                 path="/sub/" + row["token"],
                 counts={
                     fmt: sum((not x[field] for x in selected))
@@ -178,21 +179,24 @@ def listing(c):
         )
     return dict(
         subscriptions=rows,
-        configs=[{k: x[k] for k in ("id", "name", "code", "group_id", "error", "clash_error")} for x in configs],
-        groups=database.get_groups(c, "links"),
+        configs=[
+            {k: x[k] for k in ("id", "name", "code", "group_id", "error", "clash_error")}
+            for x in configs
+        ],
+        groups=database.get_groups(c, "topologies"),
         public_url=database.setting(c, "public_url", ""),
     )
 
 
 def save(c, body, ident=None):
-    old = pools.get(c, "subscriptions", ident) if ident else None
+    old = get(c, ident) if ident else None
     name = validation.check_remark(body.get("name", old["name"] if old else ""), "name", "名称")
     enabled = body.get("enabled", bool(old["enabled"]) if old else True)
     if type(enabled) is not bool:
         raise errors.UserError("启用状态无效", "enabled")
     if body.get("reset_token", False) not in (True, False):
         raise errors.UserError("重置参数无效")
-    ids = body.get("link_ids")
+    ids = body.get("configuration_ids")
     if ids is not None:
         if (
             not isinstance(ids, list)
@@ -200,15 +204,16 @@ def save(c, body, ident=None):
             or any((type(n) is not int for n in ids))
             or (len(set(ids)) != len(ids))
         ):
-            raise errors.UserError("请选择不重复的配置，最多 512 项", "link_ids")
+            raise errors.UserError("请选择不重复的配置，最多 512 项", "configuration_ids")
         available = {x["id"]: x for x in configurations(c)}
         for nid in ids:
             if nid not in available:
-                raise errors.UserError("配置已删除，请刷新后重试", "link_ids")
+                raise errors.UserError("配置已删除，请刷新后重试", "configuration_ids")
     if old:
         token = secrets.token_hex(32) if body.get("reset_token") else old["token"]
         c.execute(
-            "UPDATE subscriptions SET name=?,enabled=?,token=? WHERE id=?", (name, int(enabled), token, ident)
+            "UPDATE subscriptions SET name=?,enabled=?,token=? WHERE id=?",
+            (name, int(enabled), token, ident),
         )
     else:
         ident = c.execute(
@@ -216,8 +221,10 @@ def save(c, body, ident=None):
             (name, secrets.token_hex(32), int(enabled)),
         ).lastrowid
     if ids is not None:
-        c.execute("DELETE FROM subscription_links WHERE subscription_id=?", (ident,))
-        c.executemany("INSERT INTO subscription_links VALUES (?,?)", [(ident, n) for n in ids])
+        c.execute("DELETE FROM subscription_configurations WHERE subscription_id=?", (ident,))
+        c.executemany(
+            "INSERT INTO subscription_configurations VALUES (?,?)", [(ident, n) for n in ids]
+        )
     return dict(id=ident)
 
 
@@ -227,15 +234,18 @@ def export(c, token, fmt):
         return None
     ids = {
         r[0]
-        for r in c.execute("SELECT link_id FROM subscription_links WHERE subscription_id=?", (row["id"],))
+        for r in c.execute(
+            "SELECT configuration_id FROM subscription_configurations WHERE subscription_id=?",
+            (row["id"],),
+        )
     }
     items = [x for x in configurations(c) if x["id"] in ids and (not x["error"])]
     names = {"DIRECT", "REJECT", "GLOBAL", "订阅节点"}
     links, proxies = ([], [])
     for item in items:
         name = item["name"]
-        while fmt == 'clash' and name in names:
-            name += " [" + item['code'] + "]"
+        while fmt == "clash" and name in names:
+            name += " [" + item["code"] + "]"
         names.add(name)
         if fmt == "clash":
             if not item["clash_error"]:
@@ -247,10 +257,15 @@ def export(c, token, fmt):
                 )["uri"]
             )
     if fmt == "v2ray":
-        return (base64.b64encode("\n".join(links).encode()).decode() + "\n", "text/plain; charset=utf-8")
+        return (
+            base64.b64encode("\n".join(links).encode()).decode() + "\n",
+            "text/plain; charset=utf-8",
+        )
     group = dict(name="订阅节点", type="select", proxies=[p["name"] for p in proxies] or ["REJECT"])
     encode = lambda obj: json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
     body = "mixed-port: 7890\nallow-lan: false\nmode: rule\nproxies:"
     body += "\n" + "".join(("  - " + encode(p) + "\n" for p in proxies)) if proxies else " []\n"
-    body += "proxy-groups:\n  - " + encode(group) + "\nrules:\n  - " + encode("MATCH,订阅节点") + "\n"
+    body += (
+        "proxy-groups:\n  - " + encode(group) + "\nrules:\n  - " + encode("MATCH,订阅节点") + "\n"
+    )
     return (body, "application/yaml; charset=utf-8")

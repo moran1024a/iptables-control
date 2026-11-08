@@ -12,90 +12,6 @@ import node_sync
 import node_addresses
 import settings
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS node_snapshots (
- node_id INTEGER PRIMARY KEY, inventory TEXT NOT NULL DEFAULT '{}', metrics TEXT NOT NULL DEFAULT '{}',
- ports TEXT NOT NULL DEFAULT '{}', inventory_at INTEGER, metrics_at INTEGER, ports_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS traffic_epochs (
- node_id INTEGER NOT NULL, rule_id INTEGER NOT NULL, protocol TEXT NOT NULL, epoch TEXT NOT NULL,
- up TEXT NOT NULL, down TEXT NOT NULL, up_packets TEXT NOT NULL, down_packets TEXT NOT NULL,
- updated INTEGER NOT NULL, quality TEXT NOT NULL, PRIMARY KEY(node_id,rule_id,protocol,epoch)
-);
-CREATE TABLE IF NOT EXISTS metric_windows (
- node_id INTEGER NOT NULL, window INTEGER NOT NULL, data TEXT NOT NULL,
- PRIMARY KEY(node_id,window)
-);
-CREATE TABLE IF NOT EXISTS metric_hours (
- node_id INTEGER NOT NULL, window INTEGER NOT NULL, data TEXT NOT NULL,
- PRIMARY KEY(node_id,window)
-);
-CREATE TABLE IF NOT EXISTS archived_nodes (
- node_id INTEGER PRIMARY KEY, name TEXT NOT NULL, deleted_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS agent_switches (
- node_id INTEGER PRIMARY KEY, op TEXT NOT NULL, target TEXT NOT NULL, generation INTEGER NOT NULL,
- hash TEXT NOT NULL, config TEXT NOT NULL, result TEXT, updated INTEGER NOT NULL
-);
-"""
-
-
-def reset_v03(conn):
-    """Retain node/target resources, but start 0.4 with no legacy topology.
-
-    Port tombstones are cleanup bookkeeping, not retained forwarding configs.
-    They prevent reuse until the old Agent confirms its new empty snapshot.
-    """
-    conn.execute(
-        "INSERT OR IGNORE INTO retired_ports(node_id,port)\n        SELECT h.node_id,h.port FROM hops h JOIN nodes n ON n.id=h.node_id WHERE n.first_seen IS NOT NULL"
-    )
-    for table in (
-        "hops",
-        "chains",
-        "routes",
-        "chain_pending",
-        "sync_ops",
-        "deleted_receipts",
-        "windows",
-        "active_windows",
-        "events",
-    ):
-        conn.execute(f"DELETE FROM {table}")
-    conn.execute("DELETE FROM item_groups WHERE kind NOT IN ('nodes','targets')")
-    for kind in ("routes", "chains"):
-        conn.execute(
-            "INSERT INTO item_groups(kind,name,builtin) VALUES (?,?,1)", (kind, settings.DEFAULT_GROUP)
-        )
-    conn.execute(
-        "UPDATE nodes SET desired_generation=desired_generation+1,applied_generation=0,deleting=0,\n        reported_v=NULL,reported_mode=NULL,state='init',err='',health=NULL,skew=NULL,\n        src_ip=NULL,last_seen=NULL,\n        last_manual=NULL,last_success=NULL"
-    )
-    database.set_setting(conn, "active_window_start", str(int(time.time())))
-
-
-def migrate(conn, reset_legacy=False):
-    if conn.execute("PRAGMA user_version").fetchone()[0] == 400:
-        return
-    database.backup_database(conn, settings.DB_PATH + ".pre-0.4.0.bak")
-    with conn:
-        conn.execute("BEGIN IMMEDIATE")
-        columns = {r[1] for r in conn.execute("PRAGMA table_info(nodes)")}
-        for name, ddl in {
-            "installed_agent": "TEXT NOT NULL DEFAULT 'legacy'",
-            "backend": "TEXT NOT NULL DEFAULT 'iptables'",
-            "installation_id": "TEXT",
-            "boot_id": "TEXT",
-            "capabilities": "TEXT NOT NULL DEFAULT '[]'",
-            "connection_state": "TEXT NOT NULL DEFAULT 'unknown'",
-        }.items():
-            if name not in columns:
-                conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {ddl}")
-        for statement in SCHEMA.split(";"):
-            if statement.strip():
-                conn.execute(statement)
-        if reset_legacy:
-            reset_v03(conn)
-        conn.execute("PRAGMA user_version=400")
-
 
 def fields(text):
     return dict((line.split("=", 1) for line in text.splitlines() if "=" in line))
@@ -108,7 +24,7 @@ def newer(candidate, current):
         return (*map(int, m.groups()[:3]), int(m[4]) if m[4] else float("inf")) if m else None
 
     a, b = (parts(candidate), parts(current))
-    return a is not None and b is not None and (a > b)
+    return a is not None and (b is None or a > b)
 
 
 def artifact(name):
@@ -142,17 +58,24 @@ def packet(conn, node, source="auto", op=None, status=None, *, observe=True, obs
         "source": source,
         "phase": "begin" if source == "manual" else "poll",
         "op": op or secrets.token_hex(16),
-        "agent": status.get("version", settings.COMPONENTS["active_agent"]),
-        "au": "1" if status.get("auto_update") else "0",
+        "agent": status.get("version", node["agent"] or ""),
+        "au": "1" if status.get("auto_update", node["auto_update"]) else "0",
         "mode": "active",
         "state": status.get("state", "ok"),
         "err": str(status.get("error", ""))[:500],
         "generation": str(status.get("generation", node["applied_generation"])),
         "v": status.get("hash", node["reported_v"] or ""),
     }
-    result = fields(node_sync.sync_report(
-        conn, node, data, status.get("source_ip", ""), observe=observe, observe_only=observe_only
-    ))
+    result = fields(
+        node_sync.sync_report(
+            conn,
+            node,
+            data,
+            status.get("source_ip", ""),
+            observe=observe,
+            observe_only=observe_only,
+        )
+    )
     if result.get("action") == "apply":
         result["rules"] = forwarding.node_rule_rows(conn, node)
         result["generation"] = int(result["generation"])
@@ -175,7 +98,7 @@ def acknowledge(conn, node, data, source="auto"):
         "mode": data.get("mode", "active"),
         "state": "ok" if data.get("ok") is True else "error",
         "err": str(data.get("error", ""))[:500],
-        "au": "0",
+        "au": "1" if node["auto_update"] else "0",
         "agent": data.get("version", settings.COMPONENTS["active_agent"]),
     }
     held = data.get("held_ports", [])
@@ -207,7 +130,9 @@ def refresh_held_ports(conn, node, data):
     ):
         return
     conn.execute("DELETE FROM retired_ports WHERE node_id=?", (node["id"],))
-    conn.executemany("INSERT OR IGNORE INTO retired_ports VALUES (?,?)", ((node["id"], p) for p in held))
+    conn.executemany(
+        "INSERT OR IGNORE INTO retired_ports VALUES (?,?)", ((node["id"], p) for p in held)
+    )
 
 
 def save_snapshot(conn, nid, kind, data):
@@ -218,11 +143,15 @@ def save_snapshot(conn, nid, kind, data):
         raise errors.UserError("采集信息过大")
     now = int(time.time())
     conn.execute("INSERT OR IGNORE INTO node_snapshots(node_id) VALUES (?)", (nid,))
-    conn.execute(f"UPDATE node_snapshots SET {kind}=?,{kind}_at=? WHERE node_id=?", (encoded, now, nid))
+    conn.execute(
+        f"UPDATE node_snapshots SET {kind}=?,{kind}_at=? WHERE node_id=?", (encoded, now, nid)
+    )
     if kind == "inventory":
         node_addresses.refresh_pending(conn, nid)
     if kind == "metrics":
-        values = {k: data[k] for k in ("cpu_percent", "agent_rss") if type(data.get(k)) in (int, float)}
+        values = {
+            k: data[k] for k in ("cpu_percent", "agent_rss") if type(data.get(k)) in (int, float)
+        }
         mem = data.get("memory", {})
         if mem.get("MemTotal") and type(mem.get("MemAvailable")) in (int, float):
             values["memory_used_percent"] = 100 * (1 - mem["MemAvailable"] / mem["MemTotal"])
@@ -230,19 +159,28 @@ def save_snapshot(conn, nid, kind, data):
             previous = conn.execute(
                 f"SELECT data FROM {table} WHERE node_id=? AND window=?", (nid, now // size)
             ).fetchone()
-            aggregate = json.loads(previous[0]) if previous else {"samples": 0, "first_at": now, "values": {}}
+            aggregate = (
+                json.loads(previous[0])
+                if previous
+                else {"samples": 0, "first_at": now, "values": {}}
+            )
             aggregate["samples"] += 1
             aggregate["last_at"] = now
             for key, value in values.items():
-                stat = aggregate["values"].setdefault(key, {"count": 0, "sum": 0, "min": value, "max": value})
+                stat = aggregate["values"].setdefault(
+                    key, {"count": 0, "sum": 0, "min": value, "max": value}
+                )
                 stat["count"] += 1
                 stat["sum"] += value
                 stat["min"], stat["max"] = (min(stat["min"], value), max(stat["max"], value))
                 stat["mean"] = stat["sum"] / stat["count"]
             conn.execute(
-                f"INSERT OR REPLACE INTO {table} VALUES (?,?,?)", (nid, now // size, json.dumps(aggregate))
+                f"INSERT OR REPLACE INTO {table} VALUES (?,?,?)",
+                (nid, now // size, json.dumps(aggregate)),
             )
-            conn.execute(f"DELETE FROM {table} WHERE node_id=? AND window<?", (nid, now // size - keep))
+            conn.execute(
+                f"DELETE FROM {table} WHERE node_id=? AND window<?", (nid, now // size - keep)
+            )
 
 
 def accept_traffic(conn, nid, rows):
@@ -271,7 +209,8 @@ def accept_traffic(conn, nid, rows):
             values.append(int(value))
         ident = (nid, item["rule_id"], item["protocol"], item["epoch"])
         old = conn.execute(
-            "SELECT * FROM traffic_epochs WHERE node_id=? AND rule_id=? AND protocol=? AND epoch=?", ident
+            "SELECT * FROM traffic_epochs WHERE node_id=? AND rule_id=? AND protocol=? AND epoch=?",
+            ident,
         ).fetchone()
         if old:
             values = [max(value, int(old[key])) for key, value in zip(keys, values)]
@@ -343,7 +282,7 @@ def manage(conn, node, data):
         raise errors.UserError("节点时间不正确")
     action = data.get("manage")
     if action in ("prepare", "commit", "failed"):
-        node_addresses.receive_network(conn, node['id'], data)
+        node_addresses.receive_network(conn, node["id"], data)
     if action == "asset":
         path, _ = artifact(data.get("name"))
         return path.read_bytes()
@@ -387,7 +326,8 @@ def manage(conn, node, data):
             raise errors.UserError("已确认的同步不能取消")
         conn.execute("DELETE FROM sync_ops WHERE node_id=? AND op=?", (node["id"], record["op"]))
         conn.execute(
-            "UPDATE agent_switches SET result='aborted',updated=? WHERE node_id=?", (now, node["id"])
+            "UPDATE agent_switches SET result='aborted',updated=? WHERE node_id=?",
+            (now, node["id"]),
         )
         if (
             node["state"] == "init"
@@ -398,13 +338,23 @@ def manage(conn, node, data):
         return "proto=2\nresult=aborted\n"
     if record["result"] == "aborted":
         raise errors.UserError("同步已取消，请重新准备")
+    imported = conn.execute(
+        "SELECT 1 FROM migration_nodes WHERE node_id=?", (node["id"],)
+    ).fetchone()
+    if (
+        imported
+        and action in ("commit", "status")
+        and record["generation"] < node["desired_generation"]
+    ):
+        return f"proto=2\nresult=changed\nmode={record['target']}\n"
     if action == "status":
         return f"proto=2\nresult={record['result'] or 'pending'}\nmode={record['target']}\n"
     if action not in ("commit", "failed") or data.get("target") != record["target"]:
         raise errors.UserError("无效切换确认")
     if record["result"] == "confirmed":
         current = (
-            record["target"] == node["desired_mode"] and record["generation"] == node["desired_generation"]
+            record["target"] == node["desired_mode"]
+            and record["generation"] == node["desired_generation"]
         )
         return "proto=2\nresult=" + ("confirmed" if current else "changed") + "\n"
     conn.execute(
@@ -428,7 +378,9 @@ def manage(conn, node, data):
             "hash": record["hash"],
             "mode": record["target"],
             "ok": action == "commit",
-            "error": data.get("error", "本机交接失败，已尝试恢复原配置") if action == "failed" else "",
+            "error": (
+                data.get("error", "本机交接失败，已尝试恢复原配置") if action == "failed" else ""
+            ),
             "held_ports": json.loads(data.get("held_ports", "[]")),
             "version": data.get("agent", ""),
         },
@@ -437,9 +389,14 @@ def manage(conn, node, data):
     if result == "confirmed":
         conn.execute(
             "UPDATE nodes SET installed_agent=?,backend=?,connection_state='disconnected' WHERE id=?",
-            (record["target"], "nftables" if record["target"] == "active" else "iptables", node["id"]),
+            (
+                record["target"],
+                "nftables" if record["target"] == "active" else "iptables",
+                node["id"],
+            ),
         )
         conn.execute(
-            "UPDATE agent_switches SET result=?,updated=? WHERE node_id=?", (result, now, node["id"])
+            "UPDATE agent_switches SET result=?,updated=? WHERE node_id=?",
+            (result, now, node["id"]),
         )
     return f"proto=2\nresult={result}\n"

@@ -25,7 +25,9 @@ case "$1" in
  --held-ports) echo '[]' ;;
  --generation-only) echo 1 ;;
  --flush-traffic) [ ! -e "$CASE_ROOT/fail-flush" ] ;;
- --apply-file) [ ! -e "$CASE_ROOT/fail-apply" ] || { echo '端口冲突：TCP 10001' >&2; exit 1; } ;;
+ --apply-file)
+  [ ! -e "$CASE_ROOT/fail-apply" ] || { echo '端口冲突：TCP 10001' >&2; exit 1; }
+  cp "$2" "$CASE_ROOT/lib/config" ;;
 esac
 ''');target.chmod(0o755)
         for name in ('systemctl','nft','ss','conntrack','iptables','iptables-save','iptables-restore'):
@@ -67,7 +69,6 @@ fetch_component() { if [ "$1" = manage.sh ]; then cp "$CASE_ROOT/manager" "$3"; 
     def test_install_and_both_directions(self):
         for kind in ('active','passive','active'):
             (self.root/'mode').write_text(kind)
-            (self.root/'lib/config').write_text('snapshot')
             r=self.run_manager();self.assertEqual(r.returncode,0,r.stdout+r.stderr)
             self.assertEqual((self.root/'lib/agent-kind').read_text().strip(),kind)
             self.assertFalse((self.root/'lib/switch-work/transaction').exists())

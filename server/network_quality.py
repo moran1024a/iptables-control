@@ -5,7 +5,7 @@ import time
 import database
 import errors
 import link_quality
-import pools
+import configurations
 import probe_store
 import settings
 
@@ -14,42 +14,16 @@ RETENTION = 7 * 86400
 HISTORY_STEPS = {900: 10, 3600: 60, 86400: 300, RETENTION: 1800}
 PORT = 33445
 PROTOCOLS = ("udp-echo-v1", "icmp-echo-v1")
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS quality_pairs (
- id INTEGER PRIMARY KEY, source INTEGER NOT NULL, target INTEGER NOT NULL,
- source_addr TEXT NOT NULL, target_addr TEXT NOT NULL, port INTEGER NOT NULL,
- protocol TEXT NOT NULL DEFAULT 'udp-echo-v1',
- UNIQUE(source,target,source_addr,target_addr,port,protocol)
-);
-CREATE TABLE IF NOT EXISTS quality_samples (
- pair_id INTEGER NOT NULL, slot INTEGER NOT NULL, status TEXT NOT NULL,
- rtt REAL, error TEXT NOT NULL DEFAULT '', resolved_ip TEXT NOT NULL DEFAULT '',
- PRIMARY KEY(pair_id,slot)
-);
-CREATE INDEX IF NOT EXISTS quality_sample_age ON quality_samples(slot);
-"""
-
-
-def migrate(conn):
-    if conn.execute("PRAGMA user_version").fetchone()[0] >= 401:
-        return
-    database.backup_database(conn, settings.DB_PATH + ".pre-0.4.0-rc.2.bak")
-    with conn:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(f"ALTER TABLE nodes ADD COLUMN quality_port INTEGER NOT NULL DEFAULT {PORT}")
-        for stmt in SCHEMA.split(";"):
-            if stmt.strip():
-                conn.execute(stmt)
-        conn.execute("PRAGMA user_version=401")
 
 
 def paths(conn):
-    result = {("routes", r["id"]): json.loads(r["node_ids"]) for r in conn.execute("SELECT * FROM routes")}
-    for c in conn.execute("SELECT id FROM chains WHERE deleting=0"):
-        result["configs", c["id"]] = [
-            h[0] for h in conn.execute("SELECT node_id FROM hops WHERE chain_id=? ORDER BY seq", (c["id"],))
-        ]
-    result.update(pools.quality_paths(conn)[0])
+    result = {}
+    for r in conn.execute("SELECT id,graph FROM topologies WHERE deleted=0"):
+        result["topologies", r["id"]] = list(
+            dict.fromkeys(
+                v["node_id"] for v in json.loads(r["graph"])["vertices"] if v.get("node_id")
+            )
+        )
     return result
 
 
@@ -79,10 +53,16 @@ def stopped(nodes, pair):
         n = nodes.get(nid)
         if not n or n["deleting"]:
             return ("stopped", "节点已删除或正在删除")
-        if n["desired_mode"] != "active" or n["installed_agent"] == "passive" or n["manual_required"]:
+        if (
+            n["desired_mode"] != "active"
+            or n["installed_agent"] == "passive"
+            or n["manual_required"]
+        ):
             return ("stopped", "仅已确认的主动节点参与探测")
-        if n["installed_agent"] != "active" or "network_quality" not in json.loads(n["capabilities"]):
-            return ("unsupported", "请将两端主动 Agent 升级到 0.4.0")
+        if n["installed_agent"] != "active" or "network_quality" not in json.loads(
+            n["capabilities"]
+        ):
+            return ("unsupported", "请升级两端主动 Agent")
         if not n["quality_port"]:
             return ("disabled", "节点已关闭质量探测")
     if pair["protocol"] == "icmp-echo-v1" and "network_quality_icmp" not in json.loads(
@@ -93,9 +73,12 @@ def stopped(nodes, pair):
 
 
 def continuous(a, b):
-    if (a["status"] != "ok" or b["status"] != "ok"
-            or a.get("resolved_ip", "") != b.get("resolved_ip", "")
-            or a.get("path_key") != b.get("path_key")):
+    if (
+        a["status"] != "ok"
+        or b["status"] != "ok"
+        or a.get("resolved_ip", "") != b.get("resolved_ip", "")
+        or a.get("path_key") != b.get("path_key")
+    ):
         return False
     if a.get("epoch") or b.get("epoch"):
         return bool(a.get("epoch") == b.get("epoch") and b.get("previous_slot") == a["slot"])
@@ -106,11 +89,7 @@ def aggregate(rows):
     good = [r["rtt"] for r in rows if r["status"] == "ok" and r["rtt"] is not None]
     lost = sum((r["status"] == "timeout" for r in rows))
     sent = len(good) + lost
-    changes = [
-        abs(b["rtt"] - a["rtt"])
-        for a, b in zip(rows, rows[1:])
-        if continuous(a, b)
-    ]
+    changes = [abs(b["rtt"] - a["rtt"]) for a, b in zip(rows, rows[1:]) if continuous(a, b)]
     ordered = sorted(good)
     return dict(
         samples=sent,
@@ -154,25 +133,36 @@ def summarize(rows, seconds, now):
             failures = [r for r in batch if r["status"] != "ok"]
             state = (failures or batch)[-1] if batch else None
             broken = any(not continuous(a, b) for a, b in zip(batch, batch[1:]))
-            endpoints = {(r.get("path_key"), r.get("resolved_ip", "")) for r in batch if r["status"] == "ok"}
-            points.append(dict(
-                time=batch[0]["slot"] if batch else max(start, slot),
-                end=min(batch[-1]["slot"] + INTERVAL * 2 if batch else slot + step, now + 1),
-                **aggregate(batch),
-                status=state["status"] if state else "missing",
-                error=state["error"] if state else "",
-                failures=len(failures),
-                resolved_ip=next((r["resolved_ip"] for r in reversed(batch) if r["resolved_ip"]), ""),
-                first_slot=batch[0]["slot"] if batch else None,
-                last_slot=batch[-1]["slot"] if batch else None,
-                gap=bool(failures) or broken,
-                endpoint_change=len(endpoints) > 1,
-                connect=bool(batch and previous_sample and continuous(previous_sample, batch[0])),
-                path_key=batch[-1].get("path_key") if batch else None,
-                path_label=batch[-1].get("path_label", "") if batch else "",
-                interval=(batch[-1]["slot"] - batch[-1]["previous_slot"])
-                    if batch and batch[-1].get("previous_slot") is not None else None,
-            ))
+            endpoints = {
+                (r.get("path_key"), r.get("resolved_ip", "")) for r in batch if r["status"] == "ok"
+            }
+            points.append(
+                dict(
+                    time=batch[0]["slot"] if batch else max(start, slot),
+                    end=min(batch[-1]["slot"] + INTERVAL * 2 if batch else slot + step, now + 1),
+                    **aggregate(batch),
+                    status=state["status"] if state else "missing",
+                    error=state["error"] if state else "",
+                    failures=len(failures),
+                    resolved_ip=next(
+                        (r["resolved_ip"] for r in reversed(batch) if r["resolved_ip"]), ""
+                    ),
+                    first_slot=batch[0]["slot"] if batch else None,
+                    last_slot=batch[-1]["slot"] if batch else None,
+                    gap=bool(failures) or broken,
+                    endpoint_change=len(endpoints) > 1,
+                    connect=bool(
+                        batch and previous_sample and continuous(previous_sample, batch[0])
+                    ),
+                    path_key=batch[-1].get("path_key") if batch else None,
+                    path_label=batch[-1].get("path_label", "") if batch else "",
+                    interval=(
+                        (batch[-1]["slot"] - batch[-1]["previous_slot"])
+                        if batch and batch[-1].get("previous_slot") is not None
+                        else None
+                    ),
+                )
+            )
             if batch:
                 previous_sample = batch[-1]
     previous = None
@@ -190,14 +180,14 @@ async def view(monitor, body):
     scope, ident = (body.get("scope"), body.get("id"))
     seconds = body.get("range", 900)
     if (
-        scope not in ("routes", "configs", "links")
+        scope != "topologies"
         or type(ident) is not int
         or type(seconds) is not int
         or (seconds not in HISTORY_STEPS)
     ):
         raise errors.UserError("无效的链路或时间范围")
     now = int(time.time())
-    if scope == "links" and "source" not in body and ("target" not in body):
+    if scope == "topologies" and "source" not in body and ("target" not in body):
         return await link_quality.view(monitor, body, now)
 
     def read(conn):
@@ -207,7 +197,9 @@ async def view(monitor, body):
         nodes = {r["id"]: dict(r) for r in conn.execute(database.ordered("nodes"))}
         ids = list(dict.fromkeys(ids))
         options = [
-            dict(id=n["id"], name=n["name"], mode=n["desired_mode"]) for n in nodes.values() if n["id"] in ids
+            dict(id=n["id"], name=n["name"], mode=n["desired_mode"])
+            for n in nodes.values()
+            if n["id"] in ids
         ]
         if len(ids) < 2:
             return dict(nodes=options, pair=None, now=now)
@@ -232,8 +224,7 @@ async def view(monitor, body):
             pair=series[0]["pair"],
             now=now,
             interval=INTERVAL,
-            adjacent=(a, b)
-            in (pools.quality_paths(conn, ident)[1] if scope == "links" else set(zip(ids, ids[1:]))),
+            adjacent=(a, b) in set(zip(ids, ids[1:])),
             series=series,
         )
 
