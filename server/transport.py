@@ -141,7 +141,7 @@ class Hub:
         }
         await self.database(
             lambda c: c.execute(
-                "UPDATE nodes SET installation_id=?,boot_id=?,capabilities=?,connection_state='connected' WHERE id=?",
+                "UPDATE nodes SET installation_id=?,boot_id=?,capabilities=?,connection_state='connected',runtime_state='unknown',runtime_error='',runtime_at=0 WHERE id=?",
                 (
                     str(hello.get("installation_id", ""))[:64],
                     str(hello.get("boot_id", ""))[:64],
@@ -242,6 +242,7 @@ class Hub:
                                 "error",
                                 "auto_update",
                                 "held_ports",
+                                "forwarding",
                             )
                             if k in data
                         }

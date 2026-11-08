@@ -85,7 +85,8 @@ def preview(c, body):
             b
             for a, b in graph["edges"]
             if a == prefix[-1]
-            and kinds[b] == "node"
+            and (kinds[b] == "node" or kinds[b] == "direct"
+                 and any(x == b and kinds[y] == "node" for x, y in graph["edges"]))
             and plans(c, graph, existing, prefix + [b], required, entry)
         ]
     return dict(
@@ -161,6 +162,9 @@ def save_topology(c, body, ident=None):
         raise errors.UserError("拓扑正在删除", status=409)
     if old and body.get("revision") != old["revision"]:
         raise errors.UserError("拓扑已变化，请刷新后重试", status=409)
+    enabled = body.get("failover_enabled", bool(old["failover_enabled"]) if old else False)
+    if type(enabled) is not bool:
+        raise errors.UserError("自动灾备开关无效", "failover_enabled")
     graph = topology.validate(c, body.get("graph"))
     existing = members(c, ident) if ident else []
     if body.get("switch_only"):
@@ -184,7 +188,8 @@ def save_topology(c, body, ident=None):
                 topology.fail("对应配置不存在")
             wanted = json.loads(config["desired"])
             plan = topology.compile_plan(graph, path, wanted.get("port"))
-            if execution.operational(plan) == execution.operational(wanted):
+            c.execute("UPDATE configurations SET failover='{}' WHERE id=?", (config["id"],))
+            if execution.operational(plan) == execution.operational(wanted) and plan["graph_path"] == wanted["graph_path"]:
                 continue
             c.execute(
                 "UPDATE configurations SET desired=?,state='pending',error='',revision=revision+1 WHERE id=?",
@@ -208,6 +213,8 @@ def save_topology(c, body, ident=None):
             "INSERT INTO topologies(name,group_id,graph,sort) VALUES (?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM topologies))",
             (name, group, execution.dump(graph)),
         ).lastrowid
+    c.execute("UPDATE topologies SET failover_enabled=? WHERE id=?", (int(enabled), ident))
+    c.execute("UPDATE configurations SET failover='{}' WHERE topology_id=?", (ident,))
     chosen = plans(c, graph, existing)
     requested = {(p[0], p[-1]): p for p in checked_paths(graph, body.get("paths", []))}
     wanted = set()
@@ -296,6 +303,7 @@ def view(c, r):
         pending_graph=desired["graph"] if desired and state != "active" else None,
         port=current.get("port") if current else desired.get("port") if desired else None,
         connection=connection,
+        failover=json.loads(r["failover"]),
     )
 
 
@@ -307,6 +315,7 @@ def resources(c):
                 id=n["id"],
                 name=n["name"],
                 addr=n["addr"],
+                weight=n["weight"],
                 addresses=node_addresses.listing(c, n),
                 network=node_addresses.network(c, n["id"]),
                 mode=n["desired_mode"],
@@ -323,6 +332,10 @@ def detail(c, ident):
     configs = members(c, ident)
     views = [view(c, x) for x in configs]
     graph = json.loads(r["graph"])
+    weights = {n["id"]: n["weight"] for n in c.execute("SELECT id,weight FROM nodes")}
+    for vertex in graph["vertices"]:
+        if vertex.get("node_id"):
+            vertex["weight"] = weights.get(vertex["node_id"], 0)
     display = copy.deepcopy(graph)
     # Keep only the route snapshots needed to show still-live removed vertices.
     vertices = {v["id"]: v for v in display["vertices"]}
@@ -332,6 +345,8 @@ def detail(c, ident):
         return v["kind"], v.get("node_id"), v.get("target_id")
 
     def height(v):
+        if v["kind"] == "direct":
+            return 56
         return 62 + 24 * (
             max(1, len(display["address_book"].get(v["id"], {}))) + bool(v.get("node_id"))
         )
@@ -443,11 +458,19 @@ def delete(c, ident):
 
 def action(c, body, ident):
     row = get_topology(c, ident)
+    if body.get("action") == "failover":
+        enabled = body.get("enabled")
+        if type(enabled) is not bool or body.get("revision") != row["revision"]:
+            raise errors.UserError("拓扑已变化或开关无效，请刷新", status=409)
+        c.execute("UPDATE topologies SET failover_enabled=?,revision=revision+1 WHERE id=?", (int(enabled), ident))
+        c.execute("UPDATE configurations SET failover='{}' WHERE topology_id=?", (ident,))
+        return dict(id=ident)
     if body.get("action") != "retry":
         raise errors.UserError("只支持重试同步")
     if body.get("revision") != row["revision"]:
         raise errors.UserError("拓扑已变化，请刷新", status=409)
     for config in members(c, ident):
+        c.execute("UPDATE configurations SET failover='{}' WHERE id=?", (config["id"],))
         execution.retry(c, config["id"])
     return dict(id=ident)
 

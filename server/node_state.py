@@ -9,6 +9,13 @@ def port_error(err):
     return (err or "").startswith(("端口冲突：", "端口检查失败："))
 
 
+def runtime_error(node, now):
+    return (node["runtime_error"] or "已应用的转发规则异常") if (
+        node["desired_mode"] == "active" and node["runtime_state"] == "error"
+        and 0 <= now - node["runtime_at"] < 30
+    ) else ""
+
+
 def node_status(conn, node, now):
     """new / offline / skew / syncing / synced / error / deleting"""
     if node["deleting"]:
@@ -36,7 +43,7 @@ def node_status(conn, node, now):
         return "offline"
     if node["skew"] is not None and abs(node["skew"]) > settings.MAX_SKEW:
         return "skew"
-    if node["state"] == "error":
+    if node["state"] == "error" or runtime_error(node, now):
         return "error"
     if (
         node["applied_generation"] != node["desired_generation"]

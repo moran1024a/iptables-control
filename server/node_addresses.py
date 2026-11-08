@@ -372,7 +372,7 @@ def update_pending(c, nid, addresses):
         )
         if before != execution.operational(plan):
             c.execute(
-                "UPDATE configurations SET state='pending',error='' WHERE id=?", (row["id"],)
+                "UPDATE configurations SET state='pending',error='',failover='{}' WHERE id=?", (row["id"],)
             )
 
 

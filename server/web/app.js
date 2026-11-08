@@ -534,9 +534,10 @@ async function nodeList(request) {
 
 function drawNodes() {
   const d = list.data, kind = list.kind;
+  const weight = n => `<span class="node-weight" title="全局权重，越高越优先">权重 <b>${n.weight > 0 ? '+' : ''}${esc(n.weight ?? 0)}</b></span>`;
   if (sortMode === kind) {
     return render(listHead(kind, d.nodes.length, d.nodes.length) +
-      sortList(kind, d.nodes, (n) => `<div class="title">${esc(n.name)}</div>${nodeSub(n)}`));
+      sortList(kind, d.nodes, (n) => `<div class="node-sort-head"><div class="title">${esc(n.name)}</div>${weight(n)}</div>${nodeSub(n)}`));
   }
   const f = filters[kind];
   const items = d.nodes.filter((n) =>
@@ -545,7 +546,7 @@ function drawNodes() {
     <a class="card node-card" href="#/nodes/${n.id}" data-key="node-${n.id}">
       <div class="card-head">
         <div class="node-head"><div class="title" title="${esc(n.name)}"><span class="mode-tag ${n.desired_mode}">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${esc(n.name)}</div>${nodeSub(n)}</div>
-        <div class="meta">${pill(n.status)}<span class="muted">${ago(n.last_seen, d.now)}</span></div>
+        <div class="meta">${weight(n)}${pill(n.status)}<span class="muted">${ago(n.last_seen, d.now)}</span></div>
       </div>
       ${bar(n.bar)}
       ${n.wake?.error ? `<p class="hint t-yellow">${esc(n.wake.error)}</p>` : ""}
@@ -967,6 +968,7 @@ async function nodeForm(node) {
     <form data-form="node" data-id="${node ? node.id : ""}" data-kind="forward">
       <label><span>名称</span><input name="name" value="${esc(node?.name)}" maxlength="64" required></label>
       ${groupSelect(groups, node?.group_id)}
+      <label><span>权重</span><input name="weight" type="number" min="-100000" max="100000" step="1" required value="${node?.weight??0}"><small class="hint">0 为默认，越高越优先，作用于所有链路。</small></label>
       <label><span>同步模式</span><select name="desired_mode" >
         <option value="active" ${node?.desired_mode !== "passive" ? "selected" : ""}>主动（长连接自动同步）</option>
         <option value="passive" ${node?.desired_mode === "passive" ? "selected" : ""}>被动（默认手动，可选远程唤醒）</option>
@@ -1084,12 +1086,12 @@ const FORMS = {
     const addresses=[...form.querySelectorAll('[data-address-id]')].map(row=>Object.fromEntries([['id',row.dataset.addressId],['primary',row.querySelector('[name=primary_address]').checked],...[...row.querySelectorAll('[data-address-field]')].map(input=>[input.dataset.addressField,input.value.trim()])]));
     data.addr=addresses.find(a=>a.primary)?.host;
     if (!id) {
-      const r = await api("POST", "nodes", { addresses, name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
+      const r = await api("POST", "nodes", { addresses, weight: Number(data.weight), name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
       closeModal();
       location.hash = `#/nodes/${r.id}`;
       return;
     }
-    await api("PATCH", `nodes/${id}`, { addresses, name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
+    await api("PATCH", `nodes/${id}`, { addresses, weight: Number(data.weight), name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
     closeModal();
     toast("已保存");
     refresh();

@@ -76,6 +76,20 @@ def packet(conn, node, source="auto", op=None, status=None, *, observe=True, obs
             observe_only=observe_only,
         )
     )
+    if observe and isinstance(status.get("forwarding"), dict):
+        health = status["forwarding"]
+        latest = database.get_node(conn, node["id"])
+        if (health.get("state") in ("ok", "error", "unknown")
+                and health.get("generation") == latest["applied_generation"]
+                and health.get("hash") == latest["reported_v"]):
+            conn.execute("UPDATE nodes SET runtime_state=?,runtime_error=?,runtime_at=? WHERE id=?",
+                         (health["state"], str(health.get("error", ""))[:500], int(time.time()), node["id"]))
+            if health["state"] == "error":
+                conn.execute(
+                    "INSERT INTO active_windows(node_id,win,level) VALUES (?,?,1) "
+                    "ON CONFLICT(node_id,win) DO UPDATE SET level=1",
+                    (node["id"], int(time.time()) // settings.ACTIVE_WINDOW),
+                )
     if result.get("action") == "apply":
         result["rules"] = forwarding.node_rule_rows(conn, node)
         result["generation"] = int(result["generation"])

@@ -62,6 +62,7 @@ jobs:
           sudo unshare -nm env ICTL_KERNEL_TEST=1 python3 tests/kernel_network.py "$PWD/dist/ictl-active-linux-amd64"
           sudo unshare -n python3 tests/kernel_wake.py "$PWD/dist/ictl-wake-linux-amd64"
           (cd agent/active && go test -c -o "$RUNNER_TEMP/ictl-active-test")
+          sudo unshare -n env ICTL_KERNEL_TEST=1 "$RUNNER_TEMP/ictl-active-test" -test.run '^TestKernelForwardingHealth$'
           sudo unshare -nm python3 tests/kernel_multi_ip.py "$PWD/dist/ictl-active-linux-amd64" "$RUNNER_TEMP/ictl-active-test"
           sudo unshare -nm python3 tests/kernel_switch.py "$PWD/dist/ictl-active-linux-amd64"
           sudo unshare -nm python3 tests/kernel_quality.py "$PWD/dist/ictl-active-linux-amd64" "$RUNNER_TEMP/ictl-active-test"

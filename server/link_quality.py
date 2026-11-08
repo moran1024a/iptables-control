@@ -2,6 +2,7 @@ import hashlib
 import json
 import execution
 import configurations
+import topology
 import node_addresses
 import probe_store
 
@@ -38,8 +39,9 @@ def config_sections(c, config, nodes):
     hops = [dict(r, seq=i) for i, r in enumerate(applied["rules"])] if applied else []
     by_node = {h["node_id"]: h for h in hops}
     live_rules = {h["id"]: h for h in hops}
-    vertices = {v["id"]: v for v in plan["graph"]["vertices"]}
-    stages = [(vid, vertices[vid]["node_id"]) for vid in plan["graph_path"][1:-1]]
+    wire, path = topology.wire_graph(plan["graph"], plan["graph_path"])
+    vertices = {v["id"]: v for v in wire["vertices"]}
+    stages = [(vid, vertices[vid]["node_id"]) for vid in path[1:-1]]
     actual = [n for _, n in stages]
     expected = [plan["entry"]] + actual
     ready = bool(applied and target and [h["node_id"] for h in hops] == expected)

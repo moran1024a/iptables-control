@@ -1,4 +1,4 @@
-"""Current schema and the single node-only import from schema 504 (0.5.3)."""
+"""Current schema, RC upgrades, and the node-only import from 0.5.3."""
 
 import os
 import json
@@ -99,9 +99,21 @@ def init_db():
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version == settings.DATABASE_VERSION:
         return conn
+    if version == 600:
+        database.backup_database(conn, str(path) + ".pre-0.6.0-rc.2.bak")
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("ALTER TABLE nodes ADD COLUMN weight INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE nodes ADD COLUMN runtime_state TEXT NOT NULL DEFAULT 'unknown'")
+            conn.execute("ALTER TABLE nodes ADD COLUMN runtime_error TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE nodes ADD COLUMN runtime_at INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE topologies ADD COLUMN failover_enabled INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE configurations ADD COLUMN failover TEXT NOT NULL DEFAULT '{}'")
+            conn.execute(f"PRAGMA user_version={settings.DATABASE_VERSION}")
+        return conn
     if version != 504:
         conn.close()
-        raise errors.UserError("此版本只支持新安装或从 0.5.3 升级，请先更新到 0.5.3")
+        raise errors.UserError("此版本支持新安装、0.6.0 RC 升级或从 0.5.3 导入节点；更早版本请先更新到 0.5.3")
     database.backup_database(conn, str(path) + ".pre-0.6.0.bak")
     temporary = str(path) + ".importing"
     if os.path.exists(temporary):

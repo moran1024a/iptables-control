@@ -108,6 +108,31 @@ class MigrationTests(Fixture, unittest.TestCase):
         self.assertFalse(self.db.execute("SELECT 1 FROM migration_nodes").fetchone())
         self.assertFalse(self.db.execute("SELECT 1 FROM retired_ports").fetchone())
 
+    def test_rc1_upgrade_preserves_topology_rules_and_settings(self):
+        a, b = self.node(), self.node()
+        self.ready(a, b)
+        ident = self.save(self.graph([a, b]))
+        self.settle()
+        tables = ('nodes', 'topologies', 'configurations', 'targets', 'rules', 'settings')
+        added = {'weight', 'runtime_state', 'runtime_error', 'runtime_at', 'failover_enabled', 'failover'}
+        before = {t: [{k: row[k] for k in row.keys() if k not in added} for row in self.db.execute('SELECT * FROM '+t)] for t in tables}
+        with self.db:
+            for table, columns in [('nodes', ['weight', 'runtime_state', 'runtime_error', 'runtime_at']), ('topologies', ['failover_enabled']), ('configurations', ['failover'])]:
+                for column in columns:
+                    self.db.execute(f'ALTER TABLE {table} DROP COLUMN {column}')
+            self.db.execute('PRAGMA user_version=600')
+        self.db.close()
+        self.db = migrations.init_db()
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 601)
+        for table in tables:
+            self.assertEqual([{k: row[k] for k in row.keys() if k not in added} for row in self.db.execute('SELECT * FROM '+table)], before[table])
+        self.assertEqual(self.db.execute('SELECT failover_enabled FROM topologies WHERE id=?', (ident,)).fetchone()[0], 0)
+        self.assertEqual(database.get_node(self.db, a)['weight'], 0)
+        self.assertTrue(Path(settings.DB_PATH+'.pre-0.6.0-rc.2.bak').is_file())
+        self.db.close()
+        self.db = migrations.init_db()
+        self.assertEqual(self.db.execute('PRAGMA foreign_key_check').fetchall(), [])
+
     def test_unsupported_schema_fails_without_migrating(self):
         with self.db:
             self.db.execute("PRAGMA user_version=300")

@@ -203,6 +203,7 @@ Object.assign(ACTIONS,{
   'canvas-current':()=>topologyBinding?.focusCurrent(),
   'canvas-fullscreen':()=>topologyBinding?.fullscreen(),
   'edge-quality':()=>{location.hash=`#/quality/topologies/${canvasView.link.id}`;},
+  'link-failover':()=>graphWork(async()=>{const l=canvasView.link;await api('POST',`topologies/${l.id}/action`,{action:'failover',enabled:!l.failover_enabled,revision:l.revision});toast(l.failover_enabled?'自动灾备已关闭':'自动灾备已开启');await refresh();}),
   async 'link-delete'(){if(!await confirmBox('删除链路',`删除 <b>${esc(canvasView.link.name)}</b> 并清理其转发规则？`,'删除',true))return;await api('DELETE',`topologies/${canvasView.link.id}`);location.hash='#/routes';},
   async 'link-retry'(){const l=canvasView.link;await api('POST',`topologies/${l.id}/action`,{action:'retry',revision:l.revision});toast('已重试同步');refresh();}
 });

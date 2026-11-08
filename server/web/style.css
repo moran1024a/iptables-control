@@ -825,6 +825,9 @@ body.canvas-fullscreen { overflow:hidden; }
 .node-card .node-sub { flex:1; min-width:0; margin:0; }
 .node-card .node-sub .mono { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .node-card .meta { flex-shrink:0; gap:8px; font-size:12px; }
+.node-weight { display:inline-flex; align-items:center; gap:4px; flex:none; padding:2px 6px; border-radius:4px; background:var(--code); color:var(--muted); font-size:11px; white-space:nowrap; }
+.node-weight b { color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
+.node-sort-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
 .node-card .hint { margin:6px 0 0; }
 .target-row { display:flex; align-items:center; gap:12px; min-height:54px; }
 .collection-row { min-height:54px; }
@@ -909,6 +912,11 @@ main:has(.graph-workspace) { max-width:1800px; }
 .graph-node-body small { display:flex; justify-content:space-between; width:100%; color:var(--muted); font-size:10px; line-height:1; }
 .graph-node-body small span { color:var(--green); }
 .graph-node-body strong { max-width:100%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:13px; line-height:1.3; }
+.graph-node-body .graph-weight { margin-left:8px; color:var(--muted); font:normal 11px monospace; }
+.graph-direct .graph-node-body { height:54px; border-radius:8px; padding:8px 12px; }
+.graph-direct .graph-node-body strong { font:600 14px monospace; }
+.graph-layer-label { position:absolute; color:var(--muted); font-size:11px; letter-spacing:.05em; pointer-events:none; }
+.graph-inspector input[data-direct-weight] { width:100px; }
 button.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
 .graph-node.on-route { border-color:var(--green); box-shadow:0 0 0 1px color-mix(in srgb,var(--green) 15%,transparent); }
 .graph-node.graph-option { border-color:var(--blue); outline:3px solid var(--primary-soft); cursor:pointer; }

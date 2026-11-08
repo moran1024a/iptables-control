@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func obj(kind string, v M) M        { return M{kind: v} }
@@ -50,7 +52,11 @@ func (a *Agent) nftState() (M, bool, error) {
 }
 
 func readNFTState() (M, bool, error) {
-	b, e := run(nil, "nft", "-j", "list", "tables")
+	return readNFTWith(func(args ...string) ([]byte, error) { return run(nil, "nft", args...) })
+}
+
+func readNFTWith(read func(...string) ([]byte, error)) (M, bool, error) {
+	b, e := read("-j", "list", "tables")
 	if e != nil {
 		return nil, false, e
 	}
@@ -69,7 +75,7 @@ func readNFTState() (M, bool, error) {
 	if !found {
 		return M{"nftables": []any{}}, false, nil
 	}
-	b, e = run(nil, "nft", "-j", "list", "table", "ip", tableName)
+	b, e = read("-j", "list", "table", "ip", tableName)
 	if e != nil {
 		return nil, false, e
 	}
@@ -680,4 +686,71 @@ func (a *Agent) restore() error {
 	a.offline = true
 	defer func() { a.offline = false }()
 	return a.apply(a.config)
+}
+
+// Report evidence about the installed rules separately from update/metrics errors.
+// A failed read is unknown, not proof that traffic stopped forwarding.
+func (a *Agent) forwardingHealth() M {
+	// The caller holds stateMu. Reading an atomic nft snapshot needs no external
+	// file lock; keep the check bounded so a busy firewall cannot stall heartbeats.
+	state, message := "unknown", ""
+	check := func() error {
+		if a.config.Hash == "" {
+			return nil
+		}
+		if len(a.config.Rules) == 0 {
+			state = "ok"
+			return nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		current, exists, err := readNFTWith(func(args ...string) ([]byte, error) {
+			return command(ctx, nil, "nft", args...)
+		})
+		if err != nil {
+			return err
+		}
+		if exists {
+			if err := a.checkNFTOwner(current); err != nil {
+				return err
+			}
+		}
+		if !exists || !sameNFT(a.transaction(a.config, current, exists), current) {
+			state, message = "error", "已应用的转发规则缺失或被修改"
+			return nil
+		}
+		chains := map[string]map[string]any{}
+		for _, item := range array(current["nftables"]) {
+			value, _ := item.(map[string]any)
+			chain, _ := value["chain"].(map[string]any)
+			name, _ := chain["name"].(string)
+			chains[name] = chain
+		}
+		for _, ch := range []struct{ name, kind, hook, priority string }{
+			{"pre", "nat", "prerouting", "-105"}, {"post", "nat", "postrouting", "105"},
+			{"forward", "filter", "forward", "10"}, {"route", "filter", "prerouting", "-90"},
+		} {
+			actual := chains[ch.name]
+			if actual["type"] != ch.kind || actual["hook"] != ch.hook || fmt.Sprint(actual["prio"]) != ch.priority || actual["policy"] != "accept" {
+				state, message = "error", "转发链挂载点异常"
+				return nil
+			}
+		}
+		if a.root == "/var/lib/ictl" {
+			enabled, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(string(enabled)) != "1" {
+				state, message = "error", "系统 IPv4 转发已关闭"
+				return nil
+			}
+		}
+		state = "ok"
+		return nil
+	}
+	if err := check(); err != nil {
+		message = err.Error()
+	}
+	return M{"state": state, "error": message, "generation": a.config.Generation, "hash": a.config.Hash}
 }

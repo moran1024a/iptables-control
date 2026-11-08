@@ -147,7 +147,7 @@ def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observ
             conn.execute("UPDATE nodes SET state=?,err=? WHERE id=?", (state, err, node["id"]))
         if state == "ok":
             conn.execute(
-                "UPDATE nodes SET reported_v=?,reported_mode=?,applied_generation=?,last_success=? WHERE id=?",
+                "UPDATE nodes SET reported_v=?,reported_mode=?,applied_generation=?,last_success=?,runtime_state='unknown',runtime_error='',runtime_at=0 WHERE id=?",
                 (op["hash"], op["mode"], op["generation"], now, node["id"]),
             )
         lifecycle.add_event(

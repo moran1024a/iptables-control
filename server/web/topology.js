@@ -6,6 +6,7 @@ const graphID = () => crypto.randomUUID?.() || `v-${Date.now()}-${Math.random().
 const graphChanged = () => graphBusy || !!graphSession?.dirty || !!graphSession?.editor?.dirty;
 const graphName = v => {
   if(!v)return '未知节点';
+  if(v.kind==='direct')return 'direct';
   const name=resourceName(v.kind==='target'?canvasView.targets:canvasView.nodes,v.target_id||v.node_id);
   return name;
 };
@@ -44,7 +45,7 @@ async function graphNavigate(id) {
 }
 
 function graphWorld(g) {
-  const boxes=g.vertices.map(v=>({...v,width:220,height:graphHeight(v,g)}));
+  const boxes=g.vertices.map(v=>({...v,width:graphWidth(v),height:graphHeight(v,g)}));
   const x=boxes.length?Math.min(...boxes.map(b=>b.x-60)):0,y=boxes.length?Math.min(...boxes.map(b=>b.y-100)):0;
   return {x,y,width:Math.max(700,...boxes.map(b=>b.x+b.width+60-x)),height:Math.max(320,...boxes.map(b=>b.y+b.height+60-y))};
 }
@@ -53,7 +54,7 @@ function graphAddPosition(width,height) {
   const canvas=app.querySelector('.topology-canvas'),view=topologyBinding.view,viewport=topologyBinding.viewport;
   let x=Math.round((viewport.clientWidth/2-view.x)/view.scale+Number(canvas.dataset.worldX)-width/2);
   let y=Math.round((viewport.clientHeight/2-view.y)/view.scale+Number(canvas.dataset.worldY)-height/2);
-  const g=graphSession.graph,boxes=g.vertices.map(v=>({...v,width:220,height:graphHeight(v,g)}));
+  const g=graphSession.graph,boxes=g.vertices.map(v=>({...v,width:graphWidth(v),height:graphHeight(v,g)}));
   // Add beside existing nodes without covering them.
   for(let tries=0;tries<=boxes.length;tries++) {
     const collision=boxes.find(b=>x<b.x+b.width+20&&x+width>b.x-20&&y<b.y+b.height+20&&y+height>b.y-20);
@@ -69,7 +70,9 @@ function graphAddresses(id,g=graphCurrent()) {
   const v=g.vertices.find(v=>v.id===id);
   return g.version===2?(canvasView.nodes.find(n=>n.id===v?.node_id)?.addresses||Object.values(g.address_book?.[id]||{})):[];
 }
-const graphHeight=(v,g)=>62+24*(Math.max(1,graphAddresses(v.id,g).length)+(g.routing_version===2&&v.node_id?1:0));
+const graphWidth=v=>v.kind==='direct'?110:220;
+const graphWeight=n=>Number(n)>0?'+'+Number(n):String(Number(n)||0);
+const graphHeight=(v,g)=>v.kind==='direct'?56:62+24*(Math.max(1,graphAddresses(v.id,g).length)+(g.routing_version===2&&v.node_id?1:0));
 function graphDisplay(g) {
   if(graphSession?.kind==='edit'||graphSession?.editor)return g;
   const view=canvasView.link?.view_graph;if(!view)return g;
@@ -77,7 +80,7 @@ function graphDisplay(g) {
 }
 function graphRenderEdges(g) { return graphConnections(g); }
 function graphBoxes(g) {
-  return new Map(g.vertices.map(v=>[v.id,{...v,width:220,height:graphHeight(v,g)}]));
+  return new Map(g.vertices.map(v=>[v.id,{...v,width:graphWidth(v),height:graphHeight(v,g)}]));
 }
 function graphPortAddress(g,v,side,edge=null) {
   if(v.kind==='entry'&&side==='in')return v.address||'';
@@ -89,6 +92,7 @@ function graphPortAddress(g,v,side,edge=null) {
 }
 function graphPortPoint(g,id,side,address,boxes) {
   const b=boxes.get(id),v=g.vertices.find(v=>v.id===id),addresses=graphAddresses(id,g);
+  if(v?.kind==='direct')return [side==='out'?b.x+b.width:b.x,b.y+b.height/2];
   const i=address==='@auto'?Math.max(1,addresses.length):addresses.findIndex(a=>a.id===address);
   return [side==='out'?b.x+b.width:b.x,b.y+(v?(i>=0?62+i*24+12:62+12):b.height/2)];
 }
@@ -131,7 +135,8 @@ function graphRoundedPath(points) {
 }
 function graphRoutePoints(start,end,source,target,boxes,index=0,used=[],clearance=6,bendOffset=null) {
   const penalty=(a,b)=>graphLanePenalty(a,b,used,clearance);
-  const gap=24+(index%5)*8,exit=[source.x+source.width+gap,start[1]],enter=[target.x-gap,end[1]];
+  const room=end[0]-start[0],gap=room>0?Math.min(24+(index%5)*8,room/3):24+(index%5)*8;
+  const exit=[start[0]+gap,start[1]],enter=[end[0]-gap,end[1]];
   const obstacles=boxes.filter(b=>b.id!==source.id&&b.id!==target.id);
   if(end[0]>start[0]&&start[1]===end[1]&&!graphPathBlocked([start,end],obstacles)&&penalty(start,end)===0)return [start,end];
   if(enter[0]>=exit[0]){
@@ -206,6 +211,7 @@ function graphPort(id,side,address='',top=null,listen=false,selected=false) {
   return `<button class="graph-port ${side} ${selected?'is-bound':''}" data-action="${listen?'graph-listen':'graph-port'}" data-side="${side}" data-id="${esc(id)}" data-address="${esc(address)}" ${top==null?'':`style="top:${top}px"`} title="${side==='in'?'接收 IP':'发出 IP'}" aria-label="${side==='in'?'接收':'发出'} ${esc(address)}">${side==='in'?'‹':'›'}</button>`;
 }
 function graphNodeAddresses(g,v,editing) {
+  if(v.kind==='direct')return editing?['in','out'].map(side=>`<button class="graph-port ${side}" data-action="graph-port" data-side="${side}" data-id="${esc(v.id)}" data-address="" style="top:28px" aria-label="${side==='in'?'连入':'连出'} direct">${side==='in'?'‹':'›'}</button>`).join(''):'';
   const node=canvasView.nodes.find(n=>n.id===v.node_id),target=canvasView.targets.find(n=>n.id===v.target_id),addresses=graphAddresses(v.id,g);
   const edge=editing&&graphSession.edge!=null?g.edges[graphSession.edge]:null;
   const incoming=graphPortAddress(g,v,'in',edge),outgoing=graphPortAddress(g,v,'out',edge);
@@ -235,7 +241,7 @@ function graphCanvas(raw, l) {
     const unavailable=false;
     const badge=editing?(graphSession.connectTarget===v.id?'选择接收 IP':v.kind==='entry'&&!v.address?'选择入口 IP':''):candidate?'选下一跳':chosen.has(v.id)?'已选':current?graphEntryMarks(g,l,v.id):'';
     const tag=!editing&&v.kind==='target'?'div':'button';
-    return `<div class="graph-node ${current?'on-route':''} ${candidate?'graph-option':''} ${chosen.has(v.id)?'graph-chosen':''} ${selected?'graph-selected':''} ${unavailable?'graph-disabled':''} ${graphSession?.errorField===`vertex:${v.id}`?'graph-invalid':''}" data-key="graph-node-${esc(v.id)}" data-graph-node="${esc(v.id)}" ${current?'data-current':''} style="left:${v.x-world.x}px;top:${v.y-world.y}px;height:${graphHeight(v,g)}px"><${tag} class="graph-node-body" ${tag==='button'?`data-action="graph-select" data-id="${esc(v.id)}"`:''} ${editing?'data-graph-drag="node"':unavailable?'disabled':''}><small>${v.runtime_only?'旧路径':v.kind==='entry'?'入口':v.kind==='target'?'目标':n?.mode==='passive'?'被动节点':'节点'}<span>${badge}</span></small><strong title="${esc(graphName(v))}">${esc(graphName(v))}</strong></${tag}>${graphNodeAddresses(g,v,editing)}</div>`;
+    return `<div class="graph-node ${v.kind==='direct'?'graph-direct':''} ${current?'on-route':''} ${candidate?'graph-option':''} ${chosen.has(v.id)?'graph-chosen':''} ${selected?'graph-selected':''} ${unavailable?'graph-disabled':''} ${graphSession?.errorField===`vertex:${v.id}`?'graph-invalid':''}" data-key="graph-node-${esc(v.id)}" data-graph-node="${esc(v.id)}" ${current?'data-current':''} style="left:${v.x-world.x}px;top:${v.y-world.y}px;width:${graphWidth(v)}px;height:${graphHeight(v,g)}px"><${tag} class="graph-node-body" ${tag==='button'?`data-action="graph-select" data-id="${esc(v.id)}"`:''} ${editing?'data-graph-drag="node"':unavailable?'disabled':''}><small>${v.runtime_only?'旧路径':v.kind==='direct'?'direct':v.kind==='entry'?'入口':v.kind==='target'?'目标':n?.mode==='passive'?'被动节点':'节点'}<span>${badge}</span></small><strong title="${esc(graphName(v))}">${v.kind==='direct'?graphWeight(v.weight):esc(graphName(v))}${v.node_id?`<em class="graph-weight" title="全局权重">${graphWeight(n?.weight??v.weight)}</em>`:''}</strong></${tag}>${graphNodeAddresses(g,v,editing)}</div>`;
   }).join('');
   const order=({a,b,i})=>(active.has(`${a}/${b}`)?1:0)+(pending.has(`${a}/${b}`)?2:0)+(editing&&graphSession?.edge===i?4:0);
   const editorRoutes=graphConnectionRoutes(g,boxes,editing);
@@ -248,7 +254,16 @@ function graphCanvas(raw, l) {
     return `${editing?`<defs><marker id="${marker}" viewBox="0 0 6 6" refX="6" refY="3" markerUnits="userSpaceOnUse" markerWidth="6" markerHeight="${editorRoutes[i].arrowHeight}" preserveAspectRatio="none" orient="auto"><path d="M 0 0 L 6 3 L 0 6 Z" fill="context-stroke"/></marker></defs><path ${attrs} data-graph-halo="${i}" class="graph-edit-halo" d="${d}"/>`:''}<path data-graph-line="${i}" ${attrs} class="graph-line ${!editing?'graph-context':''} ${!editing&&(active.has(key)||pending.has(key))?'graph-covered':''} ${editing&&graphSession?.edge===i?'graph-selected-line':''}" d="${d}" marker-end="url(#${marker})"/>${editing?`<path data-graph-hit="${i}" ${attrs} class="graph-hit" d="${d}" data-action="graph-edge" data-index="${i}"><title>${esc(label)}</title></path>`:''}`;
   }).join('');
   if(!editing)lines+=graphRuntimeLines(g,l,boxes);
-  return `<div class="topology-toolbar" data-key="graph-toolbar"><div class="topology-legend">${editing?`<button class="small ${graphSession.library?'is-active':''}" data-action="graph-add-open">＋ 添加</button><button class="small" data-action="graph-check" data-graph-mutate>整理</button><button class="small" data-action="graph-undo" data-graph-mutate title="撤销 Ctrl/⌘ Z">↶</button><button class="small" data-action="graph-redo" data-graph-mutate title="重做 Ctrl/⌘ Shift Z">↷</button><span class="graph-editor-hint">${graphSession.connect?'连接到左侧 IP 点':'从右侧 IP 点拖线'}</span>`:graphEntryLegend(g)}</div><div class="topology-tools"><button class="small" data-action="canvas-out" aria-label="缩小">−</button><button class="small" data-zoom-value data-action="graph-actual-size">100%</button><button class="small" data-action="canvas-in" aria-label="放大">+</button><button class="small" data-action="canvas-fit">适应</button><button class="small" data-action="canvas-fullscreen">${topologyViews.get(graphSession?.id||l?.id||'new')?.fullscreen?'退出全屏':'全屏'}</button></div></div><div class="graph-workspace" data-key="graph-workspace">${editing&&graphSession.library?graphLibrary():''}<div class="topology graph-viewport" data-key="graph-viewport" tabindex="0" aria-label="拓扑画布"><div class="topology-canvas" data-world-x="${world.x}" data-world-y="${world.y}" style="width:${width}px;height:${height}px"><svg class="topology-cables" width="${width}" height="${height}" viewBox="${world.x} ${world.y} ${width} ${height}"><defs><marker id="graph-arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/></marker></defs>${lines}</svg>${cards}</div></div>${editing?graphInspector():''}</div>`;
+  return `<div class="topology-toolbar" data-key="graph-toolbar"><div class="topology-legend">${editing?`<button class="small ${graphSession.library?'is-active':''}" data-action="graph-add-open">＋ 添加</button><button class="small" data-action="graph-check" data-graph-mutate>整理</button><button class="small" data-action="graph-undo" data-graph-mutate title="撤销 Ctrl/⌘ Z">↶</button><button class="small" data-action="graph-redo" data-graph-mutate title="重做 Ctrl/⌘ Shift Z">↷</button><span class="graph-editor-hint">${graphSession.connect?'连接到左侧 IP 点':'从右侧 IP 点拖线'}</span>`:graphEntryLegend(g)}</div><div class="topology-tools"><button class="small" data-action="canvas-out" aria-label="缩小">−</button><button class="small" data-zoom-value data-action="graph-actual-size">100%</button><button class="small" data-action="canvas-in" aria-label="放大">+</button><button class="small" data-action="canvas-fit">适应</button><button class="small" data-action="canvas-fullscreen">${topologyViews.get(graphSession?.id||l?.id||'new')?.fullscreen?'退出全屏':'全屏'}</button></div></div><div class="graph-workspace" data-key="graph-workspace">${editing&&graphSession.library?graphLibrary():''}<div class="topology graph-viewport" data-key="graph-viewport" tabindex="0" aria-label="拓扑画布"><div class="topology-canvas" data-world-x="${world.x}" data-world-y="${world.y}" style="width:${width}px;height:${height}px"><svg class="topology-cables" width="${width}" height="${height}" viewBox="${world.x} ${world.y} ${width} ${height}"><defs><marker id="graph-arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/></marker></defs>${lines}</svg>${graphLayers(g,world)}${cards}</div></div>${editing?graphInspector():''}</div>`;
+}
+function graphLayers(g,world) {
+  const real=g.vertices.filter(v=>v.kind!=='direct'&&!v.runtime_only&&Number.isInteger(v.layer));
+  if(!real.length)return '';
+  const top=Math.min(...real.map(v=>v.y))-35;
+  return [...new Set(real.map(v=>v.layer))].sort((a,b)=>a-b).map(layer=>{
+    const items=real.filter(v=>v.layer===layer),label=layer===0?'入口':items.every(v=>v.kind==='target')?'目标':`第 ${layer} 层`;
+    return `<span class="graph-layer-label" style="left:${items[0].x-world.x}px;top:${top-world.y}px">${label}</span>`;
+  }).join('');
 }
 const graphPick=(items,value,empty)=>`<option value="">${empty}</option>`+items.map(x=>`<option value="${esc(x.id)}" ${String(value)===String(x.id)?'selected':''}>${esc(x.name)}</option>`).join('');
 function graphEditorControls() {
@@ -277,12 +292,13 @@ function graphInspector() {
   }).join(''):'';
   const entryAddress=v?.kind==='entry'?`<label class="graph-address-field">入口接收 IP<select data-graph-listen="${esc(v.id)}" aria-label="入口接收 IP">${graphAddressOptions(v,v.address)}</select></label>`:'';
   const pending=v&&s.connectTarget===v.id?`<label class="graph-address-field">连接到 ${esc(graphName(v))}<select data-graph-connect-ip="${esc(v.id)}" aria-label="选择接收 IP">${graphAddressOptions(v,'')}</select></label>`:'';
-  const content=pending||(v?`${`<select data-graph-resource aria-label="更换节点">${choices.map(n=>`<option value="${n.id}" ${(v.target_id||v.node_id)===n.id?'selected':''}>${esc(n.name)}</option>`).join('')}</select>`}${entryAddress}${graphEntryPort(v,g)}<button class="small danger" data-action="graph-remove">删除</button>`:`<span>${e.map(id=>esc(graphName(g.vertices.find(v=>v.id===id)))).join(' → ')}</span>${addressFields}<button class="small danger" data-action="graph-remove-edge">删除连线</button>`);
+  const direct=v?.kind==='direct';
+  const content=pending||(v?`${direct?`<span>direct</span><label class="graph-address-field">权重<input type="number" data-direct-weight min="-100000" max="100000" step="1" required value="${v.weight??''}" aria-label="direct 权重"></label>`:`<select data-graph-resource aria-label="更换节点">${choices.map(n=>`<option value="${n.id}" ${(v.target_id||v.node_id)===n.id?'selected':''}>${esc(n.name)}</option>`).join('')}</select>`}${entryAddress}${graphEntryPort(v,g)}<button class="small danger" data-action="graph-remove">${direct?'移除 direct':'删除'}</button>`:`<span>${e.map(id=>esc(graphName(g.vertices.find(v=>v.id===id)))).join(' → ')}</span>${addressFields}${e.every(id=>g.vertices.find(v=>v.id===id)?.kind!=='direct')?'<button class="small" data-action="graph-insert-direct">＋ direct</button>':''}<button class="small danger" data-action="graph-remove-edge">删除连线</button>`);
   return `<div class="graph-inspector" data-key="inspector-${esc(v?.id||e.join('/'))}">${content}<button class="small" data-action="graph-deselect" aria-label="关闭">×</button></div>`;
 }
 function graphLibrary() {
-  const kind=graphSession.addKind||'node',items=kind==='target'?canvasView.targets:canvasView.nodes;
-  return `<aside class="graph-library"><div class="graph-library-tabs">${[['entry','入口'],['node','节点'],['target','目标']].map(([k,n])=>`<button class="${k===kind?'is-active':''}" data-action="graph-library-kind" data-kind="${k}">${n}</button>`).join('')}</div><div class="graph-library-list">${items.map(n=>`<button draggable="true" data-action="graph-library-add" data-kind="${kind}" data-id="${n.id}"><strong>${esc(n.name)}</strong><small>${esc(n.addr||n.host||'')}</small></button>`).join('')}</div></aside>`;
+  const kind=graphSession.addKind||'node',items=kind==='direct'?[{id:'direct',name:'direct',addr:'权重 0'}]:kind==='target'?canvasView.targets:canvasView.nodes;
+  return `<aside class="graph-library"><div class="graph-library-tabs">${[['entry','入口'],['node','节点'],['target','目标'],['direct','direct']].map(([k,n])=>`<button class="${k===kind?'is-active':''}" data-action="graph-library-kind" data-kind="${k}">${n}</button>`).join('')}</div><div class="graph-library-list">${items.map(n=>`<button draggable="true" data-action="graph-library-add" data-kind="${kind}" data-id="${n.id}"><strong>${esc(n.name)}</strong><small>${esc(n.addr||n.host||'')}</small></button>`).join('')}</div></aside>`;
 }
 function drawGraph() {
   const s=graphSession,l=canvasView.link,g=graphCurrent();
@@ -294,7 +310,7 @@ function drawGraph() {
   }else if(s?.kind==='choose'){
     actions='<button data-action="graph-exit" data-graph-mutate>取消选路</button><button class="primary" data-action="graph-autocomplete" data-graph-mutate>自动补全</button>';
     controls=`<div class="graph-selection" data-key="graph-controls">${esc(graphName(g.vertices.find(v=>v.id===s.prefix[0])))} · 点击下一跳</div>`;
-  }else actions=`${linkState(l)}<a class="button" href="#/quality/topologies/${l.id}">网络质量</a><button data-action="link-edit" data-graph-mutate ${l.state==='deleting'?'disabled':''}>编辑</button><button class="danger" data-action="link-delete" data-graph-mutate ${l.state==='deleting'?'disabled':''}>删除</button>`;
+  }else actions=`${linkState(l)}<button data-action="link-failover" data-graph-mutate aria-pressed="${!!l.failover_enabled}" ${l.state==='deleting'?'disabled':''}>自动灾备${l.failover_enabled?'：开':'：关'}</button><a class="button" href="#/quality/topologies/${l.id}">网络质量</a><button data-action="link-edit" data-graph-mutate ${l.state==='deleting'?'disabled':''}>编辑</button><button class="danger" data-action="link-delete" data-graph-mutate ${l.state==='deleting'?'disabled':''}>删除</button>`;
   render(`<a class="back" href="#/routes">← 链路</a>${pageHead(title,actions)}<section class="panel topology-panel${topologyViews.get(s?.id||l?.id||'new')?.fullscreen?' is-fullscreen':''}"><div class="graph-fullscreen-actions">${actions}</div>${s?.error?`<div class="graph-error" data-key="graph-error" role="alert">${esc(s.error)}${s.conflict&&s.id?'<button class="small" data-action="graph-reload">重新载入</button>':''}</div>`:''}${controls}${graphCanvas(g,l)}${!s?'<div class="graph-route-hint" data-key="graph-hint" data-route-hint></div>':''}${!s?syncFeedback(l):''}</section>${!s?`<div class="graph-summary"><span>${g.vertices.filter(v=>v.kind==='entry'&&!v.runtime_only).length} 个入口 · ${g.vertices.filter(v=>v.kind==='target'&&!v.runtime_only).length} 个目标</span><a href="#/configs">查看配置${l.configurations?' · '+l.configurations.length:''} →</a></div>${graphRouteStatus(g,l)}${detailsBlock('graph-events-'+l.id,'切换记录',l.events.map(e=>`<p>${esc(fmtTime(e.ts))} ${esc(e.message)}</p>`).join('')||'暂无记录')}`:''}`);
   if(s?.kind==='edit'){
     app.querySelectorAll('[data-graph-field]').forEach(el=>{el.value=s[el.dataset.graphField]??'';el.setAttribute('aria-invalid',String(s.errorField===el.dataset.graphField));});
@@ -331,6 +347,8 @@ function graphValidateFields(s) {
   const invalid=(message,field)=>{const error=new Error(message);error.field=field;throw error;};
   if(s.connect)invalid('请先完成当前连线，或按 Esc 取消','vertex:'+(s.connectTarget||s.connect));
   if(!s.name.trim()||s.name.trim().length>64)invalid('名称需要包含 1 至 64 个字符','name');
+  const weight=app.querySelector('[data-direct-weight]');
+  if(weight&&!weight.checkValidity())invalid('权重须为 -100000 至 100000 的整数','vertex:'+s.selected);
   const input=app.querySelector('[data-graph-entry-port]');
   if((input&&!input.checkValidity())||(s.port!=null&&(!Number.isInteger(s.port)||s.port<1||s.port>65535)))invalid('端口必须是 1–65535 的整数','port');
 }
@@ -340,7 +358,7 @@ const graphSnapshot=s=>JSON.stringify({graph:s.graph,name:s.name,group_id:s.grou
 function graphButtons() {
   const s=graphSession;
   document.querySelectorAll('[data-graph-mutate]').forEach(el=>{
-    el.disabled=graphBusy||!!graphDrag||el.dataset.action==='graph-undo'&&!s?.undo?.length||el.dataset.action==='graph-redo'&&!s?.redo?.length||['link-edit','link-delete'].includes(el.dataset.action)&&(canvasView.link?.state==='deleting');
+    el.disabled=graphBusy||!!graphDrag||el.dataset.action==='graph-undo'&&!s?.undo?.length||el.dataset.action==='graph-redo'&&!s?.redo?.length||['link-edit','link-delete','link-failover'].includes(el.dataset.action)&&(canvasView.link?.state==='deleting');
   });
   document.querySelectorAll('.graph-library button,.graph-inspector button,.graph-inspector input,.graph-inspector select,[data-graph-field],[data-graph-entry-port],[data-graph-port-target],[data-action="graph-add-open"]').forEach(el=>{
     el.disabled=graphBusy||!!graphDrag;
@@ -448,6 +466,11 @@ function graphLinkError(source,target) {
   if(from.kind==='target'||to.kind==='entry')return '入口只能向外连接，目标只能接收连接';
   if(from.node_id&&from.node_id===to.node_id)return `两端都是同一台节点「${graphName(from)}」，不能互相转发`;
   if(g.edges.some(([a,b])=>a===source&&b===target))return '这条连线已存在';
+  if(from.kind==='direct'&&to.kind==='direct')return 'direct 不能连续连接';
+  if(from.kind==='direct'&&g.edges.some(([a])=>a===source)||to.kind==='direct'&&g.edges.some(([,b])=>b===target))return 'direct 只能连入和连出各一条线';
+  const left=from.kind==='direct'?g.vertices.find(v=>v.id===g.edges.find(([,b])=>b===source)?.[0]):from;
+  const right=to.kind==='direct'?g.vertices.find(v=>v.id===g.edges.find(([a])=>a===target)?.[1]):to;
+  if(left?.node_id&&left.node_id===right?.node_id)return 'direct 两端不能是同一台节点';
   const seen=new Set(),pending=[target];
   while(pending.length){const id=pending.pop();if(id===source)return '这条连线会形成循环';if(seen.has(id))continue;seen.add(id);g.edges.forEach(([a,b])=>{if(a===id)pending.push(b);});}
   return '';
@@ -514,20 +537,47 @@ function graphConnect(id,side,address) {
 function graphAddResource(kind,id,point=null) {
   if(graphBusy||graphSession?.kind!=='edit')return;
   const s=graphSession,g=s.graph;
-  if(!['entry','node','target'].includes(kind)||!id)return;
+  if(!['entry','node','target','direct'].includes(kind)||!id)return;
   if(['entry','target'].includes(kind)&&g.vertices.some(v=>v.kind===kind))g.version=2;
-  const v={id:graphID(),kind,[kind==='target'?'target_id':'node_id']:Number(id),disabled:false,...(point||graphAddPosition(220,110))};
+  const v={id:graphID(),kind,...(kind==='direct'?{weight:0}:{[kind==='target'?'target_id':'node_id']:Number(id)}),...(point||graphAddPosition(kind==='direct'?110:220,kind==='direct'?56:110))};
   g.vertices.push(v);
-  v.out_address='@auto';
+  if(v.node_id)v.out_address='@auto';
   const addresses=graphAddresses(v.id,g);if(addresses.length===1){v.in_address=addresses[0].id;if(kind==='entry')v.address=addresses[0].id;}
   graphCancelConnection();
   if(kind==='entry')s.addKind='node';
   s.selected=v.id;s.edge=null;graphTouch();drawGraph();graphReveal(v);
 }
 
+function graphInsertDirect() {
+  if(graphBusy||graphSession?.kind!=='edit')return;
+  const s=graphSession,g=s.graph,e=g.edges[s.edge];if(!e)return;
+  const [a,b]=e.map(id=>g.vertices.find(v=>v.id===id));if(!a||!b||a.kind==='direct'||b.kind==='direct')return;
+  const binding=g.bindings?.[e.join('/')]||{from:{},to:{}};
+  const v={id:graphID(),kind:'direct',weight:0,x:Math.round((a.x+graphWidth(a)+b.x-110)/2),y:Math.round((a.y+graphHeight(a,g)/2+b.y+graphHeight(b,g)/2)/2-28)};
+  g.vertices.push(v);g.edges.splice(s.edge,1,[a.id,v.id],[v.id,b.id]);g.bindings||={};
+  delete g.bindings[e.join('/')];
+  g.bindings[`${a.id}/${v.id}`]={from:binding.from||{},to:{}};
+  g.bindings[`${v.id}/${b.id}`]={from:{},to:binding.to||{}};
+  s.selected=v.id;s.edge=null;graphTouch();drawGraph();
+}
+function graphRemoveSelected() {
+  if(graphBusy)return;
+  const s=graphSession,g=s.graph,id=s.selected,v=g.vertices.find(v=>v.id===id);if(!v)return;
+  const before=g.edges.find(([,b])=>b===id),after=g.edges.find(([a])=>a===id);
+  if(v.kind==='direct'&&before&&after){
+    if(g.edges.some(([a,b])=>a===before[0]&&b===after[1])){s.error='两端已有另一条直连，请先删除其中一条连线';drawGraph();return;}
+    const joined=[before[0],after[1]];g.edges.push(joined);g.bindings||={};
+    g.bindings[joined.join('/')]={from:g.bindings[before.join('/')]?.from||{},to:g.bindings[after.join('/')]?.to||{}};
+  }
+  g.vertices=g.vertices.filter(v=>v.id!==id);
+  g.edges=g.edges.filter(([a,b])=>a!==id&&b!==id);
+  for(const key of Object.keys(g.bindings||{}))if(key.split('/').includes(id))delete g.bindings[key];
+  s.selected=null;graphCancelConnection();graphTouch();drawGraph();
+}
+
 function graphReveal(v) {
   const b=topologyBinding,canvas=app.querySelector('.topology-canvas'),x=(v.x-Number(canvas.dataset.worldX))*b.view.scale+b.view.x,y=(v.y-Number(canvas.dataset.worldY))*b.view.scale+b.view.y;
-  const width=(v.width||220)*b.view.scale,height=(v.height||110)*b.view.scale;
+  const width=graphWidth(v)*b.view.scale,height=graphHeight(v,graphCurrent())*b.view.scale;
   if(x<24)b.view.x+=24-x;else if(x+width>b.viewport.clientWidth-24)b.view.x+=b.viewport.clientWidth-24-x-width;
   if(y<24)b.view.y+=24-y;else if(y+height>b.viewport.clientHeight-24)b.view.y+=b.viewport.clientHeight-24-y-height;
   b.view.auto=false;b.apply();
@@ -647,6 +697,10 @@ document.addEventListener('wheel',e=>{if(graphDrag){e.preventDefault();e.stopPro
 
 document.addEventListener('input',e=>{
   if(graphSession?.kind!=='edit'||graphBusy)return;
+  if(e.target.hasAttribute('data-direct-weight')){
+    const v=graphSession.graph.vertices.find(v=>v.id===graphSession.selected);
+    if(v?.kind==='direct'){v.weight=e.target.value===''?null:Number(e.target.value);graphTouch(false);}
+  }
   const field=e.target.dataset.graphField;
   if(field){graphSession[field]=field==='name'?e.target.value:e.target.value===''?null:Number(e.target.value);graphTouch(false);}
   if(e.target.hasAttribute('data-graph-entry-port')) {
@@ -671,7 +725,7 @@ document.addEventListener('change',e=>{
     if(edge&&e.target.value)graphChooseAddress(e.target.dataset.id,e.target.dataset.graphBinding,e.target.value,edge);
     graphTouch();drawGraph();return;
   }
-  if(e.target.hasAttribute('data-graph-field')||e.target.hasAttribute('data-graph-entry-port'))graphTouch();
+  if(e.target.hasAttribute('data-graph-field')||e.target.hasAttribute('data-graph-entry-port')||e.target.hasAttribute('data-direct-weight'))graphTouch();
   if(e.target.hasAttribute('data-graph-port-target')){graphSession.portTarget=e.target.value;drawGraph();}
   const prop=e.target.dataset.graphProperty,v=graphSession.graph.vertices.find(v=>v.id===graphSession.selected);
   if(e.target.hasAttribute('data-graph-resource')&&v) {
@@ -756,8 +810,9 @@ Object.assign(ACTIONS,{
     s.selected=id;s.edge=null;drawGraph();
   },
   'graph-edge':el=>{if(graphSession?.kind!=='edit'||graphBusy)return;graphCancelConnection();graphSession.edge=Number(el.dataset.index);graphSession.selected=null;drawGraph();},
-  'graph-remove':()=>{if(graphBusy)return;const s=graphSession,id=s.selected;s.graph.vertices=s.graph.vertices.filter(v=>v.id!==id);s.graph.edges=s.graph.edges.filter(([a,b])=>a!==id&&b!==id);s.selected=null;graphCancelConnection();graphTouch();drawGraph();},
-  'graph-remove-edge':()=>{if(graphBusy)return;graphSession.graph.edges.splice(graphSession.edge,1);graphSession.edge=null;graphTouch();drawGraph();},
+  'graph-insert-direct':graphInsertDirect,
+  'graph-remove':graphRemoveSelected,
+  'graph-remove-edge':()=>{if(graphBusy)return;const s=graphSession,e=s.graph.edges[s.edge];if(!e)return;delete s.graph.bindings?.[e.join('/')];s.graph.edges.splice(s.edge,1);s.edge=null;graphTouch();drawGraph();},
   'graph-check':()=>graphWork(async()=>{const s=graphSession,page=pageVersion,r=await api('POST','topology-preview',{graph:s.graph,layout_only:true});if(graphSession!==s||pageVersion!==page)return;s.graph=r.graph;graphTouch();drawGraph();topologyBinding?.fit();}),
   'graph-publish':()=>graphWork(()=>startGraphChoice(null,true)),
   'graph-rewind':el=>graphWork(async()=>{const s=graphSession,index=s.prefix.indexOf(el.dataset.id);if(index<0)return;s.prefix=s.prefix.slice(0,index+1);s.complete=false;s.error='';await advanceGraph(s,false);}),

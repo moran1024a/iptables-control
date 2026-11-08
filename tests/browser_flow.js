@@ -15,6 +15,50 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE);
   await page.locator('.graph-node').first().waitFor();
 
 
+  // Exercise the global weight form without changing node identity or IP fields.
+  await page.goto(process.env.TEST_URL+'#/nodes/1');
+  await page.locator('[data-action=node-edit]').click();
+  await page.locator('#modal input[name=weight]').fill('-5');
+  await page.locator('#modal button.primary').click();
+  await page.locator('#modal').waitFor({state:'hidden'});
+  await page.goto(process.env.TEST_URL+'#/routes/'+process.env.TEST_ROUTE);
+  await page.locator('[data-action=link-failover]').first().click();
+  await page.waitForFunction(()=>!graphBusy&&canvasView.link.failover_enabled===1);
+  await page.locator('[data-action=link-failover]').first().click();
+  await page.waitForFunction(()=>!graphBusy&&canvasView.link.failover_enabled===0);
+  await page.locator('[data-action=link-edit]').first().click();
+  await page.evaluate(()=>ACTIONS['graph-edge']({dataset:{index:String(graphSession.graph.edges.findIndex(e=>e[0]==='v1'&&e[1]==='v3'))}}));
+  await page.locator('[data-action=graph-insert-direct]').click();
+  const direct=await page.evaluate(()=>graphSession.selected);
+  await page.locator('[data-direct-weight]').fill('-7');
+  await page.locator('[data-action=graph-check]').click();
+  await page.waitForFunction(()=>!graphBusy);
+  await page.locator('[data-action=graph-publish]').first().click();
+  await page.waitForFunction(id=>!graphSession&&!graphBusy&&canvasView.link.configurations.some(c=>c.active_path.includes(id)),direct);
+  await page.evaluate(id=>{
+    const graph=canvasView.link.graph,node=graph.vertices.find(v=>v.id===id),next=graph.vertices.find(v=>v.id==='v3');
+    if(node.weight!==-7||next.layer!==1)throw new Error('direct altered its downstream layer or lost its weight');
+    if(canvasView.nodes.find(n=>n.id===1).weight!==-5)throw new Error('global weight form was not saved');
+    if(app.querySelector(`[data-graph-node="${id}"]`).getBoundingClientRect().width>=app.querySelector('[data-graph-node="v3"]').getBoundingClientRect().width)throw new Error('direct must be a compact modifier');
+    for(const path of app.querySelectorAll('.graph-line'))if(/NaN|undefined/.test(path.getAttribute('d')))throw new Error('invalid wire coordinates');
+    const boxes=graphBoxes(graph);
+    for(const [a,b] of graph.edges.filter(e=>e.includes(id))){
+      const source=graph.vertices.find(v=>v.id===a),target=graph.vertices.find(v=>v.id===b);
+      const start=graphPortPoint(graph,a,'out',graphPortAddress(graph,source,'out',[a,b]),boxes);
+      const end=graphPortPoint(graph,b,'in',graphPortAddress(graph,target,'in',[a,b]),boxes);
+      const line=app.querySelector(`.graph-live[data-graph-from="${a}"][data-graph-to="${b}"]`);
+      if(line&&line.getBBox().y<Math.min(start[1],end[1])-12)throw new Error('short direct wire made an unnecessary detour');
+    }
+  },direct);
+  if(process.env.TEST_CANVAS_SCREENSHOT)await page.screenshot({path:process.env.TEST_CANVAS_SCREENSHOT});
+  await page.locator('[data-action=link-edit]').first().click();
+  await page.locator(`[data-action=graph-select][data-id="${direct}"]`).click();
+  await page.locator('[data-action=graph-remove]').click();
+  await page.locator('[data-action=graph-publish]').first().click();
+  await page.waitForFunction(id=>!graphSession&&!graphBusy&&!canvasView.link.view_graph.vertices.some(v=>v.id===id),direct);
+  console.log('PASS global weights, direct editing, automatic recovery toggle');
+
+
   await page.locator('[data-action=link-edit]').first().click();
   await page.locator('[data-action=graph-add-open]').click();
   await page.locator('[data-action=graph-library-add][data-id="5"]').click();
@@ -48,7 +92,7 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE);
   await page.locator('[data-nav=targets]').click();await page.locator('[data-action=target-edit]').first().waitFor();
   await page.locator('[data-nav=subscriptions]').click();
   console.log('SUBS',await page.locator('#app h1').innerText());
-  await page.locator('[data-nav=settings]').click();await page.locator('text=0.6.0-rc.1').first().waitFor();
+  await page.locator('[data-nav=settings]').click();await page.locator('text=0.6.0-rc.2').first().waitFor();
   await page.locator('[data-nav=routes]').click();
   await page.locator(`a[href="#/routes/${process.env.TEST_ROUTE}"]`).click();
   await page.locator('.graph-node').first().waitFor();

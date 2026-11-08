@@ -109,6 +109,29 @@ class V3Tests(Fixture, unittest.TestCase):
             agent_v3.refresh_held_ports(self.db,database.get_node(self.db,nid),report)
             self.assertEqual(self.db.execute('SELECT port FROM retired_ports').fetchone()[0],10002)
 
+    def test_forwarding_health_requires_current_generation_and_actual_report(self):
+        import node_state
+        nid = self.node()
+        self.ready(nid)
+        node = database.get_node(self.db, nid)
+        snapshot = dict(generation=node['applied_generation'], hash=node['reported_v'], state='ok')
+        health = dict(snapshot, state='error', error='missing rules')
+        with self.db:
+            agent_v3.packet(self.db, node, status=dict(snapshot, forwarding=health), observe_only=True)
+        current = database.get_node(self.db, nid)
+        self.assertEqual(current['runtime_state'], 'error')
+        self.assertEqual(current['state'], 'ok')  # Does not corrupt config confirmation.
+        self.assertEqual(node_state.node_status(self.db, current, int(time.time())), 'error')
+        for observe, generation in ((False, node['applied_generation']), (True, node['applied_generation']-1)):
+            with self.db:
+                agent_v3.packet(self.db, database.get_node(self.db, nid), status=dict(snapshot, forwarding=dict(health, state='ok', generation=generation)), observe=observe, observe_only=True)
+            self.assertEqual(database.get_node(self.db, nid)['runtime_state'], 'error')
+        with self.db:
+            agent_v3.packet(self.db, database.get_node(self.db, nid), status=dict(snapshot, forwarding=dict(health, state='ok', error='')), observe_only=True)
+        self.assertEqual(database.get_node(self.db, nid)['runtime_state'], 'ok')
+        self.ack(nid)
+        self.assertEqual(database.get_node(self.db, nid)['runtime_state'], 'unknown')
+
     def test_release_comparison_respects_rc_and_stable(self):
         self.assertTrue(agent_v3.newer('0.4.0','0.4.0-rc.1'))
         self.assertTrue(agent_v3.newer('0.4.0-rc.10','0.4.0-rc.2'))

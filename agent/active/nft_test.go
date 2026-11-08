@@ -231,3 +231,92 @@ func TestKernelRoundTrip(t *testing.T) {
 		t.Fatalf("clear: %v %v", exists, err)
 	}
 }
+
+func TestForwardingHealthSeparatesInstalledFaultsFromApplyErrors(t *testing.T) {
+	a := &Agent{root: t.TempDir(), installation: strings.Repeat("a", 32), config: testConfig(t), stateError: "new configuration failed"}
+	a.config.Rules[0].IP = "192.0.2.2"
+	a.config.Epoch = strings.Repeat("b", 32)
+	tx := a.transaction(a.config, M{}, false)
+	current := M{"nftables": []any{}}
+	for _, item := range array(tx["nftables"]) {
+		if add, ok := item.(M)["add"].(M); ok {
+			current["nftables"] = append(array(current["nftables"]), add)
+		}
+	}
+	original, _ := json.Marshal(current)
+	script := "#!/bin/sh\ncase \"$*\" in\n '-j list tables'|'-j list table ip ictl_active') /bin/cat \"$NFT_STATE\" ;;\n *) exit 2 ;;\nesac\n"
+	if err := os.WriteFile(a.path("nft"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", a.root)
+	t.Setenv("NFT_STATE", a.path("native.json"))
+	for _, tc := range []struct{ name, want string }{{"healthy", "ok"}, {"missing-table", "error"}, {"missing-rule", "error"}, {"changed-hook", "error"}, {"unreadable", "unknown"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var snapshot M
+			_ = json.Unmarshal(original, &snapshot)
+			switch tc.name {
+			case "missing-table":
+				snapshot["nftables"] = []any{}
+			case "missing-rule":
+				rows := array(snapshot["nftables"])
+				for i, item := range rows {
+					if _, ok := item.(M)["rule"]; ok {
+						snapshot["nftables"] = append(rows[:i], rows[i+1:]...)
+						break
+					}
+				}
+			case "changed-hook":
+				for _, item := range array(snapshot["nftables"]) {
+					if ch, ok := item.(M)["chain"].(M); ok && ch["name"] == "route" {
+						ch["prio"] = 42
+					}
+				}
+			}
+			if err := atomicJSON(a.path("native.json"), snapshot); err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "unreadable" {
+				_ = os.Remove(a.path("native.json"))
+			}
+			health := a.forwardingHealth()
+			if health["state"] != tc.want || health["hash"] != a.config.Hash || health["generation"] != a.config.Generation {
+				t.Fatal(health)
+			}
+			if a.stateError != "new configuration failed" {
+				t.Fatal("health inspection altered apply status")
+			}
+		})
+	}
+}
+
+func TestKernelForwardingHealth(t *testing.T) {
+	if os.Getenv("ICTL_KERNEL_TEST") != "1" {
+		t.Skip("requires isolated root network namespace")
+	}
+	own, err := os.Readlink("/proc/self/ns/net")
+	parent, _ := os.Readlink("/proc/1/ns/net")
+	if err != nil || own == parent {
+		t.Fatal("refusing to modify the host network")
+	}
+	a := &Agent{root: t.TempDir(), installation: randomID(), config: testConfig(t)}
+	a.config.Rules[0].IP = "192.0.2.2"
+	a.config.Epoch = randomID()
+	if err := executeNFT(a.transaction(a.config, M{}, false), false); err != nil {
+		t.Fatal(err)
+	}
+	if health := a.forwardingHealth(); health["state"] != "ok" {
+		t.Fatal("healthy installed rules", health)
+	}
+	if _, err := run(nil, "nft", "flush", "chain", "ip", tableName, "pre"); err != nil {
+		t.Fatal(err)
+	}
+	if health := a.forwardingHealth(); health["state"] != "error" {
+		t.Fatal("missing forwarding rules", health)
+	}
+	if _, err := run(nil, "nft", "delete", "table", "ip", tableName); err != nil {
+		t.Fatal(err)
+	}
+	if health := a.forwardingHealth(); health["state"] != "error" {
+		t.Fatal("missing forwarding table", health)
+	}
+}

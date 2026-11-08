@@ -3,6 +3,12 @@ import re
 import secrets
 import errors
 
+
+def check_weight(value, field="weight"):
+    if type(value) is not int or not -100000 <= value <= 100000:
+        raise errors.UserError("权重须为 -100000 至 100000 的整数", field)
+    return value
+
 HOST_RE = re.compile(
     "^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)+[A-Za-z][A-Za-z0-9-]{0,62}$"
 )

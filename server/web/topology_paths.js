@@ -167,7 +167,7 @@ function graphRuntimeLines(g,link,boxes) {
 function graphRouteStatus(g,link) {
   if(!link?.configurations?.length)return '';
   const colors=graphEntryColors(g),name=id=>graphName(g.vertices.find(v=>v.id===id));
-  const rows=link.configurations.map(c=>`<div class="graph-route-status" data-config-route="${c.id}"><span><i class="graph-entry-dot" style="background:${colors.get(c.entry)}"></i>${esc(name(c.entry))} → ${esc(name(c.target))}</span><span class="graph-route-description" title="${esc(c.active_path.map(name).join(' → '))}">${esc(c.active_path.length?(c.active_path.slice(1,-1).map(name).join(' → ')||'direct'):'等待生效')}</span>${linkState(c)}${c.error?`<small>${esc(c.error)}</small>`:''}</div>`).join('');
+  const rows=link.configurations.map(c=>`<div class="graph-route-status" data-config-route="${c.id}"><span><i class="graph-entry-dot" style="background:${colors.get(c.entry)}"></i>${esc(name(c.entry))} → ${esc(name(c.target))}</span><span class="graph-route-description" title="${esc(c.active_path.map(name).join(' → '))}">${esc(c.active_path.length?(c.active_path.slice(1,-1).map(name).join(' → ')||'direct'):'等待生效')}</span>${linkState(c)}${c.error||c.failover?.message?`<small>${esc(c.error||c.failover.message)}</small>`:''}</div>`).join('');
   return detailsBlock('graph-paths-'+link.id,'路径状态',rows);
 }
 
@@ -178,7 +178,7 @@ function graphQuickHint(id) {
   if(!id)return;
   const link=canvasView.link,page=pageVersion;
   const vertex=link.graph.vertices.find(v=>v.id===id);
-  if(!vertex||vertex.kind!=='node')return;
+  if(!vertex||!['node','direct'].includes(vertex.kind))return;
   graphHintTimer=setTimeout(async()=>{
     try{
       const result=await api('POST','topology-preview',{id:link.id,graph:link.graph,required:[id]});

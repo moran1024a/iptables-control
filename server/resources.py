@@ -33,6 +33,7 @@ class Resources:
             "kind": n["kind"],
             "name": n["name"],
             "note": n["note"],
+            "weight": n["weight"],
             "addr": n["addr"],
             "addresses": node_addresses.listing(conn, n),
             "ports": n["ports"],
@@ -45,7 +46,7 @@ class Resources:
             "protocol_version": n["protocol_version"],
             "desired_generation": n["desired_generation"],
             "applied_generation": n["applied_generation"],
-            "err": n["err"],
+            "err": n["err"] or node_state.runtime_error(n, now),
             "installed_agent": n["installed_agent"],
             "backend": n["backend"],
             "connection_state": n["connection_state"],
@@ -103,6 +104,7 @@ class Resources:
         node_addresses.save(
             conn, database.get_node(conn, cur.lastrowid), body.get("addresses", []), addr=addr
         )
+        conn.execute("UPDATE nodes SET weight=? WHERE id=?", (validation.check_weight(body.get("weight", 0)), node_id))
         self.set_wake(conn, body, database.get_node(conn, cur.lastrowid), mode)
         return {"id": cur.lastrowid}
 
@@ -162,7 +164,7 @@ class Resources:
                 "reported_v": n["reported_v"],
                 "want_v": forwarding.rules_version(forwarding.node_rules(conn, n)),
                 "state": n["state"],
-                "err": n["err"],
+                "err": n["err"] or node_state.runtime_error(n, now),
                 "group": group["name"],
                 "agent_update": (
                     "pending"
@@ -182,6 +184,8 @@ class Resources:
     @node_sync.track_mutation
     def api_node_edit(self, conn, body, node_id):
         n = database.get_node(conn, node_id)
+        if "weight" in body:
+            conn.execute("UPDATE nodes SET weight=? WHERE id=?", (validation.check_weight(body["weight"]), node_id))
         table = database.node_table(n["kind"])
         if "kind" in body and body["kind"] != n["kind"]:
             raise errors.UserError("节点类型不能修改", "kind")
@@ -440,7 +444,7 @@ class Resources:
                 database.move_group(conn, "targets", target_id, group_id)
             if host != old["host"] or port != old["port"]:
                 conn.execute(
-                    "UPDATE configurations SET state='pending',error='' WHERE deleted=0 AND json_extract(desired,'$.target')=?",
+                    "UPDATE configurations SET state='pending',error='',failover='{}' WHERE deleted=0 AND json_extract(desired,'$.target')=?",
                     (target_id,),
                 )
         else:

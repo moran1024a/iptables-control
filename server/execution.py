@@ -65,8 +65,7 @@ def event(c, ident, message):
 def operational(plan):
     if not plan:
         return None
-    g = plan["graph"]
-    path = plan["graph_path"]
+    g, path = topology.wire_graph(plan["graph"], plan["graph_path"])
     by = {v["id"]: v for v in g["vertices"]}
     result = []
     for i, vid in enumerate(path[:-1]):
@@ -151,8 +150,7 @@ def retire(c, ident, rules):
 
 def make_rules(c, config, plan, now):
     plan = copy.deepcopy(plan)
-    g = plan["graph"]
-    path = plan["graph_path"]
+    g, path = topology.wire_graph(plan["graph"], plan["graph_path"])
     by = {v["id"]: v for v in g["vertices"]}
     wanted = {by[i]["node_id"] for i in path[:-1]}
     applied = json.loads(config["applied"]) if config["applied"] else None
@@ -178,6 +176,7 @@ def make_rules(c, config, plan, now):
             error = errors.WaitingError if not snapshot["complete"] else errors.UserError
             raise error(f"{database.get_node(c,n)['name']}：{reason}")
         g["address_book"][vid][out] = resolved
+    plan["graph"]["address_book"] = g["address_book"]
     plan.update(topology.compile_routing(g, path))
     target = dict(database.get_target(c, plan["target"]))
     applied = json.loads(config["applied"]) if config["applied"] else None
@@ -262,12 +261,14 @@ def queue(c, config, now):
         projected = copy.deepcopy(plan)
         for key in ("port", "routing", "hop_addresses", "ingress_host"):
             projected[key] = current[key]
-        for index, vid in enumerate(projected["graph_path"][:-1]):
-            old_vid = current["graph_path"][index]
-            old_next = current["graph_path"][index + 1]
-            next_vid = projected["graph_path"][index + 1]
-            source = projected["graph"]["bindings"][vid + "/" + next_vid]["from"][vid]
-            old_source = current["graph"]["bindings"][old_vid + "/" + old_next]["from"][old_vid]
+        projected_wire, projected_path = topology.wire_graph(projected["graph"], projected["graph_path"])
+        current_wire, current_path = topology.wire_graph(current["graph"], current["graph_path"])
+        for index, vid in enumerate(projected_path[:-1]):
+            old_vid = current_path[index]
+            old_next = current_path[index + 1]
+            next_vid = projected_path[index + 1]
+            source = projected_wire["bindings"][vid + "/" + next_vid]["from"][vid]
+            old_source = current_wire["bindings"][old_vid + "/" + old_next]["from"][old_vid]
             if source != "@auto" and old_source != "@auto":
                 actual = current["graph"]["address_book"][old_vid][old_source]
                 for key in ("local", "device", "gateway"):
@@ -484,13 +485,18 @@ def retry(c, ident):
 
 class Monitor:
     def __init__(self, hub):
+        import failover
+        self.failover = failover.Engine()
         self.hub = hub
         self.task = None
 
     async def run(self):
         while True:
             try:
-                if await self.hub.database(tick):
+                def cycle(c):
+                    self.failover.tick(c)
+                    return tick(c)
+                if await self.hub.database(cycle):
                     self.hub.notify()
             except asyncio.CancelledError:
                 raise
