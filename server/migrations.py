@@ -109,6 +109,15 @@ def init_db():
             conn.execute("ALTER TABLE nodes ADD COLUMN runtime_at INTEGER NOT NULL DEFAULT 0")
             conn.execute("ALTER TABLE topologies ADD COLUMN failover_enabled INTEGER NOT NULL DEFAULT 0")
             conn.execute("ALTER TABLE configurations ADD COLUMN failover TEXT NOT NULL DEFAULT '{}'")
+            conn.execute("PRAGMA user_version=601")
+        version = 601
+    if version == 601:
+        database.backup_database(conn, str(path) + ".pre-0.6.0-rc.3.bak")
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("ALTER TABLE targets ADD COLUMN addresses TEXT NOT NULL DEFAULT '[]'")
+            conn.execute("CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, color TEXT NOT NULL)")
+            conn.execute("CREATE TABLE node_tags (node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY(node_id,tag_id))")
             conn.execute(f"PRAGMA user_version={settings.DATABASE_VERSION}")
         return conn
     if version != 504:

@@ -9,6 +9,7 @@ from collections import Counter
 import database
 import errors
 import node_addresses
+import target_addresses
 import validation
 
 MAX_VERTICES = 256
@@ -87,7 +88,9 @@ def validate(c, raw, complete=True):
                 fail("画布坐标无效")
             v[axis] = value
         if kind == "target":
-            v["target_id"] = database.get_target(c, raw_v.get("target_id"))["id"]
+            target = database.get_target(c, raw_v.get("target_id"))
+            v["target_id"] = target["id"]
+            graph["address_book"][ident] = {a["id"]: a for a in target_addresses.listing(target)}
         elif kind == "direct":
             v["weight"] = validation.check_weight(raw_v.get("weight", 0), "vertex:" + ident)
         else:
@@ -137,7 +140,7 @@ def validate(c, raw, complete=True):
             fail("无效的连线地址")
         mapping = {"from": {}, "to": {}}
         for side, vid in (("from", a), ("to", b)):
-            if not by_id[vid].get("node_id"):
+            if by_id[vid]["kind"] == "direct":
                 continue
             selected = source.get(side, {})
             if not isinstance(selected, dict):
@@ -148,6 +151,7 @@ def validate(c, raw, complete=True):
                 address = (
                     node_addresses.AUTO
                     if side == "from"
+                    else "main" if by_id[vid]["kind"] == "target"
                     else next(iter(book)) if len(book) == 1 else None
                 )
             if (not isinstance(address, str) or address not in book) and not (

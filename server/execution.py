@@ -13,6 +13,7 @@ import node_addresses
 import node_sync
 import settings
 import topology
+import target_addresses
 import validation
 
 
@@ -47,7 +48,7 @@ def applied_rules_present(c, config):
 
 def applied_target(c, config):
     target = json.loads(config["applied"])["target"]
-    current = c.execute("SELECT * FROM targets WHERE id=?", (target["id"],)).fetchone()
+    current = target_addresses.resolve(c, runtime_plan(config), current=True)
     return (
         dict(current)
         if current and (current["host"], current["port"]) == (target["host"], target["port"])
@@ -82,7 +83,7 @@ def operational(plan):
                 None if outgoing == "@auto" else node_addresses.routing(book[outgoing]),
             )
         )
-    return result, plan["target"], plan.get("port")
+    return result, plan["target"], plan.get("port"), target_addresses.selected(plan)
 
 
 def confirmed(c, nodes):
@@ -178,7 +179,7 @@ def make_rules(c, config, plan, now):
         g["address_book"][vid][out] = resolved
     plan["graph"]["address_book"] = g["address_book"]
     plan.update(topology.compile_routing(g, path))
-    target = dict(database.get_target(c, plan["target"]))
+    target = target_addresses.resolve(c, plan)
     applied = json.loads(config["applied"]) if config["applied"] else None
     old = applied["rules"] if applied else []
     rules = []
@@ -248,7 +249,7 @@ def queue(c, config, now):
     comparison = copy.deepcopy(plan)
     if current and comparison.get("port") is None:
         comparison["port"] = current.get("port")
-    target = database.get_target(c, plan["target"])
+    target = target_addresses.resolve(c, plan)
     previous_intent = json.loads(config["applied"]).get("intent", current) if current else None
     if (
         current
@@ -325,7 +326,7 @@ def progress(c, config, row, now):
     phase = row["phase"]
     job = json.loads(row["payload"])
     desired = json.loads(config["desired"]) if config["desired"] else None
-    target = database.get_target(c, desired["target"]) if desired else None
+    target = target_addresses.resolve(c, desired) if desired else None
     superseded = bool(
         config["deleted"]
         or operational(desired) != operational(json.loads(job["desired"]))

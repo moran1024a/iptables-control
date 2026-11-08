@@ -9,6 +9,7 @@ import lifecycle
 import network_quality
 import node_state
 import node_addresses
+import node_tags
 import node_sync
 import configurations
 import execution
@@ -17,6 +18,7 @@ import security
 import settings
 import subscriptions
 import target_config
+import target_addresses
 import validation
 import wake
 
@@ -34,6 +36,7 @@ class Resources:
             "name": n["name"],
             "note": n["note"],
             "weight": n["weight"],
+            "tags": node_tags.listing(conn, n["id"]),
             "addr": n["addr"],
             "addresses": node_addresses.listing(conn, n),
             "ports": n["ports"],
@@ -69,6 +72,7 @@ class Resources:
             "kind": kind,
             "groups": database.get_groups(conn, table),
             "nodes": nodes,
+            "tags": node_tags.catalog(conn),
         }
 
     @node_sync.track_mutation
@@ -105,6 +109,7 @@ class Resources:
             conn, database.get_node(conn, cur.lastrowid), body.get("addresses", []), addr=addr
         )
         conn.execute("UPDATE nodes SET weight=? WHERE id=?", (validation.check_weight(body.get("weight", 0)), node_id))
+        node_tags.assign(conn, node_id, body.get("tag_ids", []))
         self.set_wake(conn, body, database.get_node(conn, cur.lastrowid), mode)
         return {"id": cur.lastrowid}
 
@@ -186,6 +191,8 @@ class Resources:
         n = database.get_node(conn, node_id)
         if "weight" in body:
             conn.execute("UPDATE nodes SET weight=? WHERE id=?", (validation.check_weight(body["weight"]), node_id))
+        if "tag_ids" in body:
+            node_tags.assign(conn, node_id, body["tag_ids"])
         table = database.node_table(n["kind"])
         if "kind" in body and body["kind"] != n["kind"]:
             raise errors.UserError("节点类型不能修改", "kind")
@@ -392,6 +399,7 @@ class Resources:
                 {
                     **dict(t),
                     "params": json.loads(t["params"]),
+                    "addresses": target_addresses.listing(t),
                     "configs": refs,
                     "uri": target_config.connection(t, t["host"], t["port"], t["name"])["uri"],
                 }
@@ -442,17 +450,26 @@ class Resources:
             )
             if group_id != old["group_id"]:
                 database.move_group(conn, "targets", target_id, group_id)
-            if host != old["host"] or port != old["port"]:
-                conn.execute(
-                    "UPDATE configurations SET state='pending',error='',failover='{}' WHERE deleted=0 AND json_extract(desired,'$.target')=?",
-                    (target_id,),
-                )
         else:
             target_id = conn.execute(
                 "INSERT INTO targets(name,host,port,type,params,group_id,sort)\n                VALUES (?,?,?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM targets))",
                 (name, host, port, kind, params, group_id),
             ).lastrowid
+        target = database.get_target(conn, target_id)
+        target_addresses.save(conn, target, body.get("addresses", json.loads(target["addresses"])))
+        if old:
+            target_addresses.refresh(conn, old, database.get_target(conn, target_id))
         return {"id": target_id}
+
+    def api_tags(self, conn, body):
+        return {"tags": node_tags.catalog(conn)}
+
+    def api_tag_save(self, conn, body, ident=None):
+        return node_tags.save(conn, body, ident)
+
+    def api_tag_delete(self, conn, body, ident):
+        conn.execute("DELETE FROM tags WHERE id=?", (ident,))
+        return {"deleted": True}
 
     @node_sync.track_mutation
     def api_target_del(self, conn, body, target_id):

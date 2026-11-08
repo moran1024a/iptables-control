@@ -13,6 +13,35 @@ import topology
 
 
 class WeightTests(Fixture, unittest.TestCase):
+    def test_quick_click_preserves_confirmed_prefix_even_with_pending_change(self):
+        e, a, b, x, y = [self.node(n) for n in ('entry', 'A', 'B', 'X', 'Y')]
+        self.ready(e, a, b, x, y)
+        self.call('api_node_edit', dict(weight=50), b)
+        g = self.graph([e, a, x])
+        t = g['vertices'][-1]['id']
+        g['vertices'] += [dict(id=f'v{n}', kind='node', node_id=n) for n in (b, y)]
+        g['edges'] += [[f'v{e}', f'v{b}'], [f'v{b}', f'v{x}'], [f'v{b}', f'v{y}'], [f'v{a}', f'v{y}'], [f'v{y}', t]]
+        original = [f'v{e}', f'v{a}', f'v{x}', t]
+        wanted = [f'v{e}', f'v{a}', f'v{y}', t]
+        ident = self.save(g, paths=[original])
+        self.settle()
+        g = json.loads(configurations.get_topology(self.db, ident)['graph'])
+        r = configurations.preview(self.db, dict(id=ident, graph=g, required=[f'v{y}']))
+        self.assertEqual(r['path'], wanted)
+        # The next click still anchors to the path the user sees as active.
+        self.save(g, ident, switch_only=True, paths=[[f'v{e}', f'v{b}', f'v{x}', t]])
+        r = configurations.preview(self.db, dict(id=ident, graph=g, required=[f'v{y}']))
+        self.assertEqual(r['path'], wanted)
+        explicit = configurations.preview(self.db, dict(id=ident, graph=g, prefix=[f'v{e}', f'v{b}'], required=[f'v{y}']))
+        self.assertEqual(explicit['path'], [f'v{e}', f'v{b}', f'v{y}', t])
+        self.save(g, ident, switch_only=True, paths=[r['path']])
+        self.settle()
+        self.assertEqual(json.loads(configurations.members(self.db, ident)[0]['applied'])['plan']['graph_path'], wanted)
+        # Removing the connection requires changing the first intermediate hop.
+        g['edges'].remove([f'v{a}', f'v{y}'])
+        r = configurations.preview(self.db, dict(id=ident, graph=g, required=[f'v{y}']))
+        self.assertEqual(r['path'], [f'v{e}', f'v{b}', f'v{y}', t])
+
     def test_global_weights_and_direct_override_choose_maximum_sum(self):
         e, a, b = [self.node(n) for n in ('entry', 'A', 'B')]
         for nid, weight in ((e, 1000), (a, -8), (b, 4)):

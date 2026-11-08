@@ -8,8 +8,10 @@ import errors
 import execution
 import forwarding
 import node_addresses
+import node_tags
 import node_state
 import target_config
+import target_addresses
 import topology
 import validation
 
@@ -45,19 +47,28 @@ def plans(c, graph, existing=(), prefix=(), required=(), entry=None):
         for r in existing
         if r["desired"] and not r["deleted"]
     }
+    applied = {
+        (r["entry"], r["target"]): json.loads(r["applied"])["plan"]
+        for r in existing if r["applied"] and not r["deleted"]
+    }
     result = []
     for (a, b), fallback in topology.pairs(graph).items():
         if entry and a != entry:
             continue
         old = current.get((a, b), {})
-        path = topology.find_path(
-            graph,
-            entry=a,
-            target=b,
-            prefix=prefix,
-            required=required,
-            preferred=old.get("graph_path", []),
-        )
+        preferred = old.get("graph_path", [])
+        prefixes = [prefix]
+        if required and not prefix:
+            # A quick click changes the nearest necessary branch of the confirmed
+            # route. Weight only ranks alternatives after that retained prefix.
+            preferred = applied.get((a, b), old).get("graph_path", [])
+            prefixes = [preferred[:i] for i in range(len(preferred), 0, -1)] + [[]]
+        path = None
+        for candidate in prefixes:
+            path = topology.find_path(graph, entry=a, target=b, prefix=candidate,
+                                      required=required, preferred=preferred)
+            if path:
+                break
         if path:
             result.append(
                 dict(entry=a, target=b, path=path, unchanged=path == old.get("graph_path"))
@@ -170,7 +181,7 @@ def save_topology(c, body, ident=None):
     if body.get("switch_only"):
         if not old:
             topology.fail("请先保存拓扑")
-        if topology.snapshot(graph) != topology.snapshot(json.loads(old["graph"])):
+        if topology.snapshot(graph) != topology.snapshot(topology.validate(c, json.loads(old["graph"]))):
             raise errors.UserError("拓扑已变化，请重新选择", status=409)
         selected = checked_paths(graph, body.get("paths", []))
         changed = 0
@@ -310,12 +321,16 @@ def view(c, r):
 def resources(c):
     return dict(
         groups=database.get_groups(c, "topologies"),
+        node_groups=database.get_groups(c, "nodes"),
+        target_groups=database.get_groups(c, "targets"),
         nodes=[
             dict(
                 id=n["id"],
                 name=n["name"],
                 addr=n["addr"],
                 weight=n["weight"],
+                group_id=n["group_id"],
+                tags=node_tags.listing(c, n["id"]),
                 addresses=node_addresses.listing(c, n),
                 network=node_addresses.network(c, n["id"]),
                 mode=n["desired_mode"],
@@ -323,7 +338,7 @@ def resources(c):
             )
             for n in c.execute(database.ordered("nodes"))
         ],
-        targets=[dict(r) for r in c.execute(database.ordered("targets"))],
+        targets=[dict(r, addresses=target_addresses.listing(r)) for r in c.execute(database.ordered("targets"))],
     )
 
 

@@ -194,6 +194,10 @@ class Request:
                 parts = [parts[0]]
             elif parts == ["groups"]:
                 handler = {"POST": self.resources.api_group_add}.get(method)
+            elif parts == ["tags"]:
+                handler = {"GET": self.resources.api_tags, "POST": self.resources.api_tag_save}.get(method)
+            elif len(parts) == 2 and parts[0] == "tags" and parts[1].isdigit():
+                handler = {"PATCH": self.resources.api_tag_save, "DELETE": self.resources.api_tag_delete}.get(method)
             elif len(parts) == 2 and parts[0] == "groups" and parts[1].isdigit():
                 handler = {
                     "PATCH": self.resources.api_group_edit,

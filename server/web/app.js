@@ -47,6 +47,15 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
 
+function tagBadge(tag) {
+  const color=/^#[0-9a-f]{6}$/i.test(tag.color)?tag.color:'#3b82f6';
+  return `<span class="node-tag" style="--tag-color:${color}" title="${esc(tag.name)}">${esc(tag.name)}</span>`;
+}
+function nodeTags(tags=[],limit=2,expand=true) {
+  if(!tags.length)return '';
+  return `<span class="node-tags">${tags.slice(0,limit).map(tagBadge).join('')}${tags.length>limit?`<span class="tag-extra" hidden>${tags.slice(limit).map(tagBadge).join('')}</span><span class="tag-overflow" ${expand?'role="button" tabindex="0" data-action="tags-expand" aria-expanded="false"':''} title="${esc(tags.slice(limit).map(t=>t.name).join('、'))}">+${tags.length-limit}</span>`:''}</span>`;
+}
+
 const pad = (n) => String(n).padStart(2, "0");
 
 function clock(ts) {
@@ -537,15 +546,15 @@ function drawNodes() {
   const weight = n => `<span class="node-weight" title="全局权重，越高越优先">权重 <b>${n.weight > 0 ? '+' : ''}${esc(n.weight ?? 0)}</b></span>`;
   if (sortMode === kind) {
     return render(listHead(kind, d.nodes.length, d.nodes.length) +
-      sortList(kind, d.nodes, (n) => `<div class="node-sort-head"><div class="title">${esc(n.name)}</div>${weight(n)}</div>${nodeSub(n)}`));
+      sortList(kind, d.nodes, (n) => `<div class="node-sort-head"><div class="title">${esc(n.name)} ${nodeTags(n.tags)}</div>${weight(n)}</div>${nodeSub(n)}`));
   }
   const f = filters[kind];
   const items = d.nodes.filter((n) =>
-    (!f.mode || n.desired_mode === f.mode) && (!f.q || has(n.name, f.q)) && (!f.status || n.status === f.status) && (!f.group || n.group_id === Number(f.group)));
+    (!f.mode || n.desired_mode === f.mode) && (!f.q || has(n.name, f.q) || n.tags?.some(t=>has(t.name,f.q))) && (!f.status || n.status === f.status) && (!f.group || n.group_id === Number(f.group)) && (!f.tag || n.tags?.some(t=>t.id===Number(f.tag))));
   const card = (n) => `
     <a class="card node-card" href="#/nodes/${n.id}" data-key="node-${n.id}">
       <div class="card-head">
-        <div class="node-head"><div class="title" title="${esc(n.name)}"><span class="mode-tag ${n.desired_mode}">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${esc(n.name)}</div>${nodeSub(n)}</div>
+        <div class="node-head"><div class="title" title="${esc(n.name)}"><span class="mode-tag ${n.desired_mode}">${n.desired_mode === "passive" ? "被动" : "主动"}</span><span class="node-name">${esc(n.name)}</span> ${nodeTags(n.tags)}</div>${nodeSub(n)}</div>
         <div class="meta">${weight(n)}${pill(n.status)}<span class="muted">${ago(n.last_seen, d.now)}</span></div>
       </div>
       ${bar(n.bar)}
@@ -555,15 +564,16 @@ function drawNodes() {
     countText(ns.filter((n) => n.status === "offline").length, "离线", "t-red") +
     countText(ns.filter((n) => ["error", "skew"].includes(n.status)).length, "异常", "t-yellow");
   const tools = d.nodes.length ? filterBar(kind, [
-    filterInput("q", "搜索名称", "search"),
+    filterInput("q", "搜索名称或标签", "search"),
     filterSelect("mode", "全部模式", plainOptions([["active", "主动"], ["passive", "被动"]])),
     filterSelect("status", "全部状态", plainOptions(Object.entries(STATUS).map(([k, [label]]) => [k, label]))),
     d.groups.length > 1 ? filterSelect("group", "全部分组", groupOptions(d.groups)) : "",
+    d.tags?.length ? filterSelect("tag", "全部标签", plainOptions(d.tags.map(t=>[t.id,t.name]))) : "",
   ]) : "";
   let body = groupedList(kind, items, card, summary);
   if (!items.length && isFiltering(kind)) body = emptyState("⌕", "没有匹配的节点。");
   else if (!d.nodes.length && d.groups.length === 1) body = emptyState("◎", "还没有节点，点击右上角新增。");
-  render(listHead(kind, d.nodes.length, items.length, "node-new", "新增节点") + tools + body);
+  render(listHead(kind, d.nodes.length, items.length, "node-new", "新增节点", '<button data-action="tags-manage">标签</button>') + tools + body);
   syncFilters();
 }
 
@@ -623,7 +633,7 @@ async function nodeDetail(id, request) {
   render(`
     <a class="back" href="#/nodes">← 节点列表</a>
     <div class="detail-head">
-      <div class="node-head"><h1>${esc(n.name)}</h1>${nodeSub(n)}</div>
+      <div class="node-head"><h1>${esc(n.name)} ${nodeTags(n.tags)}</h1>${nodeSub(n)}</div>
       <div class="detail-actions"><div class="meta"><span class="muted">${n.desired_mode === "passive" ? "被动" : "主动"}</span>${pill(n.status)}<span class="muted">最后上报 ${ago(n.last_seen, d.now)}</span></div><button data-action="node-edit">编辑</button>${moreActions(`node-actions-${id}`, `<button data-action="node-rekey">重置密钥</button>${n.status === 'deleting'?'<button class="danger" data-action="node-delete" data-force="1">强制删除</button>':'<button class="danger" data-action="node-delete">删除</button>'}`)}</div>
     </div>
     ${n.note ? `<div class="panel note-full"><h2>备注</h2><div>${esc(n.note)}</div></div>` : ""}
@@ -959,7 +969,7 @@ function renderAddressCandidates(form) {
 
 async function nodeForm(node) {
   const page = pageVersion, session=modalState;
-  const { groups } = await api("GET", "nodes");
+  const { groups, tags } = await api("GET", "nodes");
   if (page !== pageVersion || session!==modalState || modalState?.busy) return;
   const addresses=node?.addresses?.length?node.addresses.map(a=>({...a})):[{host:node?.addr||'',primary:true}];
   if(!addresses.some(a=>a.primary))addresses[0].primary=true;
@@ -968,6 +978,7 @@ async function nodeForm(node) {
     <form data-form="node" data-id="${node ? node.id : ""}" data-kind="forward">
       <label><span>名称</span><input name="name" value="${esc(node?.name)}" maxlength="64" required></label>
       ${groupSelect(groups, node?.group_id)}
+      <fieldset class="tag-picker"><legend>标签</legend>${tags.length?tags.map(t=>`<label><input type="checkbox" name="tag_ids" value="${t.id}" ${node?.tags?.some(x=>x.id===t.id)?'checked':''}>${tagBadge(t)}</label>`).join(''):'<span class="hint">可在节点列表的「标签」中创建</span>'}</fieldset>
       <label><span>权重</span><input name="weight" type="number" min="-100000" max="100000" step="1" required value="${node?.weight??0}"><small class="hint">0 为默认，越高越优先，作用于所有链路。</small></label>
       <label><span>同步模式</span><select name="desired_mode" >
         <option value="active" ${node?.desired_mode !== "passive" ? "selected" : ""}>主动（长连接自动同步）</option>
@@ -1083,15 +1094,16 @@ const FORMS = {
 
   async node(form, data) {
     const id = form.dataset.id;
+    const tag_ids=[...form.querySelectorAll('[name=tag_ids]:checked')].map(input=>Number(input.value));
     const addresses=[...form.querySelectorAll('[data-address-id]')].map(row=>Object.fromEntries([['id',row.dataset.addressId],['primary',row.querySelector('[name=primary_address]').checked],...[...row.querySelectorAll('[data-address-field]')].map(input=>[input.dataset.addressField,input.value.trim()])]));
     data.addr=addresses.find(a=>a.primary)?.host;
     if (!id) {
-      const r = await api("POST", "nodes", { addresses, weight: Number(data.weight), name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
+      const r = await api("POST", "nodes", { addresses, tag_ids, weight: Number(data.weight), name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
       closeModal();
       location.hash = `#/nodes/${r.id}`;
       return;
     }
-    await api("PATCH", `nodes/${id}`, { addresses, weight: Number(data.weight), name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
+    await api("PATCH", `nodes/${id}`, { addresses, tag_ids, weight: Number(data.weight), name: data.name, note: data.note, addr: data.addr, ports: data.ports, desired_mode: data.desired_mode, quality_port: Number(data.quality_port), wake_enabled: data.wake_enabled === '1', wake_port: Number(data.wake_port), group_id: groupId(data) });
     closeModal();
     toast("已保存");
     refresh();
@@ -1614,7 +1626,7 @@ async function targetList(request) {
 }
 
 function drawTargets() {
-  const card = t => `<div class="card target-row" data-key="target-${t.id}"><div class="collection-main inline-summary"><button class="plain-title" data-action="target-edit" data-id="${t.id}" title="${esc(t.name)}">${esc(t.name)}</button><div class="sub"><span>${esc(t.type==='endpoint'?'地址':PROTOCOLS[t.type])}</span> · <span class="mono">${esc(t.host)}:${t.port}</span></div></div><span class="collection-meta muted" title="${esc(t.configs.map(c=>c.remark).join('、'))}">${t.configs.length?`${t.configs.length} 个引用`:'未引用'}</span><div class="row-actions"><button class="small" data-action="copy" data-text="${esc(t.uri||t.host+':'+t.port)}">复制</button><button class="small" data-action="target-edit" data-id="${t.id}">编辑</button>${moreActions(`target-actions-${t.id}`,`<button class="danger" data-action="target-delete" data-id="${t.id}">删除</button>`)}</div></div>`;
+  const card = t => `<div class="card target-row" data-key="target-${t.id}"><div class="collection-main inline-summary"><button class="plain-title" data-action="target-edit" data-id="${t.id}" title="${esc(t.name)}">${esc(t.name)}</button><div class="sub"><span>${esc(t.type==='endpoint'?'地址':PROTOCOLS[t.type])}</span> · <span class="mono">${esc(t.host)}:${t.port}</span>${t.addresses?.length>1?` · ${t.addresses.length} 个地址`:""}</div></div><span class="collection-meta muted" title="${esc(t.configs.map(c=>c.remark).join('、'))}">${t.configs.length?`${t.configs.length} 个引用`:'未引用'}</span><div class="row-actions"><button class="small" data-action="copy" data-text="${esc(t.uri||t.host+':'+t.port)}">复制</button><button class="small" data-action="target-edit" data-id="${t.id}">编辑</button>${moreActions(`target-actions-${t.id}`,`<button class="danger" data-action="target-delete" data-id="${t.id}">删除</button>`)}</div></div>`;
   drawManagedList("targets", list.data.targets, card, "target-new", "添加地址", "",
     `<button data-action="target-import" title="导入 SS 或 VLESS 分享链接">导入</button>`);
 }
@@ -1626,22 +1638,57 @@ function targetForm(t, imported = false) {
     ${groupSelect(list.data.groups, t?.group_id)}
     ${imported ? `<label><span>分享链接</span><textarea name="uri" rows="5" maxlength="8192" class="mono" placeholder="ss://… 或 vless://…?security=reality…" required>${esc(t?.uri)}</textarea></label><p class="hint">支持 SS、SS2022 和 VLESS Reality，地址需为 IPv4 或域名。</p>` :
       `<label><span>IPv4 或域名</span><input name="host" value="${esc(t?.host)}" required></label><label><span>端口</span><input name="port" type="number" min="1" max="65535" value="${t?.port || ""}" required></label>`}
-    ${t?.configs.length ? `<p class="t-yellow">修改会影响 ${t.configs.length} 个引用配置；未启用远程唤醒或唤醒失败的被动节点需要手动同步。</p>` : ""}
+    <section class="target-addresses"><h3>其他接入地址</h3><div data-target-address-list>${(t?.addresses||[]).filter(a=>a.id!=='main').map(targetAddressRow).join('')}</div><button type="button" class="small" data-action="target-address-add">＋ 接入地址</button><div class="form-error" data-error="addresses"></div></section>
+    ${t?.configs.length ? `<p class="hint">被修改地址的引用配置将重新同步。</p>` : ""}
     <div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
+}
+
+function targetAddressRow(a={}) {
+  const id=a.id||('a-'+(crypto.randomUUID?.()||Math.random().toString(16).slice(2)));
+  return `<div class="target-address-row" data-target-address-id="${esc(id)}"><input data-endpoint-field="name" aria-label="地址名称" placeholder="名称（可选）" maxlength="64" value="${esc(a.name)}"><input data-endpoint-field="host" aria-label="接入 IP 或域名" placeholder="IPv4 或域名" value="${esc(a.host)}" required><input type="number" data-endpoint-field="port" aria-label="接入端口" placeholder="端口" min="1" max="65535" value="${a.port||''}" required><button type="button" class="small" data-action="target-address-remove" aria-label="移除接入地址">×</button></div>`;
+}
+
+async function tagsManager() {
+  const page=pageVersion,session=modalState;
+  const {tags}=await api('GET','tags');
+  if(page!==pageVersion||session!==modalState)return;
+  openModal(`<h2>节点标签</h2><div class="tag-catalog">${tags.map(t=>`<div class="tag-catalog-row">${tagBadge(t)}<span class="row-actions"><button class="small" data-action="tag-edit" data-tag="${esc(JSON.stringify(t))}">编辑</button><button class="small danger" data-action="tag-delete" data-id="${t.id}" data-name="${esc(t.name)}">删除</button></span></div>`).join('')||'<p class="muted">暂无标签</p>'}</div><div class="form-actions"><button data-action="modal-close">关闭</button><button class="primary" data-action="tag-new">新建标签</button></div>`);
+}
+function tagForm(t) {
+  openModal(`<h2>${t?'编辑':'新建'}标签</h2><form data-form="tag" data-id="${t?.id||''}"><label><span>名称</span><input name="name" maxlength="64" value="${esc(t?.name)}" required></label><label class="tag-color-field"><span>颜色</span><input type="color" name="color" value="${t?.color||'#3b82f6'}"></label><div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
 }
 
 Object.assign(FORMS, {
   async target(form, data) {
     const id = form.dataset.id;
     const body = {name: data.name, group_id: groupId(data)};
+    body.addresses=[...form.querySelectorAll('[data-target-address-id]')].map(row=>({id:row.dataset.targetAddressId,...Object.fromEntries([...row.querySelectorAll('[data-endpoint-field]')].map(input=>[input.dataset.endpointField,input.dataset.endpointField==='port'?Number(input.value):input.value.trim()]))}));
     if (form.dataset.imported === "true") body.uri = data.uri;
     else Object.assign(body, {host: data.host, port: Number(data.port)});
     await api(id ? "PATCH" : "POST", id ? `targets/${id}` : "targets", body);
     closeModal(); toast("已保存，可在配置中选择此目标"); refresh();
   },
+  async tag(form,data) {
+    const id=form.dataset.id;
+    await api(id?'PATCH':'POST',id?`tags/${id}`:'tags',{name:data.name,color:data.color});
+    closeModal();toast('标签已保存');await refresh();await tagsManager();
+  },
 
 });
 Object.assign(ACTIONS, {
+  'tags-manage':tagsManager,
+  'tag-new':()=>tagForm(),
+  'tag-edit':el=>tagForm(JSON.parse(el.dataset.tag)),
+  async 'tag-delete'(el) {
+    if(!await confirmBox('删除标签',`删除「${esc(el.dataset.name)}」并解除节点上的关联？`,'删除',true))return;
+    await api('DELETE',`tags/${el.dataset.id}`);closeModal();await refresh();await tagsManager();
+  },
+  'tags-expand':el=>{
+    const extra=el.parentElement.querySelector('.tag-extra');extra.hidden=!extra.hidden;
+    el.setAttribute('aria-expanded',String(!extra.hidden));el.textContent=extra.hidden?'+'+extra.children.length:'收起';
+  },
+  'target-address-add':()=>$('#modal [data-target-address-list]').insertAdjacentHTML('beforeend',targetAddressRow()),
+  'target-address-remove':el=>el.closest('[data-target-address-id]').remove(),
   "target-new": () => targetForm(),
   "target-import": () => targetForm(null, true),
   "target-edit": el => targetForm(list.data.targets.find(t => t.id === Number(el.dataset.id))),
@@ -1652,6 +1699,12 @@ Object.assign(ACTIONS, {
     await api("DELETE", `targets/${t.id}`); toast("已删除"); refresh();
   },
 
+});
+
+document.addEventListener('keydown',e=>{
+  if(e.target.matches('[data-action="tags-expand"]')&&['Enter',' '].includes(e.key)){
+    e.preventDefault();ACTIONS['tags-expand'](e.target);
+  }
 });
 
 // ------------------------------------------------------------ 启动

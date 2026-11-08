@@ -114,16 +114,18 @@ class MigrationTests(Fixture, unittest.TestCase):
         ident = self.save(self.graph([a, b]))
         self.settle()
         tables = ('nodes', 'topologies', 'configurations', 'targets', 'rules', 'settings')
-        added = {'weight', 'runtime_state', 'runtime_error', 'runtime_at', 'failover_enabled', 'failover'}
+        added = {'weight', 'runtime_state', 'runtime_error', 'runtime_at', 'failover_enabled', 'failover', 'addresses'}
         before = {t: [{k: row[k] for k in row.keys() if k not in added} for row in self.db.execute('SELECT * FROM '+t)] for t in tables}
         with self.db:
-            for table, columns in [('nodes', ['weight', 'runtime_state', 'runtime_error', 'runtime_at']), ('topologies', ['failover_enabled']), ('configurations', ['failover'])]:
+            for table, columns in [('nodes', ['weight', 'runtime_state', 'runtime_error', 'runtime_at']), ('topologies', ['failover_enabled']), ('configurations', ['failover']), ('targets', ['addresses'])]:
                 for column in columns:
                     self.db.execute(f'ALTER TABLE {table} DROP COLUMN {column}')
+            self.db.execute('DROP TABLE node_tags')
+            self.db.execute('DROP TABLE tags')
             self.db.execute('PRAGMA user_version=600')
         self.db.close()
         self.db = migrations.init_db()
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], 601)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0], settings.DATABASE_VERSION)
         for table in tables:
             self.assertEqual([{k: row[k] for k in row.keys() if k not in added} for row in self.db.execute('SELECT * FROM '+table)], before[table])
         self.assertEqual(self.db.execute('SELECT failover_enabled FROM topologies WHERE id=?', (ident,)).fetchone()[0], 0)
@@ -132,6 +134,48 @@ class MigrationTests(Fixture, unittest.TestCase):
         self.db.close()
         self.db = migrations.init_db()
         self.assertEqual(self.db.execute('PRAGMA foreign_key_check').fetchall(), [])
+
+    def test_rc2_upgrade_keeps_live_routes_and_does_not_require_agent_update(self):
+        import configurations
+        a, b = self.node(), self.node()
+        self.ready(a, b)
+        ident = self.save(self.graph([a, b]))
+        self.settle()
+        # Strip address bindings absent in RC2, including confirmed snapshots.
+        def old_graph(g):
+            target_ids = {v['id'] for v in g['vertices'] if v['kind'] == 'target'}
+            for tid in target_ids:
+                g['address_book'].pop(tid, None)
+                for binding in g['bindings'].values():
+                    binding['to'].pop(tid, None)
+        with self.db:
+            graph = json.loads(configurations.get_topology(self.db, ident)['graph'])
+            old_graph(graph)
+            self.db.execute('UPDATE topologies SET graph=?', (json.dumps(graph),))
+            row = configurations.members(self.db, ident)[0]
+            desired, applied = json.loads(row['desired']), json.loads(row['applied'])
+            old_graph(desired['graph'])
+            old_graph(applied['plan']['graph'])
+            old_graph(applied['intent']['graph'])
+            self.db.execute('UPDATE configurations SET desired=?,applied=?', (json.dumps(desired), json.dumps(applied)))
+            self.db.execute('DROP TABLE node_tags')
+            self.db.execute('DROP TABLE tags')
+            self.db.execute('ALTER TABLE targets DROP COLUMN addresses')
+            self.db.execute('PRAGMA user_version=601')
+        rules = [tuple(r) for r in self.db.execute('SELECT * FROM rules')]
+        generations = [tuple(r) for r in self.db.execute('SELECT id,desired_generation FROM nodes')]
+        self.db.close()
+        self.db = migrations.init_db()
+        self.tick()
+        preview = configurations.preview(self.db, dict(id=ident, graph=graph, required=[f'v{b}']))
+        self.save(preview['graph'], ident, switch_only=True, paths=[preview['path']])
+        self.save(graph, ident)
+        self.tick()
+        self.assertEqual([tuple(r) for r in self.db.execute('SELECT * FROM rules')], rules)
+        self.assertEqual([tuple(r) for r in self.db.execute('SELECT id,desired_generation FROM nodes')], generations)
+        self.assertFalse(self.db.execute('SELECT 1 FROM jobs').fetchone())
+        self.assertEqual(len(self.call('api_targets')['targets'][0]['addresses']), 1)
+        self.assertTrue(Path(settings.DB_PATH+'.pre-0.6.0-rc.3.bak').is_file())
 
     def test_unsupported_schema_fails_without_migrating(self):
         with self.db:

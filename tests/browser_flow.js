@@ -10,9 +10,69 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE);
   await page.locator('[name=username]').fill('admin');await page.locator('[name=password]').fill('admin_pass');
   await page.locator('form button.primary').click();
   await page.locator('[data-nav=nodes]').waitFor();
+  await page.locator('[data-action=tags-manage]').click();
+  for(const [name,color] of [['区域 A','#3b82f6'],['中转','#22a35a'],['备用','#e09b00']]){
+    await page.locator('[data-action=tag-new]').click();
+    await page.locator('#modal [name=name]').fill(name);
+    await page.locator('#modal [name=color]').fill(color);
+    await page.locator('#modal button.primary').click();
+    await page.locator('#modal .tag-catalog').waitFor();
+  }
+  await page.locator('#modal [data-action=modal-close]').click();
+  await page.goto(process.env.TEST_URL+'#/nodes/1');
+  await page.locator('[data-action=node-edit]').click();
+  await page.locator('#modal [name=tag_ids]').first().waitFor();
+  for(const checkbox of await page.locator('#modal [name=tag_ids]').all())await checkbox.check();
+  await page.locator('#modal button.primary').click();
+  await page.locator('#modal').waitFor({state:'hidden'});
+  await page.locator('[data-nav=nodes]').click();
+  await page.locator('[data-key="node-1"] [data-action=tags-expand]').click();
+  if(await page.locator('[data-key="node-1"] .tag-extra .node-tag').innerText()!=='备用')throw new Error('Multiple labels were not retained');
+  if(!page.url().endsWith('#/nodes'))throw new Error('Expanding labels navigated away');
+  await page.locator('[data-filter=tag]').selectOption('1');
+  if(await page.locator('.node-card').count()!==1)throw new Error('Label filter did not restrict nodes');
+  await page.locator('[data-filter=tag]').selectOption('');
+  await page.evaluate(async()=>{
+    const group=await api('POST','groups',{kind:'nodes',name:'优先分组'});
+    await api('PATCH','nodes/3',{group_id:group.id,tag_ids:[1,2]});
+    const nodes=await api('GET','nodes');
+    await api('POST','nodes/order',{groups:[group.id,...nodes.groups.filter(g=>g.id!==group.id).map(g=>g.id)],ids:[3,5,4,2,1]});
+  });
+  await page.locator('[data-nav=targets]').click();
+  await page.locator('[data-action=target-edit][data-id="1"]').first().click();
+  await page.locator('[data-action=target-address-add]').click();
+  await page.locator('[data-endpoint-field=name]').fill('备用地址');
+  await page.locator('[data-endpoint-field=host]').fill('10.44.0.2');
+  await page.locator('[data-endpoint-field=port]').fill('8443');
+  await page.locator('#modal button.primary').click();
+  await page.locator('#modal').waitFor({state:'hidden'});
   await page.locator('[data-nav=routes]').click();
   await page.locator(`a[href="#/routes/${process.env.TEST_ROUTE}"]`).click();
   await page.locator('.graph-node').first().waitFor();
+  await page.locator('[data-action=link-edit]').first().click();
+  await page.locator('[data-action=graph-add-open]').click();
+  await page.evaluate(()=>{
+    const buttons=[...app.querySelectorAll('[data-action=graph-library-add]')];
+    if(buttons.map(b=>Number(b.dataset.id)).join(',')!==canvasView.nodes.map(n=>n.id).join(','))throw new Error('Library order differs from node list');
+    if(app.querySelector('.graph-library-group h4').textContent!=='优先分组')throw new Error('Node groups are not preserved');
+    if(!buttons.find(b=>b.dataset.id==='3').textContent.includes('中转'))throw new Error('Library labels are missing');
+  });
+  if(await page.locator('[data-action=graph-port][data-id="t1"][data-side=in]').count()!==2)throw new Error('Target endpoints have no separate connection points');
+  await page.evaluate(()=>ACTIONS['graph-edge']({dataset:{index:String(graphSession.graph.edges.findIndex(e=>e[0]==='v3'&&e[1]==='t1'))}}));
+  const alternate=await page.evaluate(()=>canvasView.targets.find(t=>t.id===1).addresses.find(a=>a.id!=='main').id);
+  await page.locator('[data-graph-binding=in]').selectOption(alternate);
+  await page.locator('[data-action=graph-publish]').first().click();
+  await page.waitForFunction(()=>!graphSession&&!graphBusy);
+  await page.evaluate(alternate=>{
+    if(canvasView.link.graph.bindings['v3/t1'].to.t1!==alternate)throw new Error('Target address selection was not saved');
+    if(canvasView.link.configurations.length!==3)throw new Error('Extra address duplicated configurations');
+  },alternate);
+  await page.locator('[data-action=link-edit]').first().click();
+  await page.evaluate(()=>ACTIONS['graph-edge']({dataset:{index:String(graphSession.graph.edges.findIndex(e=>e[0]==='v3'&&e[1]==='t1'))}}));
+  await page.locator('[data-graph-binding=in]').selectOption('main');
+  await page.locator('[data-action=graph-publish]').first().click();
+  await page.waitForFunction(()=>!graphSession&&!graphBusy);
+  console.log('PASS multi-label editor/filter, grouped library and target endpoint selection');
 
 
   // Exercise the global weight form without changing node identity or IP fields.
@@ -73,7 +133,7 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE);
   const node=page.locator(`[data-graph-node="${extra}"] [data-graph-drag]`);const box=await node.boundingBox();
   await page.mouse.move(box.x+35,box.y+20);await page.mouse.down();await page.mouse.move(box.x-60,box.y+90,{steps:8});await page.mouse.up();
   await page.locator('[data-action=graph-port][data-id="v4"][data-side=out][data-address="@auto"]').click();
-  await page.locator('[data-action=graph-port][data-id="t1"][data-side=in]').click();
+  await page.locator('[data-action=graph-port][data-id="t1"][data-side=in][data-address=main]').click();
   await page.locator('[data-action=graph-publish]').first().click();
   await page.waitForFunction(()=>!graphSession&&!graphBusy);
   await page.locator('[data-action=graph-select][data-id="v4"]').click();
@@ -92,7 +152,7 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE);
   await page.locator('[data-nav=targets]').click();await page.locator('[data-action=target-edit]').first().waitFor();
   await page.locator('[data-nav=subscriptions]').click();
   console.log('SUBS',await page.locator('#app h1').innerText());
-  await page.locator('[data-nav=settings]').click();await page.locator('text=0.6.0-rc.2').first().waitFor();
+  await page.locator('[data-nav=settings]').click();await page.locator('text=0.6.0-rc.3').first().waitFor();
   await page.locator('[data-nav=routes]').click();
   await page.locator(`a[href="#/routes/${process.env.TEST_ROUTE}"]`).click();
   await page.locator('.graph-node').first().waitFor();

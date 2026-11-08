@@ -4,6 +4,7 @@ import execution
 import configurations
 import topology
 import node_addresses
+import target_addresses
 import probe_store
 
 PROTOCOLS = ("tcp-connect-v1", "udp-echo-v1", "icmp-echo-v1")
@@ -34,7 +35,7 @@ def config_sections(c, config, nodes):
     target = (
         execution.applied_target(c, config)
         if applied
-        else c.execute("SELECT * FROM targets WHERE id=?", (plan["target"],)).fetchone()
+        else target_addresses.resolve(c, plan)
     )
     hops = [dict(r, seq=i) for i, r in enumerate(applied["rules"])] if applied else []
     by_node = {h["node_id"]: h for h in hops}

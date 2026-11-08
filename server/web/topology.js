@@ -68,7 +68,8 @@ function graphConnections(g) { return [...new Map(g.edges.map(e=>[e.join('/'),e]
 
 function graphAddresses(id,g=graphCurrent()) {
   const v=g.vertices.find(v=>v.id===id);
-  return g.version===2?(canvasView.nodes.find(n=>n.id===v?.node_id)?.addresses||Object.values(g.address_book?.[id]||{})):[];
+  const resource=v?.kind==='target'?canvasView.targets.find(n=>n.id===v.target_id):canvasView.nodes.find(n=>n.id===v?.node_id);
+  return g.version===2?(resource?.addresses||Object.values(g.address_book?.[id]||{})):[];
 }
 const graphWidth=v=>v.kind==='direct'?110:220;
 const graphWeight=n=>Number(n)>0?'+'+Number(n):String(Number(n)||0);
@@ -85,10 +86,10 @@ function graphBoxes(g) {
 function graphPortAddress(g,v,side,edge=null) {
   if(v.kind==='entry'&&side==='in')return v.address||'';
   const key=side==='in'?'to':'from',owner=v.id;
-  if(edge)return g.bindings?.[edge.join('/')]?.[key]?.[v.id]||'';
+  if(edge)return g.bindings?.[edge.join('/')]?.[key]?.[v.id]||(v.kind==='target'?'main':'');
   const values=graphConnections(g).filter(e=>e[side==='in'?1:0]===owner).map(e=>g.bindings?.[e.join('/')]?.[key]?.[v.id]).filter(Boolean);
   if(values.length&&new Set(values).size===1)return values[0];
-  return v[side+'_address']||(g.routing_version===2&&side==='out'?'@auto':graphAddresses(v.id,g).length===1?graphAddresses(v.id,g)[0].id:'');
+  return v[side+'_address']||(v.kind==='target'?'main':g.routing_version===2&&side==='out'?'@auto':graphAddresses(v.id,g).length===1?graphAddresses(v.id,g)[0].id:'');
 }
 function graphPortPoint(g,id,side,address,boxes) {
   const b=boxes.get(id),v=g.vertices.find(v=>v.id===id),addresses=graphAddresses(id,g);
@@ -224,7 +225,7 @@ function graphNodeAddresses(g,v,editing) {
   }
   const rows=addresses.length?addresses:[{id:'',name:v.kind==='target'?'':'主 IP',host:node?.addr||target?.host||''}];
   const rendered=rows.map((a,i)=>{
-    return `<div class="graph-ip-row" data-graph-address="${esc(a.id)}" ${editing?`data-action="graph-receive" data-id="${esc(v.id)}" data-address="${esc(a.id)}"`:''} title="${esc(a.host)}"><span class="graph-ip-name">${esc(a.name||(a.primary?'主 IP':'IP'))}</span><code>${esc(a.host)}${target?.port?':'+target.port:''}</code>${editing?`${v.kind==='target'?graphPort(v.id,'in','',74):graphPort(v.id,'in',a.id,74+i*24,v.kind==='entry',a.id===incoming)}${v.kind==='target'?'':graphPort(v.id,'out',a.id,74+i*24,false,a.id===outgoing)}`:`<span class="graph-ip-role">${a.id&&currentIn.has(a.id)?'入':''}${a.id&&currentOut.has(a.id)?' 出':''}</span>`}</div>`;
+    return `<div class="graph-ip-row" data-graph-address="${esc(a.id)}" ${editing?`data-action="graph-receive" data-id="${esc(v.id)}" data-address="${esc(a.id)}"`:''} title="${esc(a.host)}${a.port?':'+a.port:''}"><span class="graph-ip-name">${esc(a.name||(a.primary?'主 IP':'IP'))}</span><code>${esc(a.host)}${a.port?':'+a.port:target?.port?':'+target.port:''}</code>${editing?`${graphPort(v.id,'in',a.id,74+i*24,v.kind==='entry',a.id===incoming)}${v.kind==='target'?'':graphPort(v.id,'out',a.id,74+i*24,false,a.id===outgoing)}`:`<span class="graph-ip-role">${a.id&&currentIn.has(a.id)?'入':''}${a.id&&currentOut.has(a.id)?' 出':''}</span>`}</div>`;
   }).join('');
   if(g.routing_version!==2||!v.node_id)return rendered;
   return rendered+`<div class="graph-ip-row graph-auto-out"><span>自动出口</span>${editing?graphPort(v.id,'out','@auto',74+rows.length*24,false,outgoing==='@auto'):`<span class="graph-ip-role">${currentOut.has('@auto')?'出':''}</span>`}</div>`;
@@ -280,25 +281,33 @@ function graphEntryPort(v,g) {
 function graphAddressOptions(v,value,side='in') {
   const n=canvasView.nodes.find(n=>n.id===v.node_id);
   const auto=side==='out'&&graphCurrent().routing_version===2?`<option value="@auto" ${value==='@auto'?'selected':''}>自动出口</option>`:'';
-  return '<option value="">选择 IP</option>'+auto+graphAddresses(v.id).map(a=>`<option value="${esc(a.id)}" ${a.id===value?'selected':''}>${esc(a.host)}${a.primary?' · 主 IP':''}${side==='out'&&nodeAddressProblem(a,n?.network)?' · 出口待设置':''}</option>`).join('');
+  return '<option value="">选择地址</option>'+auto+graphAddresses(v.id).map(a=>`<option value="${esc(a.id)}" ${a.id===value?'selected':''}>${esc(a.host)}${a.port?':'+a.port:''}${a.primary?' · 主 IP':''}${side==='out'&&nodeAddressProblem(a,n?.network)?' · 出口待设置':''}</option>`).join('');
 }
 function graphInspector() {
   const s=graphSession,g=s.graph,v=g.vertices.find(v=>v.id===s.selected),e=g.edges[s.edge];
   if(!v&&!e)return '';
   const choices=v?.kind==='target'?canvasView.targets:canvasView.nodes;
+  const groups=v?.kind==='target'?canvasView.target_groups||[]:canvasView.node_groups||[];
+  const resourceOptions=v?nodeOptions(choices,groups,v.target_id||v.node_id,n=>esc(n.name)+(n.tags?.length?' · '+esc(n.tags.map(t=>t.name).join(' / ')):'')):'';
   const addressFields=e?e.map((id,i)=>{
     const node=g.vertices.find(v=>v.id===id),side=i?'in':'out';
-    return node.node_id?`<label class="graph-address-field">${i?'接收 IP':'发出 IP'}<select data-graph-binding="${side}" data-id="${esc(id)}" aria-label="${i?'接收 IP':'发出 IP'}">${graphAddressOptions(node,graphPortAddress(g,node,side,e),side)}</select></label>`:'';
+    return node.kind!=='direct'?`<label class="graph-address-field">${i?'接收地址':'发出 IP'}<select data-graph-binding="${side}" data-id="${esc(id)}" aria-label="${i?'接收 IP':'发出 IP'}">${graphAddressOptions(node,graphPortAddress(g,node,side,e),side)}</select></label>`:'';
   }).join(''):'';
   const entryAddress=v?.kind==='entry'?`<label class="graph-address-field">入口接收 IP<select data-graph-listen="${esc(v.id)}" aria-label="入口接收 IP">${graphAddressOptions(v,v.address)}</select></label>`:'';
   const pending=v&&s.connectTarget===v.id?`<label class="graph-address-field">连接到 ${esc(graphName(v))}<select data-graph-connect-ip="${esc(v.id)}" aria-label="选择接收 IP">${graphAddressOptions(v,'')}</select></label>`:'';
   const direct=v?.kind==='direct';
-  const content=pending||(v?`${direct?`<span>direct</span><label class="graph-address-field">权重<input type="number" data-direct-weight min="-100000" max="100000" step="1" required value="${v.weight??''}" aria-label="direct 权重"></label>`:`<select data-graph-resource aria-label="更换节点">${choices.map(n=>`<option value="${n.id}" ${(v.target_id||v.node_id)===n.id?'selected':''}>${esc(n.name)}</option>`).join('')}</select>`}${entryAddress}${graphEntryPort(v,g)}<button class="small danger" data-action="graph-remove">${direct?'移除 direct':'删除'}</button>`:`<span>${e.map(id=>esc(graphName(g.vertices.find(v=>v.id===id)))).join(' → ')}</span>${addressFields}${e.every(id=>g.vertices.find(v=>v.id===id)?.kind!=='direct')?'<button class="small" data-action="graph-insert-direct">＋ direct</button>':''}<button class="small danger" data-action="graph-remove-edge">删除连线</button>`);
+  const content=pending||(v?`${direct?`<span>direct</span><label class="graph-address-field">权重<input type="number" data-direct-weight min="-100000" max="100000" step="1" required value="${v.weight??''}" aria-label="direct 权重"></label>`:`<select data-graph-resource aria-label="更换节点">${resourceOptions}</select>`}${entryAddress}${graphEntryPort(v,g)}<button class="small danger" data-action="graph-remove">${direct?'移除 direct':'删除'}</button>`:`<span>${e.map(id=>esc(graphName(g.vertices.find(v=>v.id===id)))).join(' → ')}</span>${addressFields}${e.every(id=>g.vertices.find(v=>v.id===id)?.kind!=='direct')?'<button class="small" data-action="graph-insert-direct">＋ direct</button>':''}<button class="small danger" data-action="graph-remove-edge">删除连线</button>`);
   return `<div class="graph-inspector" data-key="inspector-${esc(v?.id||e.join('/'))}">${content}<button class="small" data-action="graph-deselect" aria-label="关闭">×</button></div>`;
 }
 function graphLibrary() {
   const kind=graphSession.addKind||'node',items=kind==='direct'?[{id:'direct',name:'direct',addr:'权重 0'}]:kind==='target'?canvasView.targets:canvasView.nodes;
-  return `<aside class="graph-library"><div class="graph-library-tabs">${[['entry','入口'],['node','节点'],['target','目标'],['direct','direct']].map(([k,n])=>`<button class="${k===kind?'is-active':''}" data-action="graph-library-kind" data-kind="${k}">${n}</button>`).join('')}</div><div class="graph-library-list">${items.map(n=>`<button draggable="true" data-action="graph-library-add" data-kind="${kind}" data-id="${n.id}"><strong>${esc(n.name)}</strong><small>${esc(n.addr||n.host||'')}</small></button>`).join('')}</div></aside>`;
+  const groups=kind==='direct'?[]:kind==='target'?canvasView.target_groups||[]:canvasView.node_groups||[];
+  const card=n=>`<button draggable="true" data-action="graph-library-add" data-kind="${kind}" data-id="${n.id}"><strong>${esc(n.name)}</strong>${nodeTags(n.tags,2,false)}<small>${esc(n.addr||n.host||'')}</small></button>`;
+  const rows=groups.length?groups.map(group=>{
+    const members=items.filter(n=>n.group_id===group.id);
+    return members.length?`<section class="graph-library-group" data-group-id="${group.id}"><h4>${esc(group.name)}</h4>${members.map(card).join('')}</section>`:'';
+  }).join(''):items.map(card).join('');
+  return `<aside class="graph-library"><div class="graph-library-tabs">${[['entry','入口'],['node','节点'],['target','目标'],['direct','direct']].map(([k,n])=>`<button class="${k===kind?'is-active':''}" data-action="graph-library-kind" data-kind="${k}">${n}</button>`).join('')}</div><div class="graph-library-list">${rows}</div></aside>`;
 }
 function drawGraph() {
   const s=graphSession,l=canvasView.link,g=graphCurrent();
@@ -513,7 +522,7 @@ function graphConnect(id,side,address) {
   const target=g.vertices.find(v=>v.id===id),addresses=graphAddresses(id,g);
   // A whole-card drop is unambiguous only for a single-address node. Keep the
   // wire pending until the user explicitly chooses an IP on a multi-IP node.
-  if(target.node_id&&!addresses.some(a=>a.id===address)){
+  if(target.kind!=='direct'&&!addresses.some(a=>a.id===address)){
     if(addresses.length===1)address=addresses[0].id;
     else {
       s.connectTarget=id;s.selected=id;
@@ -524,7 +533,7 @@ function graphConnect(id,side,address) {
   const edge=[s.connect,owner];
   if(g.version===2){
     g.bindings||={};const binding={from:{},to:{}};
-    for(const [index,key,direction] of [[0,'from','out'],[1,'to','in']])for(const v of g.vertices.filter(v=>v.id===edge[index]&&v.node_id)){
+    for(const [index,key,direction] of [[0,'from','out'],[1,'to','in']])for(const v of g.vertices.filter(v=>v.id===edge[index]&&v.kind!=='direct')){
       const explicit=index===0&&v.id===s.connectVertex?s.connectAddress:index===1&&v.id===id?address:null;
       const chosen=explicit;
       if(chosen){binding[key][v.id]=chosen;v[direction+'_address']=chosen;}
@@ -732,12 +741,12 @@ document.addEventListener('change',e=>{
     const id=Number(e.target.value);
     if((v.target_id||v.node_id)===id)return;
     v[v.kind==='target'?'target_id':'node_id']=id;
-    if(v.node_id){
+    if(v.node_id||v.target_id){
       delete v.address;delete v.in_address;delete v.out_address;
       for(const binding of Object.values(graphSession.graph.bindings||{}))for(const side of ['from','to'])delete binding[side]?.[v.id];
       const addresses=graphAddresses(v.id,graphSession.graph);
-      for(const side of ['in','out']){
-        const address=side==='out'?'@auto':addresses.length===1?addresses[0].id:null;
+      for(const side of v.kind==='target'?['in']:['in','out']){
+        const address=v.kind==='target'?'main':side==='out'?'@auto':addresses.length===1?addresses[0].id:null;
         if(!address)continue;
         graphChooseAddress(v.id,side,address);
         for(const edge of graphSession.graph.edges)graphChooseAddress(v.id,side,address,edge);
