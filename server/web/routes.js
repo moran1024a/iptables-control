@@ -44,6 +44,7 @@ const topologyViews = new Map();
 let topologyBinding = null;
 
 function releaseTopology(preserve = false) {
+  if(!preserve)graphClearFailurePreview();
   topologyBinding?.observer.disconnect();
   if (!preserve) {
     if (topologyBinding) topologyBinding.view.fullscreen = false;

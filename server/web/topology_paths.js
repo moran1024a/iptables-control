@@ -1,5 +1,6 @@
 // Runtime routes share the same explicit node connections as the editor.
-let graphRouteCache=null,graphConnectionCache=null,graphHintRequest=0,graphHintTimer=null;
+let graphRouteCache=null,graphConnectionCache=null;
+let graphFailurePreview=null,graphHintTimer=null,graphHintClose=null;
 
 function graphRoutes(link) {
   return (link?.configurations||[]).flatMap(c=>[
@@ -146,7 +147,7 @@ function graphRuntimeLines(g,link,boxes) {
       // shifting every bend to the right makes adjacent colours cross.
       const bend=-Math.sign(end[1]-start[1])*(span.out.offset+span.in.offset)/2;
       const points=graphRoutePoints(start,end,source,target,all,lane,used.filter(s=>s.entry!==span.entry||s.pending!==span.pending).map(s=>s.points),6,bend);
-      span.d=graphRoundedPath(points);
+      span.points=points;span.d=graphRoundedPath(points);
       const spacing=Math.min(span.out.spacing,span.in.spacing);
       span.stroke=Math.min(1.7,spacing*.45);
       span.halo=Math.min(6,spacing*.75);
@@ -175,22 +176,133 @@ function graphRouteStatus(g,link) {
   return detailsBlock('graph-paths-'+link.id,'路径状态',rows);
 }
 
-function graphQuickHint(id) {
-  clearTimeout(graphHintTimer);const token=++graphHintRequest;
-  if(rendering||graphSession||!canvasView.link||canvasView.link.state==='deleting')return;
-  const hint=app.querySelector('[data-route-hint]');if(hint)hint.textContent='';
-  if(!id)return;
-  const link=canvasView.link,page=pageVersion;
-  const vertex=link.graph.vertices.find(v=>v.id===id);
-  if(!vertex||!['node','direct'].includes(vertex.kind))return;
-  graphHintTimer=setTimeout(async()=>{
-    try{
-      const result=await api('POST','topology-preview',{id:link.id,graph:link.graph,required:[id]});
-      if(token!==graphHintRequest||graphSession||page!==pageVersion||canvasView.link!==link||!hint?.isConnected)return;
-      const changed=result.paths.filter(p=>!p.unchanged),entries=[...new Set(changed.map(p=>p.entry))],targets=[...new Set(changed.map(p=>p.target))],g=link.graph;
-      const names=ids=>ids.map(id=>graphLabel(g.vertices.find(v=>v.id===id))).join('、');
-      if(changed.length)hint.innerHTML=`可切换 ${changed.length} 个配置：${names(entries)} → ${names(targets)}`;
-      else hint.textContent=result.paths.length?'已使用当前路径':result.skipped?.[0]?.reason||'没有可切换的配置';
-    }catch(_){/* Hover is optional; clicking still performs authoritative validation. */}
-  },180);
+function graphClearFailurePreview() {
+  clearTimeout(graphHintTimer);clearTimeout(graphHintClose);
+  graphFailurePreview?.controller?.abort();graphFailurePreview=null;
+  const popover=app.querySelector('[data-failover-popover]');if(popover){popover.hidden=true;popover.replaceChildren();}
+  app.querySelector('[data-failover-lines]')?.replaceChildren();
+  app.querySelectorAll('.graph-failover-node,.graph-failover-source').forEach(el=>{
+    el.classList.remove('graph-failover-node','graph-failover-source');el.style.removeProperty('--preview-color');
+  });
 }
+
+function graphQuickHint(id) {
+  clearTimeout(graphHintClose);
+  if(rendering||graphSession||graphBusy||!canvasView?.link||canvasView.link.state==='deleting')return graphClearFailurePreview();
+  const g=graphDisplay(graphCurrent()),v=g.vertices.find(v=>v.id===id);
+  if(!v||v.kind!=='node'){
+    graphHintClose=setTimeout(graphClearFailurePreview,140);return;
+  }
+  if(graphFailurePreview?.id===id&&graphFailurePreview.linkId===canvasView.link.id)return;
+  graphClearFailurePreview();
+  const preview=graphFailurePreview={id,linkId:canvasView.link.id,revision:canvasView.link.revision,row:null,data:null,at:0};
+  graphHintTimer=setTimeout(()=>graphLoadFailurePreview(preview),250);
+}
+
+async function graphLoadFailurePreview(preview) {
+  if(graphFailurePreview!==preview||graphSession||!canvasView?.link)return;
+  const controller=new AbortController(),page=pageVersion;
+  preview.controller=controller;preview.started=true;preview.revision=canvasView.link.revision;preview.error='';
+  graphPaintFailurePreview();
+  const timer=setTimeout(()=>controller.abort(),5000);
+  try{
+    const data=await api('GET',`topologies/${preview.linkId}/failover-preview?vertex=${encodeURIComponent(preview.id)}&revision=${preview.revision}`,null,controller.signal);
+    if(graphFailurePreview!==preview||page!==pageVersion||graphSession||canvasView?.link?.id!==preview.linkId)return;
+    if(data.revision!==canvasView.link.revision)return;
+    preview.data=data;preview.at=Date.now();
+    if(!data.paths.some(r=>r.id===preview.row))preview.row=data.paths[0]?.id??null;
+  }catch(e){
+    if(graphFailurePreview===preview){preview.data=null;preview.error=e.status===409?'拓扑已变化，等待刷新':e.message;preview.at=Date.now();}
+  }finally{
+    clearTimeout(timer);
+    if(graphFailurePreview===preview){preview.controller=null;graphPaintFailurePreview();}
+  }
+}
+
+function graphRestoreFailurePreview() {
+  const preview=graphFailurePreview;
+  if(!preview)return;
+  if(graphSession||canvasView?.link?.id!==preview.linkId||!graphCurrent().vertices.some(v=>v.id===preview.id))return graphClearFailurePreview();
+  if(preview.revision!==canvasView.link.revision){
+    preview.controller?.abort();
+    const id=preview.id;graphClearFailurePreview();graphQuickHint(id);return;
+  }
+  if(!preview.started)return;
+  graphPaintFailurePreview();
+  // Refresh only an open preview, using the page's normal refresh cadence.
+  if(!preview.controller&&preview.at&&Date.now()-preview.at>2000)graphLoadFailurePreview(preview);
+}
+
+function graphFailureMarkup(g) {
+  const preview=graphFailurePreview;if(!preview)return '';
+  const v=g.vertices.find(v=>v.id===preview.id);if(!v)return '';
+  const data=preview.data,rows=data?.paths||[],colors=graphEntryColors(g);
+  const name=id=>graphLabel(g.vertices.find(v=>v.id===id));
+  return `<div class="graph-failover-heading"><strong>灾备预览</strong><span>${graphLabel(v)} 失联</span></div>${data?rows.length?`<div class="graph-failover-options">${rows.map(row=>`<button type="button" data-key="failover-${row.id}" data-failover-choice="${row.id}" class="${preview.row===row.id?'is-active':''}" aria-pressed="${preview.row===row.id}" style="--route-color:${colors.get(row.entry)}"><span><i class="graph-entry-dot"></i>${name(row.entry)} → ${targetLabel(graphName(g.vertices.find(v=>v.id===row.target)),row.target_address)}</span><small>${row.path.length?row.path.map(name).join(' → '):esc(row.message)}</small>${row.path.length?`<small>从 ${name(row.switch_at)} 切换 · 权重 ${graphWeight(row.weight)}</small>`:''}</button>`).join('')}</div><small class="graph-failover-foot">${preview.controller?'正在更新…':'按当前状态预计 · 指向条目查看路线'}</small>`:`<p>${esc(data.message)}</p>`:`<p>${esc(preview.error||'正在计算…')}</p>`}`;
+}
+
+function graphPaintFailurePreview() {
+  const preview=graphFailurePreview,popover=app.querySelector('[data-failover-popover]');
+  if(!preview||!popover||graphSession)return;
+  const g=graphDisplay(graphCurrent()),v=g.vertices.find(v=>v.id===preview.id);
+  const source=app.querySelector(`[data-graph-node="${preview.id}"]`),workspace=popover.parentElement;
+  if(!v||!source)return graphClearFailurePreview();
+  popover.hidden=false;
+  const template=document.createElement('template');template.innerHTML=graphFailureMarkup(g);
+  const wasRendering=rendering;rendering=true;
+  try{morph(popover,template.content);}finally{rendering=wasRendering;}
+  const rect=workspace.getBoundingClientRect(),anchor=source.getBoundingClientRect();
+  let left=anchor.right-rect.left+10;
+  if(left+popover.offsetWidth>rect.width-8)left=anchor.left-rect.left-popover.offsetWidth-10;
+  popover.style.left=`${Math.max(8,Math.min(left,rect.width-popover.offsetWidth-8))}px`;
+  popover.style.top=`${Math.max(8,Math.min(anchor.top-rect.top,rect.height-popover.offsetHeight-8))}px`;
+  graphPaintFailurePath();
+}
+
+function graphPaintFailurePath() {
+  const preview=graphFailurePreview,layer=app.querySelector('[data-failover-lines]');
+  if(!preview||!layer)return;
+  layer.replaceChildren();
+  app.querySelectorAll('.graph-failover-node,.graph-failover-source').forEach(el=>{
+    el.classList.remove('graph-failover-node','graph-failover-source');el.style.removeProperty('--preview-color');
+  });
+  const data=preview.data,row=data?.paths.find(r=>r.id===preview.row),g=graphDisplay(graphCurrent());
+  app.querySelector(`[data-graph-node="${preview.id}"]`)?.classList.add('graph-failover-source');
+  if(!row?.path.length)return;
+  const color=graphEntryColors(g).get(row.entry),boxes=graphBoxes(g);
+  const config=canvasView.link.configurations.find(c=>c.id===row.id),old=config?.active_graph;
+  const unchanged=new Set(row.active_path.slice(1).map((b,i)=>`${row.active_path[i]}/${b}`).filter(key=>JSON.stringify(old?.bindings?.[key])===JSON.stringify(data.graph.bindings[key])));
+  const used=(graphRouteCache?.list||[]).flatMap(r=>(r.points||[]).slice(1).map((p,i)=>[r.points[i],p]));
+  const paths=[];
+  for(const id of row.path){
+    const el=app.querySelector(`[data-graph-node="${id}"]`);
+    if(el){el.classList.add('graph-failover-node');el.style.setProperty('--preview-color',color);}
+  }
+  for(let i=1;i<row.path.length;i++){
+    const a=row.path[i-1],b=row.path[i];if(unchanged.has(`${a}/${b}`))continue;
+    if(!boxes.has(a)||!boxes.has(b))continue;
+    const binding=data.graph.bindings[`${a}/${b}`];
+    const start=graphPortPoint(g,a,'out',binding?.from?.[a]||'',boxes),end=graphPortPoint(g,b,'in',binding?.to?.[b]||'',boxes);
+    // Preview arrows occupy a separate edge of the IP row from live arrows.
+    start[1]+=11;end[1]+=11;
+    const points=graphRoutePoints(start,end,boxes.get(a),boxes.get(b),[...boxes.values()],i,used,4);
+    const d=graphRoundedPath(points);
+    for(let j=1;j<points.length;j++)used.push([points[j-1],points[j]]);
+    paths.push(`<path class="graph-failover-halo" d="${d}"/><path class="graph-failover-line" data-preview-from="${a}" data-preview-to="${b}" d="${d}" marker-end="url(#graph-failover-arrow)"/>`);
+  }
+  layer.innerHTML=`<defs><marker id="graph-failover-arrow" viewBox="0 0 7 6" refX="7" refY="3" markerUnits="userSpaceOnUse" markerWidth="6" markerHeight="4" orient="auto"><path d="M 0 0 L 7 3 L 0 6 Z" fill="${color}"/></marker></defs><g style="--preview-color:${color}">${paths.join('')}</g>`;
+}
+
+for(const event of ['mouseover','focusin','click'])document.addEventListener(event,e=>{
+  const row=e.target.closest?.('[data-failover-choice]'),preview=graphFailurePreview;
+  if(!row||!preview||preview.row===Number(row.dataset.failoverChoice))return;
+  preview.row=Number(row.dataset.failoverChoice);
+  // Keep focused/hovered buttons in place: only update their state and the SVG overlay.
+  row.parentElement.querySelectorAll('[data-failover-choice]').forEach(el=>{
+    const active=Number(el.dataset.failoverChoice)===preview.row;el.classList.toggle('is-active',active);el.setAttribute('aria-pressed',String(active));
+  });
+  graphPaintFailurePath();
+});
+document.addEventListener('pointerdown',e=>{if(!e.target.closest?.('[data-failover-popover]'))graphClearFailurePreview();});
+document.addEventListener('wheel',e=>{if(e.target.closest?.('.graph-viewport'))graphClearFailurePreview();},{passive:true});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')graphClearFailurePreview();});

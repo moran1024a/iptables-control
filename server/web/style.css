@@ -993,6 +993,20 @@ button.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
 .graph-route-status>span:first-child { display:flex; align-items:center; flex-wrap:wrap; gap:5px; min-width:0; max-width:100%; }
 .graph-route-description { flex:1; min-width:100px; color:var(--muted); }
 .graph-route-status small { width:100%; color:var(--red); }
+.graph-failover-popover { position:absolute; z-index:12; width:360px; max-width:calc(100% - 16px); max-height:min(380px,calc(100% - 16px)); overflow:auto; padding:10px; border:1px solid var(--border); border-radius:10px; background:var(--card); box-shadow:var(--shadow-hover); font-size:12px; }
+.graph-failover-heading { display:flex; flex-wrap:wrap; align-items:center; gap:7px; margin-bottom:8px; }
+.graph-failover-heading>span { color:var(--muted); font-size:11px; }
+.graph-failover-options { display:flex; flex-direction:column; gap:5px; }
+.graph-failover-options>button { padding:8px; min-height:0; text-align:left; background:transparent; border-color:transparent; }
+.graph-failover-options>button.is-active { border-color:var(--route-color); background:var(--primary-soft); }
+.graph-failover-options>button>span { display:flex; align-items:center; flex-wrap:wrap; gap:4px; font-size:12px; }
+.graph-failover-options small { display:block; margin-top:5px; color:var(--muted); line-height:1.6; font-weight:normal; }
+.graph-failover-options .node-tags { vertical-align:middle; }
+.graph-failover-foot { display:block; margin-top:9px; color:var(--muted); font-size:10px; }
+.graph-failover-halo { stroke:var(--card); stroke-width:5; fill:none; }
+.graph-failover-line { stroke:var(--preview-color); stroke-width:2; stroke-dasharray:7 4; fill:none; }
+.graph-node.graph-failover-node { outline:2px dashed var(--preview-color); outline-offset:2px; }
+.graph-node.graph-failover-source { outline:2px solid var(--red); outline-offset:2px; }
 @media(prefers-reduced-motion:reduce) { .graph-viewport .topology-flow { animation:none; } }
 .graph-meta { display:flex; gap:8px; margin-bottom:10px; }
 .graph-meta input { flex:1; min-width:80px; }

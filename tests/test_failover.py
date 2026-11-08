@@ -1,5 +1,6 @@
 """Automatic recovery owns only failed intermediate paths, never manual work."""
 import json
+import copy
 import time
 import unittest
 
@@ -8,9 +9,140 @@ import configurations
 import database
 import execution
 import failover
+import errors
 
 
 class FailoverTests(Fixture, unittest.TestCase):
+    def preview_ready(self):
+        self.network()
+        self.dead.clear()
+        self.ready(*self.ids)
+        self.prime()
+
+    def preview(self, vertex=None):
+        parent = configurations.get_topology(self.db, self.ident)
+        return self.engine.preview(self.db, self.ident, vertex or f'v{self.f}', parent['revision'], self.now)
+
+    def test_preview_is_read_only_and_matches_actual_recovery(self):
+        self.preview_ready()
+        self.db.commit()
+        before = list(self.db.iterdump())
+        observed = copy.deepcopy(self.engine.observed)
+        self.db.execute('PRAGMA query_only=ON')
+        result = self.preview()
+        self.db.execute('PRAGMA query_only=OFF')
+        self.assertEqual(before, list(self.db.iterdump()))
+        self.assertEqual(observed, self.engine.observed)
+        self.assertEqual(len(result['paths']), 1)  # The direct entry/other-target pair is unaffected.
+        row = result['paths'][0]
+        self.assertEqual(row['path'], [f'v{n}' for n in (self.e, self.p, self.b)] + [f't{self.t}'])
+        self.assertEqual(row['switch_at'], f'v{self.p}')
+        for _ in range(3):
+            self.assertEqual(self.preview()['paths'], result['paths'])
+        self.dead = {self.f}
+        self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?', (self.now-61, self.f))
+        self.step(1)
+        self.assertEqual(self.desired(), row['path'])
+
+    def test_preview_reports_disabled_passive_busy_and_no_backup(self):
+        self.preview_ready()
+        with self.assertRaises(errors.UserError):
+            self.preview(f'v{self.e}')
+        with self.assertRaises(errors.UserError):
+            self.preview(f't{self.t}')
+        with self.assertRaises(errors.UserError):
+            self.engine.preview(self.db, self.ident, f'v{self.f}', -1, self.now)
+        self.db.execute('UPDATE topologies SET failover_enabled=0')
+        self.assertEqual(self.preview()['message'], '自动灾备未开启')
+        self.db.execute('UPDATE topologies SET failover_enabled=1')
+        self.db.execute("UPDATE nodes SET desired_mode='passive' WHERE id=?", (self.f,))
+        self.assertIn('被动', self.preview()['message'])
+        self.db.execute("UPDATE nodes SET desired_mode='active' WHERE id=?", (self.f,))
+        cid = self.config()['id']
+        self.db.execute("UPDATE configurations SET state='pending' WHERE id=?", (cid,))
+        self.assertEqual(self.preview()['paths'][0]['state'], 'blocked')
+        self.db.execute("UPDATE configurations SET state='active',failover=? WHERE id=?", (json.dumps(dict(phase='paused')), cid))
+        self.assertIn('暂停', self.preview()['paths'][0]['message'])
+        self.db.execute("UPDATE configurations SET failover='{}' WHERE id=?", (cid,))
+        self.db.execute('UPDATE nodes SET last_seen=? WHERE id IN (?,?)', (self.now-61, self.b, self.c))
+        row = self.preview()['paths'][0]
+        self.assertEqual(row['state'], 'unavailable')
+        self.assertEqual(row['path'], [])
+
+    def test_equal_weight_preview_is_stable_and_matches_recovery(self):
+        self.network()
+        self.call('api_node_edit', dict(weight=5), self.c)
+        graph = json.loads(configurations.get_topology(self.db, self.ident)['graph'])
+        graph['edges'].append([f'v{self.p}', f'v{self.c}'])
+        self.save(graph, self.ident, paths=[self.original], failover_enabled=True)
+        self.settle()
+        self.dead.clear()
+        self.ready(*self.ids)
+        self.prime()
+        expected = self.preview()['paths'][0]['path']
+        self.assertEqual(expected, [f'v{n}' for n in (self.e, self.p, self.b)] + [f't{self.t}'])
+        for _ in range(8):
+            self.assertEqual(self.preview()['paths'][0]['path'], expected)
+        self.dead.add(self.f)
+        self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?', (self.now-61, self.f))
+        self.step(1)
+        self.assertEqual(self.desired(), expected)
+        self.tick(self.now)
+        self.assertTrue(self.db.execute('SELECT 1 FROM jobs').fetchone())
+        row = self.preview()['paths'][0]
+        self.assertEqual(row['state'], 'blocked')
+        self.assertIn('正在切换', row['message'])
+        self.assertEqual(row['path'], [])
+
+    def test_configurable_offline_threshold_and_validation(self):
+        self.network()
+        self.assertEqual(self.call('api_settings')['failover_offline_seconds'], 60)
+        self.call('api_settings_save', dict(failover_offline_seconds=120))
+        self.prime()  # Last heartbeat was 101 seconds ago.
+        self.assertEqual(self.desired(), self.original)
+        self.step(18)
+        self.assertEqual(self.desired(), self.original)
+        self.step(1)
+        self.assertNotEqual(self.desired(), self.original)
+        for value in (30, 3600, 60):
+            self.call('api_settings_save', dict(failover_offline_seconds=value))
+            self.assertEqual(self.call('api_settings')['failover_offline_seconds'], value)
+        for value in (29, 3601, True, False, None, 30.5, '60'):
+            with self.subTest(value=value), self.assertRaises(errors.UserError):
+                self.call('api_settings_save', dict(failover_offline_seconds=value))
+        self.call('api_settings_save', dict(public_url='https://example.test'))
+        self.assertEqual(self.call('api_settings')['failover_offline_seconds'], 60)
+
+    def test_preview_separates_pairs_and_excludes_all_instances_of_failed_machine(self):
+        e, f, backup, other = [self.node(n) for n in ('entry', 'failed', 'backup', 'second entry')]
+        t, u = self.target(), self.target()
+        self.ready(e, f, backup, other)
+        self.call('api_node_edit', dict(weight=50), f)
+        g = self.graph([e, f], t)
+        g['vertices'] += [dict(id='backup', kind='node', node_id=backup),
+                          dict(id='alias', kind='node', node_id=f),
+                          dict(id='other', kind='entry', node_id=other),
+                          dict(id=f't{u}', kind='target', target_id=u)]
+        g['edges'] += [[f'v{e}', 'backup'], ['backup', f't{t}'], [f'v{e}', 'alias'],
+                       ['alias', f't{u}'], [f'v{f}', f't{u}'], ['other', f'v{f}'], ['other', 'backup']]
+        paths = [[a, f'v{f}', b] for a in (f'v{e}', 'other') for b in (f't{t}', f't{u}')]
+        self.ident = self.save(g, paths=paths, failover_enabled=True)
+        self.settle()
+        self.now = int(time.time())
+        self.engine = failover.Engine(self.now-60)
+        nodes = {n['id']: dict(n) for n in self.db.execute('SELECT * FROM nodes')}
+        for age in (40, 30, 20, 10, 0):
+            self.engine.health({k: dict(n, last_seen=self.now-age) for k, n in nodes.items()}, self.now-age)
+        self.f = f
+        rows = self.preview()['paths']
+        self.assertEqual(len(rows), 4)
+        for row in rows:
+            if row['target'] == f't{t}':
+                self.assertEqual(row['path'], [row['entry'], 'backup', f't{t}'])
+            else:
+                self.assertEqual(row['state'], 'unavailable')
+            self.assertNotIn('alias', row['path'])
+
     def network(self):
         self.e, self.p, self.f, self.b, self.c = [self.node(n) for n in ('entry', 'upstream', 'failed', 'backup', 'bypass')]
         self.ids = [self.e, self.p, self.f, self.b, self.c]

@@ -87,6 +87,76 @@ printf '%s\\n' '#!/bin/bash' 'printf "%s\\n" "$@" > "$MOCK_ROOT/arguments"' > "$
 
 
 class CanvasBrowserTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("PLAYWRIGHT_MODULE"), "Set PLAYWRIGHT_MODULE to run Chrome interaction checks")
+    def test_failover_preview_and_settings(self):
+        import asyncio
+        import time
+        from aiohttp import web
+        from test_server import Fixture
+        import database, transport
+
+        fixture = Fixture()
+        fixture.setUp()
+        try:
+            a, b, f, d, e, unused, passive = [fixture.node(n) for n in
+                ('入口 A', '入口 B', '中转 C', '备用 D', '备用 E', '未使用 F', '被动 G')]
+            fixture.ready(a, b, f, d, e, unused)
+            fixture.ready(passive, mode='passive')
+            t, u = fixture.target(), fixture.target('203.0.113.10')
+            graph = fixture.graph([a, f], t)
+            graph['vertices'] += [dict(id=f'v{b}', kind='entry', node_id=b),
+                *[dict(id=f'v{n}', kind='node', node_id=n) for n in (d, e, unused, passive)],
+                dict(id=f't{u}', kind='target', target_id=u)]
+            graph['edges'] += [[f'v{b}', f'v{f}'], [f'v{f}', f't{u}'],
+                [f'v{a}', f'v{d}'], [f'v{b}', f'v{d}'], [f'v{d}', f't{t}'],
+                [f'v{a}', f'v{e}'], [f'v{e}', f't{u}']]
+            paths = [[f'v{x}', f'v{f}', f't{y}'] for x in (a, b) for y in (t, u)]
+            ident = fixture.save(graph, paths=paths, failover_enabled=True)
+            fixture.settle()
+            with fixture.db:
+                database.set_setting(fixture.db, 'must_change', '0')
+
+            async def check():
+                app = transport.create_app()
+                hub = app['hub']
+                now = int(time.time())
+                engine = hub.execution.failover
+                engine.started = now - 60
+                nodes = {n['id']: dict(n) for n in fixture.db.execute('SELECT * FROM nodes')}
+                for age in (40, 30, 20, 10, 0):
+                    engine.health({k: dict(n, last_seen=now-age) for k, n in nodes.items()}, now-age)
+
+                async def heartbeats():
+                    while True:
+                        await hub.database(lambda c: c.execute("UPDATE nodes SET last_seen=? WHERE desired_mode='active'", (int(time.time()),)))
+                        await asyncio.sleep(1)
+
+                runner = web.AppRunner(app)
+                await runner.setup()
+                beats = asyncio.create_task(heartbeats())
+                try:
+                    site = web.TCPSite(runner, '127.0.0.1', 0)
+                    await site.start()
+                    port = site._server.sockets[0].getsockname()[1]
+                    env = dict(os.environ, TEST_URL=f'http://127.0.0.1:{port}'+database.setting(fixture.db, 'panel_path')+'/', TEST_ROUTE=str(ident))
+                    proc = await asyncio.create_subprocess_exec('node', str(ROOT/'tests/browser_failover.js'), env=env,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                    try:
+                        out, _ = await asyncio.wait_for(proc.communicate(), 60)
+                    except BaseException:
+                        proc.kill()
+                        await proc.wait()
+                        raise
+                    self.assertEqual(proc.returncode, 0, out.decode())
+                finally:
+                    beats.cancel()
+                    await asyncio.gather(beats, return_exceptions=True)
+                    await runner.cleanup()
+
+            asyncio.run(check())
+        finally:
+            fixture.tearDown()
+
     @unittest.skipUnless(
         os.environ.get("PLAYWRIGHT_MODULE"),
         "Set PLAYWRIGHT_MODULE to run Chrome interaction checks",

@@ -13,6 +13,7 @@ import node_tags
 import node_sync
 import configurations
 import execution
+import failover
 import topology
 import security
 import settings
@@ -26,8 +27,9 @@ import wake
 class Resources:
     """Resource use cases; no HTTP transport or authentication dependency."""
 
-    def __init__(self, query=None):
+    def __init__(self, query=None, failover_engine=None):
         self.query = query or {}
+        self.failover_engine = failover_engine
 
     def node_brief(self, conn, n, now):
         return {
@@ -484,6 +486,7 @@ class Resources:
 
     def api_settings(self, conn, body):
         return {
+            "failover_offline_seconds": failover.offline_timeout(conn),
             "public_url": database.setting(conn, "public_url", ""),
             "sync_path": database.setting(conn, "sync_path"),
             "panel_path": database.setting(conn, "panel_path"),
@@ -493,6 +496,9 @@ class Resources:
         }
 
     def api_settings_save(self, conn, body):
+        timeout = body.get("failover_offline_seconds", failover.offline_timeout(conn))
+        if type(timeout) is not int or not 30 <= timeout <= 3600:
+            raise errors.UserError("失联等待时间应为 30～3600 秒的整数", "failover_offline_seconds")
         url = (
             str(body.get("public_url", database.setting(conn, "public_url", "")))
             .strip()
@@ -503,7 +509,19 @@ class Resources:
         ):
             raise errors.UserError("格式应为 http(s)://域名或IP[:端口]，不带路径", "public_url")
         database.set_setting(conn, "public_url", url)
-        return {"public_url": url}
+        database.set_setting(conn, "failover_offline_seconds", str(timeout))
+        return {"public_url": url, "failover_offline_seconds": timeout}
+
+    def api_failover_preview(self, conn, body, ident):
+        vertices, revisions = self.query.get("vertex", []), self.query.get("revision", [])
+        if (len(vertices) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", vertices[0])
+                or len(revisions) != 1 or not re.fullmatch(r"[0-9]{1,15}", revisions[0])):
+            raise errors.UserError("灾备预览参数无效")
+        if self.failover_engine is None:
+            raise errors.UserError("灾备监测尚未就绪", status=503)
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+        return self.failover_engine.preview(conn, ident, vertices[0], int(revisions[0]))
 
     def api_topologies(self, conn, body):
         return configurations.listing(conn)

@@ -32,7 +32,7 @@ class Request:
     panel_path = "/"
     sync_path = "/"
 
-    def __init__(self, method, path, headers, body, peer, *, panel_path=None, sync_path=None):
+    def __init__(self, method, path, headers, body, peer, *, panel_path=None, sync_path=None, failover_engine=None):
         self.command, self.path = method, path
         self.client_address = (peer, 0)
         self.headers = Message()
@@ -41,7 +41,7 @@ class Request:
         self.rfile = io.BytesIO(body)
         self.cookies = []
         self.response = (500, b"", [])
-        self.resources = resources.Resources()
+        self.resources = resources.Resources(failover_engine=failover_engine)
         if panel_path is not None:
             self.panel_path = panel_path
         if sync_path is not None:
@@ -170,6 +170,8 @@ class Request:
                            "DELETE": self.resources.api_topology_delete}.get(method)
             elif len(parts) == 3 and parts[0] == "topologies" and parts[1].isdigit() and parts[2] == "action":
                 handler = {"POST": self.resources.api_topology_action}.get(method)
+            elif len(parts) == 3 and parts[0] == "topologies" and parts[1].isdigit() and parts[2] == "failover-preview":
+                handler = {"GET": self.resources.api_failover_preview}.get(method)
             elif parts == ["targets"]:
                 handler = {"GET": self.resources.api_targets, "POST": self.resources.api_target_save}.get(
                     method

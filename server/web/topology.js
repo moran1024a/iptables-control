@@ -185,10 +185,11 @@ function graphFocusWires(event) {
     graphFocusEditor(target instanceof Element?target:null);return;
   }
   const item=target instanceof Element?target.closest('[data-graph-node]'):null;
-  const id=item?.dataset.graphNode||'';
+  const inPreview=target instanceof Element&&target.closest('[data-failover-popover]');
+  const id=item?.dataset.graphNode||(inPreview?graphFailurePreview?.id:'')||'';
+  graphQuickHint(id);
   if(canvas.dataset.graphFocus===id)return;
   canvas.dataset.graphFocus=id;canvas.classList.toggle('graph-focus',!!id);
-  graphQuickHint(id);
   const segments=new Set(graphRoutes(canvasView.link).filter(r=>r.path.includes(id)).flatMap(r=>
     r.path.slice(1).map((b,i)=>JSON.stringify([r.entry,r.path[i],b]))));
   canvas.querySelectorAll('[data-graph-from]').forEach(path=>path.classList.toggle('graph-nearby',path.dataset.routeEntry?
@@ -259,8 +260,8 @@ function graphCanvas(raw, l) {
     const label=editing?edges[i].map((id,n)=>{const v=g.vertices.find(v=>v.id===id),address=graphPortAddress(g,v,n?'in':'out',[a,b]),ip=graphAddresses(id,g).find(a=>a.id===address);return graphName(v)+(ip?' · '+ip.host:'');}).join(' → '):'';
     return `${editing?`<defs><marker id="${marker}" viewBox="0 0 6 6" refX="6" refY="3" markerUnits="userSpaceOnUse" markerWidth="6" markerHeight="${editorRoutes[i].arrowHeight}" preserveAspectRatio="none" orient="auto"><path d="M 0 0 L 6 3 L 0 6 Z" fill="context-stroke"/></marker></defs><path ${attrs} data-graph-halo="${i}" class="graph-edit-halo" d="${d}"/>`:''}<path data-graph-line="${i}" ${attrs} class="graph-line ${!editing?'graph-context':''} ${!editing&&(active.has(key)||pending.has(key))?'graph-covered':''} ${editing&&graphSession?.edge===i?'graph-selected-line':''}" d="${d}" marker-end="url(#${marker})"/>${editing?`<path data-graph-hit="${i}" ${attrs} class="graph-hit" d="${d}" data-action="graph-edge" data-index="${i}"><title>${esc(label)}</title></path>`:''}`;
   }).join('');
-  if(!editing)lines+=graphRuntimeLines(g,l,boxes);
-  return `<div class="topology-toolbar" data-key="graph-toolbar"><div class="topology-legend">${editing?`<button class="small ${graphSession.library?'is-active':''}" data-action="graph-add-open">＋ 添加</button><button class="small" data-action="graph-check" data-graph-mutate>整理</button><button class="small" data-action="graph-undo" data-graph-mutate title="撤销 Ctrl/⌘ Z">↶</button><button class="small" data-action="graph-redo" data-graph-mutate title="重做 Ctrl/⌘ Shift Z">↷</button><span class="graph-editor-hint">${graphSession.connect?'连接到左侧 IP 点':'从右侧 IP 点拖线'}</span>`:graphEntryLegend(g)}</div><div class="topology-tools"><button class="small" data-action="canvas-out" aria-label="缩小">−</button><button class="small" data-zoom-value data-action="graph-actual-size">100%</button><button class="small" data-action="canvas-in" aria-label="放大">+</button><button class="small" data-action="canvas-fit">适应</button><button class="small" data-action="canvas-fullscreen">${topologyViews.get(graphSession?.id||l?.id||'new')?.fullscreen?'退出全屏':'全屏'}</button></div></div><div class="graph-workspace" data-key="graph-workspace">${editing&&graphSession.library?graphLibrary():''}<div class="topology graph-viewport" data-key="graph-viewport" tabindex="0" aria-label="拓扑画布"><div class="topology-canvas" data-world-x="${world.x}" data-world-y="${world.y}" style="width:${width}px;height:${height}px"><svg class="topology-cables" width="${width}" height="${height}" viewBox="${world.x} ${world.y} ${width} ${height}"><defs><marker id="graph-arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/></marker></defs>${lines}</svg>${graphLayers(g,world)}${cards}</div></div>${editing?graphInspector():''}</div>`;
+  if(!editing)lines+=graphRuntimeLines(g,l,boxes)+'<g data-failover-lines pointer-events="none"></g>';
+  return `<div class="topology-toolbar" data-key="graph-toolbar"><div class="topology-legend">${editing?`<button class="small ${graphSession.library?'is-active':''}" data-action="graph-add-open">＋ 添加</button><button class="small" data-action="graph-check" data-graph-mutate>整理</button><button class="small" data-action="graph-undo" data-graph-mutate title="撤销 Ctrl/⌘ Z">↶</button><button class="small" data-action="graph-redo" data-graph-mutate title="重做 Ctrl/⌘ Shift Z">↷</button><span class="graph-editor-hint">${graphSession.connect?'连接到左侧 IP 点':'从右侧 IP 点拖线'}</span>`:graphEntryLegend(g)}</div><div class="topology-tools"><button class="small" data-action="canvas-out" aria-label="缩小">−</button><button class="small" data-zoom-value data-action="graph-actual-size">100%</button><button class="small" data-action="canvas-in" aria-label="放大">+</button><button class="small" data-action="canvas-fit">适应</button><button class="small" data-action="canvas-fullscreen">${topologyViews.get(graphSession?.id||l?.id||'new')?.fullscreen?'退出全屏':'全屏'}</button></div></div><div class="graph-workspace" data-key="graph-workspace">${editing&&graphSession.library?graphLibrary():''}<div class="topology graph-viewport" data-key="graph-viewport" tabindex="0" aria-label="拓扑画布"><div class="topology-canvas" data-world-x="${world.x}" data-world-y="${world.y}" style="width:${width}px;height:${height}px"><svg class="topology-cables" width="${width}" height="${height}" viewBox="${world.x} ${world.y} ${width} ${height}"><defs><marker id="graph-arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/></marker></defs>${lines}</svg>${graphLayers(g,world)}${cards}</div></div>${editing?graphInspector():`<aside class="graph-failover-popover" data-failover-popover ${graphFailurePreview?.started?'':'hidden'} aria-label="灾备预览">${graphFailureMarkup(g)}</aside>`}</div>`;
 }
 function graphLayers(g,world) {
   const real=g.vertices.filter(v=>v.kind!=='direct'&&!v.runtime_only&&Number.isInteger(v.layer));
@@ -315,6 +316,7 @@ function graphLibrary() {
   return `<aside class="graph-library"><div class="graph-library-tabs">${[['entry','入口'],['node','节点'],['target','目标'],['direct','direct']].map(([k,n])=>`<button class="${k===kind?'is-active':''}" data-action="graph-library-kind" data-kind="${k}">${n}</button>`).join('')}</div><div class="graph-library-list">${rows}</div></aside>`;
 }
 function drawGraph() {
+  if(graphSession)graphClearFailurePreview();
   const s=graphSession,l=canvasView.link,g=graphCurrent();
   const title=s?.kind==='edit'?(s.id?'编辑链路':'新建链路'):esc(s?.name||l?.name||'选择路径');
   let actions,controls='';
@@ -332,6 +334,7 @@ function drawGraph() {
   const key=s?.id||l?.id||'new',view=topologyViews.get(key),world=graphWorld(graphDisplay(g));
   if(view?.graphOrigin){view.x+=(world.x-view.graphOrigin.x)*view.scale;view.y+=(world.y-view.graphOrigin.y)*view.scale;}
   mountTopology(key);topologyBinding.view.graphOrigin={x:world.x,y:world.y};graphButtons();graphPaintConnection();graphFocusEditor();
+  graphRestoreFailurePreview();
 }
 
 

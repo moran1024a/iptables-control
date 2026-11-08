@@ -227,9 +227,12 @@ class ApiError extends Error {
   }
 }
 
-async function api(method, path, body) {
+async function api(method, path, body, signal) {
   const request = viewRequest;
   const controller = new AbortController();
+  const abort = () => controller.abort();
+  if(signal?.aborted)abort();
+  signal?.addEventListener('abort',abort,{once:true});
   const timer = setTimeout(() => controller.abort(), path.endsWith('/query') ? 45000 : 20000);
   const opt = { method, headers: {}, credentials: "same-origin", signal: controller.signal };
   if (method !== "GET") {
@@ -247,6 +250,7 @@ async function api(method, path, body) {
     throw new ApiError(0, { error: "无法连接服务端" });
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort',abort);
   }
   if (res.ok) return data;
   if (request === viewRequest && res.status === 401 && path !== "login") {
@@ -751,6 +755,13 @@ async function settingsPage(request) {
       <div class="form-error"></div>
       <div class="form-actions"><button class="primary">保存</button></div>
     </form>
+    <form class="panel" data-form="failover-settings">
+      <h2>自动灾备</h2>
+      <label><span>失联等待时间（秒）</span><input name="failover_offline_seconds" type="number" min="30" max="3600" step="1" required value="${s.failover_offline_seconds}"></label>
+      <p class="hint">默认 60 秒，范围 30～3600 秒。达到阈值后启动灾备；适用于已开启自动灾备的链路。</p>
+      <div class="form-error"></div>
+      <div class="form-actions"><button class="primary">保存</button></div>
+    </form>
     <div class="panel">
       <h2>信息</h2>
       <div class="kv-grid">
@@ -1100,6 +1111,12 @@ const FORMS = {
   async settings(form, data) {
     await api("PATCH", "settings", { public_url: data.public_url });
     toast("已保存");
+    refresh();
+  },
+
+  async 'failover-settings'(form, data) {
+    await api('PATCH','settings',{failover_offline_seconds:Number(data.failover_offline_seconds)});
+    toast('已保存');
     refresh();
   },
 

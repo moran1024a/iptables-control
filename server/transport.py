@@ -382,6 +382,7 @@ def create_app():
             request.remote or "",
             panel_path=panel_path,
             sync_path=sync_path,
+            failover_engine=hub.execution.failover,
         )
         if request.path == panel_path + "/api/quality":
             if request.method != "POST" or request.content_type != "application/json":

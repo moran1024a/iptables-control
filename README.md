@@ -2,7 +2,7 @@
 
 轻量的 IPv4 端口转发管理工具。通过 Web 面板管理多台服务器，或使用 `ipt.sh` 在单台服务器上独立管理转发。
 
-**0.6.0-rc.5（测试版）** 支持可视化拓扑、多入口与多目标、主副 IP、订阅分享和 7 天网络质量图。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，按需同步。转发节点无需安装代理核心，SS／SS2022／VLESS Reality 等目标服务需自行准备。
+**0.6.0-rc.6（测试版）** 支持可视化拓扑、多入口与多目标、主副 IP、订阅分享和 7 天网络质量图。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，按需同步。转发节点无需安装代理核心，SS／SS2022／VLESS Reality 等目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -25,14 +25,14 @@
 
 ## 安装
 
-管理多台服务器时，安装**服务端 + 节点 Agent**；只管理本机时，安装**单机脚本**即可。以下命令固定使用 0.6.0-rc.5，已有部署请先阅读[升级说明](#升级)。
+管理多台服务器时，安装**服务端 + 节点 Agent**；只管理本机时，安装**单机脚本**即可。以下命令固定使用 0.6.0-rc.6，已有部署请先阅读[升级说明](#升级)。
 
 ### 服务端
 
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.5/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.6/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -40,7 +40,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.5/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.6/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
 主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口，并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址。
@@ -64,7 +64,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.5/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.6/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -80,7 +80,7 @@ sudo bash /root/ipt.sh
 
 重新执行[服务端安装命令](#服务端)。安装器沿用现有端口和数据挂载，保留升级前数据库备份；新容器启动或就绪检查失败时尝试恢复旧容器和数据库。相同版本需要重建时，将命令末尾改为 `| bash -s -- --force`。 使用自定义 Docker 网络、额外挂载、环境变量或资源限制时，安装器会在停止服务前提示退出，请沿用原 Docker Compose 或部署命令更换镜像版本。
 
-**从 0.6.0 RC1／RC2／RC3／RC4 升级：保留全部数据，包括已有目标地址和节点标签。RC1／RC2 的节点初始无标签；RC1 的节点权重默认为 0，链路自动灾备默认关闭。**
+**从此前 0.6.0 RC 升级：保留全部数据，包括已有目标地址和节点标签。RC1／RC2 的节点初始无标签；RC1 的节点权重默认为 0，链路自动灾备默认关闭。**
 
 **从 0.5.3 升级：仅保留以下节点信息，清空旧业务数据。更早版本请先升级至 0.5.3。**
 
@@ -93,7 +93,7 @@ sudo bash /root/ipt.sh
 
 ### 节点 Agent 升级
 
-本版主动 Agent、被动 Agent 和管理器均为 **0.6.0-rc.5**。主动节点开启自动更新后自动升级；被动节点需在本机更新一次，之后普通同步自动复用已安装组件。在节点执行：
+本版主动 Agent、被动 Agent 和管理器均保持 **0.6.0-rc.5**，已安装该版本的节点无需更新。更早版本的主动节点开启自动更新后自动升级；被动节点需在本机更新一次，之后普通同步自动复用已安装组件。在节点执行：
 
 ```bash
 sudo ictl --update
@@ -117,7 +117,7 @@ sudo ictl --sync
 删除容器和镜像，保留数据卷：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.5/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.6/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；完整停用时，请先处理节点。
@@ -197,7 +197,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 编辑时可自由拖动节点，点击“整理”调整布局，保存时自动排版。入口位于第 0 层，中间节点按最长上游路径分层，目标集中在末列；共享节点只显示一次，未连通节点单独排列。画布支持缩放、平移、全屏、撤销和重做；只沿明确画出的连线选路，不允许同一路径重复经过同一服务器。
 
 - **逐跳选择**：点击入口，再按高亮依次选择下一跳。选到最后一个转发节点后自动接上可达目标，无需再点击目标；也可点击“自动补全”。点击已选节点可退回该步，Esc 取消选路。
-- **快速切换**：直接点击中间节点。系统尽量保留当前已生效的上游路径，只有无法接入所选节点时才逐级向前重选；各入口—目标独立处理。悬停可查看受影响的配置。
+- **快速切换**：直接点击中间节点。系统尽量保留当前已生效的上游路径，只有无法接入所选节点时才逐级向前重选；各入口—目标独立处理。
 - **独立选路**：各入口—目标配置分别选路，无需统一首跳。原路径仍合法时优先保留，否则选择权重和最高的可达路径，同分时优先较短路径；不会因为节点离线而拒绝保存。
 
 目标可在编辑窗口添加多个接入 `IP:端口`（也支持域名），共用原导入协议和认证信息。画布上连接到目标对应的地址圆点，或选中连线修改接收地址；不同连线互不影响。修改地址后只有引用它的配置重新同步；被引用地址需解除连线并等待同步完成才能删除。
@@ -214,10 +214,12 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 在链路详情打开“自动灾备”后：
 
-- 只关注正在使用的主动中间节点：持续失联 **60 秒**，或 Agent 连续 **30 秒**确认已应用规则异常时，触发灾备。入口、目标和被动节点不作为故障触发源；不会根据延迟或丢包自动换路。
-- 各入口—目标配置独立处理。从故障节点的上一跳寻找备用后缀，无路可走再向入口回退；选择可用候选中权重和最高的路径，同分随机选择。健康节点需稳定 **30 秒**才作为候选。
+- 只关注正在使用的主动中间节点：持续失联默认 **60 秒**，或 Agent 连续 **30 秒**确认已应用规则异常时，触发灾备。“设置 → 自动灾备”可将失联等待时间改为 **30～3600 秒**，不改变 Agent 心跳周期或节点离线显示规则。入口、目标和被动节点不作为故障触发源；不会根据延迟或丢包自动换路。
+- 各入口—目标配置独立处理。从故障节点的上一跳寻找备用后缀，无路可走再向入口回退；选择可用候选中权重和最高的路径，同分稳定选择。健康节点需稳定 **30 秒**才作为候选。
 - 保留入口、目标、配置 ID 和入口端口。切换仍需下游和入口确认；明确下发失败时最多尝试 3 条候选，回执未知时等待确认。没有可用路径时保留现有配置并显示原因。
 - 不自动切回恢复后的高权重节点。手动编辑或切换优先；默认关闭自动灾备，升级不会自行开启。
+
+在非编辑状态悬停中间节点，可查看它失联时各入口—目标配置的备用路径。指向预览中的条目，画布用对应入口颜色的虚线显示替换路段。预览使用与实际灾备相同的选路规则，不修改配置；没有备用路径、正在切换或未启用灾备时会显示原因。结果按当前状态计算，实际故障时重新判断。
 
 被动节点不主动报告健康，不能作为新备用节点。原路径上的被动节点须启用远程唤醒才能参与自动交接；被动入口也须启用远程唤醒，否则等待手动操作。
 
@@ -395,7 +397,7 @@ for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
 
 | 组件 | 版本 |
 | --- | --- |
-| 服务端 | 0.6.0-rc.5 |
+| 服务端 | 0.6.0-rc.6 |
 | 主动 Agent | 0.6.0-rc.5 |
 | 被动 Agent | 0.6.0-rc.5 |
 | 管理器 | 0.6.0-rc.5 |
