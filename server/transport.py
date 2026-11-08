@@ -49,6 +49,7 @@ class Hub:
         return dict(row)
 
     def notify(self):
+        self.execution.event.set()
         self.passive_wake.event.set()
         for session in self.sessions.values():
             session["wake"].set()
@@ -156,6 +157,7 @@ class Hub:
             )
         )
         inflight = None
+        latest_applied = status["generation"] if type(status["generation"]) is int else 0
 
         async def reconcile(received=False):
             nonlocal inflight
@@ -243,6 +245,12 @@ class Hub:
                     ))
                     await reconcile()
                 elif kind == "status":
+                    # A slow telemetry frame may follow the higher-priority
+                    # receipt for a newer configuration. Never regress it.
+                    generation = data.get("generation")
+                    if type(generation) is int and generation < latest_applied:
+                        receive = asyncio.create_task(ws.receive())
+                        continue
                     status.update(
                         {
                             k: data[k]
@@ -259,6 +267,7 @@ class Hub:
                         }
                     )
                     await reconcile(received=True)
+                    self.execution.event.set()
                 elif kind == "apply_result":
                     if not inflight or any(
                         data.get(k) != inflight[k] for k in ("op", "generation", "hash")
@@ -274,6 +283,9 @@ class Hub:
                     result = await self.database(ack)
                     await send({"type": "apply_ack", "id": data.get("op"), **result})
                     inflight = None
+                    if data.get("ok") and result.get("result") in ("confirmed", "changed", "deleted"):
+                        latest_applied = data["generation"]
+                    self.execution.event.set()
                     status.update(
                         generation=data.get("generation", 0),
                         hash=data.get("hash", ""),
@@ -290,6 +302,8 @@ class Hub:
                     await self.database(
                         lambda c: agent_v3.save_snapshot(c, nid, kind, data.get("data"))
                     )
+                    if kind == "inventory":
+                        self.execution.event.set()
                 elif kind == "traffic":
                     result = await self.database(
                         lambda c: agent_v3.accept_traffic(c, nid, data.get("data"))

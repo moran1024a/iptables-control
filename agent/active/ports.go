@@ -110,7 +110,14 @@ func rulePossible(expr []any, p string, port int, sets map[string]any) bool {
 	}
 	return true
 }
-func nativeConflict(doc M, p string, port int) string {
+
+type nativePortRules struct {
+	chains map[string][]map[string]any
+	sets   map[string]map[string]any
+	starts []string
+}
+
+func parseNativePorts(doc M) nativePortRules {
 	chains := map[string][]map[string]any{}
 	sets := map[string]map[string]any{}
 	starts := []string{}
@@ -146,6 +153,10 @@ func nativeConflict(doc M, p string, port int) string {
 			}
 		}
 	}
+	return nativePortRules{chains, sets, starts}
+}
+func (rules nativePortRules) conflict(p string, port int) string {
+	chains, sets, starts := rules.chains, rules.sets, rules.starts
 	var visit func(string, map[string]bool) string
 	visit = func(key string, seen map[string]bool) string {
 		if seen[key] {
@@ -201,7 +212,7 @@ func (a *Agent) checkConflicts(c Config) error {
 	if len(c.Rules) == 0 {
 		return nil
 	}
-	b, e := run(nil, "nft", "-j", "list", "ruleset")
+	b, e := a.prepareCommand(nil, "nft", "-j", "list", "ruleset")
 	if e != nil {
 		return fmt.Errorf("端口检查失败：%w", e)
 	}
@@ -209,23 +220,35 @@ func (a *Agent) checkConflicts(c Config) error {
 	if e != nil {
 		return e
 	}
+	return a.checkConflictsWith(c, native)
+}
+
+// Reuse only the snapshot from this locked preparation, never a cached ruleset.
+func (a *Agent) checkConflictsWith(c Config, native M) error {
 	a.quality = ""
 	for _, item := range array(native["nftables"]) {
 		if m, ok := item.(map[string]any); ok && m["flowtable"] != nil {
 			a.quality = "存在 flowtable 卸载，转发计数可能不完整"
 		}
 	}
-	sockets := map[string]string{}
+	sockets := map[string]map[int]bool{}
 	for _, p := range []string{"tcp", "udp"} {
 		flag := "-lnt"
 		if p == "udp" {
 			flag = "-aun"
 		}
-		data, e := run(nil, "ss", "-H", flag)
+		data, e := a.prepareCommand(nil, "ss", "-H", flag)
 		if e != nil {
 			return fmt.Errorf("端口检查失败：%w", e)
 		}
-		sockets[p] = string(data)
+		sockets[p] = map[int]bool{}
+		for _, line := range strings.Split(string(data), "\n") {
+			host, port := socketPort(line)
+			ip := net.ParseIP(host)
+			if host == "*" || host == "::" || ip != nil && ip.To4() != nil {
+				sockets[p][port] = true
+			}
+		}
 	}
 	peer := "/root/iptables-forward-conf/managed-forwards.conf"
 	if a.root != "/var/lib/ictl" {
@@ -265,29 +288,26 @@ func (a *Agent) checkConflicts(c Config) error {
 	}
 	var legacy string
 	if _, err := exec.LookPath("iptables-save"); err == nil {
-		b, e := run(nil, "iptables-save")
+		b, e := a.prepareCommand(nil, "iptables-save")
 		if e != nil {
 			return fmt.Errorf("端口检查失败：%w", e)
 		}
 		legacy = string(b)
 	}
+	nativeRules, legacyRules := parseNativePorts(native), parseLegacyPorts(legacy)
 	for _, r := range c.Rules {
 		for _, p := range protocols(r) {
 			key := fmt.Sprintf("%s/%d", p, r.Port)
 			if reserved[key] {
 				return fmt.Errorf("端口冲突：%s 被 ipt.sh 保存配置占用", key)
 			}
-			for _, line := range strings.Split(sockets[p], "\n") {
-				host, port := socketPort(line)
-				ip := net.ParseIP(host)
-				if port == r.Port && (host == "*" || host == "::" || ip != nil && ip.To4() != nil) {
-					return fmt.Errorf("端口冲突：%s 被本机套接字占用", key)
-				}
+			if sockets[p][r.Port] {
+				return fmt.Errorf("端口冲突：%s 被本机套接字占用", key)
 			}
-			if where := nativeConflict(native, p, r.Port); where != "" {
+			if where := nativeRules.conflict(p, r.Port); where != "" {
 				return fmt.Errorf("端口冲突：%s 与 nft %s 重叠", key, where)
 			}
-			if where := legacyConflict(legacy, p, r.Port); where != "" {
+			if where := legacyRules.conflict(p, r.Port); where != "" {
 				return fmt.Errorf("端口冲突：%s 与 iptables %s 重叠", key, where)
 			}
 		}
@@ -335,7 +355,10 @@ func shellWords(line string) []string {
 	}
 	return out
 }
-func legacyConflict(text, p string, port int) string {
+
+type legacyPortRules map[string][][]string
+
+func parseLegacyPorts(text string) legacyPortRules {
 	chains := map[string][][]string{}
 	table := ""
 	for _, line := range strings.Split(text, "\n") {
@@ -349,6 +372,9 @@ func legacyConflict(text, p string, port int) string {
 			chains[key] = append(chains[key], f[2:])
 		}
 	}
+	return chains
+}
+func (chains legacyPortRules) conflict(p string, port int) string {
 	var visit func(string, map[string]bool) string
 	visit = func(key string, seen map[string]bool) string {
 		if seen[key] {

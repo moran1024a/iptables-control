@@ -317,7 +317,12 @@ def manage(conn, node, data):
         path, _ = artifact(data.get("name"))
         return path.read_bytes()
     if action == "info":
-        return f"proto=2\nmode={node['desired_mode']}\ninstalled={node['installed_agent']}\ninstallation_id={node['installation_id'] or ''}\n"
+        extra = ""
+        if node["desired_mode"] == "passive" and node["installed_agent"] == "passive":
+            _, manager_digest = artifact("manage.sh")
+            _, passive_digest = artifact("passive.sh")
+            extra = f"manager_sha256={manager_digest}\npassive_sha256={passive_digest}\n"
+        return f"proto=2\nmode={node['desired_mode']}\ninstalled={node['installed_agent']}\ninstallation_id={node['installation_id'] or ''}\n{extra}"
     if action == "wake-assets":
         arch = data.get("arch")
         if arch not in ("amd64", "arm64"):

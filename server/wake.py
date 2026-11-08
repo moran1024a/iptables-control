@@ -44,11 +44,14 @@ def summary(conn, node):
     return dict(job) if job else None
 
 
-def authorized(conn, node, fields):
+def authorized(conn, node, fields, now=None):
     if not eligible(node) or fields.get("agent_kind") != "passive":
         return False
-    job = conn.execute("SELECT token FROM wake_jobs WHERE node_id=?", (node["id"],)).fetchone()
-    return bool(job and secrets.compare_digest(job["token"], fields.get("wake_id", "")))
+    now = int(time.time()) if now is None else now
+    job = conn.execute("SELECT token,state,started,generation FROM wake_jobs WHERE node_id=?", (node["id"],)).fetchone()
+    return bool(job and job["state"] == "waiting" and now < job["started"] + TIMEOUT
+                and job["generation"] == node["desired_generation"]
+                and secrets.compare_digest(job["token"], fields.get("wake_id", "")))
 
 
 def receipt(conn, node, generation, result, error=""):

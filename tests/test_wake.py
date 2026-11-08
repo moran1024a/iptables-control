@@ -128,6 +128,20 @@ class WakeTests(Fixture, unittest.TestCase):
         self.assertEqual(self.ack(nid, self.report(nid)), 'confirmed')
         self.assertEqual(wake.summary(self.db, database.get_node(self.db, nid))['state'], 'confirmed')
 
+    def test_expired_wake_cannot_start_another_apply(self):
+        nid, _ = self.setup_passive()
+        job = self.enable(nid)
+        with self.db:
+            self.db.execute('UPDATE wake_jobs SET started=? WHERE node_id=?', (int(time.time()) - 31, nid))
+        # Enforce the deadline even before the periodic monitor changes state.
+        self.assertEqual(self.begin_wake(nid)['action'], 'pause')
+        with self.db:
+            wake.queue(self.db, database.get_node(self.db, nid))
+        operation = self.begin_wake(nid)
+        self.assertEqual(operation['action'], 'apply')
+        self.assertGreater(int(operation['apply_budget']), 0)
+        self.assertLessEqual(int(operation['apply_budget']), 30)
+
     def test_packet_is_authenticated_and_contains_no_node_secret(self):
         key = 'ab'*32
         a = wake.packet(key, 'cd'*16, 1700000000)

@@ -99,8 +99,9 @@ func ipJSON(args ...string) ([]map[string]any, error) {
 	}
 	return rows, e
 }
-func (a *Agent) prepareProfile(p routeProfile) error {
-	addresses, e := ipJSON("address", "show", "dev", p.Device)
+func (a *Agent) prepareProfile(p routeProfile) error { return a.prepareProfileWith(p, ipJSON) }
+func (a *Agent) prepareProfileWith(p routeProfile, read func(...string) ([]map[string]any, error)) error {
+	addresses, e := read("address", "show", "dev", p.Device)
 	if e != nil {
 		return e
 	}
@@ -123,12 +124,12 @@ func (a *Agent) prepareProfile(p routeProfile) error {
 		return errors.New("路由表标识冲突")
 	}
 	table := strconv.Itoa(p.table())
-	routes, e := ipJSON("route", "show", "table", table)
+	routes, e := read("route", "show", "table", table)
 	// iproute2 reports an absent FIB table as an error on some kernels.
 	if e != nil && !strings.Contains(e.Error(), "FIB table does not exist") {
 		return e
 	}
-	rules, e := ipJSON("rule", "show")
+	rules, e := read("rule", "show")
 	if e != nil {
 		return e
 	}
@@ -150,12 +151,12 @@ func (a *Agent) prepareProfile(p routeProfile) error {
 			return errors.New("策略路由表被其他工具占用")
 		}
 	}
-	if e = atomicBytes(path, []byte(p.key()+"\n"), 0600); e != nil {
+	if e = atomicBytesChanged(path, []byte(p.key()+"\n"), 0600); e != nil {
 		return e
 	}
 	// Copy only connected routes belonging to this device. Never flush main.
 	wanted := map[string]bool{"default/32767": true}
-	connected, e := ipJSON("route", "show", "dev", p.Device, "scope", "link")
+	connected, e := read("route", "show", "dev", p.Device, "scope", "link")
 	if e != nil {
 		return e
 	}
@@ -164,14 +165,16 @@ func (a *Agent) prepareProfile(p routeProfile) error {
 		if dst == "" || dst == "default" {
 			continue
 		}
-		if _, e = run(nil, "ip", "-4", "route", "replace", dst, "dev", p.Device, "src", p.Local, "table", table, "proto", "242"); e != nil {
-			return e
+		if !routePresent(routes, dst, 0, p.Device, p.Local, "", false) {
+			if _, e = run(nil, "ip", "-4", "route", "replace", dst, "dev", p.Device, "src", p.Local, "table", table, "proto", "242"); e != nil {
+				return e
+			}
 		}
 		wanted[dst+"/0"] = true
 	}
 	gateway := p.Gateway
 	if gateway == "-" {
-		defaults, e := ipJSON("route", "show", "default", "dev", p.Device)
+		defaults, e := read("route", "show", "default", "dev", p.Device)
 		if e != nil {
 			return e
 		}
@@ -187,12 +190,16 @@ func (a *Agent) prepareProfile(p routeProfile) error {
 		}
 	}
 	args := []string{"-4", "route", "replace", "unreachable", "default", "metric", "32767", "table", table, "proto", "242"}
-	if _, e = run(nil, "ip", args...); e != nil {
-		return e
+	if !routePresent(routes, "default", 32767, "", "", "", true) {
+		if _, e = run(nil, "ip", args...); e != nil {
+			return e
+		}
 	}
 	if gateway != "-" {
-		if _, e = run(nil, "ip", "-4", "route", "replace", "default", "via", gateway, "dev", p.Device, "src", p.Local, "metric", "10", "table", table, "proto", "242"); e != nil {
-			return e
+		if !routePresent(routes, "default", 10, p.Device, p.Local, gateway, false) {
+			if _, e = run(nil, "ip", "-4", "route", "replace", "default", "via", gateway, "dev", p.Device, "src", p.Local, "metric", "10", "table", table, "proto", "242"); e != nil {
+				return e
+			}
 		}
 		wanted["default/10"] = true
 	}
@@ -235,6 +242,39 @@ func (a *Agent) prepareProfile(p routeProfile) error {
 	}
 	return nil
 }
+
+// Unknown route attributes deliberately prevent the no-op fast path.
+func routePresent(rows []map[string]any, dst string, metric int, dev, src, gateway string, unreachable bool) bool {
+	for _, r := range rows {
+		known := true
+		for key := range r {
+			switch key {
+			case "dst", "gateway", "dev", "protocol", "scope", "prefsrc", "metric", "type", "flags", "table":
+			default:
+				known = false
+			}
+		}
+		if !known {
+			continue
+		}
+		text := func(k string) string { v, _ := r[k].(string); return v }
+		kind := text("type")
+		if text("dst") != dst || int(number(r["metric"])) != metric || fmt.Sprint(r["protocol"]) != "242" {
+			continue
+		}
+		if (unreachable && kind != "unreachable") || (!unreachable && kind != "" && kind != "unicast") {
+			continue
+		}
+		if text("dev") != dev || text("prefsrc") != src || text("gateway") != gateway {
+			continue
+		}
+		if len(array(r["flags"])) != 0 || r["nexthops"] != nil || r["encap"] != nil {
+			continue
+		}
+		return true
+	}
+	return false
+}
 func profiles(c Config) map[string]routeProfile {
 	out := map[string]routeProfile{}
 	for _, r := range append(append([]Rule{}, c.Rules...), c.Retired...) {
@@ -250,8 +290,20 @@ func profiles(c Config) map[string]routeProfile {
 	return out
 }
 func (a *Agent) prepareRoutes(c Config) error {
+	cache := map[string][]map[string]any{}
+	read := func(args ...string) ([]map[string]any, error) {
+		key := strings.Join(args, "\x00")
+		if rows, ok := cache[key]; ok {
+			return rows, nil
+		}
+		rows, err := ipJSON(args...)
+		if err == nil {
+			cache[key] = rows
+		}
+		return rows, err
+	}
 	for _, p := range profiles(c) {
-		if e := a.prepareProfile(p); e != nil {
+		if e := a.prepareProfileWith(p, read); e != nil {
 			return e
 		}
 	}
@@ -261,7 +313,7 @@ func (a *Agent) prepareRoutes(c Config) error {
 			if !route.Out.enabled() {
 				continue
 			}
-			rows, e := ipJSON("route", "get", r.IP, "from", route.Out.Local, "mark", fmt.Sprint(route.Out.mark()))
+			rows, e := read("route", "get", r.IP, "from", route.Out.Local, "mark", fmt.Sprint(route.Out.mark()))
 			if e != nil {
 				return e
 			}
@@ -285,6 +337,8 @@ func (a *Agent) pruneRoutes(c Config) error {
 	for _, p := range wanted {
 		devices[p.Device] = true
 	}
+	var policy []map[string]any
+	policyRead := false
 	for _, f := range files {
 		if f.IsDir() || strings.HasPrefix(f.Name(), "rp_") {
 			continue
@@ -309,11 +363,14 @@ func (a *Agent) pruneRoutes(c Config) error {
 			return errors.New("本地路由归属不一致")
 		}
 		// Exact selectors ensure unrelated policy rules are never removed.
-		rules, e := ipJSON("rule", "show")
-		if e != nil {
-			return e
+		if !policyRead {
+			policy, e = ipJSON("rule", "show")
+			if e != nil {
+				return e
+			}
+			policyRead = true
 		}
-		for _, r := range rules {
+		for _, r := range policy {
 			if int(number(r["priority"])) == p.priority() && fmt.Sprint(r["table"]) == f.Name() && fmt.Sprint(r["protocol"]) == "242" {
 				if _, e = run(nil, "ip", "-4", "rule", "del", "priority", strconv.Itoa(p.priority()), "fwmark", fmt.Sprintf("0x%x/0xffffffff", p.mark()), "table", f.Name(), "protocol", "242"); e != nil {
 					return e

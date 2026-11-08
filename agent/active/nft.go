@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,11 +45,55 @@ func connMatch(r Rule, p string) []any {
 }
 
 func (a *Agent) nftState() (M, bool, error) {
-	d, exists, err := readNFTState()
+	d, exists, err := readNFTWith(func(args ...string) ([]byte, error) { return a.prepareCommand(nil, "nft", args...) })
 	if err == nil && exists {
 		err = a.checkNFTOwner(d)
 	}
 	return d, exists, err
+}
+
+// The full ruleset is one atomic read shared by ownership and port checks.
+// Filter by family as well as table name: an inet/ip6 table may share the name.
+func ownedNFTState(doc M) (M, bool) {
+	rows := []any{}
+	exists := false
+	for _, item := range array(doc["nftables"]) {
+		objects, _ := item.(map[string]any)
+		for kind, raw := range objects {
+			v, _ := raw.(map[string]any)
+			if v["family"] != "ip" {
+				continue
+			}
+			if kind == "table" && v["name"] == tableName {
+				exists = true
+				rows = append(rows, item)
+			} else if kind != "table" && v["table"] == tableName {
+				rows = append(rows, item)
+			}
+		}
+	}
+	return M{"nftables": rows}, exists
+}
+
+func (a *Agent) prepareNFT(c Config) (M, bool, error) {
+	if len(c.Rules) == 0 {
+		return a.nftState()
+	}
+	b, err := a.prepareCommand(nil, "nft", "-j", "list", "ruleset")
+	if err != nil {
+		return nil, false, err
+	}
+	full, err := decodeJSON(b)
+	if err != nil {
+		return nil, false, err
+	}
+	state, exists := ownedNFTState(full)
+	if exists {
+		if err = a.checkNFTOwner(state); err != nil {
+			return nil, false, err
+		}
+	}
+	return state, exists, a.checkConflictsWith(c, full)
 }
 
 func readNFTState() (M, bool, error) {
@@ -197,6 +242,35 @@ func emptyLegacyTable(d M) bool {
 	return tables == 1 && len(want) == 0
 }
 func array(v any) []any { a, _ := v.([]any); return a }
+
+// Immutable after compilation, so telemetry snapshots can share the plan.
+// Match the effective rules, not the server hash: DNS and local IPs can change.
+type nftRulePlan struct {
+	config     Config
+	commands   []any
+	normalized any
+}
+
+func (a *Agent) rulePlan(c Config) *nftRulePlan {
+	p := a.nftPlan
+	if p != nil && p.config.Epoch == c.Epoch && slices.Equal(p.config.Rules, c.Rules) && slices.Equal(p.config.Retired, c.Retired) {
+		return p
+	}
+	c.Rules = slices.Clone(c.Rules)
+	c.Retired = slices.Clone(c.Retired)
+	p = &nftRulePlan{config: c, commands: compileNFTRules(c)}
+	rules := []any{}
+	for _, item := range p.commands {
+		add := item.(M)["add"].(M)
+		if r, ok := add["rule"].(M); ok {
+			rules = append(rules, M{"chain": r["chain"], "expr": r["expr"]})
+		}
+	}
+	p.normalized = normalizeNFTRules(rules)
+	a.nftPlan = p
+	return p
+}
+
 func (a *Agent) transaction(c Config, current M, exists bool) M {
 	commands := []any{}
 	chains := map[string]bool{}
@@ -231,6 +305,19 @@ func (a *Agent) transaction(c Config, current M, exists bool) M {
 			commands = append(commands, op("add", "chain", base))
 		}
 	}
+	for _, item := range a.rulePlan(c).commands {
+		add := item.(M)["add"].(M)
+		if counter, ok := add["counter"].(M); ok && counters[counter["name"].(string)] {
+			continue
+		}
+		commands = append(commands, item)
+	}
+	return M{"nftables": commands}
+}
+
+func compileNFTRules(c Config) []any {
+	commands := []any{}
+	counters := map[string]bool{}
 	addRule := func(chain string, expr []any) {
 		commands = append(commands, op("add", "rule", M{"family": "ip", "table": tableName, "chain": chain, "expr": expr}))
 	}
@@ -291,7 +378,7 @@ func (a *Agent) transaction(c Config, current M, exists bool) M {
 			}
 		}
 	}
-	return M{"nftables": commands}
+	return commands
 }
 func executeNFT(data M, check bool) error {
 	b, e := json.Marshal(data)
@@ -305,8 +392,49 @@ func executeNFT(data M, check bool) error {
 	_, e = run(b, "nft", args...)
 	return e
 }
-func sameRule(a, b Rule) bool {
-	return a.Route == b.Route && a.ID == b.ID && a.Protocol == b.Protocol && a.Port == b.Port && a.IP == b.IP && a.TargetPort == b.TargetPort
+func flowKey(r Rule) Rule {
+	return Rule{Route: r.Route, ID: r.ID, Protocol: r.Protocol, Port: r.Port, IP: r.IP, TargetPort: r.TargetPort}
+}
+func sameConfig(a, b Config) bool {
+	return a.Generation == b.Generation && a.Hash == b.Hash && a.Epoch == b.Epoch && slices.Equal(a.Rules, b.Rules) && slices.Equal(a.Retired, b.Retired)
+}
+func unusedCounters(c Config, doc M) bool {
+	needed := map[string]bool{}
+	for _, r := range append(append([]Rule{}, c.Rules...), c.Retired...) {
+		for _, p := range protocols(r) {
+			for _, dir := range []string{"up", "down"} {
+				needed[counterName(r, p, dir, c.Epoch)] = true
+			}
+		}
+	}
+	for _, item := range array(doc["nftables"]) {
+		m, _ := item.(map[string]any)
+		v, _ := m["counter"].(map[string]any)
+		name, _ := v["name"].(string)
+		if counterRE.MatchString(name) && !needed[name] {
+			return true
+		}
+	}
+	return false
+}
+func nftChainsReady(doc M) bool {
+	chains := map[string]M{}
+	for _, item := range array(doc["nftables"]) {
+		m, _ := item.(map[string]any)
+		v, _ := m["chain"].(map[string]any)
+		if name, ok := v["name"].(string); ok {
+			chains[name] = v
+		}
+	}
+	for _, ch := range []struct{ name, kind, hook, priority string }{
+		{"pre", "nat", "prerouting", "-105"}, {"post", "nat", "postrouting", "105"}, {"forward", "filter", "forward", "10"}, {"route", "filter", "prerouting", "-90"},
+	} {
+		v := chains[ch.name]
+		if v["type"] != ch.kind || v["hook"] != ch.hook || fmt.Sprint(v["prio"]) != ch.priority || v["policy"] != "accept" {
+			return false
+		}
+	}
+	return true
 }
 func (a *Agent) projection(c Config) []byte {
 	rows := append(append([]Rule{}, c.Rules...), c.Retired...)
@@ -324,7 +452,11 @@ func (a *Agent) projection(c Config) []byte {
 	}
 	return []byte(strings.Join(lines, "\n") + "\n")
 }
-func (a *Agent) apply(c Config) error {
+func (a *Agent) apply(c Config) error { return a.applyContext(context.Background(), c) }
+func (a *Agent) applyContext(ctx context.Context, c Config) error {
+	a.kernelSnapshot = nil
+	a.prepareCtx = ctx
+	defer func() { a.prepareCtx = nil }()
 	// Resolution must not overwrite the currently applied addresses or query snapshots.
 	c.Rules = append([]Rule(nil), c.Rules...)
 	if e := validateConfig(c); e != nil {
@@ -336,15 +468,20 @@ func (a *Agent) apply(c Config) error {
 	if e := prepareIngress(&c); e != nil {
 		return e
 	}
-	return a.locked(func() (result error) {
-		state, exists, e := a.nftState()
+	return a.lockedContext(ctx, func() (result error) {
+		readAt := time.Now()
+		state, exists, e := a.prepareNFT(c)
 		if e != nil {
 			return e
 		}
-		if e = a.checkConflicts(c); e != nil {
-			return e
-		}
 		old := a.config
+		ids := map[int64]bool{}
+		next := map[Rule]bool{}
+		for _, r := range c.Rules {
+			ids[r.ID] = true
+			next[flowKey(r)] = true
+		}
+
 		c.Epoch = old.Epoch
 		if c.Epoch == "" || !exists {
 			c.Epoch = randomID()
@@ -354,31 +491,43 @@ func (a *Agent) apply(c Config) error {
 		}
 		c.Retired = append([]Rule{}, old.Retired...)
 		for _, r := range old.Rules {
-			found, logical := false, false
-			for _, n := range c.Rules {
-				found = found || sameRule(r, n)
-				logical = logical || r.ID == n.ID
-			}
-			if !found && logical {
+			if !next[flowKey(r)] && ids[r.ID] {
 				c.Retired = append(c.Retired, r)
 			}
 		}
 		// Garbage collection uses actual conntrack state. Failure keeps the reservation.
 		kept := []Rule{}
+		checked := map[connectionKey]connectionResult{}
+		retired := map[Rule]bool{}
 		for _, r := range c.Retired {
-			logical := false
-			for _, n := range c.Rules {
-				logical = logical || r.ID == n.ID
-			}
-			if !logical {
+			if !ids[r.ID] || retired[r] {
 				continue
 			}
-			live, err := hasConnections(r)
+			retired[r] = true
+			live, err := a.hasConnections(r, checked)
 			if err != nil || live {
 				kept = append(kept, r)
 			}
 		}
 		c.Retired = kept
+		plan := a.rulePlan(c)
+		rewrite := !exists || !nftChainsReady(state) || !plan.matches(state)
+		var tx M
+		if rewrite {
+			tx = a.transaction(c, state, exists)
+			raw, err := json.Marshal(tx)
+			if err != nil {
+				return err
+			}
+			if _, err = a.prepareCommand(raw, "nft", "-c", "-j", "-f", "-"); err != nil {
+				return err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Cancellation stops preparation, never an in-progress route/NAT commit.
+		a.prepareCtx = nil
 		if len(profiles(c)) > 0 || len(profiles(old)) > 0 {
 			defer func() {
 				if result != nil {
@@ -391,7 +540,7 @@ func (a *Agent) apply(c Config) error {
 			}()
 		}
 		if len(profiles(c)) > 0 {
-			if a.root == "/var/lib/ictl" {
+			if a.root == "/var/lib/ictl" && readText("/proc/sys/net/ipv4/ip_forward") != "1" {
 				if e = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644); e != nil {
 					return e
 				}
@@ -400,26 +549,49 @@ func (a *Agent) apply(c Config) error {
 				return e
 			}
 		}
-		tx := a.transaction(c, state, exists)
-		if e = executeNFT(tx, true); e != nil {
-			return e
+		if a.root == "/var/lib/ictl" {
+			if readText("/proc/sys/net/ipv4/ip_forward") != "1" {
+				if e = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644); e != nil {
+					return e
+				}
+			}
+			if e = atomicBytesChanged("/etc/sysctl.d/99-ictl.conf", []byte("net.ipv4.ip_forward=1\n"), 0644); e != nil {
+				return e
+			}
+		}
+		_, pendingErr := os.Stat(a.path("active/pending.json"))
+		if !rewrite && sameConfig(c, old) && os.IsNotExist(pendingErr) && !unusedCounters(c, state) {
+			if e = atomicJSONChanged(a.path("active/config.json"), c); e != nil {
+				return e
+			}
+			if e = atomicBytesChanged(a.path("config"), a.projection(c), 0600); e != nil {
+				return e
+			}
+			if e = a.sampleState(state, true, readAt); e != nil {
+				return e
+			}
+			return a.pruneRoutes(c)
 		}
 		if e = atomicJSON(a.path("active/pending.json"), c); e != nil {
 			return e
 		}
 		union := c
 		union.Retired = append(append([]Rule{}, c.Retired...), old.Rules...)
-		if e = atomicBytes(a.path("config"), a.projection(union), 0600); e != nil {
+		if e = atomicBytesChanged(a.path("config"), a.projection(union), 0600); e != nil {
 			return e
 		}
-		if e = executeNFT(tx, false); e != nil {
-			_ = atomicBytes(a.path("config"), a.projection(old), 0600)
+		if rewrite {
+			e = executeNFT(tx, false)
+		}
+		if e != nil {
+			_ = atomicBytesChanged(a.path("config"), a.projection(old), 0600)
 			return e
 		}
 		defer func() {
 			if result == nil {
 				return
 			}
+			a.kernelSnapshot = nil
 			current, present, err := a.nftState()
 			if err == nil && present {
 				if exists {
@@ -432,44 +604,34 @@ func (a *Agent) apply(c Config) error {
 				result = fmt.Errorf("%w; 回退失败: %v", result, err)
 			}
 			a.config = old
-			_ = atomicJSON(a.path("active/config.json"), old)
-			_ = atomicBytes(a.path("config"), a.projection(old), 0600)
+			_ = atomicJSONChanged(a.path("active/config.json"), old)
+			_ = atomicBytesChanged(a.path("config"), a.projection(old), 0600)
 		}()
-		// Only this host's forwarding switch is enabled; no global firewall rules are replaced.
-		if a.root == "/var/lib/ictl" {
-			if e = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644); e != nil {
-				return e
-			}
-			if e = atomicBytes("/etc/sysctl.d/99-ictl.conf", []byte("net.ipv4.ip_forward=1\n"), 0644); e != nil {
-				return e
-			}
-		}
+		verifyAt := time.Now()
 		verify, ok, e := a.nftState()
 		if e != nil || !ok {
 			return fmt.Errorf("规则应用后无法读取: %v", e)
 		}
-		if !sameNFT(tx, verify) {
+		if !plan.matches(verify) {
 			return errors.New("规则应用后核对失败")
 		}
+		removed := []Rule{}
 		for _, r := range append(append([]Rule{}, old.Rules...), old.Retired...) {
-			found := false
-			for _, n := range c.Rules {
-				found = found || n.ID == r.ID
-			}
-			if !found {
-				if e = deleteConnections(r); e != nil {
-					return e
-				}
+			if !ids[r.ID] {
+				removed = append(removed, r)
 			}
 		}
-		if e = atomicJSON(a.path("active/config.json"), c); e != nil {
+		if e = deleteConnections(removed); e != nil {
+			return e
+		}
+		if e = atomicJSONChanged(a.path("active/config.json"), c); e != nil {
 			return e
 		}
 		a.config = c
-		if e = atomicBytes(a.path("config"), a.projection(c), 0600); e != nil {
+		if e = atomicBytesChanged(a.path("config"), a.projection(c), 0600); e != nil {
 			return e
 		}
-		if e = a.sample(); e != nil {
+		if e = a.sampleState(verify, true, verifyAt); e != nil {
 			return e
 		}
 		// Unreferenced counters are stable after the rule transaction. Persist first,
@@ -500,7 +662,7 @@ func (a *Agent) apply(c Config) error {
 					u.Active = false
 				}
 			}
-			if e = atomicJSON(a.path("active/traffic.json"), a.usage); e != nil {
+			if e = atomicJSONChanged(a.path("active/traffic.json"), a.usage); e != nil {
 				return e
 			}
 		}
@@ -510,31 +672,25 @@ func (a *Agent) apply(c Config) error {
 		return removeIfExists(a.path("active/pending.json"))
 	})
 }
-func sameNFT(tx, current M) bool {
-	expected, actual := []any{}, []any{}
-	for _, x := range array(tx["nftables"]) {
-		m := x.(M)
-		add, _ := m["add"].(M)
-		if r, ok := add["rule"].(M); ok {
-			expected = append(expected, M{"chain": r["chain"], "expr": r["expr"]})
-		}
-	}
+func (p *nftRulePlan) matches(current M) bool {
+	actual := []any{}
 	for _, x := range array(current["nftables"]) {
 		m, _ := x.(map[string]any)
 		if r, ok := m["rule"].(map[string]any); ok {
 			actual = append(actual, M{"chain": r["chain"], "expr": r["expr"]})
 		}
 	}
+	return reflect.DeepEqual(p.normalized, normalizeNFTRules(actual))
+}
+
+func normalizeNFTRules(rules []any) any {
 	// nft emits rules grouped by chain; compare order inside each chain.
-	sort.SliceStable(expected, func(i, j int) bool { return expected[i].(M)["chain"].(string) < expected[j].(M)["chain"].(string) })
-	sort.SliceStable(actual, func(i, j int) bool { return actual[i].(M)["chain"].(string) < actual[j].(M)["chain"].(string) })
+	sort.SliceStable(rules, func(i, j int) bool { return rules[i].(M)["chain"].(string) < rules[j].(M)["chain"].(string) })
 	// Round-trip normalizes native numeric types. Kernel may normalize fib flags and NAT family.
-	a, _ := json.Marshal(expected)
-	b, _ := json.Marshal(actual)
-	var av, bv any
-	_ = json.Unmarshal(a, &av)
-	_ = json.Unmarshal(b, &bv)
-	return reflect.DeepEqual(normalizeNFT(av), normalizeNFT(bv))
+	raw, _ := json.Marshal(rules)
+	var value any
+	_ = json.Unmarshal(raw, &value)
+	return normalizeNFT(value)
 }
 func normalizeNFT(v any) any {
 	switch x := v.(type) {
@@ -550,25 +706,56 @@ func normalizeNFT(v any) any {
 	}
 	return v
 }
-func hasConnections(r Rule) (bool, error) {
+
+type connectionKey struct {
+	protocol string
+	port     int
+	ip       string
+	target   int
+}
+type connectionResult struct {
+	live bool
+	err  error
+}
+
+func (k connectionKey) args(action string) []string {
+	return []string{action, "-f", "ipv4", "-p", k.protocol, "--orig-port-dst", strconv.Itoa(k.port), "--reply-src", k.ip, "--reply-port-src", strconv.Itoa(k.target)}
+}
+
+func (a *Agent) hasConnections(r Rule, checked map[connectionKey]connectionResult) (bool, error) {
 	for _, p := range protocols(r) {
-		b, e := run(nil, "conntrack", "-L", "-f", "ipv4", "-p", p, "--orig-port-dst", strconv.Itoa(r.Port), "--reply-src", r.IP, "--reply-port-src", strconv.Itoa(r.TargetPort))
-		if e != nil {
-			return true, e
-		}
-		for _, line := range strings.Split(string(b), "\n") {
-			if strings.HasPrefix(line, p+" ") {
-				return true, nil
+		key := connectionKey{p, r.Port, r.IP, r.TargetPort}
+		result, ok := checked[key]
+		if !ok {
+			b, err := a.prepareCommand(nil, "conntrack", key.args("-L")...)
+			result.err = err
+			for _, line := range strings.Split(string(b), "\n") {
+				if strings.HasPrefix(line, p+" ") {
+					result.live = true
+					break
+				}
 			}
+			checked[key] = result
+		}
+		if result.err != nil || result.live {
+			return true, result.err
 		}
 	}
 	return false, nil
 }
-func deleteConnections(r Rule) error {
-	for _, p := range protocols(r) {
-		_, e := run(nil, "conntrack", "-D", "-f", "ipv4", "-p", p, "--orig-port-dst", strconv.Itoa(r.Port), "--reply-src", r.IP, "--reply-port-src", strconv.Itoa(r.TargetPort), "--dst-nat")
-		if e != nil && !strings.Contains(e.Error(), "0 flow entries") {
-			return e
+func deleteConnections(rules []Rule) error {
+	deleted := map[connectionKey]bool{}
+	for _, r := range rules {
+		for _, p := range protocols(r) {
+			key := connectionKey{p, r.Port, r.IP, r.TargetPort}
+			if deleted[key] {
+				continue
+			}
+			_, e := run(nil, "conntrack", append(key.args("-D"), "--dst-nat")...)
+			if e != nil && !strings.Contains(e.Error(), "0 flow entries") {
+				return e
+			}
+			deleted[key] = true
 		}
 	}
 	return nil
@@ -589,6 +776,7 @@ func (a *Agent) heldPorts() []int {
 	return out
 }
 func (a *Agent) clear() error {
+	defer func() { a.kernelSnapshot = nil }()
 	return a.locked(func() error {
 		state, exists, e := a.nftState()
 		if e != nil {
@@ -617,15 +805,17 @@ func (a *Agent) clear() error {
 		for _, u := range a.usage {
 			u.Active = false
 		}
-		if e = atomicJSON(a.path("active/traffic.json"), a.usage); e != nil {
+		if e = atomicJSONChanged(a.path("active/traffic.json"), a.usage); e != nil {
 			return e
 		}
+		removed := []Rule{}
 		for _, r := range append(append([]Rule{}, a.config.Rules...), a.config.Retired...) {
 			if net.ParseIP(r.IP) != nil {
-				if e = deleteConnections(r); e != nil {
-					return e
-				}
+				removed = append(removed, r)
 			}
+		}
+		if e = deleteConnections(removed); e != nil {
+			return e
 		}
 		_ = state
 		if e = executeNFT(M{"nftables": []any{op("delete", "table", M{"family": "ip", "name": tableName})}}, false); e != nil {
@@ -688,11 +878,40 @@ func (a *Agent) restore() error {
 	return a.apply(a.config)
 }
 
+type nftSnapshot struct {
+	config Config
+	doc    M
+	exists bool
+	at     time.Time
+}
+
+// Reuse this round's counter read at most once per report, and only for exactly
+// the same configuration. A one-second limit keeps older samples from delaying
+// fault detection; delayed/failed maintenance falls back to a fresh read.
+func (a *Agent) freshNFT(after time.Time) *nftSnapshot {
+	s := a.kernelSnapshot
+	if s != nil && s.at.After(after) && time.Since(s.at) < time.Second && sameConfig(s.config, a.config) {
+		return s
+	}
+	return nil
+}
+
 // Report evidence about the installed rules separately from update/metrics errors.
 // A failed read is unknown, not proof that traffic stopped forwarding.
 func (a *Agent) forwardingHealth() M {
-	// The caller holds stateMu. Reading an atomic nft snapshot needs no external
-	// file lock; keep the check bounded so a busy firewall cannot stall heartbeats.
+	if a.config.Hash == "" || len(a.config.Rules) == 0 {
+		return a.forwardingHealthState(nil, false, nil)
+	}
+	// Collection operates on an immutable Agent snapshot, outside stateMu.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	current, exists, err := readNFTWith(func(args ...string) ([]byte, error) {
+		return command(ctx, nil, "nft", args...)
+	})
+	return a.forwardingHealthState(current, exists, err)
+}
+
+func (a *Agent) forwardingHealthState(current M, exists bool, readErr error) M {
 	state, message := "unknown", ""
 	check := func() error {
 		if a.config.Hash == "" {
@@ -702,39 +921,21 @@ func (a *Agent) forwardingHealth() M {
 			state = "ok"
 			return nil
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		current, exists, err := readNFTWith(func(args ...string) ([]byte, error) {
-			return command(ctx, nil, "nft", args...)
-		})
-		if err != nil {
-			return err
+		if readErr != nil {
+			return readErr
 		}
 		if exists {
 			if err := a.checkNFTOwner(current); err != nil {
 				return err
 			}
 		}
-		if !exists || !sameNFT(a.transaction(a.config, current, exists), current) {
+		if !exists || !a.rulePlan(a.config).matches(current) {
 			state, message = "error", "已应用的转发规则缺失或被修改"
 			return nil
 		}
-		chains := map[string]map[string]any{}
-		for _, item := range array(current["nftables"]) {
-			value, _ := item.(map[string]any)
-			chain, _ := value["chain"].(map[string]any)
-			name, _ := chain["name"].(string)
-			chains[name] = chain
-		}
-		for _, ch := range []struct{ name, kind, hook, priority string }{
-			{"pre", "nat", "prerouting", "-105"}, {"post", "nat", "postrouting", "105"},
-			{"forward", "filter", "forward", "10"}, {"route", "filter", "prerouting", "-90"},
-		} {
-			actual := chains[ch.name]
-			if actual["type"] != ch.kind || actual["hook"] != ch.hook || fmt.Sprint(actual["prio"]) != ch.priority || actual["policy"] != "accept" {
-				state, message = "error", "转发链挂载点异常"
-				return nil
-			}
+		if !nftChainsReady(current) {
+			state, message = "error", "转发链挂载点异常"
+			return nil
 		}
 		if a.root == "/var/lib/ictl" {
 			enabled, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward")

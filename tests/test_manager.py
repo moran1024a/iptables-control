@@ -92,6 +92,31 @@ fetch_component() { if [ "$1" = manage.sh ]; then cp "$CASE_ROOT/manager" "$3"; 
                 process.kill()
             process.communicate()
 
+    def test_unchanged_passive_sync_skips_install_and_service_restart(self):
+        import hashlib
+        helper = self.root/'pkg/passive.sh'
+        helper.write_text('#!/bin/bash\necho "$*" >> "$CASE_ROOT/backend.log"\n')
+        manager = self.root/'bin/ictl'
+        manager.write_bytes((self.root/'manager').read_bytes())
+        (self.root/'lib/agent-kind').write_text('passive')
+        (self.root/'lib/mode').write_text('passive')
+        (self.root/'unit').write_text(f'ExecStart={helper} --daemon\n')
+        (self.root/'lib/installation-id').write_text('stable-id')
+        helper_hash = hashlib.sha256(helper.read_bytes()).hexdigest()
+        manager_hash = hashlib.sha256(manager.read_bytes()).hexdigest()
+        code = f"""sha256_hex() {{ sha256sum | cut -d' ' -f1; }}
+rpc() {{
+ [ "$1" = info ] || return 99
+ REPLY=$'proto=2\\nmode=passive\\ninstalled=passive\\ninstallation_id=stable-id\\npassive_sha256={helper_hash}\\nmanager_sha256={manager_hash}\\n'
+}}
+perform_sync
+"""
+        result = self.run_manager(code)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root/'backend.log').read_text().strip(), '--sync')
+        self.assertFalse((self.root/'tools.log').exists())
+        self.assertFalse((self.root/'lib/switch-work/transaction').exists())
+
     def test_install_and_both_directions(self):
         for kind in ('active','passive','active'):
             (self.root/'mode').write_text(kind)

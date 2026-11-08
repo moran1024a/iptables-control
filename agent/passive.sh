@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.6.0-rc.1"
+VERSION="0.6.0-rc.5"
 BIN="/usr/local/lib/ictl/passive.sh"
 CONF_DIR="/etc/ictl"
 CONF="$CONF_DIR/agent.conf"
@@ -41,7 +41,7 @@ need_root() {
     exit 1
   fi
   local c missing=()
-  for c in curl openssl ip iptables iptables-save iptables-restore getent flock od systemctl conntrack; do
+  for c in curl openssl ip iptables iptables-save iptables-restore getent timeout flock od systemctl conntrack; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -108,17 +108,46 @@ save_state() {
   printf 'generation=%s\nconfirm=%s\nblocked_generation=%s\nblocked_error=%s\n' "$R_GEN" "$CONFIRM" "$BLOCK_GEN" "$BLOCK_ERR" >> "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
 }
 
+SYNC_DEADLINE=-1
+SYNC_COMMIT=0
+sync_time_left() {
+  local cap="${1:-60}" left
+  if [ "$SYNC_DEADLINE" -ge 0 ] && [ "$SYNC_COMMIT" = 0 ]; then
+    left=$((SYNC_DEADLINE-SECONDS))
+    [ "$left" -gt 0 ] || return 1
+    [ "$left" -ge "$cap" ] || cap="$left"
+  fi
+  printf '%s' "$cap"
+}
+check_sync_deadline() {
+  sync_time_left 1 >/dev/null || { R_STATE=error R_ERR='同步准备超时，等待手动同步'; err "$R_ERR"; return 1; }
+}
+read_command() {
+  local budget
+  budget="$(sync_time_left 5)" || return 1
+  timeout --kill-after=1 "$budget" "$@"
+}
+with_sync() {
+  if [ "${ICTL_MANAGER_LOCK_HELD:-0}" = 1 ]; then "$@"; return $?; fi
+  local ICTL_MANAGER_LOCK_HELD=1 rc
+  exec 8>"${LOCK%.lock}-manager.lock" || return 1
+  flock -n 8 || { exec 8>&-; err '另一项安装或同步正在执行'; return 1; }
+  "$@"; rc=$?
+  flock -u 8; exec 8>&-
+  return "$rc"
+}
 with_lock() {
   if [ "${ICTL_LOCK_HELD:-0}" = 1 ]; then "$@"; return $?; fi
-  local rc
+  local rc wait ICTL_LOCK_HELD=1
+  wait="$(sync_time_left 60)" || { check_sync_deadline; return 1; }
   exec 9>"$LOCK" || { err "无法打开锁文件 $LOCK"; return 1; }
-  if ! flock -w 60 9; then
+  if ! flock -w "$wait" 9; then
     exec 9>&-
-    err "另一个 ictl 进程正在运行，请稍后重试。"
+    R_STATE=error R_ERR='等待规则锁超时，请稍后手动同步'
+    err "$R_ERR"
     return 1
   fi
-  "$@"
-  rc=$?
+  if check_sync_deadline; then "$@"; rc=$?; else rc=1; fi
   flock -u 9
   exec 9>&-
   return "$rc"
@@ -133,10 +162,11 @@ valid_ipv4() {
 
 # Explicit IPv4 routes; the profile journal is shared with the Go Agent.
 route_fields() {
-  local value="$1" tag listen source device gateway
+  local value="$1" tag listen source device gateway commas
   R_LISTEN="" R_IN="" R_OUT="" R_IDEV="" R_ODEV="" R_IGW="" R_OGW=""
   IFS=, read -r tag listen source device gateway <<< "$value"
-  [ "$tag" = v2 ] && [ "$(tr -cd ',' <<< "$value" | wc -c)" = 4 ] && [[ "$listen" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || return 1
+  commas="${value//[^,]/}"
+  [ "$tag" = v2 ] && [ "${#commas}" = 4 ] && [[ "$listen" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || return 1
   if [ "$source,$device,$gateway" != '-,-,-' ]; then
     [ "$device" != - ] && valid_ipv4 "$source" && [[ "$device" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
     { [ "$gateway" = - ] || valid_ipv4 "$gateway"; } || return 1
@@ -144,10 +174,15 @@ route_fields() {
   fi
   R_LISTEN="$listen"
 }
+declare -A ROUTE_IDS=()
 route_numbers() {
   local hash
-  hash="$(printf '%s' "$1" | sha256_hex)" || return 1
-  ROUTE_TABLE=$((100000+16#${hash:0:5}))
+  if [ -n "${ROUTE_IDS[$1]:-}" ]; then ROUTE_TABLE="${ROUTE_IDS[$1]}"
+  else
+    hash="$(printf '%s' "$1" | sha256_hex)" || return 1
+    ROUTE_TABLE=$((100000+16#${hash:0:5}))
+    ROUTE_IDS["$1"]="$ROUTE_TABLE"
+  fi
   ROUTE_MARK=$((0x49000000+ROUTE_TABLE))
   ROUTE_PRIORITY=$((18000+ROUTE_TABLE%10000))
 }
@@ -162,16 +197,55 @@ route_policy_owned() (
   [ "$table" = "$ROUTE_TABLE" ] && [ "$priority" = "$ROUTE_PRIORITY:" ] || return 1
   [ "$mark" = "$expected_mark" ] || [ "$mark" = "$expected_mark/0xffffffff" ]
 )
+# Cache read-only queries within one preparation, never across synchronizations.
+# Return through a variable so command substitution cannot discard the cache.
+route_read() {
+  local query="$*" status=0
+  if declare -p route_reads >/dev/null 2>&1 && [ -n "${route_reads[$query]+set}" ]; then
+    ROUTE_READ_RESULT="${route_reads[$query]}"
+    return 0
+  fi
+  ROUTE_READ_RESULT="$(ip "$@" 2>&1)" || status=$?
+  [ "$status" = 0 ] || return "$status"
+  if declare -p route_reads >/dev/null 2>&1; then route_reads["$query"]="$ROUTE_READ_RESULT"; fi
+  return 0
+}
+# Unknown attributes require a rewrite; only an exact owned route can be skipped.
+route_present() {
+  awk -v dst="$2" -v metric="$3" -v dev="$4" -v src="$5" -v gw="$6" -v kind="$7" '
+  {
+    d=$1; t=""; start=2
+    if(d=="unreachable" || d=="7") {t="unreachable";d=$2;start=3}
+    if(d=="unicast" || d=="1") {d=$2;start=3}
+    m=0;v="";s="";g="";p="";known=1
+    for(i=start;i<=NF;i++) {
+      key=$i
+      if(i==NF) {known=0;break}
+      value=$(++i)
+      if(key=="dev")v=value
+      else if(key=="src")s=value
+      else if(key=="via")g=value
+      else if(key=="metric")m=value
+      else if(key=="proto")p=value
+      else if(key!="scope" && key!="table")known=0
+    }
+    if(known && d==dst && t==kind && m==metric && v==dev && s==src && g==gw && p==242)found=1
+  }
+  END{exit !found}' <<< "$1"
+}
 route_prepare_profile() {
   local local_ip="$1" device="$2" gateway="$3" key="$1,$2,$3" path existing routes line prefix resolved_gw='-' current own_rule=''
   local prior_routes wanted=$'default 32767\n' metric
   route_numbers "$key" || return 1
   path="$LIB/routing/$ROUTE_TABLE"
-  ip -o -4 address show dev "$device" | awk '$3=="inet" {split($4,a,"/");print a[1]}' | grep -Fxq "$local_ip" || { echo "地址 $local_ip 未绑定在网卡 $device" >&2; return 1; }
-  routes="$(ip -N -4 route show table "$ROUTE_TABLE" 2>&1)" || {
-    [[ "$routes" == *'FIB table does not exist'* ]] || { echo "$routes" >&2; return 1; }; routes='';
+  route_read -o -4 address show dev "$device" || { echo "$ROUTE_READ_RESULT" >&2; return 1; }
+  awk '$3=="inet" {split($4,a,"/");print a[1]}' <<< "$ROUTE_READ_RESULT" | grep -Fxq "$local_ip" || { echo "地址 $local_ip 未绑定在网卡 $device" >&2; return 1; }
+  route_read -N -4 route show table "$ROUTE_TABLE" || {
+    [[ "$ROUTE_READ_RESULT" == *'FIB table does not exist'* ]] || { echo "$ROUTE_READ_RESULT" >&2; return 1; }; ROUTE_READ_RESULT='';
   }
-  existing="$(ip -N -4 -o rule show)" || return 1
+  routes="$ROUTE_READ_RESULT"
+  route_read -N -4 -o rule show || { echo "$ROUTE_READ_RESULT" >&2; return 1; }
+  existing="$ROUTE_READ_RESULT"
   existing="$(awk -v p="$ROUTE_PRIORITY:" '$1==p' <<< "$existing")"
   if [ -f "$path" ]; then
     [ "$(cat "$path")" = "$key" ] || { echo '路由表标识冲突' >&2; return 1; }
@@ -185,15 +259,20 @@ route_prepare_profile() {
     awk -v t="$ROUTE_TABLE" '{for(i=1;i<NF;i++)if($i=="lookup"&&$(i+1)==t)found=1} END{exit !found}' <<< "$line" && own_rule=1
   done <<< "$existing"
   mkdir -p "$LIB/routing" || return 1
-  printf '%s\n' "$key" > "$path.tmp" && mv "$path.tmp" "$path" || return 1
-  routes="$(ip -N -4 route show dev "$device" scope link)" || return 1
+  if [ ! -f "$path" ]; then
+    printf '%s\n' "$key" > "$path.tmp" && mv "$path.tmp" "$path" || return 1
+  fi
+  route_read -N -4 route show dev "$device" scope link || { echo "$ROUTE_READ_RESULT" >&2; return 1; }
+  routes="$ROUTE_READ_RESULT"
   while read -r prefix line; do
     [ -n "$prefix" ] && [ "$prefix" != default ] || continue
-    ip -4 route replace "$prefix" dev "$device" src "$local_ip" table "$ROUTE_TABLE" proto 242 || return 1
+    route_present "$prior_routes" "$prefix" 0 "$device" "$local_ip" '' '' ||
+      ip -4 route replace "$prefix" dev "$device" src "$local_ip" table "$ROUTE_TABLE" proto 242 || return 1
     wanted+="$prefix 0"$'\n'
   done <<< "$routes"
   if [ "$gateway" = - ]; then
-    routes="$(ip -N -4 route show default dev "$device")" || return 1
+    route_read -N -4 route show default dev "$device" || { echo "$ROUTE_READ_RESULT" >&2; return 1; }
+    routes="$ROUTE_READ_RESULT"
     while read -r line; do
       [ -n "$line" ] || continue
       current="$(awk '{for(i=1;i<NF;i++)if($i=="via")print $(i+1)}' <<< "$line")"
@@ -203,9 +282,11 @@ route_prepare_profile() {
     done <<< "$routes"
     gateway="$resolved_gw"
   fi
-  ip -4 route replace unreachable default metric 32767 table "$ROUTE_TABLE" proto 242 || return 1
+  route_present "$prior_routes" default 32767 '' '' '' unreachable ||
+    ip -4 route replace unreachable default metric 32767 table "$ROUTE_TABLE" proto 242 || return 1
   if [ "$gateway" != - ]; then
-    ip -4 route replace default via "$gateway" dev "$device" src "$local_ip" metric 10 table "$ROUTE_TABLE" proto 242 || return 1
+    route_present "$prior_routes" default 10 "$device" "$local_ip" "$gateway" '' ||
+      ip -4 route replace default via "$gateway" dev "$device" src "$local_ip" metric 10 table "$ROUTE_TABLE" proto 242 || return 1
     wanted+=$'default 10\n'
   fi
   # Remove withdrawn routes only after their replacements are in place.
@@ -224,7 +305,8 @@ route_prepare_profile() {
   fi
 }
 prepare_routes() {
-  local id proto port host target route ip result
+  local id proto port host target route ip result profile query
+  local -A prepared=() checked=() route_reads=()
   [ -f "$CONFIG" ] || return 0
   load_resolved
   while read -r id proto port host target route; do
@@ -232,12 +314,19 @@ prepare_routes() {
     route_fields "$route" || { echo '无效的地址路由配置' >&2; return 1; }
     if [ -n "$R_IN" ]; then route_prepare_profile "$R_IN" "$R_IDEV" "$R_IGW" || return 1; fi
     [ -n "$R_OUT" ] || continue
-    route_prepare_profile "$R_OUT" "$R_ODEV" "$R_OGW" || return 1
+    profile="$R_OUT,$R_ODEV,$R_OGW"
+    if [ -z "${prepared[$profile]:-}" ]; then
+      route_prepare_profile "$R_OUT" "$R_ODEV" "$R_OGW" || return 1
+      prepared["$profile"]=1
+    fi
     ip="$host"
     valid_ipv4 "$ip" || ip="${RCACHE[$host]:-}"
     valid_ipv4 "$ip" || { echo "缺少下一跳的地址缓存：$host" >&2; return 1; }
     route_numbers "$R_OUT,$R_ODEV,$R_OGW" || return 1
+    query="$profile/$ip"
+    [ -z "${checked[$query]:-}" ] || continue
     result="$(ip -4 route get "$ip" from "$R_OUT" mark "$ROUTE_MARK")" || return 1
+    checked["$query"]=1
     awk -v d="$R_ODEV" '{for(i=1;i<NF;i++)if($i=="dev"&&$(i+1)==d)ok=1} END{exit !ok}' <<< "$result" || { echo '所选出口无法路由到下一跳' >&2; return 1; }
   done < "$CONFIG"
 }
@@ -306,7 +395,7 @@ protos() {
 }
 
 # 域名 → IP 缓存，解析失败时沿用上次成功的结果
-declare -A RCACHE=()
+declare -A RCACHE=() LOOKUP_IP=() LOOKUP_STALE=()
 RCACHE_DIRTY=0
 load_resolved() {
   local h ip
@@ -329,16 +418,25 @@ save_resolved() {
 
 # 结果写入 RIP；RSTALE=1 表示本次解析失败，使用的是缓存
 resolve() {
-  local h="$1" ip
+  local h="$1" ip budget
   RIP="" RSTALE=0
   if [[ "$h" =~ ^[0-9.]+$ ]]; then
     valid_ipv4 "$h" || return 1
     RIP="$h"
     return 0
   fi
-  ip="$(getent ahostsv4 "$h" 2>/dev/null | awk '{ print $1; exit }')"
+  if [ "${LOOKUP_IP[$h]+present}" = present ]; then
+    RIP="${LOOKUP_IP[$h]}" RSTALE="${LOOKUP_STALE[$h]}"
+    [ -n "$RIP" ] || return 1
+    if [ "$RSTALE" = 0 ] && [ "${RCACHE[$h]:-}" != "$RIP" ]; then RCACHE["$h"]="$RIP"; RCACHE_DIRTY=1; fi
+    return 0
+  fi
+  budget="$(sync_time_left 3)" || return 1
+  ip="$(timeout --kill-after=1 "$budget" getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1 {print $1}')"
+  LOOKUP_IP["$h"]="" LOOKUP_STALE["$h"]=0
   if valid_ipv4 "$ip"; then
     RIP="$ip"
+    LOOKUP_IP["$h"]="$ip"
     if [ "${RCACHE[$h]:-}" != "$ip" ]; then
       RCACHE["$h"]="$ip"
       RCACHE_DIRTY=1
@@ -348,6 +446,20 @@ resolve() {
   [ -n "${RCACHE[$h]:-}" ] || return 1
   RIP="${RCACHE[$h]}"
   RSTALE=1
+  LOOKUP_IP["$h"]="$RIP" LOOKUP_STALE["$h"]=1
+}
+# Resolve once, before taking the firewall lock. render reuses this cycle's
+# results and still verifies interfaces/ports under the lock.
+warm_resolutions() {
+  local id proto port host target route
+  load_resolved
+  while read -r id proto port host target route; do
+    [ -n "$target" ] || continue
+    check_sync_deadline || return 1
+    resolve "$host" || true
+    if [ -n "$route" ] && route_fields "$route" && [ -n "$R_LISTEN" ]; then resolve "$R_LISTEN" || true; fi
+  done <<< "$1"
+  check_sync_deadline
 }
 
 # ---------------------------------------------------------------- 载荷加密
@@ -420,11 +532,10 @@ check_peer_ports() {
 # "ct status dnat" in ipt.sh FORWARD accept rules. No Python dependency here.
 check_native_ports() {
   command -v nft >/dev/null 2>&1 || return 0
-  local listing key proto port result
-  listing="$(nft -n list ruleset 2>/dev/null)" || { echo '端口检查失败：无法读取原生 nftables'; return 1; }
-  for key in "${!requested[@]}"; do
-    proto="${key%:*}" port="${key#*:}"
-    result="$(awk -v p="$proto" -v port="$port" '
+  local listing key wanted="" result
+  listing="$(read_command nft -n list ruleset 2>/dev/null)" || { echo '端口检查失败：无法读取原生 nftables'; return 1; }
+  for key in "${!requested[@]}"; do wanted+="${key/:/ }"$'\n'; done
+    result="$(awk -v wanted="$wanted" '
       function possible(line,    n,a,i,m,r,hit) {
         if (line ~ /tcp dport/ && p!="tcp") return 0
         if (line ~ /udp dport/ && p!="udp") return 0
@@ -475,11 +586,16 @@ check_native_ports() {
         rules[k,++count[k]]=line
       }
       END {
-        for (k in starts) if (visit(k)) exit
+        n=split(wanted,requests,"\n")
+        for(q=1;q<=n;q++) {
+          if(requests[q]=="") continue
+          split(requests[q],parts," "); p=parts[1]; port=parts[2]
+          for(k in visited) delete visited[k]
+          for(k in starts) if(visit(k)) exit
+        }
       }
     ' <<< "$listing")" || { echo '端口检查失败：无法解析原生 nftables'; return 1; }
     [ -z "$result" ] || { echo "$result"; return 1; }
-  done
 }
 
 # Receives a validated wire configuration; caller holds /run/ictl.lock throughout the apply.
@@ -502,7 +618,7 @@ check_port_conflicts() {
   if ! error="$(check_native_ports)"; then ERRS+=("$error"); return 1; fi
   d="$(mktemp -d "$LIB/ports.XXXXXX")" || { ERRS+=('端口检查失败：无法创建临时文件'); return 1; }
   for key in "${!requested[@]}"; do printf '%s\n' "${key/:/ }"; done > "$d/wanted"
-  if ! iptables-save > "$d/rules" 2> "$d/error"; then
+  if ! read_command iptables-save > "$d/rules" 2> "$d/error"; then
     rm -rf "$d"; ERRS+=('端口检查失败：无法读取防火墙规则'); return 1
   fi
   error="$(awk '
@@ -565,7 +681,7 @@ check_port_conflicts() {
   if [ "$rc" -ne 0 ]; then rm -rf "$d"; ERRS+=("${error:-端口检查失败：无法解析防火墙规则}"); return 1; fi
   for proto in tcp udp; do
     if [ "$proto" = tcp ]; then p=-lnt; else p=-aun; fi
-    if ! ss -H "$p" > "$d/sockets" 2> "$d/error"; then
+    if ! read_command ss -H "$p" > "$d/sockets" 2> "$d/error"; then
       rm -rf "$d"; ERRS+=('端口检查失败：无法读取本机端口，请检查 ss（iproute2）'); return 1
     fi
     while read -r -a columns; do
@@ -612,6 +728,7 @@ clean_legacy_persistence() {
 render() {
   local id proto lport host tport route p pre="" post="" fwd="" mangle="" in_match snat out_mark in_mark next_ip listen_ip local_addresses
   local -a incoming
+  local addresses_read=0
   load_resolved
   if [ -f "$CONFIG" ]; then
     while read -r id proto lport host tport route; do
@@ -629,7 +746,10 @@ render() {
           if ! resolve "$R_LISTEN"; then ERRS+=("rule $id receive address resolve failed: $R_LISTEN"); continue; fi
           [ "$RSTALE" -eq 1 ] && ERRS+=("rule $id receive address using cache: $R_LISTEN")
           listen_ip="$RIP"; RIP="$next_ip"
-          if ! local_addresses="$(ip -o -4 address show)"; then ERRS+=('无法读取本机地址'); continue; fi
+          if [ "$addresses_read" = 0 ]; then
+            if ! local_addresses="$(ip -o -4 address show)"; then ERRS+=('无法读取本机地址'); continue; fi
+            addresses_read=1
+          fi
           incoming=("-d $listen_ip")
           if ! awk -v ip="$listen_ip" '{split($4,a,"/");if(a[1]==ip)found=1} END{exit !found}' <<< "$local_addresses"; then
             incoming+=('-m addrtype --dst-type LOCAL')
@@ -799,14 +919,19 @@ apply_rules() {
   fi
   render
   [ "${#ERRS[@]}" -eq 0 ] || return 1
-  check_port_conflicts "$(cat "$CONFIG" 2>/dev/null)" || return 1
+  if [ "${PORTS_CHECKED:-0}" != 1 ]; then check_port_conflicts "$(cat "$CONFIG" 2>/dev/null)" || return 1; fi
+  check_sync_deadline || { ERRS+=("$R_ERR"); return 1; }
+  SYNC_COMMIT=1
   ensure_ip_forward
   if ! out="$(prepare_routes 2>&1)"; then ERRS+=("$out"); return 1; fi
   [ "${#ERRS[@]}" -eq 0 ] || return 1
-  previous="$(owned_snapshot)" || { ERRS+=("read iptables failed"); return 1; }
-  flags="$(jump_flags)"
+  if [ "${BEFORE_RULES+present}" = present ]; then previous="$BEFORE_RULES"; flags="$BEFORE_FLAGS"
+  else
+    previous="$(owned_snapshot)" || { ERRS+=("read iptables failed"); return 1; }
+    flags="$(jump_flags)"
+  fi
   if [ -f "$APPLIED" ] && printf '%s' "$RENDERED" | cmp -s - "$APPLIED" &&
-      [ -f "$KERNEL" ] && [ "$(cat "$KERNEL")" = "$previous" ] && jumps_ok; then
+      [ -f "$KERNEL" ] && [ "$(cat "$KERNEL")" = "$previous" ] && [ "$flags" = $'1\n1\n1\n1' ]; then
     prune_routes "$(current_route_profiles)" || { ERRS+=("清理旧路由失败"); return 1; }
     return 0
   fi
@@ -896,12 +1021,17 @@ local_apply() {
 # 发送一次加密请求：明文从标准输入读取，校验并解密后的响应写入文件 $1，$2 为超时秒数（默认 15）。
 # 输出 HTTP 状态码；响应校验失败时为 bad，连接失败时为 000
 send_request() {
-  local out="$1" d code req_tag size
+  local out="$1" d code req_tag size limit
   d="$(mktemp -d /run/ictl.XXXXXX)" || { echo 000; return; }
   aes | tail -c +9 > "$d/msg"
   req_tag="$(hmac_hex "$MK" < "$d/msg")"
   { cat "$d/msg"; hex2bin "$req_tag"; } | openssl base64 -A > "$d/req"
-  code="$(curl -sS --connect-timeout 5 --max-time "${2:-15}" -o "$d/body" -w '%{http_code}' \
+  limit="${2:-15}"
+  if [ "${SOURCE:-}" = wake ]; then
+    if [ "${PHASE:-}" = ack ]; then limit=5
+    else limit="$(sync_time_left "$limit")" || { rm -rf "$d"; echo 000; return; }; fi
+  fi
+  code="$(curl -sS --connect-timeout 5 --max-time "$limit" -o "$d/body" -w '%{http_code}' \
     -H 'Content-Type: text/plain' --data-binary @"$d/req" "$URL" 2>/dev/null)"
   if [ "$code" = "200" ]; then
     # 校验响应的 HMAC（绑定本次请求）后解密
@@ -1001,15 +1131,15 @@ acknowledge() {
 apply_snapshot() {
   local config="$1" generation="$2" mode="$3" dir old_mode="$MODE" old_gen="$R_GEN" old_v="$R_V" name snapshot flags
   ERRS=()
-  if ! check_port_conflicts "$config"; then
-    R_STATE=error R_ERR="${ERRS[0]}"
-    return 1
-  fi
+  if ! check_port_conflicts "$config"; then R_STATE=error R_ERR="${ERRS[0]}"; return 1; fi
+  local PORTS_CHECKED=1
+  check_sync_deadline || return 1
   dir="$(mktemp -d "$LIB/apply.XXXXXX")" || return 1
   for name in config applied kernel resolved state mode; do
     [ ! -f "$LIB/$name" ] || cp "$LIB/$name" "$dir/$name" || { rm -rf "$dir"; return 1; }
   done
   snapshot="$(owned_snapshot)" && flags="$(jump_flags)" || { rm -rf "$dir"; return 1; }
+  local BEFORE_RULES="$snapshot" BEFORE_FLAGS="$flags"
   if printf '%s\n' "$config" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"; then
     CFG_ERR=""; local_apply
   else
@@ -1038,7 +1168,10 @@ apply_snapshot() {
 }
 
 cycle() {
-  local request action config generation mode hash original_mode original_gen original_v
+  local request action config generation mode hash original_mode original_gen original_v request_started budget
+  LOOKUP_IP=() LOOKUP_STALE=() ROUTE_IDS=()
+  SYNC_COMMIT=0 SYNC_DEADLINE=-1
+  [ "${1:-auto}" != wake ] || SYNC_DEADLINE=$((SECONDS+30))
   mkdir -p "$LIB" || return 1
   load_state; load_mode || return 1
   NEW=0 CFG_ERR=""
@@ -1055,8 +1188,13 @@ cycle() {
   OP="$(openssl rand -hex 16)" || return 1
   request="$(mktemp /run/ictl.XXXXXX)" || return 1
   request_text "$R_STATE" > "$request"
+  request_started=$SECONDS
   if ! exchange < "$request"; then rm -f "$request"; save_state; return 1; fi
   rm -f "$request"
+  if [ "$SOURCE" = wake ]; then
+    budget="$(response_field apply_budget)"
+    if [[ "$budget" =~ ^[0-9]{1,2}$ ]] && [ "$budget" -le 30 ]; then SYNC_DEADLINE=$((request_started+10#$budget)); fi
+  fi
   action="$(response_field action)"
   if [ "$action" = switch ]; then err "请使用 sudo ictl --sync 安装主动 Agent"; return 22; fi
   if [ "$action" = pause ]; then
@@ -1071,7 +1209,7 @@ cycle() {
     save_state; return 1
   fi
   if [ "$action" = same ]; then
-    local_apply
+    warm_resolutions "$(cat "$CONFIG")" && with_lock local_apply
     if is_port_error "$R_ERR"; then BLOCK_GEN="$R_GEN" BLOCK_ERR="$R_ERR"; fi
     if [ -n "$BLOCK_GEN" ]; then R_STATE=error R_ERR="$BLOCK_ERR"; fi
     save_state || return 1
@@ -1093,7 +1231,7 @@ cycle() {
   if [ "$SOURCE" = auto ] && [ "$BLOCK_GEN" = "$generation" ]; then
     R_STATE=error R_ERR="$BLOCK_ERR"
   else
-    apply_snapshot "$config" "$generation" "$mode" || { R_STATE=error; R_ERR="${R_ERR:-local apply failed}"; }
+    warm_resolutions "$config" && with_lock apply_snapshot "$config" "$generation" "$mode" || { R_STATE=error; R_ERR="${R_ERR:-local apply failed}"; }
   fi
   if is_port_error "$R_ERR"; then BLOCK_GEN="$generation" BLOCK_ERR="$R_ERR"; fi
   # An error ACK identifies the attempted snapshot, while persistent state remains the previous one.
@@ -1168,7 +1306,13 @@ main() {
       [ ! -f "$LIB/switch-work/transaction" ] || return 1
       [ -f "$CONF_DIR/wake.conf" ] && grep -qx 'ENABLED=1' "$CONF_DIR/wake.conf" || return 1
       ACK_FILE="$LIB/wake-ack"
-      with_lock cycle wake
+      with_sync cycle wake
+      return $? ;;
+    --sync)
+      need_root || return 1
+      [ "$(cat "$LIB/agent-kind" 2>/dev/null)" = passive ] || return 1
+      [ ! -f "$LIB/switch-work/transaction" ] || return 1
+      with_sync cycle manual
       return $? ;;
     --apply-file)
       need_root || return 1

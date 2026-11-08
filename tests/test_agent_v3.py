@@ -239,6 +239,10 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
         ack=await ws.receive_json(timeout=3)
         self.assertEqual(ack['result'],'confirmed')
         self.assertEqual((await ws.receive_json(timeout=3))['type'],'ready')
+        # Slow telemetry queued before the receipt must not roll back status.
+        await ws.send_json(dict(type='status', session=session, generation=0, hash='', state='ok'))
+        await ws.send_json(dict(type='heartbeat', session=session))
+        self.assertEqual((await ws.receive_json(timeout=3))['type'], 'ready')
         query=asyncio.create_task(self.app['hub'].query(nid,dict(kind='inventory')))
         request=await ws.receive_json(timeout=3)
         self.assertEqual(request['type'],'query')

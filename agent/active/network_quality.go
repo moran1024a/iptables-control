@@ -251,6 +251,8 @@ type qualityMonitor struct {
 	workers        chan struct{}
 	mu             sync.Mutex
 	last           time.Time
+	setupCancel    context.CancelFunc
+	applying       bool
 	listenerMu     sync.Mutex
 	listener       *net.UDPConn
 	listenerPort   int
@@ -277,19 +279,28 @@ func (q *qualityMonitor) setup(a *Agent, body M) {
 // Stop a probe socket before applying a newly assigned forwarding port. Forwarding
 // wins even if a disable/port-change message and a config arrive in reverse order.
 func (q *qualityMonitor) applyConfig(a *Agent, c Config) error {
+	return q.applyContext(a, c, context.Background())
+}
+func (q *qualityMonitor) applyContext(a *Agent, c Config, ctx context.Context) error {
+	q.mu.Lock()
+	q.applying = true
+	if q.setupCancel != nil {
+		q.setupCancel()
+	}
+	q.mu.Unlock()
+	defer func() { q.mu.Lock(); q.applying = false; q.mu.Unlock() }()
 	q.listenerMu.Lock()
-	defer q.listenerMu.Unlock()
 	for _, r := range c.Rules {
 		if q.listener != nil && r.Port == q.listenerPort && r.Protocol != "tcp" {
 			q.listener.Close()
 			q.listener = nil
-			status := M{"type": "quality_listener", "id": q.listenerStatus["id"], "port": q.listenerPort,
-				"error": "探测端口与新转发规则冲突，已停止探测"}
-			_ = q.send(status)
+			status := M{"type": "quality_listener", "id": q.listenerStatus["id"], "port": q.listenerPort, "error": "探测端口与新转发规则冲突，已停止探测"}
+			go func() { _ = q.send(status) }()
 			break
 		}
 	}
-	return a.apply(c)
+	q.listenerMu.Unlock()
+	return a.applyContext(ctx, c)
 }
 
 func (q *qualityMonitor) run() {
@@ -313,13 +324,27 @@ func (q *qualityMonitor) run() {
 			}
 			status := M{"type": "quality_listener", "id": body["id"], "port": port, "error": ""}
 			q.listenerMu.Lock()
+			q.mu.Lock()
+			if q.applying {
+				q.mu.Unlock()
+				q.listenerMu.Unlock()
+				status["error"] = "配置正在应用，稍后重试探测监听"
+				if q.ctx.Err() == nil {
+					_ = q.send(status)
+				}
+				continue
+			}
+			work, cancel := context.WithTimeout(q.ctx, 2*time.Second)
+			q.setupCancel = cancel
+			q.mu.Unlock()
+			a.prepareCtx = work
 			if q.listener != nil {
 				q.listener.Close()
 				q.listener = nil
 			}
 			q.listenerPort, q.listenerStatus = port, status
 			if port != 0 {
-				err = a.locked(func() error {
+				err = a.lockedContext(work, func() error {
 					if q.ctx.Err() != nil {
 						return q.ctx.Err()
 					}
@@ -351,6 +376,10 @@ func (q *qualityMonitor) run() {
 					status["error"] = err.Error()
 				}
 			}
+			q.mu.Lock()
+			q.setupCancel = nil
+			cancel()
+			q.mu.Unlock()
 			q.listenerMu.Unlock()
 			if q.ctx.Err() == nil {
 				_ = q.send(status)
@@ -383,7 +412,7 @@ func (q *qualityMonitor) probeWithAgent(a *Agent, body M) {
 		}
 	}
 	// Bind route probes to an installed rule before starting asynchronous I/O.
-	// The session owns the state mutex while processing this message.
+	// The caller provides an immutable configuration snapshot.
 	if id := int64(number(body["rule_id"])); id != 0 {
 		valid := false
 		if a != nil && readText(a.path("paused")) == "" {

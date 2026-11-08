@@ -11,6 +11,25 @@ class PassiveTests(AgentHarness,unittest.TestCase):
 
     def tearDown(self):self.temp.cleanup()
 
+    def test_dns_is_resolved_once_before_rule_lock(self):
+        getent = self.bin/'getent'
+        getent.write_text('#!/bin/sh\necho lookup >> "$MOCK_ROOT/dns-count"\necho "192.0.2.1 STREAM example.test"\n')
+        getent.chmod(0o755)
+        self.assertShell("""printf 'v=abc\\n1 both 10001 example.test 443\\n2 tcp 10002 example.test 443\\n' > "$CONFIG"
+warm_resolutions "$(cat "$CONFIG")" || exit 1
+with_lock local_apply
+[ "$R_STATE" = ok ]
+""")
+        self.assertEqual((self.root/'dns-count').read_text().splitlines(), ['lookup'])
+
+    def test_expired_preparation_never_changes_rules(self):
+        self.assertShell("""SYNC_DEADLINE=0
+! with_lock apply_snapshot $'v=abc\\n1 both 10001 192.0.2.1 443' 1 passive || exit 1
+[ "$R_STATE" = error ]
+""")
+        self.assertFalse((self.root/'kernel.json').exists())
+        self.assertFalse((self.lib/'config').exists())
+
     def test_new_receive_and_source_route_format(self):
         self.assertShell('''
 route_fields 'v2,198.18.0.7,-,-,-' || exit 1
@@ -38,6 +57,65 @@ for key in '10.0.0.95,eth0,-' '10.0.0.108,eth0,-'; do
   ! route_policy_owned "$ROUTE_PRIORITY: from all fwmark $mark/0xffffff00 lookup $ROUTE_TABLE proto 242" || exit 1
   ! route_policy_owned "${rule/proto 242/proto 4}" || exit 1
 done
+''')
+
+    def test_route_noop_requires_exact_owned_route(self):
+        self.assertShell('''
+line='default via 10.0.0.1 dev eth0 proto 242 src 10.0.0.2 metric 10'
+route_present "$line" default 10 eth0 10.0.0.2 10.0.0.1 '' || exit 1
+for changed in "${line/10.0.0.1/10.0.0.9}" "${line/10.0.0.2/10.0.0.3}" "${line/eth0/eth1}" "${line/proto 242/proto 4}" "$line onlink" "$line mtu 1400"; do
+  ! route_present "$changed" default 10 eth0 10.0.0.2 10.0.0.1 '' || exit 1
+done
+route_present '10.0.0.0/24 dev eth0 proto 242 scope link src 10.0.0.2' 10.0.0.0/24 0 eth0 10.0.0.2 '' '' || exit 1
+route_present 'unreachable default proto 242 metric 32767' default 32767 '' '' '' unreachable || exit 1
+route_present '7 default proto 242 metric 32767' default 32767 '' '' '' unreachable
+''')
+
+    def test_route_preparation_reuses_reads_but_rechecks_next_sync(self):
+        self.assertShell('''
+mkdir -p "$LIB/routing"
+: > "$MOCK_ROOT/policies"
+for source in 10.0.0.2 10.0.0.3; do
+  key="$source,test0,-"; route_numbers "$key"
+  printf '%s\\n' "$key" > "$LIB/routing/$ROUTE_TABLE"
+  printf -v mark '0x%x' "$ROUTE_MARK"
+  printf '%s: from all fwmark %s lookup %s proto 242\\n' "$ROUTE_PRIORITY" "$mark" "$ROUTE_TABLE" >> "$MOCK_ROOT/policies"
+  printf '10.0.0.0/24 dev test0 proto 242 scope link src %s\\ndefault via 10.0.0.1 dev test0 proto 242 src %s metric 10\\nunreachable default proto 242 metric 32767\\n' "$source" "$source" > "$MOCK_ROOT/table-$ROUTE_TABLE"
+done
+printf 'v=abc\\n1 tcp 10001 192.0.2.1 443 v2,198.18.0.1,10.0.0.2,test0,-\\n2 tcp 10002 192.0.2.2 443 v2,198.18.0.1,10.0.0.3,test0,-\\n' > "$CONFIG"
+cat() {
+  case "$1" in /proc/sys/net/ipv4/conf/*/rp_filter) echo 0 ;; *) command cat "$@" ;; esac
+}
+ip() {
+  printf '%s\\n' "$*" >> "$MOCK_ROOT/ip-calls"
+  case "$*" in
+    '-o -4 address show dev test0') printf '1: test0 inet 10.0.0.2/24 scope global test0\\n1: test0 inet 10.0.0.3/24 scope global test0\\n' ;;
+    '-N -4 -o rule show') cat "$MOCK_ROOT/policies" ;;
+    '-N -4 route show table '*) cat "$MOCK_ROOT/table-${@: -1}" ;;
+    '-N -4 route show dev test0 scope link') echo '10.0.0.0/24 dev test0 proto kernel scope link' ;;
+    '-N -4 route show default dev test0') echo 'default via 10.0.0.1 dev test0' ;;
+    '-4 route get '*) echo '192.0.2.1 via 10.0.0.1 dev test0' ;;
+    '-4 route replace '*) [ -f "$MOCK_ROOT/allow-repair" ] ;;
+    *) echo "unexpected ip $*" >&2; return 1 ;;
+  esac
+}
+prepare_routes || exit 1
+[ "$(grep -c -- '-N -4 -o rule show' "$MOCK_ROOT/ip-calls")" = 1 ] || exit 1
+[ "$(grep -c -- '-o -4 address show dev test0' "$MOCK_ROOT/ip-calls")" = 1 ] || exit 1
+[ "$(grep -c -- '-N -4 route show dev test0 scope link' "$MOCK_ROOT/ip-calls")" = 1 ] || exit 1
+[ "$(grep -c -- '-N -4 route show default dev test0' "$MOCK_ROOT/ip-calls")" = 1 ] || exit 1
+! grep -q 'replace' "$MOCK_ROOT/ip-calls" || exit 1
+# A subsequent sync must observe and repair a changed route, despite identical config.
+route_numbers '10.0.0.2,test0,-'
+sed -i 's/via 10.0.0.1 /via 10.0.0.9 /' "$MOCK_ROOT/table-$ROUTE_TABLE"
+touch "$MOCK_ROOT/allow-repair"
+prepare_routes || exit 1
+[ "$(grep -c -- '-N -4 -o rule show' "$MOCK_ROOT/ip-calls")" = 2 ] || exit 1
+[ "$(grep -c -- '-4 route replace default via 10.0.0.1 dev test0 src 10.0.0.2' "$MOCK_ROOT/ip-calls")" = 1 ] || exit 1
+# Foreign routes must still prevent application.
+route_numbers '10.0.0.2,test0,-'
+sed -i 's/proto 242/proto 4/g' "$MOCK_ROOT/table-$ROUTE_TABLE"
+! prepare_routes
 ''')
 
     def test_clear_removes_only_owned_tcp_and_udp_connections(self):

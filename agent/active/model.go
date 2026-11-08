@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-const version = "0.6.0-rc.4"
+const version = "0.6.0-rc.5"
 const tableName = "ictl_active"
 
 type M = map[string]any
@@ -47,7 +47,12 @@ type Config struct {
 	Epoch      string `json:"epoch"`
 }
 type Agent struct {
-	stateMu        *sync.Mutex // Shared by control and local maintenance; snapshots are read-only.
+	stateMu        *sync.Mutex // Serializes rule application and published state only.
+	maintenance    *maintenanceWork
+	prepareCtx     context.Context
+	dns            map[string]dnsResult
+	nftPlan        *nftRulePlan
+	kernelSnapshot *nftSnapshot
 	root           string
 	url            string
 	key            string
@@ -123,6 +128,24 @@ func atomicJSON(path string, v any) error {
 	}
 	return atomicBytes(path, append(b, '\n'), 0600)
 }
+
+// Skip redundant durable writes, but repair missing files or permissions.
+func atomicBytesChanged(path string, data []byte, mode os.FileMode) error {
+	if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, data) {
+		if info, err := os.Stat(path); err == nil && info.Mode().Perm() == mode {
+			return nil
+		}
+	}
+	return atomicBytes(path, data, mode)
+}
+func atomicJSONChanged(path string, v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return atomicBytesChanged(path, append(b, '\n'), 0600)
+}
+
 func command(ctx context.Context, input []byte, name string, args ...string) ([]byte, error) {
 	c := exec.CommandContext(ctx, name, args...)
 	c.Stdin = bytes.NewReader(input)
@@ -153,6 +176,12 @@ func run(input []byte, name string, args ...string) ([]byte, error) {
 	return command(ctx, input, name, args...)
 }
 func (a *Agent) locked(fn func() error) error {
+	return a.lockedContext(context.Background(), fn)
+}
+func (a *Agent) lockedContext(ctx context.Context, fn func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if os.Getenv("ICTL_LOCK_HELD") == "1" {
 		return fn()
 	}
@@ -174,7 +203,11 @@ func (a *Agent) locked(fn func() error) error {
 		if !errors.Is(e, syscall.EWOULDBLOCK) || time.Now().After(deadline) {
 			return fmt.Errorf("规则锁: %w", e)
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	return fn()
@@ -307,9 +340,12 @@ func protocols(r Rule) []string {
 	return []string{r.Protocol}
 }
 func (a *Agent) resolve(c *Config) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(a.preparationContext(), 10*time.Second)
 	defer cancel()
 	resolved := map[string]string{}
+	if a.dns == nil {
+		a.dns = map[string]dnsResult{}
+	}
 	cached := map[string]string{}
 	for _, old := range a.config.Rules {
 		if net.ParseIP(old.IP).To4() != nil {
@@ -327,10 +363,18 @@ func (a *Agent) resolve(c *Config) error {
 		if ip := resolved[host]; ip != "" {
 			return ip, nil
 		}
+		if entry := a.dns[host]; entry.ip != "" && time.Now().Before(entry.expires) {
+			resolved[host] = entry.ip
+			return entry.ip, nil
+		}
 		ips, e := net.DefaultResolver.LookupIP(ctx, "ip4", host)
 		if e == nil && len(ips) > 0 {
 			resolved[host] = ips[0].To4().String()
+			a.dns[host] = dnsResult{resolved[host], time.Now().Add(time.Minute)}
 			return resolved[host], nil
+		}
+		if err := a.preparationContext().Err(); err != nil {
+			return "", err
 		}
 		if net.ParseIP(cached[host]).To4() == nil {
 			return "", fmt.Errorf("DNS 解析失败: %s", host)
@@ -350,6 +394,11 @@ func (a *Agent) resolve(c *Config) error {
 			if r.ListenIP, err = lookup(route.Listen); err != nil {
 				return err
 			}
+		}
+	}
+	for host := range a.dns {
+		if _, ok := resolved[host]; !ok {
+			delete(a.dns, host)
 		}
 	}
 	return nil

@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.6.0-rc.4"
+VERSION="0.6.0-rc.5"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -181,6 +181,9 @@ perform_sync() (
   trap 'exit 143' TERM
   sync_transaction "$@"
 )
+component_matches() {
+  [[ "$2" =~ ^[0-9a-f]{64}$ ]] && [ -f "$1" ] && [ "$(sha256_hex < "$1")" = "$2" ]
+}
 sync_transaction() {
   local wanted="${1:-}" artifact digest manager_digest helper_digest old_kind item
   local failed_active=0
@@ -214,6 +217,18 @@ sync_transaction() {
   if [ -f "$LIB/agent-kind" ]; then read -r FROM < "$LIB/agent-kind"
   elif [ -f "$UNIT" ] || [ -f "$LIB/config" ]; then die '缺少 Agent 类型标识；请先升级到 0.5.3 后再迁移'; return 1; fi
   [ "${UPDATE_ONLY:-0}" != 1 ] || [ "$FROM" = "$TARGET" ] || { die '更新不能转换 Agent 类型；请使用 --sync 确认切换'; return 1; }
+  # Ordinary passive sync keeps the installed components and service intact.
+  # Missing metadata or an unfinished handover always takes the full path.
+  if [ "$FROM" = passive ] && [ "$TARGET" = passive ] && [ "$(field installed)" = passive ] &&
+      [ "${UPDATE_ONLY:-0}" != 1 ] && [ ! -f "$WORK/transaction" ] &&
+      [ -f "$UNIT" ] && grep -Fxq "ExecStart=$PKG/passive.sh --daemon" "$UNIT" &&
+      [ "$(cat "$LIB/mode" 2>/dev/null)" = passive ] &&
+      [ "$(field installation_id)" = "$(cat "$LIB/installation-id" 2>/dev/null)" ] &&
+      component_matches "$PKG/passive.sh" "$(field passive_sha256)" &&
+      component_matches /usr/local/bin/ictl "$(field manager_sha256)"; then
+    bash "$PKG/passive.sh" --sync
+    return $?
+  fi
   rpc prepare || return 1
   OP="$(field op)" GEN="$(field generation)" HASH="$(field v)" NEW_VERSION="$(field version)"
   SYNC_PREPARED=1
@@ -387,6 +402,7 @@ main() {
   if [ "$action" != --status ] && [ "${ICTL_MANAGER_LOCK_HELD:-0}" != 1 ]; then
     exec 8>/run/ictl-manager.lock
     flock -n 8 || { die '另一项安装或同步正在执行'; return 1; }
+    export ICTL_MANAGER_LOCK_HELD=1
     # The menu may have remained open while another operation changed identity.
     read_identity || return 1
   fi

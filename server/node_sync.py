@@ -95,7 +95,7 @@ def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observ
         source not in ("manual", "auto", "wake") or phase not in ("begin", "poll", "ack", "asset")
     ):
         raise errors.UserError("无效同步阶段")
-    if source == "wake" and phase != "ack" and (not wake.authorized(conn, node, fields)):
+    if source == "wake" and phase != "ack" and (not wake.authorized(conn, node, fields, now)):
         return "proto=2\naction=pause\nmode=passive\n"
     au = {"0": 0, "1": 1}.get(fields.get("au"))
     if observe:
@@ -249,4 +249,8 @@ def sync_report(conn, node, fields, source_ip, now=None, *, observe=True, observ
                 (now, node["id"]),
             )
             lifecycle.add_event(conn, node["id"], "手动同步开始", now)
-    return f"proto=2\naction=apply\nop={opid}\ngeneration={op['generation']}\nmode={op['mode']}\nv={op['hash']}\n{op['rules']}\n"
+    budget = ""
+    if source == "wake":
+        job = conn.execute("SELECT started FROM wake_jobs WHERE node_id=?", (node["id"],)).fetchone()
+        budget = f"apply_budget={max(0, job['started'] + wake.TIMEOUT - now)}\n"
+    return f"proto=2\naction=apply\nop={opid}\ngeneration={op['generation']}\nmode={op['mode']}\n{budget}v={op['hash']}\n{op['rules']}\n"

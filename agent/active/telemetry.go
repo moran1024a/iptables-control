@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -34,10 +35,18 @@ var counterRE = regexp.MustCompile(`^r([0-9]+)_(tcp|udp)_(up|down)_([a-f0-9]{32}
 func uintText(n uint64) string  { return strconv.FormatUint(n, 10) }
 func parseUint(s string) uint64 { n, _ := strconv.ParseUint(s, 10, 64); return n }
 func (a *Agent) sample() error {
+	readAt := time.Now()
 	doc, exists, e := a.nftState()
 	if e != nil {
 		return e
 	}
+	return a.sampleState(doc, exists, readAt)
+}
+func (a *Agent) sampleState(doc M, exists bool, readAt time.Time) error {
+	c := a.config
+	c.Rules = append([]Rule(nil), c.Rules...)
+	c.Retired = append([]Rule(nil), c.Retired...)
+	a.kernelSnapshot = &nftSnapshot{config: c, doc: doc, exists: exists, at: readAt}
 	if !exists {
 		for _, u := range a.usage {
 			if u.Active {
@@ -45,7 +54,7 @@ func (a *Agent) sample() error {
 				u.Quality = "统计缺口：内核计数器丢失"
 			}
 		}
-		return atomicJSON(a.path("active/traffic.json"), a.usage)
+		return atomicJSONChanged(a.path("active/traffic.json"), a.usage)
 	}
 	type value struct {
 		id                               int64
@@ -78,14 +87,14 @@ func (a *Agent) sample() error {
 			item.downPackets = number(v["packets"])
 		}
 	}
-	for _, v := range values {
-		var use *Usage
-		for _, u := range a.usage {
-			if u.Active && u.RuleID == v.id && u.Protocol == v.protocol && u.KernelEpoch == v.epoch {
-				use = u
-				break
-			}
+	active := map[string]*Usage{}
+	for _, u := range a.usage {
+		if u.Active {
+			active[fmt.Sprintf("%d/%s/%s", u.RuleID, u.Protocol, u.KernelEpoch)] = u
 		}
+	}
+	for key, v := range values {
+		use := active[key]
 		quality := "ok"
 		if a.quality != "" {
 			quality = a.quality
@@ -141,7 +150,7 @@ func (a *Agent) sample() error {
 			u.Quality = "统计缺口：计数器消失或系统重启"
 		}
 	}
-	return atomicJSON(a.path("active/traffic.json"), a.usage)
+	return atomicJSONChanged(a.path("active/traffic.json"), a.usage)
 }
 func (a *Agent) traffic() []Usage {
 	out := []Usage{}
@@ -153,7 +162,13 @@ func (a *Agent) traffic() []Usage {
 		out = append(out, row)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return fmt.Sprintf("%d%s%s", out[i].RuleID, out[i].Protocol, out[i].Epoch) < fmt.Sprintf("%d%s%s", out[j].RuleID, out[j].Protocol, out[j].Epoch)
+		if out[i].RuleID != out[j].RuleID {
+			return out[i].RuleID < out[j].RuleID
+		}
+		if out[i].Protocol != out[j].Protocol {
+			return out[i].Protocol < out[j].Protocol
+		}
+		return out[i].Epoch < out[j].Epoch
 	})
 	return out
 }
@@ -246,10 +261,16 @@ func (a *Agent) metrics() M {
 	result["traffic_quality"] = a.quality
 	return result
 }
-func (a *Agent) inventory() M {
+func (a *Agent) inventory() M { return a.inventoryCached("") }
+func (a *Agent) inventoryCached(nftVersion string) M {
 	result := M{"sampled_at": time.Now().UnixMilli(), "version": version, "os": readText("/etc/os-release"), "kernel": readText("/proc/sys/kernel/osrelease"), "arch": runtime.GOARCH, "cpus": runtime.NumCPU(), "boot_id": a.boot, "installation_id": a.installation, "backend": "nftables", "cgroup": readText("/proc/self/cgroup")}
-	if b, e := run(nil, "nft", "--version"); e == nil {
-		result["nft_version"] = strings.TrimSpace(string(b))
+	if nftVersion == "" {
+		if b, e := run(nil, "nft", "--version"); e == nil {
+			nftVersion = strings.TrimSpace(string(b))
+		}
+	}
+	if nftVersion != "" {
+		result["nft_version"] = nftVersion
 	}
 	if ifaces, e := net.Interfaces(); e == nil {
 		rows := []M{}
@@ -435,4 +456,187 @@ func (a *Agent) queryContext(parent context.Context, body M) M {
 		return M{"sampled_at": time.Now().UnixMilli(), "error": "结果过大，请缩小查询范围", "truncated": true}
 	}
 	return out
+}
+
+// Only absolute cumulative values travel on the wire. A reconnect creates a
+// fresh ledger, so loss of either a report or its ACK cannot lose increments.
+type trafficLedger struct {
+	mu      sync.Mutex
+	acked   map[string]Usage
+	pending map[string]trafficReport
+}
+type trafficReport struct {
+	id  string
+	row Usage
+}
+
+func usageKey(u Usage) string { return fmt.Sprintf("%d/%s/%s", u.RuleID, u.Protocol, u.Epoch) }
+func sameUsage(a, b Usage) bool {
+	return a.Up == b.Up && a.Down == b.Down && a.UpPackets == b.UpPackets && a.DownPackets == b.DownPackets && a.Quality == b.Quality
+}
+func (l *trafficLedger) send(rows []Usage, send func(M) error) error {
+	l.mu.Lock()
+	if l.acked == nil {
+		l.acked = map[string]Usage{}
+		l.pending = map[string]trafficReport{}
+	}
+	current := map[string]bool{}
+	changed := make([]Usage, 0, len(rows))
+	for _, row := range rows {
+		key := usageKey(row)
+		current[key] = true
+		if old, ok := l.acked[key]; !ok || !sameUsage(old, row) {
+			changed = append(changed, row)
+		}
+	}
+	for key := range l.acked {
+		if !current[key] {
+			delete(l.acked, key)
+			delete(l.pending, key)
+		}
+	}
+	l.mu.Unlock()
+	for start := 0; start < len(changed); start += 1000 {
+		batch := changed[start:min(start+1000, len(changed))]
+		id := randomID()
+		l.mu.Lock()
+		for _, row := range batch {
+			l.pending[usageKey(row)] = trafficReport{id, row}
+		}
+		l.mu.Unlock()
+		if err := send(M{"type": "traffic", "id": id, "data": batch}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (l *trafficLedger) acknowledge(a *Agent, msg M) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	changed := false
+	for _, item := range array(msg["data"]) {
+		row, _ := item.(map[string]any)
+		key := fmt.Sprintf("%d/%s/%s", number(row["rule_id"]), row["protocol"], row["epoch"])
+		report, ok := l.pending[key]
+		if !ok || report.id != msg["id"] {
+			continue
+		}
+		u := report.row
+		if row["up"] != u.Up || row["down"] != u.Down || row["up_packets"] != u.UpPackets || row["down_packets"] != u.DownPackets {
+			continue
+		}
+		l.acked[key] = u
+		delete(l.pending, key)
+		if current := a.usage[key]; current != nil && !current.Active && sameUsage(*current, u) {
+			delete(a.usage, key)
+			changed = true
+		}
+	}
+	if changed {
+		return atomicJSONChanged(a.path("active/traffic.json"), a.usage)
+	}
+	return nil
+}
+
+// A counter may become archived after its last active value was acknowledged.
+// Retire it without waiting for another identical report; its values are
+// already durable on the server. The caller holds the agent state mutex.
+func (l *trafficLedger) prune(a *Agent) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	changed := false
+	for key, u := range a.usage {
+		if prior, ok := l.acked[key]; ok && !u.Active && sameUsage(*u, prior) {
+			delete(a.usage, key)
+			delete(l.acked, key)
+			delete(l.pending, key)
+			changed = true
+		}
+	}
+	if changed {
+		return atomicJSONChanged(a.path("active/traffic.json"), a.usage)
+	}
+	return nil
+}
+
+// Slow read-only collection runs outside the configuration mutex. Suppress a
+// health snapshot if rules changed while it was being collected.
+func (a *Agent) collect(ctx context.Context, ready <-chan struct{}, ledger *trafficLedger, send func(M) error, interval time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-ready:
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	metrics := a.snapshot()
+	count := 0
+	nftVersion := ""
+	lastHealth := time.Time{}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+		snapshot := a.snapshot()
+		count++
+		var health M
+		if cached := snapshot.freshNFT(lastHealth); cached != nil {
+			health = snapshot.forwardingHealthState(cached.doc, cached.exists, nil)
+			lastHealth = cached.at
+		} else {
+			lastHealth = time.Now()
+			health = snapshot.forwardingHealth()
+		}
+		metrics.stateError, metrics.quality = snapshot.stateError, snapshot.quality
+		measured := metrics.metrics()
+		a.stateMu.Lock()
+		if err := ctx.Err(); err != nil {
+			a.stateMu.Unlock()
+			return err
+		}
+		// Preserve rate baselines across reconnects without holding the state
+		// mutex during /proc reads. A cancelled old collector cannot publish.
+		a.lastCPU, a.lastCPUParts = metrics.lastCPU, metrics.lastCPUParts
+		a.lastProcessCPU, a.lastMetrics = metrics.lastProcessCPU, metrics.lastMetrics
+		a.lastNet = metrics.lastNet
+		if err := ledger.prune(a); err != nil {
+			a.stateMu.Unlock()
+			return err
+		}
+		current := sameConfig(snapshot.config, a.config)
+		state, errorText := "ok", a.stateError
+		if errorText != "" {
+			state = "error"
+		}
+		rows := a.traffic()
+		a.stateMu.Unlock()
+		if current {
+			if err := send(M{"type": "status", "generation": snapshot.config.Generation, "hash": snapshot.config.Hash, "state": state, "error": errorText, "auto_update": snapshot.autoUpdate, "held_ports": snapshot.heldPorts(), "forwarding": health}); err != nil {
+				return err
+			}
+		}
+		if err := send(M{"type": "metrics", "data": measured}); err != nil {
+			return err
+		}
+		if err := ledger.send(rows, send); err != nil {
+			return err
+		}
+		if count == 1 || count%6 == 0 {
+			inventory := snapshot.inventoryCached(nftVersion)
+			nftVersion, _ = inventory["nft_version"].(string)
+			if err := send(M{"type": "inventory", "data": inventory}); err != nil {
+				return err
+			}
+		}
+		if count == 1 || count%3 == 0 {
+			readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			ports := snapshot.portSnapshot(readCtx, false)
+			cancel()
+			if err := send(M{"type": "ports", "data": ports}); err != nil {
+				return err
+			}
+		}
+	}
 }

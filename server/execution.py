@@ -510,9 +510,11 @@ class Monitor:
         self.failover = failover.Engine()
         self.hub = hub
         self.task = None
+        self.event = asyncio.Event()
 
     async def run(self):
         while True:
+            self.event.clear()
             try:
                 def cycle(c):
                     self.failover.tick(c)
@@ -523,7 +525,10 @@ class Monitor:
                 raise
             except Exception:
                 logging.exception("configuration execution")
-            await asyncio.sleep(1)
+            try:
+                await asyncio.wait_for(self.event.wait(), 1)
+            except asyncio.TimeoutError:
+                pass
 
     def start(self):
         self.task = asyncio.create_task(self.run())
