@@ -118,9 +118,9 @@ def sections(c, link, nodes, expand=True, configuration=None):
             explicit = bool(plan.get('routing'))
             if explicit and source in by_node:
                 route = node_addresses.rule_route(c, by_node[source]['id'])
-                fields = route.split(',') if route else []
-                if len(fields) == 6:
-                    spec['source_route'] = ','.join((fields[1], fields[3], fields[5]))
+                source_route = node_addresses.source_route(route)
+                if source_route:
+                    spec['source_route'] = source_route
                 if peer and not terminal:
                     index = expected.index(peer)
                     spec['host'] = plan['hop_addresses'][index]

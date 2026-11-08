@@ -18,9 +18,13 @@ import (
 // A profile is a local source address and its explicitly selected network.
 // The same on-disk format is used by the Bash agent during handover.
 type routeProfile struct{ Local, Device, Gateway string }
-type ruleRoute struct{ In, Out routeProfile }
+type ruleRoute struct {
+	In, Out routeProfile
+	Listen  string
+}
 
 var deviceRE = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,15}$`)
+var listenRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]*$`)
 
 func parseRoute(value string) (ruleRoute, error) {
 	var r ruleRoute
@@ -28,6 +32,23 @@ func parseRoute(value string) (ruleRoute, error) {
 		return r, nil
 	}
 	p := strings.Split(value, ",")
+	if len(p) == 5 && p[0] == "v2" {
+		if len(p[1]) > 253 || !listenRE.MatchString(p[1]) {
+			return r, errors.New("无效的接收地址")
+		}
+		r.Listen = p[1]
+		if p[2] == "-" && p[3] == "-" && p[4] == "-" {
+			return r, nil
+		}
+		if p[2] == "-" || p[3] == "-" {
+			return r, errors.New("指定出口缺少源 IP 或网卡")
+		}
+		// Reuse the legacy profile validator; receiving itself has no local
+		// interface prerequisite. Only a selected source needs this profile.
+		legacy, err := parseRoute(strings.Join([]string{p[2], p[2], p[3], p[3], p[4], p[4]}, ","))
+		r.Out = legacy.Out
+		return r, err
+	}
 	if len(p) != 6 {
 		return r, errors.New("无效的地址路由配置")
 	}
@@ -47,7 +68,8 @@ func parseRoute(value string) (ruleRoute, error) {
 	r.Out = routeProfile{p[1], p[3], p[5]}
 	return r, nil
 }
-func (p routeProfile) key() string { return p.Local + "," + p.Device + "," + p.Gateway }
+func (p routeProfile) enabled() bool { return p.Local != "" }
+func (p routeProfile) key() string   { return p.Local + "," + p.Device + "," + p.Gateway }
 func (p routeProfile) table() int {
 	h := sha256.Sum256([]byte(p.key()))
 	n, _ := strconv.ParseInt(hex.EncodeToString(h[:])[:5], 16, 32)
@@ -229,8 +251,11 @@ func profiles(c Config) map[string]routeProfile {
 	for _, r := range append(append([]Rule{}, c.Rules...), c.Retired...) {
 		if r.Route != "" {
 			route, _ := parseRoute(r.Route)
-			out[route.In.key()] = route.In
-			out[route.Out.key()] = route.Out
+			for _, p := range []routeProfile{route.In, route.Out} {
+				if p.enabled() {
+					out[p.key()] = p
+				}
+			}
 		}
 	}
 	return out
@@ -244,6 +269,9 @@ func (a *Agent) prepareRoutes(c Config) error {
 	for _, r := range c.Rules {
 		if r.Route != "" {
 			route, _ := parseRoute(r.Route)
+			if !route.Out.enabled() {
+				continue
+			}
 			rows, e := ipJSON("route", "get", r.IP, "from", route.Out.Local, "mark", fmt.Sprint(route.Out.mark()))
 			if e != nil {
 				return e

@@ -582,7 +582,8 @@ def begin(c, link, plan, selected, path, reason, previous=None, *, update_plan=T
     new = []
     for index, nid in enumerate(path):
         n = database.get_node(c, nid)
-        if routes and agent_v3.newer("0.5.1-rc.1", n["agent"] or "0.0.0"):
+        required_agent = '0.5.3' if routes and routes[index].startswith('v2,') else '0.5.1-rc.1'
+        if routes and agent_v3.newer(required_agent, n["agent"] or "0.0.0"):
             raise errors.UserError(f"请先更新节点 {n['name']} 的 Agent，以支持指定 IP 转发")
         if n["deleting"] or n["manual_required"]:
             raise errors.UserError(f"{n['name']} 正在删除或等待模式确认")

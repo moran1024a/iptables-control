@@ -34,7 +34,9 @@ func connMatch(r Rule, p string) []any {
 	expr := []any{match(meta("l4proto"), p), M{"match": M{"op": "in", "left": ct("status", ""), "right": "dnat"}}, match(ct("proto-dst", "original"), r.Port), match(ct("saddr", "reply"), r.IP), match(ct("proto-src", "reply"), r.TargetPort)}
 	if r.Route != "" {
 		route, _ := parseRoute(r.Route)
-		expr = append(expr, match(ct("daddr", "original"), route.In.Local))
+		if route.In.enabled() {
+			expr = append(expr, match(ct("daddr", "original"), route.In.Local))
+		}
 	}
 	return expr
 }
@@ -228,9 +230,19 @@ func (a *Agent) transaction(c Config, current M, exists bool) M {
 	}
 	for _, r := range c.Rules {
 		for _, p := range protocols(r) {
-			expr := []any{match(obj("fib", M{"result": "type", "flags": []string{"daddr"}}), "local"), match(payload(p, "dport"), r.Port)}
-			if r.Route != "" {
-				route, _ := parseRoute(r.Route)
+			route, _ := parseRoute(r.Route)
+			local := match(obj("fib", M{"result": "type", "flags": []string{"daddr"}}), "local")
+			expr := []any{local, match(payload(p, "dport"), r.Port)}
+			if route.Listen != "" {
+				// Unbound advertised addresses may arrive unchanged (routed IP)
+				// or translated to a local IP by the provider. Ports are reserved
+				// node-wide; unrelated transit destinations must still pass through.
+				exact := []any{match(payload("ip", "daddr"), r.ListenIP), match(payload(p, "dport"), r.Port)}
+				addRule("pre", append(exact, obj("dnat", M{"addr": r.IP, "port": r.TargetPort})))
+				if r.LocalListen {
+					continue
+				}
+			} else if route.In.enabled() {
 				expr = append(expr, match(payload("ip", "daddr"), route.In.Local))
 			}
 			addRule("pre", append(expr, obj("dnat", M{"addr": r.IP, "port": r.TargetPort})))
@@ -247,8 +259,13 @@ func (a *Agent) transaction(c Config, current M, exists bool) M {
 			nat := M{"masquerade": nil}
 			if r.Route != "" {
 				route, _ := parseRoute(r.Route)
-				nat = obj("snat", M{"addr": route.Out.Local})
+				if route.Out.enabled() {
+					nat = obj("snat", M{"addr": route.Out.Local})
+				}
 				for dir, profile := range map[string]routeProfile{"original": route.Out, "reply": route.In} {
+					if !profile.enabled() {
+						continue
+					}
 					expr := append(connMatch(r, p), match(ct("direction", ""), dir), obj("mangle", M{"key": meta("mark"), "value": profile.mark()}))
 					addRule("route", expr)
 				}
@@ -308,6 +325,9 @@ func (a *Agent) apply(c Config) error {
 		return e
 	}
 	if e := a.resolveCached(&c); e != nil {
+		return e
+	}
+	if e := prepareIngress(&c); e != nil {
 		return e
 	}
 	return a.locked(func() (result error) {
@@ -624,6 +644,35 @@ func (a *Agent) resolveCached(c *Config) error {
 		if ip := net.ParseIP(r.IP); ip == nil || ip.To4() == nil {
 			return errors.New("缺少可用的离线地址缓存")
 		}
+		route, _ := parseRoute(r.Route)
+		if route.Listen != "" && net.ParseIP(r.ListenIP).To4() == nil {
+			return errors.New("缺少接收地址的离线缓存")
+		}
+	}
+	return nil
+}
+
+func prepareIngress(c *Config) error {
+	needed := false
+	for _, r := range c.Rules {
+		route, _ := parseRoute(r.Route)
+		needed = needed || route.Listen != ""
+	}
+	if !needed {
+		return nil
+	}
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return fmt.Errorf("读取本机地址: %w", err)
+	}
+	local := map[string]bool{}
+	for _, address := range addresses {
+		if ip, _, err := net.ParseCIDR(address.String()); err == nil {
+			local[ip.String()] = true
+		}
+	}
+	for i := range c.Rules {
+		c.Rules[i].LocalListen = local[c.Rules[i].ListenIP]
 	}
 	return nil
 }

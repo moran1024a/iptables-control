@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.5.1"
+VERSION="0.5.3"
 LATEST_URL="https://github.com/moran1024a/iptables-control/releases/latest/download/ictl.sh"
 GH_PROXY="https://gh-proxy.com/"   # 手动更新加 --mirror 时使用的 GitHub 下载加速
 BIN="/usr/local/lib/ictl/passive.sh"
@@ -137,7 +137,21 @@ valid_ipv4() {
 
 # Explicit IPv4 routes; the profile journal is shared with the Go Agent.
 route_fields() {
-  local value="$1" extra
+  local value="$1" extra listen source device gateway
+  R_LISTEN=""
+  if [[ "$value" = v2,* ]]; then
+    IFS=, read -r extra listen source device gateway extra <<< "$value"
+    [ "$(tr -cd ',' <<< "$value" | wc -c)" = 4 ] && [[ "$listen" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]] || return 1
+    if [ "$source,$device,$gateway" = '-,-,-' ]; then
+      R_IN="" R_OUT="" R_IDEV="" R_ODEV="" R_IGW="" R_OGW=""
+    else
+      [ "$source" != - ] && [ "$device" != - ] || return 1
+      route_fields "$source,$source,$device,$device,$gateway,$gateway" || return 1
+      R_IN="" R_IDEV="" R_IGW=""
+    fi
+    R_LISTEN="$listen"
+    return 0
+  fi
   IFS=, read -r R_IN R_OUT R_IDEV R_ODEV R_IGW R_OGW extra <<< "$value"
   [ -z "${extra:-}" ] && [ "$(tr -cd ',' <<< "$value" | wc -c)" = 5 ] || return 1
   valid_ipv4 "$R_IN" && valid_ipv4 "$R_OUT" || return 1
@@ -230,7 +244,9 @@ prepare_routes() {
   while read -r id proto port host target route; do
     [ -n "${route:-}" ] || continue
     route_fields "$route" || { echo '无效的地址路由配置' >&2; return 1; }
-    route_prepare_profile "$R_IN" "$R_IDEV" "$R_IGW" && route_prepare_profile "$R_OUT" "$R_ODEV" "$R_OGW" || return 1
+    if [ -n "$R_IN" ]; then route_prepare_profile "$R_IN" "$R_IDEV" "$R_IGW" || return 1; fi
+    [ -n "$R_OUT" ] || continue
+    route_prepare_profile "$R_OUT" "$R_ODEV" "$R_OGW" || return 1
     ip="$host"
     valid_ipv4 "$ip" || ip="${RCACHE[$host]:-}"
     valid_ipv4 "$ip" || { echo "缺少下一跳的地址缓存：$host" >&2; return 1; }
@@ -267,8 +283,14 @@ prune_routes() {
   done
 }
 current_route_profiles() {
+  local id proto port host target route
   [ -f "$CONFIG" ] || return 0
-  awk 'NF==6 {split($6,r,",");print r[1]","r[3]","r[5];print r[2]","r[4]","r[6]}' "$CONFIG"
+  while read -r id proto port host target route; do
+    [ -n "${route:-}" ] || continue
+    route_fields "$route" || return 1
+    if [ -n "$R_IN" ]; then printf '%s,%s,%s\n' "$R_IN" "$R_IDEV" "$R_IGW"; fi
+    if [ -n "$R_OUT" ]; then printf '%s,%s,%s\n' "$R_OUT" "$R_ODEV" "$R_OGW"; fi
+  done < "$CONFIG"
 }
 
 # 服务端下发的配置：首行 v=版本，其余每行 规则id 协议 入站端口 目标地址 目标端口
@@ -602,7 +624,8 @@ clean_legacy_persistence() {
 
 # 根据本地缓存的配置生成 iptables-restore 输入，写入 RENDERED；问题追加到 ERRS
 render() {
-  local id proto lport host tport route p pre="" post="" fwd="" mangle="" in_match snat out_mark in_mark
+  local id proto lport host tport route p pre="" post="" fwd="" mangle="" in_match snat out_mark in_mark next_ip listen_ip local_addresses
+  local -a incoming
   load_resolved
   if [ -f "$CONFIG" ]; then
     while read -r id proto lport host tport route; do
@@ -612,19 +635,38 @@ render() {
         continue
       fi
       [ "$RSTALE" -eq 1 ] && ERRS+=("rule $id resolve failed: $host, using cached $RIP")
-      in_match=""; snat="MASQUERADE"
+      incoming=('-m addrtype --dst-type LOCAL'); snat="MASQUERADE"; in_mark=""; out_mark=""
       if [ -n "$route" ]; then
         route_fields "$route" || { ERRS+=('无效的地址路由配置'); continue; }
-        in_match="-d $R_IN "; snat="SNAT --to-source $R_OUT"
-        route_numbers "$R_IN,$R_IDEV,$R_IGW"; in_mark="$ROUTE_MARK"
-        route_numbers "$R_OUT,$R_ODEV,$R_OGW"; out_mark="$ROUTE_MARK"
+        if [ -n "$R_LISTEN" ]; then
+          next_ip="$RIP"
+          if ! resolve "$R_LISTEN"; then ERRS+=("rule $id receive address resolve failed: $R_LISTEN"); continue; fi
+          [ "$RSTALE" -eq 1 ] && ERRS+=("rule $id receive address using cache: $R_LISTEN")
+          listen_ip="$RIP"; RIP="$next_ip"
+          if ! local_addresses="$(ip -o -4 address show)"; then ERRS+=('无法读取本机地址'); continue; fi
+          incoming=("-d $listen_ip")
+          if ! awk -v ip="$listen_ip" '{split($4,a,"/");if(a[1]==ip)found=1} END{exit !found}' <<< "$local_addresses"; then
+            incoming+=('-m addrtype --dst-type LOCAL')
+          fi
+        else
+          incoming=("-m addrtype --dst-type LOCAL -d $R_IN")
+          route_numbers "$R_IN,$R_IDEV,$R_IGW"; in_mark="$ROUTE_MARK"
+        fi
+        if [ -n "$R_OUT" ]; then
+          snat="SNAT --to-source $R_OUT"
+          route_numbers "$R_OUT,$R_ODEV,$R_OGW"; out_mark="$ROUTE_MARK"
+        fi
       fi
       for p in $(protos "$proto"); do
-        if [ -n "$route" ]; then
-          mangle+="-A ICTL-ROUTE -p $p -d $R_IN --dport $lport -j MARK --set-xmark $out_mark/0xffffffff"$'\n'
+        for in_match in "${incoming[@]}"; do
+          if [ -n "$out_mark" ]; then
+            mangle+="-A ICTL-ROUTE -p $p $in_match --dport $lport -j MARK --set-xmark $out_mark/0xffffffff"$'\n'
+          fi
+          pre+="-A ICTL-PRE -p $p $in_match --dport $lport -j DNAT --to-destination $RIP:$tport"$'\n'
+        done
+        if [ -n "$in_mark" ]; then
           mangle+="-A ICTL-ROUTE -m conntrack --ctstate DNAT --ctdir REPLY --ctproto $p --ctorigdst $R_IN --ctorigdstport $lport --ctreplsrc $RIP --ctreplsrcport $tport -j MARK --set-xmark $in_mark/0xffffffff"$'\n'
         fi
-        pre+="-A ICTL-PRE -p $p -m addrtype --dst-type LOCAL ${in_match}--dport $lport -j DNAT --to-destination $RIP:$tport"$'\n'
         post+="-A ICTL-POST -p $p -d $RIP --dport $tport -m conntrack --ctstate DNAT --ctorigdstport $lport -j $snat"$'\n'
         # 原始/回复元组在两个方向保持不变；不用 -p，RELATED ICMP 也按原连接匹配。
         fwd+="-A ICTL-FWD -m conntrack --ctstate DNAT --ctproto $p --ctorigdstport $lport --ctreplsrc $RIP --ctreplsrcport $tport -j ACCEPT"$'\n'

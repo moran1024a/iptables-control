@@ -332,7 +332,7 @@ class TopologyTests(Fixture, unittest.TestCase):
             self.db.execute('INSERT INTO sessions VALUES (?,?)',(hashlib.sha256(token.encode()).hexdigest(),int(time.time())+86400*7))
         exercise=r'''
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
-const wait=async fn=>{for(let i=0;i<250;i++){if(fn())return;await pause(25);}throw Error('Timeout: '+fn);};
+const wait=async fn=>{for(let i=0;i<250;i++){if(fn())return;await pause(25);}throw Error('Timeout: '+fn+' '+(graphSession?.error||''));};
 const assert=(x,m)=>{if(!x)throw Error(m);};
 const click=selector=>{const el=document.querySelector(selector);assert(el,'missing '+selector);el.focus();el.click();};
 window.addEventListener('error',e=>fetch('/panel/test-result',{method:'POST',body:'FAIL '+e.message}));
@@ -415,7 +415,7 @@ window.addEventListener('unhandledrejection',e=>fetch('/panel/test-result',{meth
  graphSession.library=false;graphSession.selected=null;drawGraph();
  // Layout is available for unfinished drafts and does not mutate the running route.
  graphSession.graph.vertices.push({id:'loose',kind:'node',node_id:nodeID,x:500,y:900,disabled:false});
- await ACTIONS['graph-check']();assert(!graphSession.error,'cannot arrange an unfinished draft');
+ await ACTIONS['graph-check']();assert(!graphSession.error,'cannot arrange an unfinished draft: '+graphSession.error);
  graphSession.selected='loose';ACTIONS['graph-remove']();
  const runtime=(await api('GET','links/1')).link.active_path.join(',');
  assert(runtime==='entry,b,target','editing changed live path');
@@ -456,6 +456,16 @@ window.addEventListener('unhandledrejection',e=>fetch('/panel/test-result',{meth
  const binding=document.querySelector('[data-graph-binding="out"]');binding.value='public';binding.dispatchEvent(new Event('change',{bubbles:true}));
  assert(graphSession.graph.bindings[`${m1.id}/${t1.id}`].from[m1.id]==='public','wire inspector did not set IP');
  assert(graphSession.graph.bindings[`${m1.id}/${t2.id}`].from[m1.id]==='private','IP change leaked into another wire');
+ const autoBinding=document.querySelector('[data-graph-binding="out"]');
+ autoBinding.value='@auto';autoBinding.dispatchEvent(new Event('change',{bubbles:true}));
+ assert(graphSession.graph.bindings[`${m1.id}/${t1.id}`].from[m1.id]==='@auto','automatic egress selection was lost');
+ const autoPin=document.querySelector(`[data-graph-node="${m1.id}"] .graph-port.out[data-address="@auto"]`);
+ assert(autoPin?.classList.contains('is-bound'),'automatic egress is not visible on its pin');
+ const autoPoint=graphPortPoint(graphSession.graph,m1.id,'out','@auto',graphBoxes(graphSession.graph));
+ const autoNode=graphSession.graph.vertices.find(v=>v.id===m1.id);
+ assert(autoPoint[1]-autoNode.y===parseFloat(autoPin.style.top),'wire and automatic egress pin are misaligned');
+ const restoreBinding=document.querySelector('[data-graph-binding="out"]');
+ restoreBinding.value='public';restoreBinding.dispatchEvent(new Event('change',{bubbles:true}));
  graphSession.edge=null;drawGraph();
  const beforeInput=JSON.stringify(graphSession.graph.bindings);
  click(`[data-graph-node="${m1.id}"] .graph-port.in[data-address="private"]`);
@@ -723,8 +733,8 @@ window.addEventListener('unhandledrejection',e=>fetch('/panel/test-result',{meth
                     for _ in range(8):
                         with c:
                             for n in c.execute('SELECT * FROM nodes').fetchall():
-                                packet=agent_v3.packet(c,n,status=dict(version='0.5.1-rc.1',state='ok'))
-                                if packet.get('action')=='apply':agent_v3.acknowledge(c,database.get_node(c,n['id']),dict(op=packet['op'],generation=packet['generation'],hash=packet['hash'],ok=True,version='0.5.1-rc.1'))
+                                packet=agent_v3.packet(c,n,status=dict(version=settings.COMPONENTS['active_agent'],state='ok'))
+                                if packet.get('action')=='apply':agent_v3.acknowledge(c,database.get_node(c,n['id']),dict(op=packet['op'],generation=packet['generation'],hash=packet['hash'],ok=True,version=settings.COMPONENTS['active_agent']))
                             before=node_sync.mutation_snapshot(c);pools.tick(c);node_sync.finish_mutation(c,before)
                     c.close();self.send_response(204);self.send_header('Content-Length','0');self.end_headers();return
                 super().run_request()

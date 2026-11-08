@@ -46,10 +46,21 @@ def listing(c, node):
 
 ROUTING_FIELDS = ('id', 'host', 'local', 'device', 'gateway')
 DEVICE = re.compile(r'[A-Za-z0-9_.:-]{1,15}')
+AUTO = '@auto'
 
 
 def routing(address):
     return {k: address.get(k, '') for k in ROUTING_FIELDS}
+
+
+def bound_routing(graph, vid, address):
+    """Receiving only binds the advertised host; source overrides are separate."""
+    if graph.get('routing_version') != 2:
+        return routing(address)
+    explicit = any(mapping.get('from', {}).get(vid) == address['id'] for mapping in graph.get('bindings', {}).values())
+    if not explicit:
+        return {k: address[k] for k in ('id', 'host')}
+    return routing(address)
 
 
 def write(c, nid, values):
@@ -178,6 +189,18 @@ def ready(address, snapshot=None):
     return not problem(address, snapshot)
 
 
+def egress_problem(address, snapshot=None):
+    """Only explicit source selection requires an address on this machine."""
+    local = address.get('local') or address['host']
+    if snapshot and snapshot['complete'] and not any(a['local'] == local for a in snapshot['addresses']):
+        return f'指定出口 {local} 不在本机；请选择自动出口，或在高级设置中指定本机源 IP'
+    if not address.get('local') or not address.get('device'):
+        return '指定出口尚未识别，请同步 Agent；也可以选择自动出口'
+    if snapshot and snapshot['complete'] and not any(a['local'] == local and a['device'] == address['device'] for a in snapshot['addresses']):
+        return '指定出口的网卡已变化，请在节点高级设置中更新网卡'
+    return ''
+
+
 def ipv4(value, optional=False):
     if optional and not value:
         return ''
@@ -240,9 +263,9 @@ def save(c, node, values, *, addr=None):
         result.append(address)
     # Labels are presentation only; changing them must not interrupt forwarding.
     new = {a['id']: a for a in result}
-    # An unresolved address may occur in a draft, but cannot have been published.
-    # Let the user finish its local binding without first removing the draft edge.
-    changed = {ident for ident, a in old.items() if ident not in new or ready(a) and routing(a) != routing(new[ident])}
+    # Receiving addresses need not exist on a NIC, but their live bindings still
+    # have to remain stable. Drafts can always be repaired below.
+    changed = {ident for ident, a in old.items() if ident not in new or routing(a) != routing(new[ident])}
     if changed:
         import topology
         # Draft bindings are references by ID, and will be revalidated when
@@ -250,7 +273,9 @@ def save(c, node, values, *, addr=None):
         for name, doc in topology.documents(c, published_only=True):
             graph = doc.get('graph', {})
             used = references(graph)
-            if any(used.get(v['id'], set()) & changed for v in graph.get('vertices', []) if v.get('node_id') == node['id']):
+            if any(ident not in new or bound_routing(graph, v['id'], old[ident]) != bound_routing(graph, v['id'], new[ident])
+                   for v in graph.get('vertices', []) if v.get('node_id') == node['id']
+                   for ident in used.get(v['id'], set()) & changed):
                 raise errors.UserError(f"地址正被已应用或待下发的链路「{name}」引用。请新增修正后的 IP，在链路中替换并应用后再删除旧地址", 'addresses')
     write(c, node['id'], result)
     host = next(a['host'] for a in result if a['primary'])
@@ -269,7 +294,7 @@ def references(graph):
     for mapping in graph.get('bindings', {}).values():
         for side in ('from', 'to'):
             for vertex, address in mapping.get(side, {}).items():
-                if vertex in used:
+                if vertex in used and address != AUTO:
                     used[vertex].add(address)
     return used
 
@@ -288,9 +313,21 @@ def edge_key(a, b):
     return a + '/' + b
 
 
-def route_token(incoming, outgoing):
+def route_token(incoming, outgoing, version=1):
+    if version == 2:
+        source = tuple(outgoing[k] or '-' for k in ('local', 'device', 'gateway')) if outgoing else ('-', '-', '-')
+        return ','.join(('v2', incoming['host'], *source))
     return ','.join((incoming['local'], outgoing['local'], incoming['device'], outgoing['device'],
                      incoming['gateway'] or '-', outgoing['gateway'] or '-'))
+
+
+def source_route(route):
+    fields = route.split(',')
+    if len(fields) == 5 and fields[0] == 'v2':
+        return ','.join(fields[2:]) if fields[2] != '-' else ''
+    if len(fields) == 6:
+        return ','.join((fields[1], fields[3], fields[5]))
+    return ''
 
 
 def rule_route(c, rule_id):

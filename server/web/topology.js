@@ -70,7 +70,7 @@ function graphAddresses(id,g=graphCurrent()) {
   const v=g.vertices.find(v=>v.id===id);
   return g.version===2?(poolView.nodes.find(n=>n.id===v?.node_id)?.addresses||Object.values(g.address_book?.[id]||{})):[];
 }
-const graphHeight=(v,g)=>62+24*Math.max(1,graphAddresses(v.id,g).length);
+const graphHeight=(v,g)=>62+24*(Math.max(1,graphAddresses(v.id,g).length)+(g.routing_version===2&&v.node_id?1:0));
 function graphDisplay(g) {
   if(graphSession?.kind==='edit'||graphSession?.editor)return g;
   const view=poolView.link?.view_graph;if(!view)return g;
@@ -86,11 +86,11 @@ function graphPortAddress(g,v,side,edge=null) {
   if(edge)return g.bindings?.[edge.join('/')]?.[key]?.[v.id]||'';
   const values=graphConnections(g).filter(e=>e[side==='in'?1:0]===owner).map(e=>g.bindings?.[e.join('/')]?.[key]?.[v.id]).filter(Boolean);
   if(values.length&&new Set(values).size===1)return values[0];
-  return v[side+'_address']||(graphAddresses(v.id,g).length===1?graphAddresses(v.id,g)[0].id:'');
+  return v[side+'_address']||(g.routing_version===2&&side==='out'?'@auto':graphAddresses(v.id,g).length===1?graphAddresses(v.id,g)[0].id:'');
 }
 function graphPortPoint(g,id,side,address,boxes) {
   const b=boxes.get(id),v=g.vertices.find(v=>v.id===id),addresses=graphAddresses(id,g);
-  const i=addresses.findIndex(a=>a.id===address);
+  const i=address==='@auto'?Math.max(1,addresses.length):addresses.findIndex(a=>a.id===address);
   return [side==='out'?b.x+b.width:b.x,b.y+(v?(i>=0?62+i*24+12:62+12):b.height/2)];
 }
 function graphEdgeCurve(g,a,b,boxes,index=0) {
@@ -211,10 +211,11 @@ function graphNodeAddresses(g,v,editing) {
   const edge=editing&&graphSession.edge!=null?g.edges[graphSession.edge]:null;
   const incoming=graphPortAddress(g,v,'in',edge),outgoing=graphPortAddress(g,v,'out',edge);
   const rows=addresses.length?addresses:[{id:'',name:v.kind==='target'?'':v.kind==='direct'?'direct':'主 IP',host:node?.addr||target?.host||''}];
-  return rows.map((a,i)=>{
-    const problem=node?nodeAddressProblem(a,node.network):'';
-    return `<div class="graph-ip-row ${editing&&problem?'graph-ip-warning':''}" data-graph-address="${esc(a.id)}" ${editing?`data-action="graph-receive" data-id="${esc(v.id)}" data-address="${esc(a.id)}"`:''} title="${esc(problem||a.host)}"><span class="graph-ip-name">${esc(a.name||(a.primary?'主 IP':'IP'))}</span><code>${esc(a.host)}${target?.port?':'+target.port:''}</code>${editing&&problem?'<span class="graph-ip-warning-mark">!</span>':''}${editing?`${v.kind==='target'?graphPort(v.id,'in','',74):graphPort(v.id,'in',a.id,74+i*24,v.kind==='entry',a.id===incoming)}${v.kind==='target'?'':graphPort(v.id,'out',a.id,74+i*24,false,a.id===outgoing)}`:`<span class="graph-ip-role">${a.id&&a.id===incoming?'入':''}${a.id&&a.id===outgoing?' 出':''}</span>`}</div>`;
+  const rendered=rows.map((a,i)=>{
+    return `<div class="graph-ip-row" data-graph-address="${esc(a.id)}" ${editing?`data-action="graph-receive" data-id="${esc(v.id)}" data-address="${esc(a.id)}"`:''} title="${esc(a.host)}"><span class="graph-ip-name">${esc(a.name||(a.primary?'主 IP':'IP'))}</span><code>${esc(a.host)}${target?.port?':'+target.port:''}</code>${editing?`${v.kind==='target'?graphPort(v.id,'in','',74):graphPort(v.id,'in',a.id,74+i*24,v.kind==='entry',a.id===incoming)}${v.kind==='target'?'':graphPort(v.id,'out',a.id,74+i*24,false,a.id===outgoing)}`:`<span class="graph-ip-role">${a.id&&a.id===incoming?'入':''}${a.id&&a.id===outgoing?' 出':''}</span>`}</div>`;
   }).join('');
+  if(g.routing_version!==2||!v.node_id)return rendered;
+  return rendered+`<div class="graph-ip-row graph-auto-out"><span>自动出口</span>${editing?graphPort(v.id,'out','@auto',74+rows.length*24,false,outgoing==='@auto'):`<span class="graph-ip-role">${outgoing==='@auto'?'出':''}</span>`}</div>`;
 }
 function graphCanvas(raw, l) {
   const g=graphDisplay(raw),editing=graphSession?.kind==='edit',choosing=graphSession?.kind==='choose';
@@ -255,9 +256,10 @@ function graphEntryPort(v,g) {
   const value=g.version===2?g.ports?.[`${v.id}/${target?.id}`]:s.port;
   return `${g.version===2&&targets.length>1?`<select data-graph-port-target aria-label="端口对应目标">${targets.map(t=>`<option value="${esc(t.id)}" ${t===target?'selected':''}>${esc(graphName(t))}</option>`).join('')}</select>`:''}<input type="number" data-key="port-${esc(v.id)}/${esc(target?.id||'')}" data-graph-entry-port="${esc(v.id)}" data-target="${esc(target?.id||'')}" min="1" max="65535" placeholder="自动端口" value="${value??''}" aria-label="入口端口" title="入口端口，留空自动分配">`;
 }
-function graphAddressOptions(v,value) {
+function graphAddressOptions(v,value,side='in') {
   const n=poolView.nodes.find(n=>n.id===v.node_id);
-  return '<option value="">选择 IP</option>'+graphAddresses(v.id).map(a=>`<option value="${esc(a.id)}" ${a.id===value?'selected':''}>${esc(a.host)}${a.primary?' · 主 IP':''}${nodeAddressProblem(a,n?.network)?' · 待处理':''}</option>`).join('');
+  const auto=side==='out'&&graphCurrent().routing_version===2?`<option value="@auto" ${value==='@auto'?'selected':''}>自动出口</option>`:'';
+  return '<option value="">选择 IP</option>'+auto+graphAddresses(v.id).map(a=>`<option value="${esc(a.id)}" ${a.id===value?'selected':''}>${esc(a.host)}${a.primary?' · 主 IP':''}${side==='out'&&nodeAddressProblem(a,n?.network)?' · 出口待设置':''}</option>`).join('');
 }
 function graphInspector() {
   const s=graphSession,g=s.graph,v=g.vertices.find(v=>v.id===s.selected),e=g.edges[s.edge];
@@ -265,7 +267,7 @@ function graphInspector() {
   const choices=v?.kind==='target'?poolView.targets:poolView.nodes;
   const addressFields=e?e.map((id,i)=>{
     const node=g.vertices.find(v=>v.id===id),side=i?'in':'out';
-    return node.node_id?`<label class="graph-address-field">${i?'接收 IP':'发出 IP'}<select data-graph-binding="${side}" data-id="${esc(id)}" aria-label="${i?'接收 IP':'发出 IP'}">${graphAddressOptions(node,graphPortAddress(g,node,side,e))}</select></label>`:'';
+    return node.node_id?`<label class="graph-address-field">${i?'接收 IP':'发出 IP'}<select data-graph-binding="${side}" data-id="${esc(id)}" aria-label="${i?'接收 IP':'发出 IP'}">${graphAddressOptions(node,graphPortAddress(g,node,side,e),side)}</select></label>`:'';
   }).join(''):'';
   const entryAddress=v?.kind==='entry'?`<label class="graph-address-field">入口接收 IP<select data-graph-listen="${esc(v.id)}" aria-label="入口接收 IP">${graphAddressOptions(v,v.address)}</select></label>`:'';
   const pending=v&&s.connectTarget===v.id?`<label class="graph-address-field">连接到 ${esc(graphName(v))}<select data-graph-connect-ip="${esc(v.id)}" aria-label="选择接收 IP">${graphAddressOptions(v,'')}</select></label>`:'';
@@ -312,16 +314,27 @@ function startGraphEditor(l) {
   graphSession={kind:'edit',id:l?.id,revision:l?.revision,name:draft?.name??l?.name??'',group_id:draft?.group_id||l?.group_id||poolView.groups[0]?.id,
     port:draft?draft.port:l?.plan.port??null,graph:structuredClone(draft?.graph||l?.graph||{version:2,vertices:[],edges:[],bindings:{},ports:{}}),dirty:false,addKind:l?'node':'entry',library:!l};
   graphSession.graph.edges=graphConnections(graphSession.graph);
+  graphSession.graph.routing_version=2;
   if(graphSession.graph.version!==2){
     const g=graphSession.graph,entry=g.vertices.find(v=>v.kind==='entry'),target=g.vertices.find(v=>v.kind==='target');
     g.version=2;g.bindings={};g.ports={};
     if(entry&&target&&graphSession.port)g.ports[`${entry.id}/${target.id}`]=graphSession.port;
     for(const v of g.vertices){
       const addresses=graphAddresses(v.id,g);
-      if(addresses.length===1){v.in_address=v.out_address=addresses[0].id;if(v.kind==='entry')v.address=addresses[0].id;}
+      v.out_address='@auto';
+      if(addresses.length===1){v.in_address=addresses[0].id;if(v.kind==='entry')v.address=addresses[0].id;}
     }
   }
   if(graphSession.graph.version===2){
+    const g=graphSession.graph;
+    g.bindings||={};
+    for(const [a,b] of g.edges){
+      const binding=g.bindings[`${a}/${b}`]||={from:{},to:{}};
+      binding.from||={};binding.to||={};
+      if(g.vertices.find(v=>v.id===a)?.node_id)binding.from[a]??='@auto';
+      const addresses=graphAddresses(b,g);
+      if(addresses.length===1)binding.to[b]??=addresses[0].id;
+    }
     graphSession.port=null;
     if(!draft) {graphSession.graph.ports||={};for(const c of l?.configurations||[])if(c.port)graphSession.graph.ports[`${c.entry}/${c.target}`]=c.port;}
   }
@@ -506,7 +519,7 @@ function graphStartConnection(id,address) {
   const s=graphSession,v=s.graph.vertices.find(v=>v.id===id);
   graphCancelConnection();s.edge=null;s.selected=null;s.error='';s.errorField='';
   if(!v||v.kind==='target')return false;
-  if(v.node_id&&!graphAddresses(id).some(a=>a.id===address)){
+  if(v.node_id&&!(s.graph.routing_version===2&&address==='@auto')&&!graphAddresses(id).some(a=>a.id===address)){
     s.error=`请先为「${graphName(v)}」配置发出 IP`;s.errorField='vertex:'+id;drawGraph();return false;
   }
   s.connect=s.connectVertex=id;s.connectAddress=address;
@@ -550,7 +563,8 @@ function graphAddResource(kind,id,point=null) {
   if(['entry','target'].includes(kind)&&g.vertices.some(v=>v.kind===kind))g.version=2;
   const v={id:graphID(),kind,[kind==='target'?'target_id':'node_id']:Number(id),disabled:false,...(point||graphAddPosition(220,110))};
   g.vertices.push(v);
-  const addresses=graphAddresses(v.id,g);if(addresses.length===1){v.in_address=v.out_address=addresses[0].id;if(kind==='entry')v.address=addresses[0].id;}
+  v.out_address='@auto';
+  const addresses=graphAddresses(v.id,g);if(addresses.length===1){v.in_address=addresses[0].id;if(kind==='entry')v.address=addresses[0].id;}
   graphCancelConnection();
   if(kind==='entry')s.addKind='node';
   s.selected=v.id;s.edge=null;graphTouch();drawGraph();graphReveal(v);
@@ -713,9 +727,11 @@ document.addEventListener('change',e=>{
       delete v.address;delete v.in_address;delete v.out_address;
       for(const binding of Object.values(graphSession.graph.bindings||{}))for(const side of ['from','to'])delete binding[side]?.[v.id];
       const addresses=graphAddresses(v.id,graphSession.graph);
-      if(addresses.length===1)for(const side of ['in','out']){
-        graphChooseAddress(v.id,side,addresses[0].id);
-        for(const edge of graphSession.graph.edges)graphChooseAddress(v.id,side,addresses[0].id,edge);
+      for(const side of ['in','out']){
+        const address=side==='out'?'@auto':addresses.length===1?addresses[0].id:null;
+        if(!address)continue;
+        graphChooseAddress(v.id,side,address);
+        for(const edge of graphSession.graph.edges)graphChooseAddress(v.id,side,address,edge);
       }
     }
     graphTouch();drawGraph();

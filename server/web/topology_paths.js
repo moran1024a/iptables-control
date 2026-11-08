@@ -46,7 +46,7 @@ function graphLanePenalty(a,b,used,clearance=6) {
 function graphConnectionRoutes(g,boxes,editing=true) {
   const edges=graphConnections(g),ports=g.vertices.map(v=>[v.id,graphAddresses(v.id,g).map(a=>a.id)]);
   const moving=editing&&graphDrag?.moved?graphDrag.node.id:null;
-  const key=JSON.stringify([g.vertices,g.bindings,edges,ports,moving,editing]);
+  const key=JSON.stringify([g.routing_version,g.vertices,g.bindings,edges,ports,moving,editing]);
   if(graphConnectionCache?.key===key)return graphConnectionCache.routes;
   const groups=new Map(),used=[],routes=edges.map(([a,b],i)=>({a,b,i}));
   for(const r of routes)for(const [side,id] of [['out',r.a],['in',r.b]]){
@@ -109,7 +109,7 @@ function graphRuntimeLines(g,link,boxes) {
   const list=[...spans.values()].sort((a,b)=>entries.indexOf(a.entry)-entries.indexOf(b.entry)||Number(a.pending)-Number(b.pending)||a.a.localeCompare(b.a)||a.b.localeCompare(b.b));
   // Port rows use the live address inventory, not only the published snapshot.
   const ports=g.vertices.map(v=>graphAddresses(v.id,g).map(a=>a.id));
-  const key=JSON.stringify([g.vertices,g.bindings,list,ports]);
+  const key=JSON.stringify([g.routing_version,g.vertices,g.bindings,list,ports]);
   if(graphRouteCache?.key!==key){
     const used=[],ports=new Map();
     // Allocate both ends by the actual IP port. Distinct source edges can still

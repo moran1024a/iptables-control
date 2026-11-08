@@ -37,6 +37,12 @@ for device, prefix in [('client','192.0.2'), ('target','198.51.100')]:
 run('ip','-n','target','address','add','203.0.113.9/32','dev','lo')
 # A functioning host route also permits reverse-path validation of public peers.
 run('ip','route','add','default','via','198.51.100.2','dev','target')
+# One address is routed to this machine without being configured on any NIC.
+# Another is translated by an upstream namespace, as on a cloud public IP.
+for ip in ('203.0.113.50', '198.18.0.7', '203.0.113.9'):
+    run('ip','-n','client','route','add',ip+'/32','via','192.0.2.1')
+run('ip','netns','exec','client','iptables','-t','nat','-A','OUTPUT',
+    '-d','198.18.0.7','-j','DNAT','--to-destination','192.0.2.1')
 # These profiles intentionally hash to the same RPDB priority. Exact marks
 # must let them coexist, including during active/passive handover.
 run('ip','link','add','eth0','type','dummy')
@@ -68,23 +74,40 @@ try:
                '2 both 30124 198.51.100.2 30444 192.0.2.1,198.51.100.1,client,target,-,-',
                '3 both 30125 203.0.113.9 30443 192.0.2.3,198.51.100.3,client,target,-,198.51.100.2',
                '4 both 30126 198.51.100.2 30443 10.0.0.95,198.51.100.3,eth0,target,-,-',
-               '5 both 30127 198.51.100.2 30443 10.0.0.108,198.51.100.3,eth0,target,-,-']
+               '5 both 30127 198.51.100.2 30443 10.0.0.108,198.51.100.3,eth0,target,-,-',
+               '6 both 30128 198.51.100.2 30443 v2,192.0.2.3,-,-,-',
+               '7 both 30129 198.51.100.2 30443 v2,203.0.113.50,-,-,-',
+               '8 both 30130 198.51.100.2 30443 v2,198.18.0.7,-,-,-',
+               '9 both 30131 198.51.100.2 30443 v2,198.18.0.7,198.51.100.3,target,-']
         content='\n'.join(lines); snapshot=root/'snapshot'
         snapshot.write_text('v='+hashlib.sha256(content.encode()).hexdigest()[:12]+'\n'+content+'\n')
         def check():
             run('ip','netns','exec','client',sys.executable,'-c', '''
 import socket
-for incoming,port,expected in [('192.0.2.3',30123,b'30443:198.51.100.3'),('192.0.2.1',30124,b'30444:198.51.100.1'),('192.0.2.3',30125,b'30443:198.51.100.3')]:
+for incoming,port,expected in [('192.0.2.3',30123,b'30443:198.51.100.3'),('192.0.2.1',30124,b'30444:198.51.100.1'),('192.0.2.3',30125,b'30443:198.51.100.3'),('192.0.2.3',30128,b'30443:198.51.100.1'),('203.0.113.50',30129,b'30443:198.51.100.1'),('198.18.0.7',30130,b'30443:198.51.100.1'),('198.18.0.7',30131,b'30443:198.51.100.3')]:
  s=socket.create_connection((incoming,port),timeout=2)
  assert s.recv(100)==expected
  s.close()
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(2)
-s.sendto(b'x',('192.0.2.3',30123));assert s.recv(100)==b'198.51.100.3'
-try:socket.create_connection(('192.0.2.1',30123),timeout=.3)
-except OSError:pass
-else:raise AssertionError('accepted traffic on the wrong local address')
+for incoming,port,source in [('192.0.2.3',30123,b'198.51.100.3'),('203.0.113.50',30129,b'198.51.100.1'),('198.18.0.7',30130,b'198.51.100.1'),('198.18.0.7',30131,b'198.51.100.3')]:
+ s.sendto(b'x',(incoming,port));assert s.recv(100)==source
+for incoming,port in [('192.0.2.1',30123),('192.0.2.1',30128),('203.0.113.9',30129)]:
+ try:socket.create_connection((incoming,port),timeout=.3)
+ except OSError:pass
+ else:raise AssertionError('accepted traffic on an unrelated destination')
 ''')
         agent('--apply-file',str(snapshot),'--generation','1');check()
+        def reject_unavailable_source(command):
+            saved = snapshot.read_text()
+            bad = content.replace('v2,198.18.0.7,198.51.100.3,target,-', 'v2,198.18.0.7,198.51.100.99,target,-')
+            snapshot.write_text('v='+hashlib.sha256(bad.encode()).hexdigest()[:12]+'\n'+bad+'\n')
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=25)
+                assert result.returncode != 0 and '198.51.100.99' in result.stderr, result
+                check()  # Rejection must leave the previous working rules in place.
+            finally:
+                snapshot.write_text(saved)
+        reject_unavailable_source([binary,'--state-root',str(root),'--conf',str(conf),'--apply-file',str(snapshot),'--generation','2'])
         if len(sys.argv) > 2:
             result=run('env','ICTL_ROUTING_KERNEL=1',str(Path(sys.argv[2]).resolve()),
                        '-test.run','^TestDiagnosticRouteKernel$','-test.v')
@@ -120,6 +143,7 @@ local_apply
 [ "$R_STATE" = ok ] || { echo "$R_ERR" >&2; exit 1; }
 '''
         run('bash','-c',script,'test',passive,str(root));check()
+        reject_unavailable_source(['bash','-c',script,'test',passive,str(root)])
         shared=[r for r in json.loads(run('ip','-j','-4','rule','show')) if r['priority']==24860]
         assert len(shared)==2 and len({r['fwmark'] for r in shared})==2,shared
         run('bash','-c',script,'test',passive,str(root));check()
@@ -128,6 +152,6 @@ local_apply
         assert not list((root/'routing').glob('[0-9]*'))
         rules=json.loads(run('ip','-j','-4','rule','show'))
         assert not any(str(r.get('protocol'))=='242' for r in rules), rules
-        print('active/passive explicit IPv4 forwarding, UDP, reply routing and cleanup: OK')
+        print('active/passive IPv4: local, routed, cloud NAT, automatic/explicit egress, TCP/UDP and cleanup: OK')
 finally:
     server.terminate();server.wait(timeout=5)

@@ -11,6 +11,20 @@ class PassiveTests(AgentHarness,unittest.TestCase):
 
     def tearDown(self):self.temp.cleanup()
 
+    def test_new_receive_and_source_route_format(self):
+        self.assertShell('''
+route_fields 'v2,198.18.0.7,-,-,-' || exit 1
+[ "$R_LISTEN" = 198.18.0.7 ] && [ -z "$R_IN$R_OUT" ] || exit 1
+route_fields 'v2,cloud.example,10.0.0.2,ens3,-' || exit 1
+[ -z "$R_IN" ] && [ "$R_OUT,$R_ODEV,$R_OGW" = '10.0.0.2,ens3,-' ] || exit 1
+! route_fields 'v2,cloud.example,-,ens3,-' || exit 1
+! route_fields 'v2,cloud.example,10.0.0.2,-,-' || exit 1
+! route_fields 'v2,cloud.example,-,-,-,extra' || exit 1
+printf '%s\\n' 'v=abc' '1 both 10001 192.0.2.1 443 v2,198.18.0.7,-,-,-' '2 tcp 10002 192.0.2.1 443 v2,cloud.example,10.0.0.2,ens3,-' > "$CONFIG"
+valid_config "$(cat "$CONFIG")" || exit 1
+[ "$(current_route_profiles)" = '10.0.0.2,ens3,-' ]
+''')
+
     def test_policy_priority_can_be_shared_only_by_exact_owned_marks(self):
         self.assertShell('''
 mkdir -p "$LIB/routing"

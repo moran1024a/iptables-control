@@ -406,7 +406,9 @@ func (a *Agent) queryContext(parent context.Context, body M) M {
 				e = err
 				break
 			}
-			dialer = routeDialer("tcp-connect-v1", route.Out)
+			if route.Out.enabled() {
+				dialer = routeDialer("tcp-connect-v1", route.Out)
+			}
 		}
 		destination := ips[0].String()
 		if net.ParseIP(r.IP) != nil {

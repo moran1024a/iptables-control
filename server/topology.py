@@ -111,7 +111,7 @@ def snapshot(graph):
              for b in result['vertices'] if b['kind']=='target'}
     result['ports'] = {k: v for k, v in result.get('ports', {}).items() if k in pairs}
     used = node_addresses.references(result)
-    result['address_book'] = {vid: {ident: node_addresses.routing(address)
+    result['address_book'] = {vid: {ident: node_addresses.bound_routing(result, vid, address)
         for ident, address in addresses.items() if ident in used.get(vid, set())}
         for vid, addresses in result.get('address_book', {}).items() if vid in used}
     return result
@@ -147,8 +147,12 @@ def validate_bindings(c, raw, graph, complete, check_network=True):
     pairs = {a + '/' + b for a in entries for b in targets}
     graph['ports'] = {key: validation.check_port(value, 'port') for key, value in ports.items() if key in pairs}
     networks = {}
-    def check_address(v, address):
-        reason = node_addresses.problem(address, networks[v['node_id']] if check_network else None)
+    modern = graph.get('routing_version') == 2
+    def check_address(v, address, side='to'):
+        if modern and side == 'to':
+            return
+        check = node_addresses.egress_problem if modern else node_addresses.problem
+        reason = check(address, networks[v['node_id']] if check_network else None)
         if reason:
             name = database.get_node(c, v['node_id'])['name']
             fail(f"「{name}」地址 {address['host']}：{reason}", 'vertex:' + v['id'])
@@ -180,6 +184,10 @@ def validate_bindings(c, raw, graph, complete, check_network=True):
                 if v['id'] != component or not v.get('node_id'): continue
                 available = graph['address_book'][v['id']]
                 ident = values.get(v['id'])
+                if modern and side == 'from' and ident is None: ident = node_addresses.AUTO
+                if modern and side == 'from' and ident == node_addresses.AUTO:
+                    clean[side][v['id']] = ident
+                    continue
                 if ident is None and len(available) == 1: ident = next(iter(available))
                 if ident not in available:
                     if complete and not v['disabled']:
@@ -188,7 +196,7 @@ def validate_bindings(c, raw, graph, complete, check_network=True):
                         fail(f'请点击「{name}」的{direction} IP 连接点', 'vertex:' + v['id'])
                 else:
                     if complete and not v['disabled']:
-                        check_address(v, available[ident])
+                        check_address(v, available[ident], side)
                     clean[side][v['id']] = ident
         graph['bindings'][key] = clean
 
@@ -202,6 +210,8 @@ def compile_routing(graph, path):
     def chosen(a, b, vid, side):
         key = node_addresses.edge_key(a, b)
         ident = graph['bindings'].get(key, {}).get(side, {}).get(vid)
+        if graph.get('routing_version') == 2 and side == 'from' and ident == node_addresses.AUTO:
+            return None
         try: return book[vid][ident]
         except KeyError: fail('路径缺少进出地址映射', 'vertex:' + vid)
     for index, vid in enumerate(path):
@@ -212,7 +222,7 @@ def compile_routing(graph, path):
             except KeyError: fail('请选择入口接收地址', 'vertex:' + vid)
         else: inc = chosen(path[index-1], vid, vid, 'to')
         out = chosen(vid, path[index+1], vid, 'from')
-        routes.append(node_addresses.route_token(inc, out))
+        routes.append(node_addresses.route_token(inc, out, graph.get('routing_version', 1)))
         incoming.append(inc['host'])
     return dict(routing=routes, hop_addresses=incoming, ingress_host=incoming[0] if incoming else None)
 
@@ -241,7 +251,7 @@ def arrange(graph):
         if v['kind'] == 'target': ranks[v['id']] = final_rank
     layers = {}
     for i in queue: layers.setdefault(ranks[i], []).append(i)
-    card_height = lambda v: 62 + 24 * max(1, len(graph.get('address_book', {}).get(v['id'], {})))
+    card_height = lambda v: 62 + 24 * (max(1, len(graph.get('address_book', {}).get(v['id'], {}))) + (1 if graph.get('routing_version') == 2 and v.get('node_id') else 0))
     heights = {i: card_height(v) for i, v in nodes.items()}
     if not layers: return graph
     original_y = {i: v.get('y', 0) for i, v in nodes.items()}
@@ -298,6 +308,10 @@ def validate(c, raw, complete=True, check_network=True):
     if not isinstance(edges, list) or len(edges) > MAX_EDGES:
         fail(f"画布最多包含 {MAX_EDGES} 条连线")
     ids, result = set(), dict(version=raw['version'], vertices=[], edges=[])
+    if 'routing_version' in raw:
+        if raw['version'] != 2 or type(raw['routing_version']) is not int or raw['routing_version'] != 2:
+            fail('无效的地址路由版本')
+        result['routing_version'] = 2
     def ident(value):
         if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) or value in ids:
             fail("组件标识无效或重复")
@@ -326,7 +340,8 @@ def validate(c, raw, complete=True, check_network=True):
             item["node_id"] = n["id"]
             for side in ('in_address', 'out_address'):
                 if side in v:
-                    if not isinstance(v[side], str) or not re.fullmatch(r'[A-Za-z0-9_-]{0,48}', v[side]):
+                    auto = result.get('routing_version') == 2 and side == 'out_address' and v[side] == node_addresses.AUTO
+                    if not auto and (not isinstance(v[side], str) or not re.fullmatch(r'[A-Za-z0-9_-]{0,48}', v[side])):
                         fail('无效的节点 IP 选择')
                     item[side] = v[side]
             if raw['version'] == 2 and item['kind'] == 'entry':
@@ -746,11 +761,16 @@ def available_routes(c, graph):
     networks = {v['node_id']: node_addresses.network(c, v['node_id'])
                 for v in vertices.values() if v.get('node_id')}
 
-    def usable(vid, ident):
+    modern = graph.get('routing_version') == 2
+    def usable(vid, ident, side='to'):
         vertex = vertices[vid]
         if not vertex.get('node_id'):
             return True
+        if modern and side == 'from' and ident == node_addresses.AUTO:
+            return True
         address = graph.get('address_book', {}).get(vid, {}).get(ident)
+        if modern:
+            return bool(address and (side == 'to' or not node_addresses.egress_problem(address, networks[vertex['node_id']])))
         return bool(address and node_addresses.ready(address, networks[vertex['node_id']]))
 
     edges = []
@@ -758,7 +778,7 @@ def available_routes(c, graph):
         binding = graph.get('bindings', {}).get(node_addresses.edge_key(a, b), {})
         if vertices[a]['kind'] == 'entry' and not usable(a, vertices[a].get('address')):
             continue
-        if all(usable(vid, binding.get(side, {}).get(vid)) for side, vid in (('from', a), ('to', b))):
+        if all(usable(vid, binding.get(side, {}).get(vid), side) for side, vid in (('from', a), ('to', b))):
             edges.append([a, b])
     return dict(graph, edges=edges)
 
@@ -781,9 +801,13 @@ def ready_path(c, graph, path, automatic=False, blocked=()):
             fail("路径包含未就绪节点：" + nodes.get(v.get('node_id'), {}).get('name', '已删除'), "vertex:"+v["id"])
         if v['id'] in path and v.get('node_id') and graph.get('version') == 2:
             snapshot = node_addresses.network(c, v['node_id'])
-            for ident in used.get(v['id'], ()):
+            modern = graph.get('routing_version') == 2
+            outgoing = {graph['bindings'].get(a+'/'+b, {}).get('from', {}).get(a)
+                        for a, b in zip(path, path[1:]) if a == v['id']} if modern else used.get(v['id'], ())
+            for ident in outgoing:
+                if modern and ident == node_addresses.AUTO: continue
                 address = graph['address_book'][v['id']][ident]
-                reason = node_addresses.problem(address, snapshot)
+                reason = (node_addresses.egress_problem if modern else node_addresses.problem)(address, snapshot)
                 if reason:
                     fail(f"「{nodes[v['node_id']]['name']}」地址 {address['host']}：{reason}", 'vertex:' + v['id'])
 

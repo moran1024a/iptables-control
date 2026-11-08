@@ -23,19 +23,21 @@ import (
 	"time"
 )
 
-const version = "0.5.1"
+const version = "0.5.3"
 const tableName = "ictl_active"
 
 type M = map[string]any
 
 type Rule struct {
-	Route      string `json:"route,omitempty"`
-	ID         int64  `json:"id"`
-	Protocol   string `json:"protocol"`
-	Port       int    `json:"port"`
-	Host       string `json:"host"`
-	TargetPort int    `json:"tport"`
-	IP         string `json:"ip"`
+	Route       string `json:"route,omitempty"`
+	ID          int64  `json:"id"`
+	Protocol    string `json:"protocol"`
+	Port        int    `json:"port"`
+	Host        string `json:"host"`
+	TargetPort  int    `json:"tport"`
+	IP          string `json:"ip"`
+	ListenIP    string `json:"listen_ip,omitempty"`
+	LocalListen bool   `json:"local_listen,omitempty"`
 }
 type Config struct {
 	Generation int64  `json:"generation"`
@@ -308,32 +310,47 @@ func (a *Agent) resolve(c *Config) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	resolved := map[string]string{}
+	cached := map[string]string{}
+	for _, old := range a.config.Rules {
+		if net.ParseIP(old.IP).To4() != nil {
+			cached[old.Host] = old.IP
+		}
+		route, _ := parseRoute(old.Route)
+		if route.Listen != "" && net.ParseIP(old.ListenIP).To4() != nil {
+			cached[route.Listen] = old.ListenIP
+		}
+	}
+	lookup := func(host string) (string, error) {
+		if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+			return ip.To4().String(), nil
+		}
+		if ip := resolved[host]; ip != "" {
+			return ip, nil
+		}
+		ips, e := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+		if e == nil && len(ips) > 0 {
+			resolved[host] = ips[0].To4().String()
+			return resolved[host], nil
+		}
+		if net.ParseIP(cached[host]).To4() == nil {
+			return "", fmt.Errorf("DNS 解析失败: %s", host)
+		}
+		a.stateError = "DNS 解析失败，使用缓存: " + host
+		resolved[host] = cached[host]
+		return cached[host], nil
+	}
 	for i := range c.Rules {
 		r := &c.Rules[i]
-		if ip := net.ParseIP(r.Host); ip != nil && ip.To4() != nil {
-			r.IP = ip.To4().String()
-			continue
+		route, _ := parseRoute(r.Route)
+		var err error
+		if r.IP, err = lookup(r.Host); err != nil {
+			return err
 		}
-		if ip := resolved[r.Host]; ip != "" {
-			r.IP = ip
-			continue
-		}
-		ips, e := net.DefaultResolver.LookupIP(ctx, "ip4", r.Host)
-		if e == nil && len(ips) > 0 {
-			r.IP = ips[0].To4().String()
-			resolved[r.Host] = r.IP
-			continue
-		}
-		for _, old := range a.config.Rules {
-			if old.Host == r.Host && net.ParseIP(old.IP).To4() != nil {
-				r.IP = old.IP
-				break
+		if route.Listen != "" {
+			if r.ListenIP, err = lookup(route.Listen); err != nil {
+				return err
 			}
 		}
-		if r.IP == "" {
-			return fmt.Errorf("DNS 解析失败: %s", r.Host)
-		}
-		a.stateError = "DNS 解析失败，使用缓存: " + r.Host
 	}
 	return nil
 }

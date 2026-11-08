@@ -370,7 +370,7 @@ func (q *qualityMonitor) probeWithAgent(a *Agent, body M) {
 			for _, r := range a.config.Rules {
 				if r.Route != "" {
 					route, _ := parseRoute(r.Route)
-					if route.Out.key() == key {
+					if route.Out.enabled() && route.Out.key() == key {
 						selected = []routeProfile{route.Out}
 						break
 					}

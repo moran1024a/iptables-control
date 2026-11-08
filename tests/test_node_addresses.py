@@ -17,6 +17,72 @@ import topology
 
 
 class AddressTests(Fixture, unittest.TestCase):
+    def modern_graph(self, nid, outgoing=node_addresses.AUTO):
+        ident = self.addresses(nid)[0]['id']
+        return dict(version=2, routing_version=2,
+                    vertices=[dict(id='e', kind='entry', node_id=nid, address=ident),
+                              dict(id='t', kind='target', target_id=self.target())],
+                    edges=[['e', 't']], bindings={'e/t': {'from': {'e': outgoing}, 'to': {}}})
+
+    def test_receiving_public_address_does_not_need_nic_mapping(self):
+        nid = self.node()
+        self.inventory(nid, ('ens3', '10.0.0.2/24'))
+        graph = topology.validate(self.db, self.modern_graph(nid))
+        self.assertEqual(topology.available_routes(self.db, graph)['edges'], [['e', 't']])
+        topology.ready_path(self.db, graph, ['e', 't'])
+        plan = topology.compile_routing(graph, ['e', 't'])
+        self.assertEqual(plan['routing'], ['v2,192.0.2.1,-,-,-'])
+        self.assertEqual(plan['ingress_host'], '192.0.2.1')
+        self.assertEqual(node_addresses.source_route(plan['routing'][0]), '')
+        # Later inventory may fill a NIC but cannot change receive-only bindings.
+        snapshot = topology.snapshot(graph)
+        self.inventory(nid, ('ens3', '192.0.2.1/24'))
+        self.assertEqual(snapshot, topology.snapshot(topology.validate(self.db, graph)))
+
+    def test_explicit_egress_is_not_silently_changed_to_automatic(self):
+        nid = self.node()
+        self.inventory(nid, ('ens3', '10.0.0.2/24'))
+        address = self.addresses(nid)[0]
+        raw = self.modern_graph(nid, address['id'])
+        with self.assertRaisesRegex(errors.UserError, '指定出口.*不在本机'):
+            topology.validate(self.db, raw)
+        address['local'] = '10.0.0.2'
+        self.call('api_node_edit', dict(addresses=[address]), nid)
+        graph = topology.validate(self.db, raw)
+        plan = topology.compile_routing(graph, ['e', 't'])
+        self.assertEqual(plan['routing'], ['v2,192.0.2.1,10.0.0.2,ens3,-'])
+        self.assertEqual(node_addresses.source_route(plan['routing'][0]), '10.0.0.2,ens3,-')
+        self.inventory(nid, ('ens9', '10.0.0.2/24'))
+        self.assertEqual(topology.available_routes(self.db, graph)['edges'], [])
+        with self.assertRaisesRegex(errors.UserError, '指定出口的网卡已变化'):
+            topology.ready_path(self.db, graph, ['e', 't'])
+
+    def test_new_routes_require_updated_agent_and_lock_receiving_host(self):
+        nid = self.node()
+        with self.db:
+            self.db.execute("UPDATE nodes SET agent='0.5.1',installed_agent='active',first_seen=1,protocol_version=2 WHERE id=?", (nid,))
+        graph = self.modern_graph(nid)
+        with self.assertRaisesRegex(errors.UserError, '请先更新节点'):
+            self.call('api_graph_save', dict(name='new', graph=graph, apply=True), None)
+        with self.db:
+            self.db.execute("UPDATE nodes SET agent='0.5.3' WHERE id=?", (nid,))
+        self.call('api_graph_save', dict(name='new', graph=graph, apply=True), None)
+        address = self.addresses(nid)[0]
+        address['host'] = '192.0.2.99'
+        with self.assertRaisesRegex(errors.UserError, '引用'):
+            self.call('api_node_edit', dict(addresses=[address]), nid)
+        # A receive-only reference does not lock unrelated egress settings.
+        address = self.addresses(nid)[0]
+        address.update(local='10.0.0.2', device='ens3')
+        self.call('api_node_edit', dict(addresses=[address]), nid)
+
+    def test_automatic_address_is_not_a_valid_receiving_binding(self):
+        nid = self.node()
+        raw = self.modern_graph(nid)
+        raw['vertices'][0]['address'] = node_addresses.AUTO
+        with self.assertRaises(errors.UserError):
+            topology.validate(self.db, raw)
+
     def addresses(self, nid):
         return node_addresses.listing(self.db, database.get_node(self.db, nid))
 

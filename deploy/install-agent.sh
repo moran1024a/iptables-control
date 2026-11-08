@@ -2,7 +2,7 @@
 # Install the explicitly selected release. RC releases never follow /latest.
 set -euo pipefail
 umask 077
-VERSION="0.5.2"
+VERSION="0.5.3"
 BASE="https://github.com/moran1024a/iptables-control/releases/download/v$VERSION"
 TRUSTED_BASE="$BASE"
 URL='' KEY='' KIND=active
