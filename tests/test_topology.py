@@ -444,14 +444,48 @@ window.addEventListener('unhandledrejection',e=>fetch('/panel/test-result',{meth
  port.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:9,clientX:pr.x+5,clientY:pr.y+5}));
  document.dispatchEvent(new PointerEvent('pointercancel',{bubbles:true,pointerId:9}));await pause(10);
  assert(JSON.stringify(graphSession.graph.bindings)===beforeWire,'cancelled wire changed existing IP bindings');
- // Selecting a wire scopes an IP change to that node connection.
+ // Selecting an existing wire must not capture the next outgoing-pin click.
  const firstEdge=graphSession.graph.edges.findIndex(([a,b])=>a===m1.id&&b===t1.id);
  graphSession.edge=firstEdge;drawGraph();
  const pin=document.querySelector(`[data-graph-node="${m1.id}"] .graph-port.out[data-address="public"]`),rect=pin.getBoundingClientRect();
  pin.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:10,clientX:rect.x+5,clientY:rect.y+5}));
  document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerId:10}));await pause(10);
- assert(graphSession.graph.bindings[`${m1.id}/${t1.id}`].from[m1.id]==='public','selected wire IP unchanged');
+ assert(graphSession.connect===m1.id&&graphSession.edge===null,'selected wire swallowed new connection');
+ assert(graphSession.graph.bindings[`${m1.id}/${t1.id}`].from[m1.id]==='private','new connection changed existing wire');
+ graphCancelConnection();graphSession.edge=firstEdge;drawGraph();
+ const binding=document.querySelector('[data-graph-binding="out"]');binding.value='public';binding.dispatchEvent(new Event('change',{bubbles:true}));
+ assert(graphSession.graph.bindings[`${m1.id}/${t1.id}`].from[m1.id]==='public','wire inspector did not set IP');
  assert(graphSession.graph.bindings[`${m1.id}/${t2.id}`].from[m1.id]==='private','IP change leaked into another wire');
+ graphSession.edge=null;drawGraph();
+ const beforeInput=JSON.stringify(graphSession.graph.bindings);
+ click(`[data-graph-node="${m1.id}"] .graph-port.in[data-address="private"]`);
+ assert(JSON.stringify(graphSession.graph.bindings)===beforeInput,'receive pin rewrote existing wires');
+ // Dropping on a multi-IP header waits for a choice; IP text is also a drop target.
+ const connectedGraph=structuredClone(graphSession.graph);
+ graphSession.graph.edges=graphSession.graph.edges.filter(([a,b])=>a!==e1.id||b!==m1.id);
+ graphSession.selected=null;drawGraph();topologyBinding.fit();
+ const dropOn=selector=>{
+   const source=document.querySelector(`[data-graph-node="${e1.id}"] .graph-port.out[data-address="public"]`),r=source.getBoundingClientRect();
+   source.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,pointerId:11,clientX:r.x+5,clientY:r.y+5}));
+   const rect=document.querySelector(selector).getBoundingClientRect(),x=rect.x+rect.width/2,y=rect.y+rect.height/2;
+   document.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,pointerId:11,clientX:x,clientY:y}));
+   document.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerId:11,clientX:x,clientY:y}));
+ };
+ dropOn(`[data-graph-node="${m1.id}"] .graph-node-body`);await pause(10);
+ assert(graphSession.connectTarget===m1.id&&graphSession.graph.edges.length===7,'ambiguous drop added an incomplete edge');
+ click(`[data-graph-node="${m1.id}"] .graph-port.in[data-address="private"]`);
+ assert(graphSession.graph.bindings[`${e1.id}/${m1.id}`].to[m1.id]==='private','pending IP choice was ignored');
+ graphSession.graph.edges=graphSession.graph.edges.filter(([a,b])=>a!==e1.id||b!==m1.id);drawGraph();
+ dropOn(`[data-graph-node="${m1.id}"] .graph-ip-row code`);await pause(10);
+ assert(graphSession.graph.edges.length===8,'drop on IP text failed');
+ graphSession.graph=connectedGraph;graphSession.selected=null;graphSession.edge=null;drawGraph();
+ const editorLines=graphConnectionRoutes(graphSession.graph,graphBoxes(graphSession.graph));
+ const ends=editorLines.filter(r=>r.b===m1.id).map(r=>r.in.point.join(','));
+ assert(new Set(ends).size===ends.length,'editor arrowheads overlap at receiving IP');
+ graphFocusEditor(document.querySelector(`[data-graph-node="${m1.id}"]`));
+ assert(document.querySelector('.graph-edit-focus .graph-nearby[data-graph-from]'),'editor focus did not highlight connected lines');
+ graphSession.edge=firstEdge;drawGraph();
+ assert(graphConnectionRoutes(graphSession.graph,graphBoxes(graphSession.graph))===editorLines,'selection recalculated geometry');
  graphSession.edge=null;drawGraph();
  // Choose a receive IP through the actual card button, without an address dialog.
  click(`[data-graph-node="${e1.id}"] [data-action="graph-listen"][data-address="private"]`);
@@ -519,7 +553,7 @@ window.addEventListener('unhandledrejection',e=>fetch('/panel/test-result',{meth
  assert(bad.classList.contains('graph-invalid')&&br.left<vr.right&&br.right>vr.left&&br.top<vr.bottom&&br.bottom>vr.top,'invalid node is not revealed');
  graphChooseAddress(extra.id,'in','public');graphChooseAddress(extra.id,'out','private');
  graphConnect(e1.id,'out','public');graphConnect(extra.id,'in','public');
- assert(graphSession.edge==null,'completed connection remained selected');
+ assert(!graphSession.connect&&graphSession.graph.edges[graphSession.edge].join('/')===`${e1.id}/${extra.id}`,'completed connection did not show its own settings');
  // A previously selected, unrelated edge must not swallow the next pin click.
  graphSession.edge=graphSession.graph.edges.findIndex(([a,b])=>a===e1.id&&b===m1.id);drawGraph();
  const nextPin=document.querySelector(`[data-graph-node="${extra.id}"] .graph-port.out[data-address="private"]`),nr=nextPin.getBoundingClientRect();

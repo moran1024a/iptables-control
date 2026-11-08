@@ -83,29 +83,30 @@ def preview(c, graph, body):
             active_paths[m['entry'], m['target']] = path
             if m['job']: busy.add(m['entry'])
     allowed = topology.ready_path(c, graph, None) if body.get('ready', True) else None
+    selection = topology.available_routes(c, graph) if body.get('ready', True) else graph
     paths, skipped, options, complete = [], [], set(), False
-    edges = topology.expanded_edges(graph)
+    edges = topology.expanded_edges(selection)
     targets = [v['id'] for v in graph['vertices'] if v['kind'] == 'target']
     for a in (v['id'] for v in graph['vertices'] if v['kind'] == 'entry' and (entry is None or v['id'] == entry)):
         if a in busy:
             skipped.append(dict(entry=a, count=len(targets), targets=targets, reason='此入口正在同步，请等待确认'))
             continue
         preferred = current.get(a, {})
-        selected = topology.entry_paths(graph, a, prefix=prefix, required=required, preferred=preferred, allowed=allowed)
+        selected = topology.entry_paths(selection, a, prefix=prefix, required=required, preferred=preferred, allowed=allowed)
         if not selected:
             skipped.append(dict(entry=a, count=len(targets), targets=targets, reason='没有符合选择且能覆盖全部目标的统一首跳'))
             continue
         choices = set()
         if prefix:
             for source, nxt in edges:
-                if source == prefix[-1] and vertices[nxt]['kind'] != 'target' and topology.entry_paths(graph, a, prefix=prefix+[nxt], required=required, preferred=preferred, allowed=allowed):
+                if source == prefix[-1] and vertices[nxt]['kind'] != 'target' and topology.entry_paths(selection, a, prefix=prefix+[nxt], required=required, preferred=preferred, allowed=allowed):
                     choices.add(nxt)
             if vertices[prefix[-1]]['kind'] == 'target':
                 complete = True  # Accept full paths from earlier clients.
             elif not choices or body.get('finish') is True:
                 # Only the target suffix is automatic. Any remaining choice
                 # between intermediate nodes still belongs to the user.
-                final = topology.entry_paths(graph, a, prefix=prefix, direct=True,
+                final = topology.entry_paths(selection, a, prefix=prefix, direct=True,
                     required=required, preferred=preferred, allowed=allowed)
                 if final:
                     selected, choices, complete = final, set(), True
@@ -232,7 +233,7 @@ def save(c, body, ident=None):
         raise errors.UserError('旧配置正在清理，请等待节点确认', status=409)
     apply = body.get('apply', False)
     if type(apply) is not bool: topology.fail('无效的应用操作')
-    graph = topology.validate(c, body.get('graph'), complete=apply)
+    graph = topology.validate(c, body.get('graph'), complete=apply, check_network=not body.get('switch_only'))
     name = validation.check_remark(body.get('name', old['name'] if old else ''), 'name', '名称')
     group_id = database.check_group(c, 'links', body.get('group_id', old['group_id'] if old else None))
     if not apply:

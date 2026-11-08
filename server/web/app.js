@@ -665,10 +665,15 @@ function bytesText(value) {
   } catch (_) { return "-"; }
 }
 
+function nodeAddressProblem(a, network={}) {
+  if (!a.local) return '请选择对应的本机 IP';
+  if (network.complete && !(network.addresses||[]).some(n=>n.local===a.local)) return '本机未发现此 IP；NAT 地址请选择对应的本机 IP';
+  if (!a.device) return '网卡待识别，请同步 Agent 或选择本机 IP';
+  if (network.complete && !(network.addresses||[]).some(n=>n.local===a.local&&n.device===a.device)) return '本机 IP 与网卡不匹配，请重新匹配网卡';
+  return '';
+}
 function nodeAddressStatus(a, network={}) {
-  if (!a.local || !a.device) return '待识别';
-  if (network.complete && !(network.addresses||[]).some(n=>n.local===a.local&&n.device===a.device)) return '最近采集未发现';
-  return a.device;
+  return nodeAddressProblem(a,network)||a.device;
 }
 
 function nodeAddressPanel(n) {
@@ -1015,10 +1020,10 @@ function nodeAddressRow(a={}) {
     <div class="node-address-main"><label class="address-primary" title="设为主 IP"><input type="radio" name="primary_address" value="${esc(id)}" ${a.primary?'checked':''}><span data-primary-label>${a.primary?'主 IP':'副 IP'}</span></label>
     ${field('host','IP 地址',`required data-previous="${esc(a.host||'')}" ${a.primary?'name="addr"':''}`)}${field('name','名称（选填)','maxlength="64"')}
     <button type="button" class="small" data-action="node-address-remove" aria-label="删除地址" ${a.primary?'disabled':''}>×</button></div>
-    <details class="address-advanced"><summary>高级 <span class="muted" data-address-status></span></summary><div class="address-routing">
-    <label><span>本机 IP</span>${field('local','与 IP 地址相同','list="node-local-addresses"')}</label>
+    <div class="address-local"><label><span>对应本机 IP</span>${field('local','与 IP 地址相同','list="node-local-addresses"')}</label><span class="muted" data-address-status></span><button type="button" class="small" data-action="node-address-resolve" hidden>匹配网卡</button></div>
+    <details class="address-advanced"><summary>高级路由</summary><div class="address-routing">
     <label><span>网卡</span>${field('device','自动识别','list="node-devices"')}</label>
-    <label><span>网关</span>${field('gateway','自动识别')}</label></div><p class="hint">NAT 地址请选择对应的本机 IP；网卡和网关可手动指定。</p></details></div>`;
+    <label><span>网关</span>${field('gateway','自动识别')}</label></div></details></div>`;
 }
 
 function syncAddressRows(form) {
@@ -1031,8 +1036,10 @@ function syncAddressRows(form) {
     if(primary)field('host').name='addr';else field('host').removeAttribute('name');
     const local=field('local').value.trim()||field('host').value.trim();
     const matches=[...new Set(candidates.filter(n=>n.local===local).map(n=>n.device))];
-    if(network.complete!==false&&!field('device').value&&matches.length===1)field('device').value=matches[0];
+    if(network.complete&&!field('device').value&&matches.length===1)field('device').value=matches[0];
     row.querySelector('[data-address-status]').textContent=nodeAddressStatus({local,device:field('device').value},network);
+    row.classList.toggle('address-unresolved',!!nodeAddressProblem({local,device:field('device').value},network));
+    row.querySelector('[data-action=node-address-resolve]').hidden=!(network.complete&&matches.length===1&&matches[0]!==field('device').value);
   });
 }
 
@@ -1061,7 +1068,7 @@ async function nodeForm(node) {
         <option value="passive" ${node?.desired_mode === "passive" ? "selected" : ""}>被动（默认手动，可选远程唤醒）</option>
       </select></label>
       ${node?`<p class="hint">${node.first_seen && node.protocol_version < 2 ? '请先升级 Agent 并同步一次，才能切换模式。' : '切换模式后需在本机运行 sudo ictl --sync 确认。'}</p>`:''}
-      <section class="node-addresses"><h3>IP 地址</h3><div data-address-list>${addresses.map(nodeAddressRow).join('')}</div><div class="actions"><button type="button" class="small" data-action="node-address-add">＋ 副 IP</button>${node?.installed_agent==='active'&&node?.desired_mode==='active'?'<button type="button" class="small" data-action="node-address-refresh">刷新识别</button>':''}<small class="muted" data-address-sampled></small></div>
+      <section class="node-addresses"><h3>IP 地址</h3><p class="hint">主 IP 用于访问节点。NAT 环境请将访问地址对应到本机 IP。</p><div data-address-list>${addresses.map(nodeAddressRow).join('')}</div><div class="actions"><button type="button" class="small" data-action="node-address-add">＋ 副 IP</button>${node?.installed_agent==='active'&&node?.desired_mode==='active'?'<button type="button" class="small" data-action="node-address-refresh">刷新识别</button>':''}<small class="muted" data-address-sampled></small></div>
       <details class="address-picker"><summary>从已识别地址添加</summary><div data-address-candidates></div><button type="button" class="small" data-action="node-address-pick">添加选中</button></details>
       ${node?.src_ip?`<p class="hint">最近连接来源 ${esc(node.src_ip)}；NAT 环境可能与主 IP 不同。</p>`:''}
       <datalist id="node-local-addresses"></datalist><datalist id="node-devices"></datalist><div data-error="addresses" class="form-error"></div></section>
@@ -1950,6 +1957,13 @@ if (document.readyState === 'loading') document.addEventListener('DOMContentLoad
 else route();
 
 Object.assign(ACTIONS, {
+  'node-address-resolve':el=>{
+    const row=el.closest('[data-address-id]'),form=row.closest('form');
+    const local=row.querySelector('[data-address-field=local]').value.trim()||row.querySelector('[data-address-field=host]').value.trim();
+    const devices=[...new Set((form._network?.addresses||[]).filter(a=>a.local===local).map(a=>a.device))];
+    if(form._network?.complete&&devices.length===1)row.querySelector('[data-address-field=device]').value=devices[0];
+    syncAddressRows(form);
+  },
   'node-address-add':()=>{
     const form=$('#modal form');
     if(form.querySelectorAll('[data-address-id]').length>=33)return toast('最多添加 32 个副 IP',true);

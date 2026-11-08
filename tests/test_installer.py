@@ -92,7 +92,8 @@ class InstallerTests(unittest.TestCase):
     def test_success_removes_only_old_container_and_keeps_backup(self):
         r=self.run_install();self.assertEqual(r.returncode,0,r.stderr)
         containers=json.loads((self.root/'containers').read_text());self.assertEqual(list(containers),['ictl-server'])
-        self.assertTrue(containers['ictl-server']['image'].endswith('0.5.1'))
+        version=json.loads((ROOT/'server/components.json').read_text())['server']
+        self.assertEqual(containers['ictl-server']['image'],f'ghcr.io/moran1024a/ictl-server:{version}')
         backup=next((self.root/'data').glob('*.bak'));c=sqlite3.connect(backup)
         self.assertEqual(c.execute('PRAGMA user_version').fetchone()[0],202);c.close()
 

@@ -13,6 +13,7 @@ import errors
 import node_addresses
 import node_sync
 import settings
+import topology
 
 
 class AddressTests(Fixture, unittest.TestCase):
@@ -69,6 +70,32 @@ class AddressTests(Fixture, unittest.TestCase):
         self.call('api_node_edit', dict(addresses=values), nid)
         self.assertEqual(self.addresses(nid)[0]['host'], 'nat.example.com')
         self.assertEqual(database.get_node(self.db, nid)['addr'], '10.0.0.2')
+
+    def test_changed_interface_blocks_publish_but_allows_draft_repair(self):
+        nid = self.node()
+        self.inventory(nid, ('eth0', '192.0.2.1/24'))
+        address = self.addresses(nid)[0]
+        graph = dict(version=2, vertices=[dict(id='e', kind='entry', node_id=nid, address=address['id']),
+                     dict(id='t', kind='target', target_id=self.target())], edges=[['e', 't']],
+                     bindings={'e/t': {'from': {'e': address['id']}, 'to': {}}})
+        topology.validate(self.db, graph)
+        self.call('api_graph_save', dict(name='draft', graph=graph, apply=False), None)
+        self.inventory(nid, ('ens3', '192.0.2.1/24'))
+        self.assertEqual(self.addresses(nid)[0]['device'], 'eth0')  # Never silently rewire.
+        self.assertFalse(node_addresses.ready(address, node_addresses.network(self.db, nid)))
+        with self.assertRaisesRegex(errors.UserError, '最近采集未发现'):
+            topology.validate(self.db, graph)
+        address['device'] = 'ens3'
+        self.call('api_node_edit', dict(addresses=[address]), nid)
+        self.assertEqual(self.addresses(nid)[0]['id'], address['id'])
+        topology.validate(self.db, graph)
+
+    def test_connecting_two_copies_of_same_host_has_specific_error(self):
+        nid = self.node()
+        graph = dict(version=2, vertices=[dict(id='e', kind='entry', node_id=nid),
+                     dict(id='n', kind='node', node_id=nid)], edges=[['e', 'n']])
+        with self.assertRaisesRegex(errors.UserError, '同一台节点'):
+            topology.validate(self.db, graph, complete=False)
 
     def test_rc1_migration_keeps_addresses_ids_and_does_not_rekey(self):
         nid = self.node()

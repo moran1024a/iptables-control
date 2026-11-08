@@ -2,7 +2,7 @@
 
 轻量的 IPv4 端口转发管理工具。通过 Web 面板管理多台服务器，或使用 `ipt.sh` 在单台服务器上独立管理转发。
 
-**0.5.1** 支持可视化拓扑、多入口与多目标、主副 IP、订阅分享和 7 天网络质量图。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，按需同步。转发节点无需安装代理核心，SS／SS2022／VLESS Reality 等目标服务需自行准备。
+**0.5.2** 支持可视化拓扑、多入口与多目标、主副 IP、订阅分享和 7 天网络质量图。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，按需同步。转发节点无需安装代理核心，SS／SS2022／VLESS Reality 等目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -25,14 +25,14 @@
 
 ## 安装
 
-管理多台服务器时，安装**服务端 + 节点 Agent**；只管理本机时，安装**单机脚本**即可。以下命令固定使用 0.5.1，已有部署请先阅读[升级说明](#升级)。
+管理多台服务器时，安装**服务端 + 节点 Agent**；只管理本机时，安装**单机脚本**即可。以下命令固定使用 0.5.2，已有部署请先阅读[升级说明](#升级)。
 
 ### 服务端
 
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.5.1/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.5.2/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -40,7 +40,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.5
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.5.1/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.5.2/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
 主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口，并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址。
@@ -64,7 +64,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.5
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.5.1/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.5.2/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -80,7 +80,9 @@ sudo bash /root/ipt.sh
 
 重新执行[服务端安装命令](#服务端)。安装器沿用现有端口和数据挂载，保留升级前数据库备份；新容器启动或就绪检查失败时尝试恢复旧容器和数据库。相同版本需要重建时，将命令末尾改为 `| bash -s -- --force`。
 
-从 **0.4.x 或 0.5.x RC** 升级到 0.5.1：
+从 **0.5.1** 升级到 **0.5.2** 只需更新服务端，保留现有数据和转发规则；已使用 0.5.1 的 Agent 无需更新。
+
+从 **0.4.x 或 0.5.x RC** 升级到 0.5.2：
 
 - 保留节点、目标、配置身份、端口、订阅、质量历史和未完成的切换事务。
 - 旧池展开为独立节点及明确连线；已锁定池的其他成员转为禁用。重新编辑旧链路时使用新版画布。
@@ -102,7 +104,7 @@ sudo bash /root/ipt.sh
 
 ### 节点 Agent 升级
 
-0.5.1 的主动 Agent、被动 Agent 和管理器均为 **0.5.1**。服务端升级后，在节点执行：
+本版的主动 Agent、被动 Agent 和管理器仍为 **0.5.1**。旧版节点需要升级时，在节点执行：
 
 ```bash
 sudo ictl --update
@@ -126,7 +128,7 @@ sudo ictl --sync
 删除容器和镜像，保留数据卷：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.5.1/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.5.2/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；完整停用时，请先处理节点。
@@ -178,11 +180,11 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 每个节点有一个**主 IP**和多个可选**副 IP**。主 IP 是默认联系地址，实际连接来源在详情中单独显示；修改主 IP 保留节点密钥。
 
-在“节点 → 编辑 → 从已识别地址添加”中勾选副 IP，也可以手填已有的 IPv4 地址。名称可留空，网卡会自动匹配。NAT 环境在地址的“高级”设置中选择实际本机 IP；多个匹配或特殊路由时，再指定网卡、网关。待识别地址可先保存，补全后才能用于发布链路。
+在“节点 → 编辑 → 从已识别地址添加”中勾选副 IP，也可以手填已有的 IPv4 地址。名称可留空，网卡会自动匹配。“对应本机 IP”通常与填写的 IP 相同；NAT 环境需选择网卡上实际存在的地址，例如公网 `203.0.113.10` 对应本机 `10.0.0.5`。多个匹配或特殊路由时，在“高级路由”中指定网卡、网关。待识别地址可先保存，补全后才能用于发布链路。
 
-画布上每个 IP 有自己的连接点。只有一个 IP 时自动使用；多个 IP 时，在连线时明确选择从哪个 IP 发出、从哪个 IP 接收。它们可以是两个公网地址、两个内网地址或其他 IPv4 组合，不要求按“公网／内网”分类。要修改已有连线，先选中该线，再点击对应 IP 圆点。
+画布上每个 IP 有自己的连接点。只有一个 IP 时自动使用；多个 IP 时，在连线时明确选择从哪个 IP 发出、从哪个 IP 接收，拖到目标 IP 行也可完成连接。它们可以是两个公网地址、两个内网地址或其他 IPv4 组合，不要求按“公网／内网”分类。要修改已有连线，先选中该线，再在下方选择发出与接收 IP。选中入口可设置“入口接收 IP”，生成的配置使用该地址。
 
-本机 IP 必须已绑定在对应网卡上；NAT 公网地址需映射到实际本机 IP。基础网络和回程路由需可用，面板不会给网卡添加 IP。把副 IP 设为主 IP 不改变已有连线；已引用地址的参数需先解除引用才能修改。
+本机 IP 必须已绑定在对应网卡上；NAT 公网地址需映射到实际本机 IP。基础网络和回程路由需可用，面板不会给网卡添加 IP。把副 IP 设为主 IP 不改变已有连线。仅被草稿引用的地址可以直接修正；已用于发布链路的地址，需新增正确地址，在链路中替换并应用后再删除旧地址。
 
 ### 多入口、多目标与配置
 
@@ -379,7 +381,7 @@ for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
 
 | 组件 | 版本 |
 | --- | --- |
-| 服务端 | 0.5.1 |
+| 服务端 | 0.5.2 |
 | 主动 Agent | 0.5.1 |
 | 被动 Agent／管理器 | 0.5.1 |
 | 唤醒组件 | 0.4.3 |

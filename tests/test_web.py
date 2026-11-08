@@ -160,7 +160,17 @@ window.addEventListener("error",e=>{document.querySelector('#result').textConten
   assert(!addressRows[0].querySelector('[data-action=node-address-remove]').disabled,'old primary remained locked');
   addressRows[0].querySelector('[data-address-field=host]').value='192.0.2.8';
   addressRows[0].querySelector('[data-address-field=host]').dispatchEvent(new Event('change',{bubbles:true}));
-  assert(addressRows[0].querySelector('[data-address-field=device]').value===''&&addressRows[0].textContent.includes('待识别'),'changed IP reused stale device');
+  assert(addressRows[0].querySelector('[data-address-field=device]').value==='','changed IP reused stale device');
+  assert(addressRows[0].textContent.includes('本机未发现'),'missing IP needs an actionable mapping message');
+  const local=addressRows[0].querySelector('[data-address-field=local]');
+  assert(!local.closest('details'),'local mapping is hidden in advanced settings');
+  local.value='10.0.0.1';local.dispatchEvent(new Event('change',{bubbles:true}));
+  assert(addressRows[0].querySelector('[data-address-field=device]').value==='eth1','local mapping did not resolve device');
+  addressForm._network={complete:true,addresses:[{local:'10.0.0.1',device:'ens3'}]};renderAddressCandidates(addressForm);
+  const repair=addressRows[0].querySelector('[data-action=node-address-resolve]');
+  assert(!repair.hidden&&addressRows[0].querySelector('[data-address-field=device]').value==='eth1','new inventory silently changed device');
+  ACTIONS['node-address-resolve'](repair);
+  assert(addressRows[0].querySelector('[data-address-field=device]').value==='ens3','explicit device repair was ignored');
   closeModal();
   node.desired_mode='passive';
   node.status='error';node.err='端口冲突：TCP 10001 已被本机服务占用';

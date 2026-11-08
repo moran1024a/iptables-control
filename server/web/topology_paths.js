@@ -1,5 +1,5 @@
 // Runtime routes share the same explicit node connections as the editor.
-let graphRouteCache=null,graphHintRequest=0,graphHintTimer=null;
+let graphRouteCache=null,graphConnectionCache=null,graphHintRequest=0,graphHintTimer=null;
 
 function graphRoutes(link) {
   if(link?.selection_mode==='independent')return (link.configurations||[]).flatMap(c=>[
@@ -31,16 +31,61 @@ function graphEntryMarks(g,link,id) {
   return [...entries].filter(entry=>colors.has(entry)).map(entry=>`<i class="graph-entry-dot" style="background:${colors.get(entry)}" title="${esc(graphName(g.vertices.find(v=>v.id===entry)))}"></i>`).join('');
 }
 
-function graphLanePenalty(a,b,used) {
+function graphLanePenalty(a,b,used,clearance=6) {
   const horizontal=a[1]===b[1];let cost=0;
   for(const [c,d] of used){
     const same=horizontal===(c[1]===d[1]),axis=horizontal?0:1,other=1-axis;
     if(same){
       const overlap=Math.min(Math.max(a[axis],b[axis]),Math.max(c[axis],d[axis]))-Math.max(Math.min(a[axis],b[axis]),Math.min(c[axis],d[axis]));
-      if(overlap>2&&Math.abs(a[other]-c[other])<6)cost+=1000+overlap*15;
+      if(overlap>2&&Math.abs(a[other]-c[other])<clearance)cost+=1000+overlap*15;
     }else if(c[axis]>Math.min(a[axis],b[axis])&&c[axis]<Math.max(a[axis],b[axis])&&a[other]>Math.min(c[other],d[other])&&a[other]<Math.max(c[other],d[other]))cost+=35;
   }
   return cost;
+}
+
+function graphConnectionRoutes(g,boxes,editing=true) {
+  const edges=graphConnections(g),ports=g.vertices.map(v=>[v.id,graphAddresses(v.id,g).map(a=>a.id)]);
+  const moving=editing&&graphDrag?.moved?graphDrag.node.id:null;
+  const key=JSON.stringify([g.vertices,g.bindings,edges,ports,moving,editing]);
+  if(graphConnectionCache?.key===key)return graphConnectionCache.routes;
+  const groups=new Map(),used=[],routes=edges.map(([a,b],i)=>({a,b,i}));
+  for(const r of routes)for(const [side,id] of [['out',r.a],['in',r.b]]){
+    const v=g.vertices.find(v=>v.id===id),address=graphPortAddress(g,v,side,[r.a,r.b]);
+    const point=graphPortPoint(g,id,side,address,boxes),key=JSON.stringify([id,side,address]);
+    if(!groups.has(key))groups.set(key,[]);
+    groups.get(key).push({r,side,point});
+  }
+  for(const group of groups.values()){
+    // Sort by the other endpoint's position, never by current selection.
+    group.sort((a,b)=>{
+      const x=boxes.get(a.side==='out'?a.r.b:a.r.a),y=boxes.get(b.side==='out'?b.r.b:b.r.a);
+      return x.y-y.y||x.x-y.x||a.r.i-b.r.i;
+    });
+    const spacing=Math.min(9,18/Math.max(1,group.length-1));
+    group.forEach((p,i)=>{
+      if(editing)p.point[0]+=p.side==='out'?10:-12;
+      p.point[1]+=(i-(group.length-1)/2)*spacing;
+      p.r[p.side]={point:p.point,spacing};
+    });
+  }
+  const ordered=[...routes].sort((a,b)=>boxes.get(a.a).x-boxes.get(b.a).x||boxes.get(a.a).y-boxes.get(b.a).y||a.i-b.i);
+  // Keep unrelated wires steady during a drag. Route the whole canvas once
+  // again on release, including wires which now need to avoid the moved card.
+  if(moving)for(const r of ordered){
+    const prior=graphConnectionCache?.routes[r.i];
+    if(r.a!==moving&&r.b!==moving&&prior?.a===r.a&&prior.b===r.b){
+      Object.assign(r,prior);
+      for(let i=1;i<r.points.length;i++)used.push([r.points[i-1],r.points[i]]);
+    }
+  }
+  for(const r of ordered){
+    if(r.d)continue;
+    const spacing=Math.min(r.in.spacing,r.out.spacing);
+    const points=graphRoutePoints(r.out.point,r.in.point,boxes.get(r.a),boxes.get(r.b),[...boxes.values()],r.i,used,Math.min(6,spacing*.8));
+    r.points=points;r.d=graphRoundedPath(points);r.arrowHeight=Math.min(5,r.in.spacing*.65);
+    for(let i=1;i<points.length;i++)used.push([points[i-1],points[i]]);
+  }
+  graphConnectionCache={key,routes};return routes;
 }
 
 function graphRuntimeLines(g,link,boxes) {
@@ -84,8 +129,9 @@ function graphRuntimeLines(g,link,boxes) {
       const slot=c=>c.side==='out'?JSON.stringify([c.span.entry,c.span.pending]):c.span;
       const slots=[...new Set(connections.map(slot))],spacing=Math.min(8,16/Math.max(1,slots.length-1));
       for(const c of connections){
-        c.point[1]+=(slots.indexOf(slot(c))-(slots.length-1)/2)*spacing;
-        c.span[c.side]={point:c.point,spacing,lane:slots.indexOf(slot(c))};
+        const offset=(slots.indexOf(slot(c))-(slots.length-1)/2)*spacing;
+        c.point[1]+=offset;
+        c.span[c.side]={point:c.point,spacing,lane:slots.indexOf(slot(c)),offset};
       }
     }
     for(const span of list){
@@ -94,7 +140,10 @@ function graphRuntimeLines(g,link,boxes) {
       const source=boxes.get(edge[0]),target=boxes.get(edge[1]);
       const obstacles=[...boxes.values()].filter(box=>box.id!==span.a&&box.id!==span.b);
       const all=[source,target,...obstacles.filter(box=>box.id!==source.id&&box.id!==target.id)];
-      const points=graphRoutePoints(start,end,source,target,all,lane,used.filter(s=>s.entry!==span.entry||s.pending!==span.pending).map(s=>s.points));
+      // Parallel routes need opposite bend offsets when travelling down/up;
+      // shifting every bend to the right makes adjacent colours cross.
+      const bend=-Math.sign(end[1]-start[1])*(span.out.offset+span.in.offset)/2;
+      const points=graphRoutePoints(start,end,source,target,all,lane,used.filter(s=>s.entry!==span.entry||s.pending!==span.pending).map(s=>s.points),6,bend);
       span.d=graphRoundedPath(points);
       const spacing=Math.min(span.out.spacing,span.in.spacing);
       span.stroke=Math.min(1.7,spacing*.45);

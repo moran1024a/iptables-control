@@ -1196,6 +1196,7 @@ def view_resources(c, cache=None):
                 name=n["name"],
                 addr=n["addr"],
                 addresses=node_addresses.listing(c, n),
+                network=node_addresses.network(c, n['id']),
                 mode=n["desired_mode"],
                 eligible=n["installed_agent"] == "active"
                 and n["desired_mode"] == "active"

@@ -117,14 +117,16 @@ def snapshot(graph):
     return result
 
 
-def documents(c):
+def documents(c, published_only=False):
     """All saved, running and in-flight plans, including rollback and drafts."""
-    for row in c.execute('''SELECT l.name,l.plan,l.applied,l.job,g.draft,
+    for row in c.execute('''SELECT l.name,l.state,l.plan,l.applied,l.job,g.draft,
             t.graph,t.applied_graph,b.graph AS batch_graph FROM links l
         LEFT JOIN link_graphs g ON g.link_id=l.id
         LEFT JOIN topology_canvases t ON t.root_id=l.id
         LEFT JOIN link_batches b ON b.root_id=l.id'''):
-        docs = [json.loads(row[key]) for key in ('plan', 'draft') if row[key]]
+        if published_only and row['state'] == 'draft' and not any(row[k] for k in ('applied', 'job', 'applied_graph', 'batch_graph')):
+            continue
+        docs = [json.loads(row[key]) for key in (('plan',) if published_only else ('plan', 'draft')) if row[key]]
         if row['applied']: docs.append(json.loads(row['applied'])['plan'])
         if row['job']:
             job = json.loads(row['job'])
@@ -134,7 +136,7 @@ def documents(c):
         for doc in docs: yield row['name'], doc
 
 
-def validate_bindings(c, raw, graph, complete):
+def validate_bindings(c, raw, graph, complete, check_network=True):
     bindings = raw.get('bindings', {})
     if not isinstance(bindings, dict): fail('无效的地址映射')
     graph['bindings'], graph['address_book'] = {}, {}
@@ -144,8 +146,16 @@ def validate_bindings(c, raw, graph, complete):
     targets = [v['id'] for v in graph['vertices'] if v['kind'] == 'target']
     pairs = {a + '/' + b for a in entries for b in targets}
     graph['ports'] = {key: validation.check_port(value, 'port') for key, value in ports.items() if key in pairs}
+    networks = {}
+    def check_address(v, address):
+        reason = node_addresses.problem(address, networks[v['node_id']] if check_network else None)
+        if reason:
+            name = database.get_node(c, v['node_id'])['name']
+            fail(f"「{name}」地址 {address['host']}：{reason}", 'vertex:' + v['id'])
     for v in graph['vertices']:
         if v.get('node_id'):
+            if v['node_id'] not in networks:
+                networks[v['node_id']] = node_addresses.network(c, v['node_id'])
             graph['address_book'][v['id']] = {a['id']: a for a in node_addresses.listing(c, database.get_node(c, v['node_id']))}
             if complete and not v['disabled'] and not graph['address_book'][v['id']]:
                 fail('请先在节点编辑页设置 IP 地址', 'vertex:' + v['id'])
@@ -155,8 +165,8 @@ def validate_bindings(c, raw, graph, complete):
             fail('入口和目标不能禁用，请从画布移除', 'vertex:' + v['id'])
         if v['kind'] == 'entry' and complete and v.get('address') not in graph['address_book'][v['id']]:
             fail('请选择入口接收地址', 'vertex:' + v['id'])
-        if v['kind'] == 'entry' and complete and not node_addresses.ready(graph['address_book'][v['id']][v['address']]):
-            fail('入口地址待识别，请先同步 Agent 或在地址高级设置中选择本机地址、网卡', 'vertex:' + v['id'])
+        if v['kind'] == 'entry' and complete:
+            check_address(v, graph['address_book'][v['id']][v['address']])
     for source, target in connections(graph):
         key = node_addresses.edge_key(source, target)
         mapping = bindings.get(key, {})
@@ -177,8 +187,8 @@ def validate_bindings(c, raw, graph, complete):
                         direction = '发出' if side == 'from' else '接收'
                         fail(f'请点击「{name}」的{direction} IP 连接点', 'vertex:' + v['id'])
                 else:
-                    if complete and not v['disabled'] and not node_addresses.ready(available[ident]):
-                        fail(f"地址 {available[ident]['host']} 待识别，请先同步 Agent 或补全地址高级设置", 'vertex:' + v['id'])
+                    if complete and not v['disabled']:
+                        check_address(v, available[ident])
                     clean[side][v['id']] = ident
         graph['bindings'][key] = clean
 
@@ -278,7 +288,7 @@ def arrange(graph):
     return graph
 
 
-def validate(c, raw, complete=True):
+def validate(c, raw, complete=True, check_network=True):
     if not isinstance(raw, dict) or type(raw.get("version")) is not int or raw["version"] not in (1, 2):
         fail("无效的拓扑版本")
     raw = flatten(raw)
@@ -332,6 +342,9 @@ def validate(c, raw, complete=True):
             fail("不能重复连线或连接节点自身", "edge:" + a)
         if by_id.get(a, {}).get("kind") == "target" or by_id.get(b, {}).get("kind") == "entry":
             fail("入口不能接收入站连线，目标不能继续转发", "edge:" + a)
+        if by_id[a].get('node_id') and by_id[a].get('node_id') == by_id[b].get('node_id'):
+            name = database.get_node(c, by_id[a]['node_id'])['name']
+            fail(f'两端都是同一台节点「{name}」，不能互相转发', 'vertex:' + b)
         seen.add(tuple(edge)); result["edges"].append(edge[:])
     result["edges"] = [list(e) for e in connections(result)]
     for kind in ("entry", "target"):
@@ -341,7 +354,7 @@ def validate(c, raw, complete=True):
         if complete and not count and (kind == 'target' or raw['version'] == 2):
             fail('请至少添加一个' + ('入口' if kind == 'entry' else '目标'))
     if raw['version'] == 2:
-        validate_bindings(c, raw, result, complete)
+        validate_bindings(c, raw, result, complete, check_network)
         if sum(v['kind'] == 'entry' for v in vertices) * sum(v['kind'] == 'target' for v in vertices) > 64:
             fail('每张拓扑最多生成 64 个入口与目标组合')
     if complete and len(vertices) > 1 and not endpoints(result)[0]:
@@ -365,6 +378,17 @@ def validate(c, raw, complete=True):
                     if not find_path(result, entry=source['id'], target=destination['id']):
                         name = database.get_node(c, source['node_id'])['name']
                         target_name = database.get_target(c, destination['target_id'])['name']
+                        # Distinguish physical node reuse from missing wires.
+                        structural = dict(result, vertices=[{k: val for k, val in v.items() if k != 'node_id'} for v in result['vertices']])
+                        path = find_path(structural, entry=source['id'], target=destination['id'])
+                        if path:
+                            seen_nodes = set()
+                            for vid in path:
+                                nid = by_id[vid].get('node_id')
+                                if nid and nid in seen_nodes:
+                                    repeated = database.get_node(c, nid)['name']
+                                    fail(f'入口「{name}」到目标「{target_name}」的路径重复经过节点「{repeated}」，请修改连线', 'vertex:' + vid)
+                                seen_nodes.add(nid)
                         fail(f'入口「{name}」无法到达目标「{target_name}」', 'vertex:'+source['id'])
         elif not find_path(result): fail("没有满足禁用和节点不重复约束的入口到目标路径")
         entry, target = endpoints(result)
@@ -714,6 +738,31 @@ def save(c, body, ident=None):
     return dict(id=ident)
 
 
+def available_routes(c, graph):
+    """Filter unusable address bindings for selection without changing the canvas."""
+    if graph.get('version') != 2:
+        return graph
+    vertices = {v['id']: v for v in graph['vertices']}
+    networks = {v['node_id']: node_addresses.network(c, v['node_id'])
+                for v in vertices.values() if v.get('node_id')}
+
+    def usable(vid, ident):
+        vertex = vertices[vid]
+        if not vertex.get('node_id'):
+            return True
+        address = graph.get('address_book', {}).get(vid, {}).get(ident)
+        return bool(address and node_addresses.ready(address, networks[vertex['node_id']]))
+
+    edges = []
+    for a, b in connections(graph):
+        binding = graph.get('bindings', {}).get(node_addresses.edge_key(a, b), {})
+        if vertices[a]['kind'] == 'entry' and not usable(a, vertices[a].get('address')):
+            continue
+        if all(usable(vid, binding.get(side, {}).get(vid)) for side, vid in (('from', a), ('to', b))):
+            edges.append([a, b])
+    return dict(graph, edges=edges)
+
+
 def ready_path(c, graph, path, automatic=False, blocked=()):
     import pools
     nodes = {r["id"]: dict(r) for r in c.execute("SELECT * FROM nodes")}
@@ -725,15 +774,26 @@ def ready_path(c, graph, path, automatic=False, blocked=()):
         if n["desired_mode"] == "active": return pools.ready(n, int(time.time()))
         return not automatic or bool(n["wake_enabled"] and n["wake_port"])
     if path is None: return allowed
+    used = node_addresses.references(dict(vertices=[v for v in graph['vertices'] if v['id'] in path],
+        bindings={a+'/'+b: graph.get('bindings', {}).get(a+'/'+b, {}) for a, b in zip(path, path[1:])}))
     for v in graph["vertices"]:
         if v["id"] in path and not allowed(v):
             fail("路径包含未就绪节点：" + nodes.get(v.get('node_id'), {}).get('name', '已删除'), "vertex:"+v["id"])
+        if v['id'] in path and v.get('node_id') and graph.get('version') == 2:
+            snapshot = node_addresses.network(c, v['node_id'])
+            for ident in used.get(v['id'], ()):
+                address = graph['address_book'][v['id']][ident]
+                reason = node_addresses.problem(address, snapshot)
+                if reason:
+                    fail(f"「{nodes[v['node_id']]['name']}」地址 {address['host']}：{reason}", 'vertex:' + v['id'])
 
 
 def preview(c, body):
     if body.get('layout_only') is True:
         return dict(graph=arrange(validate(c, body.get('graph'), complete=False)))
-    graph = validate(c, body.get("graph"))
+    # Live route selection must be able to leave an invalid old path. Check
+    # current interface presence on the path actually being applied instead.
+    graph = validate(c, body.get("graph"), check_network=bool(body.get('arrange')))
     if graph.get('version') == 2:
         import topology_groups
         return topology_groups.preview(c, graph, body)

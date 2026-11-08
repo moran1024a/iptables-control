@@ -15,7 +15,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="0.5.1"
+VERSION="0.5.2"
 REGISTRY="ghcr.io"
 MIRROR_REGISTRY="ghcr.nju.edu.cn"
 REPO="moran1024a/ictl-server"

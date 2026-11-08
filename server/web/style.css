@@ -920,6 +920,9 @@ button.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
 .graph-ip-name { max-width:46px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .graph-ip-row code { padding:0; background:none; font-size:10px; color:var(--text); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .graph-ip-role { font-size:9px; color:var(--green); white-space:nowrap; }
+.graph-ip-row[data-action] { cursor:pointer; }
+.graph-ip-row[data-action]:hover { background:var(--primary-soft); }
+.graph-ip-warning-mark { color:var(--yellow); font-weight:700; }
 .graph-port { position:absolute; z-index:5; width:20px; height:20px; min-height:20px!important; padding:0; border:1.5px solid var(--border); background:var(--card); color:var(--muted); line-height:16px; border-radius:50%; font-size:17px; transform:translateY(-50%); touch-action:none; }
 .graph-port.in { left:-10px; }.graph-port.out { right:-10px; }
 .graph-port:hover,.graph-port.is-bound { color:var(--blue); border-color:var(--blue); background:var(--primary-soft); }
@@ -931,6 +934,10 @@ button.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
 .graph-line.graph-live { stroke:var(--green); stroke-width:1.8; opacity:1; }
 .graph-line.graph-next { stroke:var(--yellow); stroke-width:1.8; stroke-dasharray:5 5; opacity:1; }
 .graph-line.graph-selected-line { stroke:var(--blue); stroke-width:2; opacity:1; }
+.graph-edit-halo { stroke:var(--card); stroke-width:4; pointer-events:none; }
+.graph-edit-focus [data-graph-from]:not(.graph-nearby) { opacity:.12; }
+.graph-edit-focus .graph-nearby.graph-line { opacity:1; stroke:var(--blue); stroke-width:2; }
+.graph-edit-focus .graph-nearby.graph-hit { stroke-width:10; }
 .graph-focus [data-graph-from]:not(.graph-nearby) { opacity:.2; }
 .graph-line.graph-nearby:not(.graph-live):not(.graph-next) { stroke:var(--blue); opacity:.9; }
 .graph-hit { pointer-events:stroke; cursor:pointer; stroke:transparent; stroke-width:14; }
@@ -943,7 +950,8 @@ button.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
 .graph-line.graph-route-line,.graph-viewport .graph-route-flow { stroke:var(--route-color); }
 .graph-line.graph-route-line,.graph-viewport .graph-route-flow { stroke-width:var(--route-stroke,1.7); }
 .graph-route-muted { opacity:.13; }
-.graph-context { opacity:.16; stroke-dasharray:2 5; }
+.graph-context { opacity:.1; stroke-dasharray:3 6; }
+.graph-covered { display:none; }
 .graph-route-hint { min-height:20px; margin-top:5px; font-size:11px; color:var(--muted); }
 .graph-route-status { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:6px 0; border-top:1px solid var(--border); font-size:12px; }
 .graph-route-status>span:first-child { display:flex; align-items:center; gap:5px; }
@@ -969,6 +977,7 @@ button.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
 .graph-inspector input[data-graph-entry-port] { width:100px; }
 .graph-inspector .inline-check { display:flex; align-items:center; gap:5px; margin:0; white-space:nowrap; }.graph-inspector .inline-check input { width:auto; }
 .graph-inspector > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.graph-inspector .graph-address-field { display:flex; flex-direction:column; gap:3px; font-size:10px; color:var(--muted); margin:0; }
 .graph-fullscreen-actions { display:none; }
 .is-fullscreen .graph-fullscreen-actions { display:flex; justify-content:flex-end; gap:8px; margin-bottom:10px; }
 .is-fullscreen .graph-workspace { flex:1; min-height:0; }.is-fullscreen .graph-library { max-height:none; }
@@ -990,7 +999,12 @@ button.graph-node-body:not(:disabled):hover { background:var(--primary-soft); }
 .node-address-row input[type=radio],.address-candidate input { width:auto;margin:0; }
 .address-advanced { margin:6px 0 0;padding:3px 0;border:0;box-shadow:none;background:none; }
 .address-advanced summary { font-size:12px;cursor:pointer; }
-.address-routing { display:grid;grid-template-columns:1.4fr 1fr 1.4fr;gap:8px;margin-top:8px; }
+.address-routing { display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px; }
+.address-local { display:flex;align-items:center;gap:8px;margin-top:8px;font-size:11px; }
+.address-local label { margin:0;flex:0 1 190px; }
+.address-local [data-address-status] { flex:1; }
+.address-local button { flex:none; }
+.address-unresolved [data-address-status] { color:var(--yellow); }
 .address-routing label { margin:0; }
 .address-picker { margin-top:8px; }
 .address-candidate { display:flex;gap:8px;align-items:center;margin:6px 0; }

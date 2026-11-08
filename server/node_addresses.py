@@ -160,8 +160,22 @@ def receive_network(c, nid, fields):
     refresh_pending(c, nid)
 
 
-def ready(address):
-    return bool(address.get('local') and address.get('device'))
+def problem(address, snapshot=None):
+    if not address.get('local'):
+        return '请选择对应的本机 IP'
+    if snapshot and snapshot['complete'] and not any(a['local'] == address['local'] for a in snapshot['addresses']):
+        return f"最近采集未发现本机 IP {address['local']}；NAT 地址请选择对应的本机 IP"
+    if not address.get('device'):
+        return '网卡待识别，请同步 Agent 或选择本机 IP'
+    if snapshot and snapshot['complete'] and not any(
+            a['local'] == address['local'] and a['device'] == address['device']
+            for a in snapshot['addresses']):
+        return f"最近采集未发现 {address['local']} / {address['device']}，请核对本机 IP 和网卡"
+    return ''
+
+
+def ready(address, snapshot=None):
+    return not problem(address, snapshot)
 
 
 def ipv4(value, optional=False):
@@ -231,11 +245,13 @@ def save(c, node, values, *, addr=None):
     changed = {ident for ident, a in old.items() if ident not in new or ready(a) and routing(a) != routing(new[ident])}
     if changed:
         import topology
-        for name, doc in topology.documents(c):
+        # Draft bindings are references by ID, and will be revalidated when
+        # published. Only a running/pending plan needs an immutable binding.
+        for name, doc in topology.documents(c, published_only=True):
             graph = doc.get('graph', {})
             used = references(graph)
             if any(used.get(v['id'], set()) & changed for v in graph.get('vertices', []) if v.get('node_id') == node['id']):
-                raise errors.UserError(f"地址正被链路「{name}」引用，请先修改链路", 'addresses')
+                raise errors.UserError(f"地址正被已应用或待下发的链路「{name}」引用。请新增修正后的 IP，在链路中替换并应用后再删除旧地址", 'addresses')
     write(c, node['id'], result)
     host = next(a['host'] for a in result if a['primary'])
     c.execute('UPDATE nodes SET addr=? WHERE id=?', (host, node['id']))

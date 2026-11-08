@@ -862,8 +862,48 @@ class MultiTopologyTests(Fixture, unittest.TestCase):
         values=node_addresses.listing(self.db,database.get_node(self.db,nid))
         values[1]['device']='eth1'
         self.call('api_node_edit',dict(addresses=values),nid)
+        with self.assertRaisesRegex(errors.UserError,'最近采集未发现'):
+            self.save(ident=root)
+        with self.db:
+            agent_v3.save_snapshot(self.db,nid,'inventory',dict(interfaces=[
+                dict(name='eth0',addresses=[f'192.0.2.{nid}/24']),
+                dict(name='eth1',addresses=[f'10.0.0.{nid}/24'])]))
         self.save(ident=root);self.finish(root)
         self.assertFalse(self.get(root)['pending_changes'])
+
+    def test_bad_old_interface_does_not_block_switching_to_healthy_path(self):
+        root=self.save();self.finish(root)
+        bad=self.ids[2]
+        with self.db:
+            node_addresses.receive_network(self.db,bad,dict(network_complete='1',
+                network_addresses=f'ens3,192.0.2.{bad}/24;eth1,10.0.0.{bad}/24'))
+        before=self.get(root)
+        result=topology.preview(self.db,dict(id=root,graph=before['active_graph'],required=['n']))
+        self.assertTrue(result['paths'])
+        rejected=topology.preview(self.db,dict(id=root,graph=before['active_graph'],required=['m']))
+        self.assertFalse(rejected['paths'])
+        choices=topology.preview(self.db,dict(id=root,graph=before['active_graph'],prefix=['a']))
+        self.assertEqual(choices['options'],['n'])
+        self.assertEqual(choices['graph']['edges'],before['active_graph']['edges'])
+        self.switch_paths(root,[['a','n','c'],['a','n','d']]);self.finish(root)
+        self.assertTrue(all('n' in row['active_path'] for row in self.get(root)['configurations'] if row['entry']=='a'))
+        failed=self.switch_paths(root,[['a','m','c'],['a','m','d']])
+        self.assertEqual(failed['changed'],0)
+        self.assertIn('最近采集未发现',failed['skipped'][0]['reason'])
+
+    def test_preview_keeps_healthy_ip_on_node_with_an_unusable_ip(self):
+        graph=topology.flatten(self.graph)
+        graph['bindings']['b/m']['to']['m']='private'
+        root=self.save(graph=graph);self.finish(root)
+        nid=self.ids[2]
+        with self.db:
+            node_addresses.receive_network(self.db,nid,dict(network_complete='1',
+                network_addresses=f'eth1,10.0.0.{nid}/24'))
+        active=self.get(root)['active_graph']
+        result=topology.preview(self.db,dict(id=root,graph=active,required=['m']))
+        self.assertEqual({p['entry'] for p in result['paths']},{'b'})
+        self.assertEqual(result['skipped'][0]['entry'],'a')
+        self.assertEqual(result['graph']['bindings'],active['bindings'])
 
     def test_failed_new_target_remains_protected_and_dangling_canvas_can_be_opened(self):
         root=self.save();self.finish(root)
