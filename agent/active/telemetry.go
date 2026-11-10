@@ -196,18 +196,21 @@ func (a *Agent) metrics() M {
 	f := strings.Fields(line)
 	var total, idle uint64
 	var cpuParts [8]uint64
-	for i, v := range f[1:] {
-		if i >= 8 {
-			break
+	stableCPU := len(f) >= 9 && f[0] == "cpu" && a.lastCPU[0] > 0
+	for i := 0; i < len(f)-1 && i < len(cpuParts); i++ {
+		n, err := strconv.ParseUint(f[i+1], 10, 64)
+		if err != nil || n < a.lastCPUParts[i] {
+			stableCPU = false
 		}
-		n, _ := strconv.ParseUint(v, 10, 64)
 		cpuParts[i] = n
 		total += n
 		if i == 3 || i == 4 {
 			idle += n
 		}
 	}
-	if total > a.lastCPU[0] && a.lastCPU[0] > 0 {
+	// Kernel counters can decrease. Establish a new baseline instead of
+	// underflowing unsigned deltas and publishing an invalid percentage.
+	if stableCPU && total > a.lastCPU[0] && idle >= a.lastCPU[1] && idle-a.lastCPU[1] <= total-a.lastCPU[0] {
 		result["cpu_percent"] = 100 * (1 - float64(idle-a.lastCPU[1])/float64(total-a.lastCPU[0]))
 		parts := M{}
 		for i, key := range []string{"user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal"} {

@@ -91,8 +91,14 @@ class Hub:
             return web.json_response({"error": "查询超时，请重试"}, status=504)
         except ConnectionResetError:
             return web.json_response({"error": "节点连接已断开"}, status=409)
+        except errors.UserError as exc:
+            return web.json_response({"error": "节点返回无效采集信息：" + str(exc)}, status=502)
         finally:
             self.queries.pop((nid, op), None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
     async def websocket(self, request):
         node = await self.authenticate(request)
@@ -132,9 +138,6 @@ class Hub:
         session["send"] = send
         old = self.sessions.get(nid)
         self.sessions[nid] = session
-        if old:
-            await old["ws"].close(code=1000, message=b"replaced")
-        await send({"type": "welcome", "heartbeat": 10, "timeout": 30})
         status = {
             "version": str(hello.get("version", ""))[:40],
             "auto_update": bool(hello.get("auto_update", node["auto_update"])),
@@ -145,17 +148,6 @@ class Hub:
             ),
             "state": "ok",
         }
-        await self.database(
-            lambda c: c.execute(
-                "UPDATE nodes SET installation_id=?,boot_id=?,capabilities=?,connection_state='connected',runtime_state='unknown',runtime_error='',runtime_at=0 WHERE id=?",
-                (
-                    str(hello.get("installation_id", ""))[:64],
-                    str(hello.get("boot_id", ""))[:64],
-                    json.dumps(capabilities),
-                    nid,
-                ),
-            )
-        )
         inflight = None
         latest_applied = status["generation"] if type(status["generation"]) is int else 0
 
@@ -163,6 +155,8 @@ class Hub:
             nonlocal inflight
 
             def prepare(c):
+                if self.sessions.get(nid) is not session:
+                    return {"action": "replaced"}
                 n = c.execute("SELECT * FROM nodes WHERE id=?", (nid,)).fetchone()
                 if n is None or n["key"] != node["key"]:
                     return {"action": "revoked"}
@@ -202,6 +196,28 @@ class Hub:
 
         receive = wake = None
         try:
+            if old:
+                await old["ws"].close(code=1000, message=b"replaced")
+            if self.sessions.get(nid) is not session:
+                return ws
+            await send({"type": "welcome", "heartbeat": 10, "timeout": 30})
+
+            def connected(c):
+                if self.sessions.get(nid) is not session:
+                    return
+                c.execute(
+                    "UPDATE nodes SET installation_id=?,boot_id=?,capabilities=?,connection_state='connected',runtime_state='unknown',runtime_error='',runtime_at=0 WHERE id=?",
+                    (
+                        str(hello.get("installation_id", ""))[:64],
+                        str(hello.get("boot_id", ""))[:64],
+                        json.dumps(capabilities),
+                        nid,
+                    ),
+                )
+
+            await self.database(connected)
+            if self.sessions.get(nid) is not session:
+                return ws
             await reconcile(received=True)
             receive = asyncio.create_task(ws.receive())
             wake = asyncio.create_task(session["wake"].wait())
@@ -328,14 +344,23 @@ class Hub:
             for task in (receive, wake):
                 if task:
                     task.cancel()
+            for (node_id, _), (session_id, future) in list(self.queries.items()):
+                if node_id == nid and session_id == session["id"] and not future.done():
+                    future.set_exception(ConnectionResetError("Agent disconnected"))
             if self.sessions.get(nid) is session:
                 self.sessions.pop(nid, None)
-                await self.database(
-                    lambda c: c.execute(
+
+                def disconnected(c):
+                    # Check again under the database write lock: a replacement
+                    # may have connected while this cleanup awaited its turn.
+                    if nid in self.sessions:
+                        return
+                    c.execute(
                         "UPDATE nodes SET connection_state=CASE WHEN connection_state='paused' THEN 'paused' ELSE 'disconnected' END WHERE id=?",
                         (nid,),
                     )
-                )
+
+                await self.database(disconnected)
             await ws.close()
         return ws
 
@@ -425,7 +450,10 @@ def create_app():
                     raise ValueError()
             except ValueError as exc:
                 raise web.HTTPBadRequest() from exc
-            return await hub.query(int(parts[1]), query)
+            response = await hub.query(int(parts[1]), query)
+            for cookie in h.cookies:
+                response.headers.add("Set-Cookie", cookie)
+            return response
         await asyncio.to_thread(h.route, request.method)
         code, data, headers = h.response
         response = web.Response(status=code, body=data)

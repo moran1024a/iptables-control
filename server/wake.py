@@ -5,9 +5,7 @@ import logging
 import secrets
 import socket
 import time
-import database
 import lifecycle
-import settings
 
 TIMEOUT = 30
 INTERVAL = 10

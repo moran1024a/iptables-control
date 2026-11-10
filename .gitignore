@@ -2,4 +2,3 @@ __pycache__/
 *.py[cod]
 server/assets/
 dist/
-tunnel-agent/tunnel-agent

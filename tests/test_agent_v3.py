@@ -25,6 +25,23 @@ import transport
 
 
 class V3Tests(Fixture, unittest.TestCase):
+    def test_malformed_telemetry_does_not_replace_last_good_snapshot(self):
+        nid = self.node()
+        with self.db:
+            agent_v3.save_snapshot(self.db, nid, 'metrics', dict(cpu_percent=12, memory=dict(MemTotal=100, MemAvailable=40)))
+        for kind, data in (
+            ('metrics', dict(cpu_percent=float('nan'))),
+            ('metrics', dict(memory=dict(MemTotal='100', MemAvailable=40))),
+            ('metrics', dict(interfaces={'eth0': None})),
+            ('ports', dict(rows=[None])),
+            ('inventory', dict(interfaces=[None])),
+        ):
+            with self.subTest(kind=kind, data=data), self.assertRaises(errors.UserError), self.db:
+                agent_v3.save_snapshot(self.db, nid, kind, data)
+        data = agent_v3.telemetry(self.db, nid)
+        self.assertEqual(data['metrics']['cpu_percent'], 12)
+        self.assertEqual(data['history'][0]['data']['samples'], 1)
+
     def test_corrupt_capabilities_cannot_stop_global_scheduling(self):
         import execution, failover, network_quality
         a, b = self.node(), self.node()
@@ -155,6 +172,17 @@ class V3Tests(Fixture, unittest.TestCase):
 
 
 class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
+    async def test_failed_welcome_does_not_leave_a_registered_session(self):
+        nid = self.node()
+        self.ready(nid)
+        node = database.get_node(self.db, nid)
+        with patch.object(transport.web.WebSocketResponse, 'send_json', side_effect=ConnectionResetError('closed during welcome')):
+            ws = await self.client.ws_connect(http_harness.Handler.sync_path+'/v3/ws',
+                                             headers={'Authorization': 'Bearer '+node['key']})
+            await ws.send_json(dict(type='hello', protocol=3, version=settings.VERSION))
+            await ws.receive(timeout=3)
+            await ws.close()
+        self.assertNotIn(nid, self.app['hub'].sessions)
 
     async def test_invalid_hello_does_not_replace_connection_or_store_corrupt_data(self):
         from aiohttp import WSMsgType
@@ -190,6 +218,70 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
         for key in ('applied_generation', 'reported_v', 'runtime_at', 'state'):
             self.assertEqual(after[key], before[key])
         await ws.close()
+
+    async def test_disconnect_finishes_pending_query_without_full_timeout(self):
+        nid = self.node()
+        self.ready(nid)
+        ws, session, _ = await self.connect(nid)
+        token = 'query-session'
+        with self.db:
+            database.set_setting(self.db, 'must_change', '0')
+            self.db.execute('INSERT INTO sessions VALUES (?,?)',
+                            (hashlib.sha256(token.encode()).hexdigest(), int(time.time()) + 100))
+        query = asyncio.create_task(self.client.post(
+            http_harness.Handler.panel_path+f'/api/nodes/{nid}/query',
+            json=dict(kind='inventory'), headers={'Cookie': settings.SESSION_COOKIE+'='+token}))
+        request = await ws.receive_json(timeout=3)
+        self.assertEqual(request['type'], 'query')
+        await ws.close()
+        response = await asyncio.wait_for(query, 1)
+        self.assertEqual(response.status, 409)
+        self.assertIn('Set-Cookie', response.headers)
+        self.assertEqual(self.app['hub'].queries, {})
+
+    async def test_malformed_query_result_is_reported_without_saving_it(self):
+        nid = self.node()
+        self.ready(nid)
+        ws, session, _ = await self.connect(nid)
+        query = asyncio.create_task(self.app['hub'].query(nid, dict(kind='inventory')))
+        request = await ws.receive_json(timeout=3)
+        await ws.send_json(dict(type='query_result', session=session, id=request['id'],
+                                data=dict(interfaces=[None])))
+        self.assertEqual((await query).status, 502)
+        self.assertFalse(self.db.execute('SELECT 1 FROM node_snapshots WHERE node_id=?', (nid,)).fetchone())
+        await ws.close()
+
+    async def test_delayed_disconnect_cannot_overwrite_replacement_session(self):
+        nid = self.node()
+        self.ready(nid)
+        old, _, _ = await self.connect(nid)
+        hub = self.app['hub']
+        database_call = hub.database
+        started, resume, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def delayed_database(fn, **kwargs):
+            if fn.__name__ != 'disconnected':
+                return await database_call(fn, **kwargs)
+            started.set()
+            await resume.wait()
+            try:
+                return await database_call(fn, **kwargs)
+            finally:
+                finished.set()
+
+        hub.database = delayed_database
+        try:
+            await old.close()
+            await asyncio.wait_for(started.wait(), 3)
+            current, session, _ = await self.connect(nid)
+            resume.set()
+            await asyncio.wait_for(finished.wait(), 3)
+            self.assertEqual(hub.sessions[nid]['id'], session)
+            self.assertEqual(database.get_node(self.db, nid)['connection_state'], 'connected')
+            await current.close()
+        finally:
+            resume.set()
+            hub.database = database_call
 
     async def test_private_controls_and_artifacts_reject_missing_or_wrong_identity(self):
         nid = self.node()

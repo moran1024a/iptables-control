@@ -4,10 +4,10 @@
     2,
     3
   ],
-  "server": "0.6.0-rc.7",
-  "active_agent": "0.6.0-rc.5",
-  "passive_agent": "0.6.0-rc.5",
+  "server": "0.6.0",
+  "active_agent": "0.6.0",
+  "passive_agent": "0.6.0",
   "wake_agent": "0.4.3",
-  "manager": "0.6.0-rc.5",
+  "manager": "0.6.0",
   "standalone": "3.2.3"
 }

@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.6.0-rc.5"
+VERSION="0.6.0"
 BIN="/usr/local/lib/ictl/passive.sh"
 CONF_DIR="/etc/ictl"
 CONF="$CONF_DIR/agent.conf"
@@ -66,12 +66,6 @@ load_conf() {
     esac
   done < "$CONF"
   [ -n "$URL" ] && [ -n "$KEY" ]
-}
-
-save_conf() {
-  mkdir -p "$CONF_DIR"
-  (umask 077 && printf 'URL=%s\nKEY=%s\nAUTO_UPDATE=%s\n' "$URL" "$KEY" "$AUTO_UPDATE" > "$CONF.tmp") &&
-    mv "$CONF.tmp" "$CONF"
 }
 
 # 上报给服务端的内容：R_V 已处理的版本，R_STATE ok/error，R_ERR 错误说明
@@ -1100,7 +1094,7 @@ exchange() {
 
 # Store the full immutable acknowledgment for bounded, idempotent retries.
 acknowledge() {
-  local attempt result request
+  local attempt result request PHASE=ack
   [ -f "$ACK_FILE" ] || return 0
   CONFIRM="unknown"
   request="$(mktemp /run/ictl.XXXXXX)" || return 1
@@ -1171,6 +1165,7 @@ cycle() {
   local request action config generation mode hash original_mode original_gen original_v request_started budget
   LOOKUP_IP=() LOOKUP_STALE=() ROUTE_IDS=()
   SYNC_COMMIT=0 SYNC_DEADLINE=-1
+  SOURCE="${1:-auto}"
   [ "${1:-auto}" != wake ] || SYNC_DEADLINE=$((SECONDS+30))
   mkdir -p "$LIB" || return 1
   load_state; load_mode || return 1
@@ -1184,7 +1179,7 @@ cycle() {
     if [ "$CONFIRM" = deleted ]; then save_state; return 0; fi
     if [ "${1:-auto}" = auto ] && [ "$MODE" = passive ]; then save_state; return 0; fi
   fi
-  SOURCE="${1:-auto}" PHASE=poll; [[ "$SOURCE" != manual && "$SOURCE" != wake ]] || PHASE=begin
+  PHASE=poll; [[ "$SOURCE" != manual && "$SOURCE" != wake ]] || PHASE=begin
   OP="$(openssl rand -hex 16)" || return 1
   request="$(mktemp /run/ictl.XXXXXX)" || return 1
   request_text "$R_STATE" > "$request"

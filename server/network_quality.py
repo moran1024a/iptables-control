@@ -5,9 +5,7 @@ import time
 import database
 import errors
 import link_quality
-import configurations
 import probe_store
-import settings
 import agent_v3
 
 INTERVAL = 10

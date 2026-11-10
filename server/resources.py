@@ -142,6 +142,16 @@ class Resources:
     def api_node_get(self, conn, body, node_id):
         now = int(time.time())
         n = database.get_node(conn, node_id)
+        version = settings.COMPONENTS[n["desired_mode"] + "_agent"]
+        if n["installed_agent"] == "unknown":
+            update = "uninstalled"
+        elif n["manual_required"] or n["installed_agent"] != n["desired_mode"]:
+            update = "switch"
+        elif agent_v3.newer(version, n["agent"]):
+            update = ("manual" if n["desired_mode"] == "passive" else
+                      "pending" if n["auto_update"] else "disabled")
+        else:
+            update = "newer" if agent_v3.newer(n["agent"], version) else "same"
         rules = forwarding.node_rule_rows(conn, n)
         group = conn.execute(
             "SELECT name FROM item_groups WHERE id = ?", (n["group_id"],)
@@ -155,9 +165,7 @@ class Resources:
             "sync_path": database.setting(conn, "sync_path"),
             "public_url": database.setting(conn, "public_url", ""),
             "version": settings.VERSION,
-            "forward_version": settings.COMPONENTS.get(
-                n["desired_mode"] + "_agent", settings.VERSION
-            ),
+            "forward_version": version,
             "installer_url": f"https://github.com/{settings.REPO}/releases/download/v{settings.VERSION}/install-agent.sh",
             "telemetry": agent_v3.telemetry(conn, node_id),
             "node": {
@@ -174,13 +182,7 @@ class Resources:
                 "state": n["state"],
                 "err": n["err"] or node_state.runtime_error(n, now),
                 "group": group["name"],
-                "agent_update": (
-                    "pending"
-                    if agent_v3.newer(
-                        settings.COMPONENTS[n["desired_mode"] + "_agent"], n["agent"] or "0.0.0"
-                    )
-                    else "same"
-                ),
+                "agent_update": update,
             },
             "rules": rules,
             "configs": [

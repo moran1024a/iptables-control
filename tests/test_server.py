@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
@@ -155,6 +156,38 @@ def fields(text):
 
 
 class ServerTests(Fixture, unittest.TestCase):
+    def test_panel_read_keeps_one_snapshot_during_concurrent_update(self):
+        self.db.execute("PRAGMA journal_mode=WAL")
+        nid = self.node("before")
+
+        def concurrent_read(_resources, conn, _body):
+            before = database.get_node(conn, nid)["name"]
+            with self.db:
+                self.db.execute("UPDATE nodes SET name='after' WHERE id=?", (nid,))
+            after = database.get_node(conn, nid)["name"]
+            return dict(before=before, after=after)
+
+        with patch.object(resources.Resources, "api_configs", concurrent_read):
+            code, data, _ = self.request("configs", method="GET")
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(data), dict(before="before", after="before"))
+        self.assertEqual(database.get_node(self.db, nid)["name"], "after")
+
+    def test_agent_upgrade_hint_matches_mode_and_update_policy(self):
+        nid = self.node()
+        cases = [
+            ("active", "active", "0.5.3", 0, 0, "disabled"),
+            ("active", "active", "0.5.3", 1, 0, "pending"),
+            ("passive", "passive", "0.5.3", 1, 0, "manual"),
+            ("active", "passive", "0.5.3", 1, 1, "switch"),
+            ("active", "active", "99.0.0", 1, 0, "newer"),
+        ]
+        for mode, installed, version, auto, manual, expected in cases:
+            with self.subTest(expected=expected), self.db:
+                self.db.execute("UPDATE nodes SET desired_mode=?,installed_agent=?,agent=?,auto_update=?,manual_required=? WHERE id=?",
+                                (mode, installed, version, auto, manual, nid))
+                self.assertEqual(self.call("api_node_get", {}, nid)["node"]["agent_update"], expected)
+
     def request(self, path, body=None, method="POST"):
         with self.db:
             database.set_setting(self.db, "must_change", "0")

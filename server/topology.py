@@ -4,7 +4,6 @@ import copy
 import math
 import json
 import re
-import random
 from collections import Counter
 import database
 import errors
@@ -26,10 +25,6 @@ def endpoints(graph):
         next((v["id"] for v in graph["vertices"] if v["kind"] == k), None)
         for k in ("entry", "target")
     )
-
-
-def connections(graph):
-    return [tuple(e) for e in graph["edges"]]
 
 
 def snapshot(graph):
@@ -230,7 +225,7 @@ def path_weight(graph, path):
 
 
 def find_path(graph, *, entry=None, target=None, required=(), prefix=(), preferred=(),
-              allowed=None, edge_allowed=None, randomize=False, forbidden=(), **unused):
+              allowed=None, edge_allowed=None, forbidden=()):
     entry0, target0 = endpoints(graph)
     entry, target = entry or entry0, target or target0
     by = {v["id"]: v for v in graph["vertices"]}
@@ -305,9 +300,8 @@ def find_path(graph, *, entry=None, target=None, required=(), prefix=(), preferr
                 value = score + (by[b].get("weight", 0) if by[b]["kind"] in ("node", "direct") else 0)
                 key = state(candidate)
                 old = best[b].get(key)
-                tie = old is not None and value == old[0] and (
-                    bool(random.getrandbits(1)) if randomize
-                    else (len(candidate), candidate) < (len(old[1]), old[1]))
+                tie = (old is not None and value == old[0]
+                       and (len(candidate), candidate) < (len(old[1]), old[1]))
                 if old is None or value > old[0] or tie:
                     best[b][key] = value, candidate
     options = [(score, path) for score, path in best[target].values()
@@ -316,7 +310,7 @@ def find_path(graph, *, entry=None, target=None, required=(), prefix=(), preferr
         return None
     score = max(x[0] for x in options)
     options = [p for v, p in options if v == score]
-    return random.choice(options) if randomize else min(options, key=lambda p: (len(p), p))
+    return min(options, key=lambda p: (len(p), p))
 
 
 def wire_graph(graph, path):

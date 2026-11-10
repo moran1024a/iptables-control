@@ -2,7 +2,7 @@
 
 轻量的 IPv4 端口转发管理工具。通过 Web 面板管理多台服务器，或使用 `ipt.sh` 在单台服务器上独立管理转发。
 
-**0.6.0-rc.7（测试版）** 支持可视化拓扑、多入口与多目标、主副 IP、订阅分享和 7 天网络质量图。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，按需同步。转发节点无需安装代理核心，SS／SS2022／VLESS ENC 等目标服务需自行准备。
+**0.6.0（正式版）** 支持可视化拓扑、多入口与多目标、主副 IP、权重灾备、订阅分享和 7 天网络质量图。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，按需同步。转发节点无需安装代理核心，SS／SS2022／VLESS ENC 等目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -25,14 +25,14 @@
 
 ## 安装
 
-管理多台服务器时，安装**服务端 + 节点 Agent**；只管理本机时，安装**单机脚本**即可。以下命令固定使用 0.6.0-rc.7，已有部署请先阅读[升级说明](#升级)。
+管理多台服务器时，安装**服务端 + 节点 Agent**；只管理本机时，安装**单机脚本**即可。以下命令固定使用 0.6.0，已有部署请先阅读[升级说明](#升级)。
 
 ### 服务端
 
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.7/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -40,7 +40,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.7/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
 主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口，并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址。
@@ -64,7 +64,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.7/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -80,7 +80,9 @@ sudo bash /root/ipt.sh
 
 重新执行[服务端安装命令](#服务端)。安装器沿用现有端口和数据挂载，保留升级前数据库备份；新容器启动或就绪检查失败时尝试恢复旧容器和数据库。相同版本需要重建时，将命令末尾改为 `| bash -s -- --force`。 使用自定义 Docker 网络、额外挂载、环境变量或资源限制时，安装器会在停止服务前提示退出，请沿用原 Docker Compose 或部署命令更换镜像版本。
 
-**从此前 0.6.0 RC 升级：删除受管 VLESS Reality 目标及其关联配置；多目标链路只移除对应目标，其他配置保留。** 旧规则在节点下次成功同步时清理，确认前保留端口占用。节点、其他类型目标、标签和订阅链接保持不变；原 Reality 配置从订阅中移除。自行部署的 Reality 代理服务需自行处理。RC1／RC2 的节点初始无标签；RC1 的节点权重默认为 0，链路自动灾备默认关闭。
+**从 0.6.0-rc.7 升级：保留全部数据，数据库版本不变。** 服务端和两种 Agent 均升级至正式版，节点升级方式见下文。
+
+**从 0.6.0 RC1～RC6 升级：删除受管 VLESS Reality 目标及其关联配置；多目标链路只移除对应目标，其他配置保留。** 旧规则在节点下次成功同步时清理，确认前保留端口占用。节点、其他类型目标、标签和订阅链接保持不变；原 Reality 配置从订阅中移除。自行部署的 Reality 代理服务需自行处理。RC1／RC2 的节点初始无标签；RC1 的节点权重默认为 0，链路自动灾备默认关闭。
 
 **从 0.5.3 升级：仅保留以下节点信息，清空旧业务数据。更早版本请先升级至 0.5.3。**
 
@@ -89,11 +91,11 @@ sudo bash /root/ipt.sh
 - 节点下一次成功同步会清理旧转发规则；清理确认前，旧端口仍保留占用。远端节点上的单机脚本规则不受影响。
 - 主动节点开启自动更新后自动更新到本版。被动节点首次迁移需在本机运行 `sudo ictl --sync`，之后仍按原有手动／唤醒方式同步。
 
-数据库版本为 **603**，本次升级前备份为 `ictl.db.pre-0.6.0-rc.7.bak`；从 RC1／RC2 迁移数据库时还会保留 `ictl.db.pre-0.6.0-rc.3.bak`。Docker 升级备份为 `/data/ictl.db.pre-deploy-*.bak`，节点导入另保留 `ictl.db.pre-0.6.0.bak`。回退需同时恢复升级前数据库与对应旧镜像；已同步的节点也需要重新同步旧配置，不能保证升级期间转发不中断。
+数据库版本为 **603**。Docker 升级备份为 `/data/ictl.db.pre-deploy-*.bak`；从 RC1～RC6 迁移至 603 时另保留 `ictl.db.pre-0.6.0-rc.7.bak`，从 RC1／RC2 迁移还会保留 `ictl.db.pre-0.6.0-rc.3.bak`，从 0.5.3 导入节点时保留 `ictl.db.pre-0.6.0.bak`。回退需同时恢复升级前数据库与对应旧镜像；已同步的节点也需要重新同步旧配置，不能保证升级期间转发不中断。
 
 ### 节点 Agent 升级
 
-本版主动 Agent、被动 Agent 和管理器均保持 **0.6.0-rc.5**，已安装该版本的节点无需更新。更早版本的主动节点开启自动更新后自动升级；被动节点需在本机更新一次，之后普通同步自动复用已安装组件。在节点执行：
+本版主动 Agent、被动 Agent 和管理器均为 **0.6.0 正式版**。主动节点开启自动更新后会自动升级；关闭自动更新的主动节点，以及被动节点，需在本机执行：
 
 ```bash
 sudo ictl --update
@@ -117,7 +119,7 @@ sudo ictl --sync
 删除容器和镜像，保留数据卷：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.7/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；完整停用时，请先处理节点。
@@ -386,6 +388,7 @@ node --check server/web/app.js
 node --check server/web/routes.js
 node --check server/web/topology.js
 node --check server/web/topology_paths.js
+node --check server/web/subscriptions.js
 (cd agent/active && go test ./...)
 (cd agent/wake && go test ./...)
 for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
@@ -399,10 +402,10 @@ for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
 
 | 组件 | 版本 |
 | --- | --- |
-| 服务端 | 0.6.0-rc.7 |
-| 主动 Agent | 0.6.0-rc.5 |
-| 被动 Agent | 0.6.0-rc.5 |
-| 管理器 | 0.6.0-rc.5 |
+| 服务端 | 0.6.0 |
+| 主动 Agent | 0.6.0 |
+| 被动 Agent | 0.6.0 |
+| 管理器 | 0.6.0 |
 | 唤醒组件 | 0.4.3 |
 | 单机脚本 | 3.2.3 |
 

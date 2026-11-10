@@ -26,6 +26,27 @@ func nftFixture(c Config, a *Agent) M {
 	}
 	return M{"nftables": rows}
 }
+
+func TestCPUCounterRegressionDoesNotPublishInvalidMetrics(t *testing.T) {
+	a := &Agent{root: t.TempDir()}
+	a.metrics()
+	// A stale baseline must not wrap unsigned deltas into huge percentages.
+	a.lastCPU = [2]uint64{1, ^uint64(0) / 2}
+	a.lastCPUParts[4] = ^uint64(0) / 2
+	metrics := a.metrics()
+	for _, key := range []string{"cpu_percent", "cpu_parts_percent"} {
+		if value, ok := metrics[key]; ok {
+			t.Fatalf("invalid counter interval published %s: %v", key, value)
+		}
+	}
+	if metrics["memory"] == nil {
+		t.Fatal("CPU counter reset discarded the other telemetry")
+	}
+	if value, ok := a.metrics()["cpu_percent"].(float64); ok && (value < 0 || value > 100) {
+		t.Fatalf("CPU sampling did not recover: %v", value)
+	}
+}
+
 func fakeAppliedAgent(t *testing.T) *Agent {
 	t.Helper()
 	root := t.TempDir()

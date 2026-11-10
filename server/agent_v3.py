@@ -168,9 +168,28 @@ def refresh_held_ports(conn, node, data):
 def save_snapshot(conn, nid, kind, data):
     if kind not in ("inventory", "metrics", "ports") or not isinstance(data, dict):
         raise errors.UserError("无效的采集信息")
-    encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    try:
+        encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except (ValueError, TypeError):
+        raise errors.UserError("采集信息含有无效数值") from None
     if len(encoded.encode()) > 512 * 1024:
         raise errors.UserError("采集信息过大")
+    # Reject malformed reports before replacing the last usable snapshot. These
+    # collections are also consumed directly by the node details view.
+    if kind in ("inventory", "ports"):
+        rows = data.get("interfaces" if kind == "inventory" else "rows", [])
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise errors.UserError("无效的采集列表")
+    if kind == "metrics":
+        for key in ("memory", "disk", "interfaces"):
+            if not isinstance(data.get(key, {}), dict):
+                raise errors.UserError("无效的采集信息：" + key)
+        if any(not isinstance(row, dict) for row in data.get("interfaces", {}).values()):
+            raise errors.UserError("无效的网卡采集信息")
+        values = [data[k] for k in ("cpu_percent", "agent_rss") if k in data]
+        values += list(data.get("memory", {}).values())
+        if any(type(value) not in (int, float) or value < 0 for value in values):
+            raise errors.UserError("无效的 CPU 或内存数值")
     now = int(time.time())
     conn.execute("INSERT OR IGNORE INTO node_snapshots(node_id) VALUES (?)", (nid,))
     conn.execute(
@@ -183,7 +202,7 @@ def save_snapshot(conn, nid, kind, data):
             k: data[k] for k in ("cpu_percent", "agent_rss") if type(data.get(k)) in (int, float)
         }
         mem = data.get("memory", {})
-        if mem.get("MemTotal") and type(mem.get("MemAvailable")) in (int, float):
+        if mem.get("MemTotal") and "MemAvailable" in mem:
             values["memory_used_percent"] = 100 * (1 - mem["MemAvailable"] / mem["MemTotal"])
         for table, size, keep in [("metric_windows", 60, 10080), ("metric_hours", 3600, 720)]:
             previous = conn.execute(

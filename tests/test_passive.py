@@ -30,6 +30,19 @@ with_lock local_apply
         self.assertFalse((self.root/'kernel.json').exists())
         self.assertFalse((self.lib/'config').exists())
 
+    def test_wake_retries_receipt_with_ack_timeout_before_new_work(self):
+        (self.conf/'agent.conf').write_text('URL=https://example.invalid/sync\nKEY='+'ab'*32+'\n')
+        (self.lib/'ack').write_text('proto=2\nsource=wake\nphase=ack\nop='+'ab'*16+'\n')
+        self.assertShell('''
+derive_keys() { :; }
+exchange() {
+  [ "$SOURCE/$PHASE" = wake/ack ] || return 1
+  RESPONSE=$'proto=2\\nresult=deleted\\n'
+}
+cycle wake || exit 1
+[ "$CONFIRM" = deleted ] && [ ! -f "$ACK_FILE" ]
+''')
+
     def test_new_receive_and_source_route_format(self):
         self.assertShell('''
 route_fields 'v2,198.18.0.7,-,-,-' || exit 1

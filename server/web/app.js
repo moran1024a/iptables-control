@@ -12,11 +12,12 @@ const STATUS = {
   error: ["异常", "yellow"],
   deleting: ["删除中", "grey"],
 };
-// 节点端版本与服务端不一致时的说明
+// 根据组件版本、模式和自动更新开关给出可执行的升级提示。
 const AGENT_UPDATE = {
   pending: "等待节点自动更新",
   disabled: "节点已关闭自动更新，可在节点上运行 <code>sudo ictl --update</code> 更新",
-  unavailable: "服务端缺少同版本的节点端脚本，无法自动更新，可在节点上运行 <code>sudo ictl --update</code> 更新",
+  manual: "请在节点上运行 <code>sudo ictl --update</code> 更新被动 Agent",
+  switch: "请在节点上运行 <code>sudo ictl --sync</code> 确认安装模式",
   newer: "节点端版本高于目标版本",
 };
 const LEVEL = { white: "无手动同步", ok: "正常", fault: "故障", lost: "失联", none: "无数据" };
@@ -628,7 +629,7 @@ async function nodeDetail(id, request) {
     <span>来源 IP</span><span class="mono">${esc(n.src_ip || "-")}</span>
     <span>时差</span><span>${skew}</span>
     <span>节点端版本</span><span>${esc(n.agent || "-")}${AGENT_UPDATE[n.agent_update]
-      ? `<span class="muted">（目标转发 Agent 为 ${esc(d.forward_version)}，${(n.desired_mode === "passive" && n.agent_update === "pending") ? "等待本机手动同步时更新" : AGENT_UPDATE[n.agent_update]}）</span>` : ""}</span>
+      ? `<span class="muted">（目标转发 Agent 为 ${esc(d.forward_version)}，${AGENT_UPDATE[n.agent_update]}）</span>` : ""}</span>
     <span>已安装组件</span><span>${esc(n.installed_agent || "unknown")} / ${esc(n.backend || "iptables")}</span>
     <span>管理连接</span><span>${esc(n.connection_state || "旧版轮询")}</span>
     <span>确认进度</span><span>${n.applied_generation} / ${n.desired_generation}</span>

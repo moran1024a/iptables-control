@@ -225,8 +225,9 @@ class Request:
                 else []
             )
             self.resources.query = query
-            if method != "GET":
-                conn.execute("BEGIN IMMEDIATE")
+            # A response may join several snapshots and resource tables. Keep
+            # one view even when an Agent receipt commits between its queries.
+            conn.execute("BEGIN" if method == "GET" else "BEGIN IMMEDIATE")
             with conn:
                 result = handler(conn, body, *args)
             self.send_json(200, result)
