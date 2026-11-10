@@ -1,0 +1,73 @@
+const {chromium}=require(process.env.PLAYWRIGHT_MODULE);
+(async()=>{
+  const browser=await chromium.launch({executablePath:process.env.TEST_BROWSER||'/opt/google/chrome/chrome',headless:true,args:['--no-sandbox']});
+  const page=await browser.newPage({viewport:{width:1360,height:920}}),errors=[];
+  page.on('pageerror',e=>errors.push(String(e)));
+  try {
+    await page.goto(process.env.TEST_URL);
+    await page.locator('[name=username]').fill('admin');
+    await page.locator('[name=password]').fill('admin_pass');
+    await page.locator('form button.primary').click();
+    await page.locator('[data-nav=configs]').click();
+    await page.locator('[data-config-id=C0001]').waitFor();
+    const original=await page.locator('[data-config-id=C0001] .title').innerText();
+    for(const [uri,name] of [['socks5://user:p%40ss@proxy.example.com:1080#Imported','Imported'],['https://user:pass@http.example.com:443#HTTPS','HTTPS']]){
+      await page.locator('[data-action=external-new]').click();
+      await page.locator('#modal [name=uri]').fill(uri);
+      await page.waitForFunction(name=>document.querySelector('#modal [name=name]')?.value===name,name);
+      await page.locator('#modal button.primary').click();
+      await page.locator('#modal').waitFor({state:'hidden'});
+    }
+    await page.locator('[data-config-id=E0001]').waitFor();
+    await page.locator('[data-key=config-actions] summary').click();
+    await page.locator('[data-action=group-new][data-kind=external_configurations]').click();
+    await page.locator('#modal [name=name]').fill('External group');
+    await page.locator('#modal button.primary').click();
+    await page.locator('#modal').waitFor({state:'hidden'});
+    await page.locator('[data-config-id=E0001] [data-action=external-edit]').first().click();
+    await page.locator('#modal [name=name]').fill('Renamed <safe>');
+    await page.locator('#modal [name=group_id]').selectOption({label:'External group'});
+    await page.locator('#modal button.primary').click();
+    await page.locator('#modal').waitFor({state:'hidden'});
+    if(await page.locator('[data-config-id=C0001] .title').innerText()!==original)throw Error('External edit changed C configuration');
+    await page.locator('[data-collection-source]').selectOption('external');
+    if(await page.locator('[data-config-id]').count()!==2)throw Error('Source filter incorrect');
+    await page.locator('[data-collection-query]').fill('Renamed');
+    if(await page.locator('[data-config-id]').count()!==1)throw Error('External search incorrect');
+    await page.locator('[data-collection-query]').fill('');
+    await page.locator('[data-collection-source]').selectOption('');
+    await page.locator('[data-key=config-actions] summary').click();
+    await page.locator('[data-action=sort-start][data-kind=external_configurations]').click();
+    await page.locator('.sort-card').first().waitFor();
+    if(await page.locator('.sort-card').count()!==2)throw Error('C item included in external sort');
+    await page.locator('[data-action=sort-save]').click();
+    await page.locator('[data-config-id=C0001]').waitFor();
+    await page.locator('[data-nav=subscriptions]').click();
+    await page.locator('[data-action=subscription-new]').click();
+    await page.locator('#modal [name=name]').fill('Mixed');
+    await page.locator('[data-subscription-all]').check();
+    if(await page.locator('[name=configuration_id]:checked').count()!==3)throw Error('All selection omitted Mihomo-only HTTP item');
+    await page.locator('#modal button.primary').click();
+    await page.locator('#modal').waitFor({state:'hidden'});
+    const state=await page.evaluate(async()=>{
+      const d=await api('GET','subscriptions'),s=d.subscriptions[0];
+      return {s,clash:await(await fetch(s.path+'?format=clash')).text(),links:await(await fetch(s.path+'?format=v2ray')).text()};
+    });
+    if(state.s.configuration_ids.length!==1||state.s.external_configuration_ids.length!==2)throw Error('Mixed IDs were not retained');
+    if(state.s.counts.clash!==3||state.s.counts.v2ray!==2)throw Error('Compatibility counts incorrect');
+    if(!state.clash.includes('Renamed <safe>'))throw Error('Renamed external profile missing in export');
+    if(!Buffer.from(state.links,'base64').toString().includes('Renamed%20%3Csafe%3E'))throw Error('Share name was not escaped');
+    await page.locator('[data-nav=configs]').click();
+    await page.locator('[data-config-id=E0001] summary').click();
+    await page.locator('[data-config-id=E0001] [data-action=external-delete]').click();
+    await page.locator('[data-confirm="1"]').click();
+    await page.locator('[data-config-id=E0001]').waitFor({state:'detached'});
+    if(await page.locator('[data-config-id=C0001]').count()!==1)throw Error('External delete removed C item');
+    const end=await page.evaluate(async()=>({c:await api('GET','configs'),s:await api('GET','subscriptions')}));
+    if(end.s.subscriptions[0].configuration_ids.length!==1||end.s.subscriptions[0].external_configuration_ids.length!==1)throw Error('Delete association cleanup incorrect');
+    await page.setViewportSize({width:390,height:844});
+    if(process.env.TEST_EXTERNAL_SCREENSHOT)await page.screenshot({path:process.env.TEST_EXTERNAL_SCREENSHOT,fullPage:true});
+    if(errors.length)throw Error(errors.join('\n'));
+    console.log('External import, rename, grouping, sort, mixed subscription and deletion passed');
+  } finally {await browser.close();}
+})().catch(e=>{console.error(e);process.exitCode=1;});

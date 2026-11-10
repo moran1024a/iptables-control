@@ -31,6 +31,13 @@ def reality_uri(host='reality.example.com', port=443):
             '&path=%2Fmy%2Bpath&fp=firefox&flow=&extra=%7B%22mode%22%3A%22auto%22%7D#Reality')
 
 
+def enc_uri(host='enc.example.com', port=443):
+    key = base64.urlsafe_b64encode(b'p' * 32).decode().rstrip('=')
+    return (f'vless://00000000-0000-4000-8000-000000000001@{host}:{port}'
+            f'?encryption=mlkem768x25519plus.native.1rtt.{key}&security=none&type=xhttp'
+            '&path=%2Fmy%2Bpath&extra=%7B%22mode%22%3A%22auto%22%7D#ENC')
+
+
 class ImportTests(Fixture, unittest.TestCase):
     def imported(self, uri=None, **kw):
         return self.call('api_target_save', dict(uri=uri or ss_uri(), **kw))['id']
@@ -52,7 +59,7 @@ class ImportTests(Fixture, unittest.TestCase):
         with self.assertRaises(errors.UserError): self.imported(group_id=database.default_group(self.db, 'nodes'))
 
     def test_share_links_round_trip_without_losing_transport_or_secrets(self):
-        for uri in (ss_uri(), reality_uri()):
+        for uri in (ss_uri(), enc_uri()):
             tid = self.imported(uri)
             t = database.get_target(self.db, tid)
             original = target_config.import_uri(uri)
@@ -62,9 +69,9 @@ class ImportTests(Fixture, unittest.TestCase):
             self.assertEqual(parsed['port'], 10001)
             self.assertEqual(parsed['name'], '入口 + # 中文')
             self.assertEqual(parsed['params'], original['params'])
-            if t['type'] == 'vless-reality':
+            if t['type'] == 'vless-enc':
                 self.assertEqual(parse_qs(urlsplit(link).query, keep_blank_values=True),
-                                 parse_qs(urlsplit(uri).query, keep_blank_values=True))
+                                 {k: [v] for k, v in original['params']['share_query']})
 
     def test_ss22_plain_and_legacy_base64_and_sip002_plugin(self):
         tc = target_config

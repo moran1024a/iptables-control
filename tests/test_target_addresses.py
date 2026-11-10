@@ -2,7 +2,7 @@ import json
 import unittest
 
 from test_server import Fixture
-from test_imports import ss_uri, reality_uri
+from test_imports import ss_uri, enc_uri
 import configurations
 import database
 import errors
@@ -112,10 +112,10 @@ class TargetAddressTests(Fixture, unittest.TestCase):
         self.assertEqual(len(self.call('api_targets')['targets'][0]['addresses']), 1)
 
     def test_validation_and_reality_credentials(self):
-        tid = self.call('api_target_save', dict(uri=reality_uri()))['id']
+        tid = self.call('api_target_save', dict(uri=enc_uri()))['id']
         self.call('api_target_save', dict(addresses=[dict(id='same-ip', host='192.0.2.8', port=443), dict(id='other-port', host='192.0.2.8', port=8443)]), tid)
         before = self.call('api_targets')['targets'][0]
-        self.assertEqual(target_config.import_uri(before['uri'])['params'], target_config.import_uri(reality_uri())['params'])
+        self.assertEqual(target_config.import_uri(before['uri'])['params'], target_config.import_uri(enc_uri())['params'])
         for values in ([dict(id='main', host='192.0.2.2', port=443)], [dict(id='bad', host='192.0.2.2', port=0)], [dict(id='dup', host=before['host'], port=before['port'])]):
             with self.subTest(values=values), self.assertRaises(errors.UserError):
                 self.call('api_target_save', dict(addresses=values), tid)

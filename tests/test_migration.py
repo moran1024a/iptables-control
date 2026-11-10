@@ -9,6 +9,11 @@ import agent_v3, database, errors, migrations, node_sync, security, settings
 
 
 class MigrationTests(Fixture, unittest.TestCase):
+    def drop_external(self):
+        self.db.execute("DROP TABLE subscription_external_configurations")
+        self.db.execute("DROP TABLE external_configurations")
+        self.db.execute("DELETE FROM item_groups WHERE kind='external_configurations'")
+
     def old(self):
         self.db.close()
         Path(settings.DB_PATH).unlink()
@@ -122,6 +127,7 @@ class MigrationTests(Fixture, unittest.TestCase):
                     self.db.execute(f'ALTER TABLE {table} DROP COLUMN {column}')
             self.db.execute('DROP TABLE node_tags')
             self.db.execute('DROP TABLE tags')
+            self.drop_external()
             self.db.execute('PRAGMA user_version=600')
         self.db.close()
         self.db = migrations.init_db()
@@ -161,6 +167,7 @@ class MigrationTests(Fixture, unittest.TestCase):
             self.db.execute('DROP TABLE node_tags')
             self.db.execute('DROP TABLE tags')
             self.db.execute('ALTER TABLE targets DROP COLUMN addresses')
+            self.drop_external()
             self.db.execute('PRAGMA user_version=601')
         rules = [tuple(r) for r in self.db.execute('SELECT * FROM rules')]
         generations = [tuple(r) for r in self.db.execute('SELECT id,desired_generation FROM nodes')]

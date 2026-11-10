@@ -3,8 +3,8 @@
 import json
 import os
 
-VERSION = "0.6.0-rc.6"
-DATABASE_VERSION = 602
+VERSION = "0.6.0-rc.7"
+DATABASE_VERSION = 603
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)
@@ -38,5 +38,5 @@ STATIC = {
     "style.css": "text/css; charset=utf-8",
 }
 HEALTH = {"ok": "正常", "error": "故障", "skew": "时间不一致"}
-KINDS = ("nodes", "targets", "topologies")
+KINDS = ("nodes", "targets", "topologies", "external_configurations")
 DEFAULT_GROUP = "默认分组"

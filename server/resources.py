@@ -12,6 +12,7 @@ import node_addresses
 import node_tags
 import node_sync
 import configurations
+import external_configurations
 import execution
 import failover
 import topology
@@ -422,8 +423,6 @@ class Resources:
                 parsed["port"],
                 target_config.canonical(parsed["params"]),
             )
-            if kind == "vless-reality":
-                validation.check_host(parsed["params"]["server_name"], "uri")
             fallback = old["name"] if old else parsed["name"]
         elif old and old["type"] != "endpoint":
             if any((k in body for k in ("host", "port", "type", "params"))):
@@ -543,6 +542,15 @@ class Resources:
 
     def api_configs(self, conn, body):
         return configurations.configs(conn)
+
+    def api_external_preview(self, conn, body):
+        return external_configurations.preview(body)
+
+    def api_external_save(self, conn, body, ident=None):
+        return external_configurations.save(conn, body, ident)
+
+    def api_external_delete(self, conn, body, ident):
+        return external_configurations.delete(conn, ident)
 
     def api_config_rename(self, conn, body, ident):
         config = execution.get(conn, ident)

@@ -1,11 +1,11 @@
+"""Mixed topology/external subscriptions; format conversion lives in proxy_formats."""
 import base64
 import json
 import secrets
 import database
 import errors
-import execution
 import configurations as configs
-import target_config
+import proxy_formats
 import validation
 
 
@@ -16,256 +16,115 @@ def get(c, ident):
     return row
 
 
-def clash_proxy(target, connection, name):
-    p = json.loads(target["params"])
-    q = dict(p.get("share_query", []))
-    out = dict(name=name, server=connection["host"], port=connection["port"], udp=True)
-    if target["type"] == "shadowsocks":
-        unknown = set(q) - {"plugin"}
-        if unknown:
-            raise ValueError("Mihomo 暂不支持转换参数：" + ", ".join(sorted(unknown)))
-        out.update(type="ss", cipher=p["method"], password=p["password"])
-        if q.get("plugin"):
-            plugin, *options = q["plugin"].split(";")
-            opts = dict(
-                (part.split("=", 1) if "=" in part else (part, True) for part in options if part)
-            )
-            if plugin in ("obfs-local", "simple-obfs") and set(opts) <= {"obfs", "obfs-host"}:
-                if opts.get("obfs") not in ("http", "tls"):
-                    raise ValueError("无效的 obfs 模式")
-                out.update(
-                    plugin="obfs",
-                    **{"plugin-opts": {"mode": opts["obfs"], "host": opts.get("obfs-host", "")}},
-                )
-            elif plugin == "v2ray-plugin" and set(opts) <= {"mode", "tls", "host", "path", "mux"}:
-                if opts.get("mode", "websocket") != "websocket":
-                    raise ValueError("Mihomo 仅支持 v2ray-plugin websocket 模式")
-                out.update(
-                    plugin=plugin,
-                    **{
-                        "plugin-opts": dict(
-                            mode="websocket",
-                            tls="tls" in opts,
-                            host=opts.get("host", ""),
-                            path=opts.get("path", "/"),
-                            mux="mux" in opts,
-                        )
-                    },
-                )
-            else:
-                raise ValueError("Mihomo 暂不支持转换此 SS 插件")
-        return out
-    if target["type"] != "vless-reality":
-        raise ValueError("仅有地址和端口，缺少代理协议")
-    unknown = set(q) - {
-        "encryption",
-        "security",
-        "sni",
-        "fp",
-        "pbk",
-        "sid",
-        "type",
-        "flow",
-        "alpn",
-        "host",
-        "path",
-        "serviceName",
-        "headerType",
-        "spx",
-    }
-    if unknown or q.get("encryption", "none") not in ("none", ""):
-        raise ValueError("Mihomo 暂不支持转换此 VLESS 参数")
-    network = q.get("type", "tcp")
-    if network == "raw":
-        network = "tcp"
-    if (
-        network not in ("tcp", "ws", "grpc", "http", "h2", "httpupgrade")
-        or q.get("headerType", "none") != "none"
-    ):
-        raise ValueError("Mihomo 暂不支持转换此传输方式")
-    out.update(
-        type="vless",
-        uuid=p["uuid"],
-        tls=True,
-        servername=p["server_name"],
-        **{
-            "client-fingerprint": q.get("fp") or "chrome",
-            "reality-opts": {"public-key": p["public_key"], "short-id": p["short_id"]},
-        },
-    )
-    flow = q.get("flow", "" if "share_query" in p else "xtls-rprx-vision")
-    if flow:
-        out["flow"] = flow
-    if q.get("alpn"):
-        out["alpn"] = q["alpn"].split(",")
-    if network in ("ws", "httpupgrade"):
-        out["network"] = "ws"
-        opts = {"path": q.get("path", "/")}
-        if q.get("host"):
-            opts["headers"] = {"Host": q["host"]}
-        if network == "httpupgrade":
-            opts["v2ray-http-upgrade"] = True
-        out["ws-opts"] = opts
-    elif network == "grpc":
-        out.update(network="grpc", **{"grpc-opts": {"grpc-service-name": q.get("serviceName", "")}})
-    elif network in ("http", "h2"):
-        out["network"] = network
-        out[network + "-opts"] = (
-            {"path": [q.get("path", "/")], "headers": {"Host": q.get("host", "").split(",")}}
-            if network == "http"
-            else {"path": q.get("path", "/"), "host": q.get("host", "").split(",")}
-        )
-    return out
-
-
-def configurations(c):
-    result = []
-    for row in sorted(
-        [dict(r) for r in c.execute("SELECT * FROM configurations WHERE deleted=0")],
-        key=configs.order(c),
-    ):
-        view = configs.view(c, row)
-        target = (
-            execution.applied_target(c, row)
-            if row["applied"]
-            else database.get_target(c, json.loads(row["desired"])["target"])
-        )
-        connection = view["connection"]
-        error = "配置尚未生效" if not connection else ""
-        if target["type"] == "endpoint":
-            error = "仅有地址和端口，缺少代理协议"
-        item = dict(
-            id=row["id"],
-            name=row["name"],
-            code=configs.code(row["id"]),
-            group_id=configs.get_topology(c, row["topology_id"])["group_id"],
-            connection=connection,
-            target=dict(target),
-            error=error,
-            clash_error=error,
-        )
+def catalog(c):
+    listing = configs.configs(c)
+    items = []
+    for item in listing['configs']:
+        connection = item['connection']
+        row = {k:item[k] for k in ('id','source','name','code','group_id')}
+        row.update(error='', clash_error='', node=None)
+        error = '配置尚未生效' if not connection else '仅有地址和端口，缺少代理协议' if connection['protocol'] == 'endpoint' else ''
         if not error:
             try:
-                clash_proxy(target, connection, row["name"])
+                row['node'] = proxy_formats.parse(connection['uri'])
             except ValueError as exc:
-                item["clash_error"] = str(exc)
-        result.append(item)
-    return result
+                error = str(exc)
+        if error:
+            row.update(error=error, clash_error=error)
+        else:
+            row['error'] = proxy_formats.link_error(row['node'])
+            try:
+                proxy_formats.mihomo(row['node'], row['name'])
+            except ValueError as exc:
+                row['clash_error'] = str(exc)
+        items.append(row)
+    return items, listing['groups']
+
+
+MEMBERS = (('topology', 'configuration_ids', 'subscription_configurations', 'configuration_id'),
+           ('external', 'external_configuration_ids', 'subscription_external_configurations', 'external_configuration_id'))
+
+
+def selections(c, ident):
+    return {field:[r[0] for r in c.execute(f'SELECT {column} FROM {table} WHERE subscription_id=?', (ident,))]
+            for source,field,table,column in MEMBERS}
+
+
+def selected(items, ids):
+    wanted = {source:set(ids[field]) for source,field,_,_ in MEMBERS}
+    return [x for x in items if x['id'] in wanted[x['source']]]
 
 
 def listing(c):
-    configs = configurations(c)
+    items, groups = catalog(c)
     rows = []
-    for row in c.execute("SELECT * FROM subscriptions ORDER BY id"):
-        ids = [
-            r[0]
-            for r in c.execute(
-                "SELECT configuration_id FROM subscription_configurations WHERE subscription_id=?",
-                (row["id"],),
-            )
-        ]
-        selected = [x for x in configs if x["id"] in ids]
-        rows.append(
-            dict(
-                row,
-                enabled=bool(row["enabled"]),
-                configuration_ids=ids,
-                path="/sub/" + row["token"],
-                counts={
-                    fmt: sum((not x[field] for x in selected))
-                    for fmt, field in (("v2ray", "error"), ("clash", "clash_error"))
-                },
-            )
-        )
-    return dict(
-        subscriptions=rows,
-        configs=[
-            {k: x[k] for k in ("id", "name", "code", "group_id", "error", "clash_error")}
-            for x in configs
-        ],
-        groups=database.get_groups(c, "topologies"),
-        public_url=database.setting(c, "public_url", ""),
-    )
+    for row in c.execute('SELECT * FROM subscriptions ORDER BY id'):
+        ids = selections(c, row['id'])
+        members = selected(items, ids)
+        rows.append(dict(row, **ids, enabled=bool(row['enabled']), path='/sub/'+row['token'],
+                         counts={fmt:sum(not x[field] for x in members)
+                                 for fmt,field in (('v2ray','error'),('clash','clash_error'))}))
+    return dict(subscriptions=rows, configs=[{k:v for k,v in x.items() if k != 'node'} for x in items],
+                groups=groups, public_url=database.setting(c,'public_url',''))
 
 
 def save(c, body, ident=None):
     old = get(c, ident) if ident else None
-    name = validation.check_remark(body.get("name", old["name"] if old else ""), "name", "名称")
-    enabled = body.get("enabled", bool(old["enabled"]) if old else True)
+    name = validation.check_remark(body.get('name', old['name'] if old else ''), 'name', '名称')
+    enabled = body.get('enabled', bool(old['enabled']) if old else True)
     if type(enabled) is not bool:
-        raise errors.UserError("启用状态无效", "enabled")
-    if body.get("reset_token", False) not in (True, False):
-        raise errors.UserError("重置参数无效")
-    ids = body.get("configuration_ids")
-    if ids is not None:
-        if (
-            not isinstance(ids, list)
-            or len(ids) > 512
-            or any((type(n) is not int for n in ids))
-            or (len(set(ids)) != len(ids))
-        ):
-            raise errors.UserError("请选择不重复的配置，最多 512 项", "configuration_ids")
-        available = {x["id"]: x for x in configurations(c)}
-        for nid in ids:
-            if nid not in available:
-                raise errors.UserError("配置已删除，请刷新后重试", "configuration_ids")
+        raise errors.UserError('启用状态无效','enabled')
+    if type(body.get('reset_token', False)) is not bool:
+        raise errors.UserError('重置参数无效')
+    ids = selections(c, ident) if old else {field:[] for _,field,_,_ in MEMBERS}
+    for source,field,table,column in MEMBERS:
+        if field not in body:
+            continue
+        values = body[field]
+        if not isinstance(values,list) or len(values)>512 or any(type(v) is not int for v in values) or len(set(values))!=len(values):
+            raise errors.UserError('请选择不重复的配置，最多 512 项',field)
+        target = 'configurations' if source == 'topology' else 'external_configurations'
+        available = {r[0] for r in c.execute(f'SELECT id FROM {target}' + (' WHERE deleted=0' if source=='topology' else ''))}
+        if not set(values) <= available:
+            raise errors.UserError('配置已删除，请刷新后重试',field)
+        ids[field] = values
+    if sum(map(len,ids.values())) > 512:
+        raise errors.UserError('最多绑定 512 项配置')
     if old:
-        token = secrets.token_hex(32) if body.get("reset_token") else old["token"]
-        c.execute(
-            "UPDATE subscriptions SET name=?,enabled=?,token=? WHERE id=?",
-            (name, int(enabled), token, ident),
-        )
+        token = secrets.token_hex(32) if body.get('reset_token') else old['token']
+        c.execute('UPDATE subscriptions SET name=?,enabled=?,token=? WHERE id=?',(name,int(enabled),token,ident))
     else:
-        ident = c.execute(
-            "INSERT INTO subscriptions(name,token,enabled) VALUES (?,?,?)",
-            (name, secrets.token_hex(32), int(enabled)),
-        ).lastrowid
-    if ids is not None:
-        c.execute("DELETE FROM subscription_configurations WHERE subscription_id=?", (ident,))
-        c.executemany(
-            "INSERT INTO subscription_configurations VALUES (?,?)", [(ident, n) for n in ids]
-        )
+        ident = c.execute('INSERT INTO subscriptions(name,token,enabled) VALUES (?,?,?)',(name,secrets.token_hex(32),int(enabled))).lastrowid
+    for source,field,table,column in MEMBERS:
+        if field in body:
+            c.execute(f'DELETE FROM {table} WHERE subscription_id=?',(ident,))
+            c.executemany(f'INSERT INTO {table} VALUES (?,?)',[(ident,n) for n in ids[field]])
     return dict(id=ident)
 
 
 def export(c, token, fmt):
-    row = c.execute("SELECT * FROM subscriptions WHERE token=? AND enabled=1", (token,)).fetchone()
+    row = c.execute('SELECT * FROM subscriptions WHERE token=? AND enabled=1',(token,)).fetchone()
     if row is None:
         return None
-    ids = {
-        r[0]
-        for r in c.execute(
-            "SELECT configuration_id FROM subscription_configurations WHERE subscription_id=?",
-            (row["id"],),
-        )
-    }
-    items = [x for x in configurations(c) if x["id"] in ids and (not x["error"])]
-    names = {"DIRECT", "REJECT", "GLOBAL", "订阅节点"}
-    links, proxies = ([], [])
-    for item in items:
-        name = item["name"]
-        while fmt == "clash" and name in names:
-            name += " [" + item["code"] + "]"
+    items, _ = catalog(c)
+    names = {'DIRECT','REJECT','GLOBAL','订阅节点'}
+    links, proxies = [], []
+    for item in selected(items,selections(c,row['id'])):
+        if item['clash_error' if fmt=='clash' else 'error']:
+            continue
+        name = item['name']
+        while fmt=='clash' and name in names:
+            name += ' ['+item['code']+']'
         names.add(name)
-        if fmt == "clash":
-            if not item["clash_error"]:
-                proxies.append(clash_proxy(item["target"], item["connection"], name))
+        if fmt=='clash':
+            proxies.append(proxy_formats.mihomo(item['node'],name))
         else:
-            links.append(
-                target_config.connection(
-                    item["target"], item["connection"]["host"], item["connection"]["port"], name
-                )["uri"]
-            )
-    if fmt == "v2ray":
-        return (
-            base64.b64encode("\n".join(links).encode()).decode() + "\n",
-            "text/plain; charset=utf-8",
-        )
-    group = dict(name="订阅节点", type="select", proxies=[p["name"] for p in proxies] or ["REJECT"])
-    encode = lambda obj: json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
-    body = "mixed-port: 7890\nallow-lan: false\nmode: rule\nproxies:"
-    body += "\n" + "".join(("  - " + encode(p) + "\n" for p in proxies)) if proxies else " []\n"
-    body += (
-        "proxy-groups:\n  - " + encode(group) + "\nrules:\n  - " + encode("MATCH,订阅节点") + "\n"
-    )
-    return (body, "application/yaml; charset=utf-8")
+            links.append(proxy_formats.share(item['node'],name))
+    if fmt=='v2ray':
+        return base64.b64encode('\n'.join(links).encode()).decode()+'\n','text/plain; charset=utf-8'
+    group = dict(name='订阅节点',type='select',proxies=[p['name'] for p in proxies] or ['REJECT'])
+    encode = lambda obj: json.dumps(obj,ensure_ascii=True,separators=(',',':'))
+    body = 'mixed-port: 7890\nallow-lan: false\nmode: rule\nproxies:'
+    body += '\n'+''.join('  - '+encode(p)+'\n' for p in proxies) if proxies else ' []\n'
+    body += 'proxy-groups:\n  - '+encode(group)+'\nrules:\n  - '+encode('MATCH,订阅节点')+'\n'
+    return body,'application/yaml; charset=utf-8'

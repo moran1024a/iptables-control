@@ -2,7 +2,7 @@
 
 轻量的 IPv4 端口转发管理工具。通过 Web 面板管理多台服务器，或使用 `ipt.sh` 在单台服务器上独立管理转发。
 
-**0.6.0-rc.6（测试版）** 支持可视化拓扑、多入口与多目标、主副 IP、订阅分享和 7 天网络质量图。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，按需同步。转发节点无需安装代理核心，SS／SS2022／VLESS Reality 等目标服务需自行准备。
+**0.6.0-rc.7（测试版）** 支持可视化拓扑、多入口与多目标、主副 IP、订阅分享和 7 天网络质量图。主动节点使用 Go + nftables 和长连接，被动节点使用 Bash + iptables，按需同步。转发节点无需安装代理核心，SS／SS2022／VLESS ENC 等目标服务需自行准备。
 
 [版本下载](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -25,14 +25,14 @@
 
 ## 安装
 
-管理多台服务器时，安装**服务端 + 节点 Agent**；只管理本机时，安装**单机脚本**即可。以下命令固定使用 0.6.0-rc.6，已有部署请先阅读[升级说明](#升级)。
+管理多台服务器时，安装**服务端 + 节点 Agent**；只管理本机时，安装**单机脚本**即可。以下命令固定使用 0.6.0-rc.7，已有部署请先阅读[升级说明](#升级)。
 
 ### 服务端
 
 准备一台已安装并启动 Docker 的 Linux 服务器，使用有 Docker 权限的账号执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.6/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.7/install-server.sh | bash
 ```
 
 安装完成后，打开输出的**完整面板地址**。默认账号为 `admin`，密码为 `admin_pass`，首次登录必须修改。
@@ -40,7 +40,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6
 默认端口为 `8730`，容器名为 `ictl-server`，数据卷为 `ictl-data`。如需指定端口或使用国内镜像：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.6/install-server.sh | bash -s -- --port 9000 --mirror
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.7/install-server.sh | bash -s -- --port 9000 --mirror
 ```
 
 主动 Agent 必须使用有可信证书的 HTTPS。请配置支持 WebSocket 的反向代理，转发至服务端的实际端口，并在面板“设置 → 对外地址”填写节点可访问的 HTTPS 地址。
@@ -64,7 +64,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6
 不需要服务端或 Agent。在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.6/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.7/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -80,7 +80,7 @@ sudo bash /root/ipt.sh
 
 重新执行[服务端安装命令](#服务端)。安装器沿用现有端口和数据挂载，保留升级前数据库备份；新容器启动或就绪检查失败时尝试恢复旧容器和数据库。相同版本需要重建时，将命令末尾改为 `| bash -s -- --force`。 使用自定义 Docker 网络、额外挂载、环境变量或资源限制时，安装器会在停止服务前提示退出，请沿用原 Docker Compose 或部署命令更换镜像版本。
 
-**从此前 0.6.0 RC 升级：保留全部数据，包括已有目标地址和节点标签。RC1／RC2 的节点初始无标签；RC1 的节点权重默认为 0，链路自动灾备默认关闭。**
+**从此前 0.6.0 RC 升级：删除受管 VLESS Reality 目标及其关联配置；多目标链路只移除对应目标，其他配置保留。** 旧规则在节点下次成功同步时清理，确认前保留端口占用。节点、其他类型目标、标签和订阅链接保持不变；原 Reality 配置从订阅中移除。自行部署的 Reality 代理服务需自行处理。RC1／RC2 的节点初始无标签；RC1 的节点权重默认为 0，链路自动灾备默认关闭。
 
 **从 0.5.3 升级：仅保留以下节点信息，清空旧业务数据。更早版本请先升级至 0.5.3。**
 
@@ -89,7 +89,7 @@ sudo bash /root/ipt.sh
 - 节点下一次成功同步会清理旧转发规则；清理确认前，旧端口仍保留占用。远端节点上的单机脚本规则不受影响。
 - 主动节点开启自动更新后自动更新到本版。被动节点首次迁移需在本机运行 `sudo ictl --sync`，之后仍按原有手动／唤醒方式同步。
 
-数据库版本为 **602**，从 RC1／RC2 迁移数据库时另保留 `ictl.db.pre-0.6.0-rc.3.bak`。Docker 升级备份为 `/data/ictl.db.pre-deploy-*.bak`，节点导入另保留 `ictl.db.pre-0.6.0.bak`。回退需同时恢复升级前数据库与对应旧镜像；已同步的节点也需要重新同步旧配置，不能保证升级期间转发不中断。
+数据库版本为 **603**，本次升级前备份为 `ictl.db.pre-0.6.0-rc.7.bak`；从 RC1／RC2 迁移数据库时还会保留 `ictl.db.pre-0.6.0-rc.3.bak`。Docker 升级备份为 `/data/ictl.db.pre-deploy-*.bak`，节点导入另保留 `ictl.db.pre-0.6.0.bak`。回退需同时恢复升级前数据库与对应旧镜像；已同步的节点也需要重新同步旧配置，不能保证升级期间转发不中断。
 
 ### 节点 Agent 升级
 
@@ -117,7 +117,7 @@ sudo ictl --sync
 删除容器和镜像，保留数据卷：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.6/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.0-rc.7/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷中的全部数据。卸载服务端不会清理远端节点规则；完整停用时，请先处理节点。
@@ -146,7 +146,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 ### 删除面板对象
 
-删除节点或目标前，需先从引用它的链路中移除。切换和清理期间的引用需等待节点确认后释放。删除链路后，端口也会在清理确认后释放；配置页中的条目由链路生成。
+删除节点或目标前，需先从引用它的链路中移除。切换和清理期间的引用需等待节点确认后释放。删除链路后，端口也会在清理确认后释放；配置页中的 C 编号条目由链路生成；E 编号条目可独立删除，同时移除其订阅绑定。
 
 ## 使用指南
 
@@ -157,10 +157,10 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 | 节点 | 安装了 Agent 的转发服务器 | 入口 A、中转 B |
 | 目标 | 最终连接的服务 | `192.0.2.10:443` 或 SS 分享链接 |
 | 链路 | 由节点和目标组成的拓扑 | 入口 A → 中转 B → 目标 |
-| 配置 | 一个入口与一个目标对应的连接信息 | 入口地址、SS／VLESS 导入链接 |
+| 配置 | 链路生成的连接信息或手动导入的外部节点 | 固定编号、改名、复制链接、外部配置分组 |
 
 1. **接入节点**：按[节点 Agent](#节点-agent)完成安装，确认 IP 已识别。
-2. **添加目标**：在“目标”中添加 IPv4／域名和端口，或导入 SS／SS2022／VLESS Reality 分享链接。
+2. **添加目标**：在“目标”中添加 IPv4／域名和端口，或导入 SS／SS2022／VLESS ENC 分享链接。
 3. **创建链路**：进入“链路 → 新增链路”，点击“添加”，放入入口、需要的中转节点和目标。从起点右侧的 IP 圆点拖线到终点左侧的 IP 圆点。
 4. **保存并同步**：点击“保存”，系统校验连线并自动排版。节点离线也可保存；后台待节点就绪后下发。主动节点和已启用唤醒的被动节点自动同步；其余被动节点运行 `sudo ictl --sync`。
 5. **连接使用**：显示“已应用”后，在“配置”中复制入口地址或导入链接，也可以加入[订阅](#订阅)。
@@ -190,7 +190,7 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 在“配置”点击“改名”即可修改名称。改名和中间路径切换不改变配置 ID、入口端口及订阅绑定；更换入口地址或端口后，需更新客户端连接信息。导入链接和订阅仅使用配置名称，Clash 遇到重名或保留名称时会附加 ID。
 
-节点、目标和链路支持分组、排序与筛选。配置跟随链路的分组和排序，无需单独设置。
+节点、目标和链路支持分组、排序与筛选。C 配置跟随链路的分组和排序；E 外部配置可独立分组和排序。
 
 ### 编辑与切换路径
 
@@ -255,11 +255,13 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 反向代理需将 `/sub/` 路径转发到服务端。
 
-1. 在“配置”之后的“订阅”面板新增订阅，填写名称，勾选需要分享的配置；可使用“全选”。
-2. 复制 **Clash 链接**或 **v2rayN 链接**，在客户端添加订阅。VLESS Reality 使用支持 Mihomo 的客户端。
-3. 修改链路或配置名称后，在客户端更新订阅。条目使用配置名称，顺序跟随链路分组和排序。
+1. 在“配置”中复制 C 配置，或点“导入配置”粘贴一条外部节点链接。E 编号固定、删除后不复用；可以修改名称、链接、分组和顺序。外部配置直接由客户端连接，不经过受管节点。
+2. 在“订阅”新增订阅，勾选 C／E 配置，也可使用“全选”。复制 **Clash 链接（Mihomo）**或 **v2rayN 链接**，在客户端添加订阅。
+3. 修改名称、连接信息或顺序后，在客户端更新订阅。条目只使用配置名称；先按链路顺序列出 C 配置，再按外部分组顺序列出 E 配置。
 
-SS／SS2022 和 VLESS Reality 可导出；仅 IP＋端口的配置不能作为代理订阅项。不支持的插件或传输参数会在绑定列表提示，对应格式会跳过该项。
+外部导入支持九类：**SS／SS2022、VMess、VLESS、Trojan、Hysteria2、TUIC v5、AnyTLS、SOCKS5、HTTP／HTTPS 代理**。VLESS 外部配置可使用 ENC、TLS 或 Reality；受管“目标”只接受 VLESS ENC。仅支持手动导入单个节点，不抓取第三方订阅地址。
+
+请使用支持相应协议的新版客户端。HTTP／HTTPS 代理可用于 Mihomo，当前 v2rayN 不支持其分享链接。仅 IP＋端口的 C 配置不能作为代理订阅项；不支持转换的插件或参数会在绑定列表说明，并只在对应格式中跳过，不会静默移除加密或证书校验参数。
 
 持有订阅链接即可获取绑定配置的代理凭据，请只分享给需要的人。禁用、删除或重置链接后，旧链接立即失效，但已获取的凭据不会因此撤销。
 
@@ -397,7 +399,7 @@ for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
 
 | 组件 | 版本 |
 | --- | --- |
-| 服务端 | 0.6.0-rc.6 |
+| 服务端 | 0.6.0-rc.7 |
 | 主动 Agent | 0.6.0-rc.5 |
 | 被动 Agent | 0.6.0-rc.5 |
 | 管理器 | 0.6.0-rc.5 |

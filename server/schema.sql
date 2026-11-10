@@ -61,7 +61,7 @@ CREATE TABLE targets (
  host TEXT NOT NULL, port INTEGER NOT NULL, params TEXT NOT NULL DEFAULT '{}',
  addresses TEXT NOT NULL DEFAULT '[]',
  group_id INTEGER NOT NULL, sort INTEGER NOT NULL DEFAULT 0,
- CHECK(type IN ('endpoint','shadowsocks','vless-reality')),
+ CHECK(type IN ('endpoint','shadowsocks','vless-enc')),
  CHECK(port BETWEEN 1 AND 65535)
 );
 CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, color TEXT NOT NULL);
@@ -185,6 +185,16 @@ CREATE TABLE subscription_configurations (
  PRIMARY KEY(subscription_id,configuration_id)
 );
 CREATE TABLE migration_nodes (node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE);
+CREATE TABLE external_configurations (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, uri TEXT NOT NULL,
+ group_id INTEGER NOT NULL REFERENCES item_groups(id), sort INTEGER NOT NULL DEFAULT 0,
+ revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE subscription_external_configurations (
+ subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+ external_configuration_id INTEGER NOT NULL REFERENCES external_configurations(id) ON DELETE CASCADE,
+ PRIMARY KEY(subscription_id,external_configuration_id)
+);
 CREATE INDEX rules_node ON rules(node_id);
 CREATE INDEX configurations_topology ON configurations(topology_id);
 CREATE INDEX probe_sample_age ON probe_samples(slot);

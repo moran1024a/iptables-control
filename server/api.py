@@ -159,6 +159,12 @@ class Request:
                 handler = {"POST": self.resources.api_node_rekey}.get(method)
             elif parts == ["configs"]:
                 handler = {"GET": self.resources.api_configs}.get(method)
+            elif parts == ["external-config-preview"]:
+                handler = {"POST": self.resources.api_external_preview}.get(method)
+            elif parts == ["external-configs"]:
+                handler = {"POST": self.resources.api_external_save}.get(method)
+            elif len(parts) == 2 and parts[0] == "external-configs" and parts[1].isdigit():
+                handler = {"PATCH": self.resources.api_external_save, "DELETE": self.resources.api_external_delete}.get(method)
             elif len(parts) == 3 and parts[0] == 'configs' and parts[1].isdigit() and parts[2] == 'name':
                 handler = {'PATCH': self.resources.api_config_rename}.get(method)
             elif parts == ["topologies"]:

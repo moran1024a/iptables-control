@@ -6,8 +6,8 @@ const memberName=id=>resourceName(canvasView.nodes,id);
 const pageHead=(title,buttons='')=>`<div class="page-head"><h1>${title}</h1><div class="head-actions">${buttons}</div></div>`;
 const linkStatus=l=>l.state;
 const linkState=l=>`<span class="badge ${l.state==='error'?'removing':l.state==='active'?'applied':'applying'}">${LINK_STATES[l.state]||esc(l.state)}</span>`;
-const collectionFilters = {topologies:{q:'',state:'',group:''}, configs:{q:'',state:'',group:''}};
-filters.topologies=collectionFilters.topologies; filters.configs=collectionFilters.configs;
+const collectionFilters = {topologies:{q:'',state:'',group:''}, configs:{q:'',state:'',group:'',source:''}};
+filters.topologies=collectionFilters.topologies; filters.configs=collectionFilters.configs; filters.external_configurations=collectionFilters.configs;
 let drawCollection = null;
 const matchesSearch = (kind, text) => text.toLowerCase().includes(collectionFilters[kind].q.trim().toLowerCase());
 const statusGroup = l => {
@@ -16,7 +16,7 @@ const statusGroup = l => {
 };
 function collectionTools(kind, count, total, statuses, groups=[]) {
   const f=collectionFilters[kind];
-  return `<div class="collection-tools" data-collection="${kind}"><input type="search" data-collection-query value="${esc(f.q)}" placeholder="搜索名称或地址" aria-label="搜索列表"><select data-collection-state aria-label="筛选状态"><option value="">全部状态</option>${statuses.map(([key,label])=>`<option value="${key}" ${f.state===key?'selected':''}>${label}</option>`).join('')}</select>${groups.length>1?`<select data-collection-group aria-label="筛选分组"><option value="">全部分组</option>${groups.map(g=>`<option value="${g.id}" ${String(g.id)===f.group?'selected':''}>${esc(g.name)}</option>`).join('')}</select>`:''}<span class="count">${count} / ${total}</span></div>`;
+  return `<div class="collection-tools" data-collection="${kind}"><input type="search" data-collection-query value="${esc(f.q)}" placeholder="搜索名称或地址" aria-label="搜索列表"><select data-collection-state aria-label="筛选状态"><option value="">全部状态</option>${statuses.map(([key,label])=>`<option value="${key}" ${f.state===key?'selected':''}>${label}</option>`).join('')}</select>${groups.length>1?`<select data-collection-group aria-label="筛选分组"><option value="">全部分组</option>${groups.map(g=>`<option value="${g.id}" ${String(g.id)===f.group?'selected':''}>${esc(g.name)}</option>`).join('')}</select>`:''}${kind==='configs'?`<select data-collection-source aria-label="筛选来源"><option value="">全部来源</option><option value="topology" ${f.source==='topology'?'selected':''}>链路生成</option><option value="external" ${f.source==='external'?'selected':''}>外部导入</option></select>`:''}<span class="count">${count} / ${total}</span></div>`;
 }
 document.addEventListener('input',e=>{
   const box=e.target.closest('[data-collection]');if(!box || !e.target.hasAttribute('data-collection-query'))return;
@@ -24,7 +24,7 @@ document.addEventListener('input',e=>{
 });
 document.addEventListener('change',e=>{
   const box=e.target.closest('[data-collection]');if(!box)return;
-  const field=e.target.hasAttribute('data-collection-state')?'state':e.target.hasAttribute('data-collection-group')?'group':null;
+  const field=e.target.hasAttribute('data-collection-state')?'state':e.target.hasAttribute('data-collection-group')?'group':e.target.hasAttribute('data-collection-source')?'source':null;
   if(!field)return;collectionFilters[box.dataset.collection][field]=e.target.value;drawCollection?.();
 });
 
@@ -180,16 +180,64 @@ document.addEventListener('change',e=>{
 
 async function configSummary(request) {
   const d=await api('GET','configs');if(request!==viewRequest)return;
+  d.external_configurations=d.configs.filter(c=>c.source==='external');
+  const externalGroups=d.groups.filter(g=>g.source==='external'),topologyGroups=d.groups.filter(g=>g.source==='topology');
   list={kind:'configs',data:d,draw:()=>drawCollection()};
   drawCollection=()=>{
-    const f=collectionFilters.configs,route=c=>`${c.entry_name} → ${c.target_name}${targetAddressName(c.target_address)?' · '+targetAddressName(c.target_address):''}`;
-    const rows=d.configs.filter(c=>matchesSearch('configs',[c.name,c.code,c.topology_name,route(c),c.connection?.host,...c.entry_tags.map(t=>t.name),c.target_address?.host,c.target_address?.port].join(' '))&&(!f.state||statusGroup(c)===f.state)&&(!f.group||c.group_id===Number(f.group)));
-    const card=c=>`<div class="collection-row" data-key="config-${c.id}" data-config-id="${c.id}"><div class="collection-main inline-summary config-summary"><a class="title" href="#/routes/${c.topology_id}" title="${esc(c.name)}">${esc(c.name)}</a><small class="muted config-id">${esc(c.code)}</small><div class="sub"><a class="config-source" href="#/routes/${c.topology_id}" title="${esc(c.topology_name)}">链路：${esc(c.topology_name)}</a><code>${c.connection?esc(c.connection.host)+':'+c.connection.port:'等待入口确认'}</code><span class="config-path" title="${esc(route(c))}">${nodeLabel({name:c.entry_name,tags:c.entry_tags})} → ${targetLabel(c.target_name,c.target_address)}</span></div>${c.error?`<div class="row-error">${esc(c.error)}</div>`:''}</div>${linkState(c)}<div class="row-actions"><button class="small" data-action="config-rename" data-id="${c.id}">改名</button>${c.connection?`<button class="small" data-action="copy" data-text="${esc(c.connection.uri)}">复制${c.connection.protocol==='endpoint'?'地址':'导入链接'}</button>`:''}</div></div>`;
-    render(pageHead('配置','<a class="button" href="#/routes">管理链路 →</a>')+collectionTools('configs',rows.length,d.configs.length,[['active','已生效'],['pending','等待同步'],['error','异常']],d.groups)+`<div class="collection">${groupedList('configs',rows,card,()=> '配置',false)||emptyState('⇄','暂无配置')}</div>`);
+    if(sortMode==='external_configurations'){
+      list.data.groups=externalGroups;
+      return render(pageHead('外部配置排序','<button data-action="sort-cancel">取消</button><button class="primary" data-action="sort-save" data-kind="external_configurations">完成</button>')+sortList('external_configurations',d.external_configurations,c=>`<span class="title">${esc(c.name)}</span> <small class="muted">${c.code}</small>`));
+    }
+    list.data.groups=[...topologyGroups,...externalGroups];
+    const f=collectionFilters.configs,route=c=>`${c.entry_name||''} → ${c.target_name||''}${targetAddressName(c.target_address)?' · '+targetAddressName(c.target_address):''}`;
+    const rows=d.configs.filter(c=>matchesSearch('configs',[c.name,c.code,c.topology_name,route(c),c.connection?.host,c.connection?.protocol,...(c.entry_tags||[]).map(t=>t.name),c.target_address?.host,c.target_address?.port].join(' '))&&(!f.state||statusGroup(c)===f.state)&&(!f.group||c.group_id===Number(f.group))&&(!f.source||c.source===f.source));
+    const card=c=>{
+      const external=c.source==='external',address=c.connection?`${c.connection.host.includes(':')?'['+c.connection.host+']':c.connection.host}:${c.connection.port}`:'等待入口确认';
+      return `<div class="collection-row" data-key="config-${c.code}" data-config-id="${c.code}"><div class="collection-main inline-summary config-summary">${external?`<button class="plain-title" data-action="external-edit" data-id="${c.id}">${esc(c.name)}</button>`:`<a class="title" href="#/routes/${c.topology_id}" title="${esc(c.name)}">${esc(c.name)}</a>`}<small class="muted config-id">${esc(c.code)}</small><div class="sub">${external?`<span>外部导入 · ${esc(PROTOCOLS[c.connection.protocol]||c.connection.protocol)}</span>`:`<a class="config-source" href="#/routes/${c.topology_id}" title="${esc(c.topology_name)}">链路：${esc(c.topology_name)}</a>`}<code>${esc(address)}</code>${external?'':`<span class="config-path" title="${esc(route(c))}">${nodeLabel({name:c.entry_name,tags:c.entry_tags})} → ${targetLabel(c.target_name,c.target_address)}</span>`}</div>${c.error?`<div class="row-error">${esc(c.error)}</div>`:''}</div>${external?'<span class="badge">已导入</span>':linkState(c)}<div class="row-actions"><button class="small" data-action="${external?'external-edit':'config-rename'}" data-id="${c.id}">${external?'编辑':'改名'}</button>${c.connection?`<button class="small" data-action="copy" data-text="${esc(c.connection.uri)}">复制${c.connection.protocol==='endpoint'?'地址':'导入链接'}</button>`:''}${external?moreActions(`external-${c.id}`,`<button class="danger" data-action="external-delete" data-id="${c.id}">删除</button>`):''}</div></div>`;
+    };
+    const buttons='<a class="button" href="#/routes">管理链路</a><button class="primary" data-action="external-new">导入配置</button>'+moreActions('config-actions',`<button data-action="group-new" data-kind="external_configurations">新建外部分组</button><button data-action="sort-start" data-kind="external_configurations" ${isFiltering('configs')?'disabled':''}>外部配置排序</button>`);
+    const content=groupedList('configs',rows.filter(c=>c.source==='topology'),card,()=> '配置',false,topologyGroups)+groupedList('external_configurations',rows.filter(c=>c.source==='external'),card,()=> '配置',true,externalGroups);
+    render(pageHead('配置',buttons)+collectionTools('configs',rows.length,d.configs.length,[['active','已生效'],['pending','等待同步'],['error','异常'],['imported','已导入']],d.groups)+`<div class="collection">${content||emptyState('⇄','暂无配置')}</div>`);
   };drawCollection();
 }
+
+function externalForm(c) {
+  const groups=list.data.groups.filter(g=>g.source==='external');
+  openModal(`<form data-form="external" data-id="${c?.id||''}" data-revision="${c?.revision||''}"><h2>${c?'编辑':'导入'}配置 ${c?`<small class="muted">${c.code}</small>`:''}</h2><label><span>节点链接</span><textarea class="mono" name="uri" rows="4" maxlength="8192" required placeholder="粘贴一条节点分享链接">${esc(c?.uri||'')}</textarea></label><p class="hint" data-external-preview>SS · VMess · VLESS · Trojan · Hysteria2 · TUIC · AnyTLS · SOCKS5 · HTTP/HTTPS</p><label><span>名称</span><input name="name" maxlength="64" value="${esc(c?.name||'')}" placeholder="自动识别链接名称"></label>${groupSelect(groups,c?.group_id)}<div class="form-error"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
+  const form=$('#modal form'),input=form.elements.uri,name=form.elements.name;
+  let timer=null,manual=!!c;
+  name.addEventListener('input',()=>{manual=!!name.value;});
+  input.addEventListener('input',()=>{
+    clearTimeout(timer);const uri=input.value;
+    timer=setTimeout(async()=>{
+      if(!form.isConnected||!uri.trim())return;
+      try {
+        const parsed=await api('POST','external-config-preview',{uri});
+        if(!form.isConnected||input.value!==uri)return;
+        if(!manual)name.value=parsed.name.slice(0,64);
+        form.querySelector('[data-external-preview]').textContent=`${PROTOCOLS[parsed.protocol]} · ${parsed.host}:${parsed.port}`;
+      } catch(e) {
+        if(form.isConnected&&input.value===uri)form.querySelector('[data-external-preview]').textContent=e.message;
+      }
+    },300);
+  });
+}
+FORMS.external=async(form,data)=>{
+  const id=form.dataset.id;
+  await api(id?'PATCH':'POST',id?`external-configs/${id}`:'external-configs',{name:data.name,uri:data.uri,group_id:groupId(data),revision:Number(form.dataset.revision)});
+  closeModal();toast('配置已保存');await refresh();
+};
+Object.assign(ACTIONS,{
+  'external-new':()=>externalForm(),
+  'external-edit':el=>externalForm(list.data.external_configurations.find(c=>c.id===Number(el.dataset.id))),
+  async 'external-delete'(el){
+    const c=list.data.external_configurations.find(c=>c.id===Number(el.dataset.id));
+    if(!await confirmBox('删除外部配置',`删除 <b>${esc(c.name)}</b> 及其订阅绑定？`,'删除',true))return;
+    await api('DELETE',`external-configs/${c.id}`);toast('配置已删除');await refresh();
+  }
+});
 function configRename(ident) {
-  const config=list.data.configs.find(c=>c.id===ident);if(!config)return;
+  const config=list.data.configs.find(c=>c.source==='topology'&&c.id===ident);if(!config)return;
   openModal(`<form data-form="config-rename" data-id="${config.id}" data-previous-name="${esc(config.name)}"><h2>配置名称 <small class="muted config-id">${esc(config.code)}</small></h2><label><span>名称</span><input name="name" value="${esc(config.name)}" maxlength="64" required autocomplete="off"></label><div class="form-error" role="alert"></div><div class="form-actions"><button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
   $('#modal input[name=name]').select();
 }

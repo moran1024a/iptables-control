@@ -4,7 +4,7 @@
     2,
     3
   ],
-  "server": "0.6.0-rc.6",
+  "server": "0.6.0-rc.7",
   "active_agent": "0.6.0-rc.5",
   "passive_agent": "0.6.0-rc.5",
   "wake_agent": "0.4.3",

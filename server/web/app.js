@@ -40,7 +40,7 @@ const sortValues = () => JSON.stringify(['.sort-group','.sort-card'].map(selecto
 const sortChanged = () => sortMode && sortInitial !== null && sortValues() !== sortInitial;
 const openDetails = new Set();    // 已展开的折叠区，刷新后保持
 const revealedKeys = new Set();   // 已显示密钥的节点
-const filters = { nodes: {}, targets: {}, topologies: {}, configs: {} };   // 搜索和筛选条件，刷新页面后清空
+const filters = { nodes: {}, targets: {}, topologies: {}, configs: {}, external_configurations: {} };   // 搜索和筛选条件，刷新页面后清空
 const collapsed = new Set(JSON.parse(localStorage.getItem("ictl-collapsed") || "[]"));   // 已折叠的分组
 
 function esc(s) {
@@ -429,7 +429,7 @@ function showChangeAccount() {
 
 // ------------------------------------------------------------ 节点列表
 
-const KIND_LABEL = { nodes: "节点", targets: "目标", topologies: "链路", configs: "配置" };
+const KIND_LABEL = { nodes: "节点", targets: "目标", topologies: "链路", configs: "配置", external_configurations: "外部配置" };
 
 // 列表页标题栏：排序模式下显示「取消 / 完成」；搜索或筛选时不能排序
 function listHead(kind, total, shown, newAction, newLabel, extraActions = "") {
@@ -456,8 +456,7 @@ function saveCollapsed() {
 
 // 按分组显示：items 已按分组和组内顺序排列。只有默认分组时不显示组头。
 // 搜索或筛选时隐藏没有匹配项的分组，有匹配项的分组临时展开
-function groupedList(kind, items, card, summary, editable = true) {
-  const groups = list.data.groups;
+function groupedList(kind, items, card, summary, editable = true, groups = list.data.groups) {
   const rows = kind === 'nodes' || kind === 'targets';
   if (groups.length === 1) return rows ? `<div class="resource-rows">${items.map(card).join('')}</div>` : items.map(card).join("");
   const filtering = isFiltering(kind);
@@ -476,8 +475,8 @@ function groupHead(kind, g, sum, handle = "", editable = true) {
   return `<div class="group-head" data-action="group-toggle" data-group="${kind}-${g.id}">
     ${handle}<span class="chevron"></span><span class="group-name">${esc(g.name)}</span><span class="group-sum">${sum}</span>
     ${handle || !editable ? "" : `<span class="group-actions">
-      <button class="small" data-action="group-rename" data-id="${g.id}">改名</button>
-      ${g.builtin ? "" : `<button class="small danger" data-action="group-delete" data-id="${g.id}">删除</button>`}
+      <button class="small" data-action="group-rename" data-kind="${kind}" data-id="${g.id}">改名</button>
+      ${g.builtin ? "" : `<button class="small danger" data-action="group-delete" data-kind="${kind}" data-id="${g.id}">删除</button>`}
     </span>`}
   </div>`;
 }
@@ -1266,17 +1265,18 @@ const ACTIONS = {
     groupForm(el.dataset.kind);
   },
   "group-rename"(el) {
-    groupForm(list.kind, list.data.groups.find((g) => g.id === Number(el.dataset.id)));
+    groupForm(el.dataset.kind || list.kind, list.data.groups.find((g) => g.id === Number(el.dataset.id)));
   },
   async "group-delete"(el) {
+    const kind = el.dataset.kind || list.kind;
     const g = list.data.groups.find((x) => x.id === Number(el.dataset.id));
-    const count = list.data[list.kind].filter((x) => x.group_id === g.id).length;
-    const def = list.data.groups.find((x) => x.builtin);
+    const count = list.data[kind].filter((x) => x.group_id === g.id).length;
+    const def = list.data.groups.find((x) => x.builtin && (!g.source || x.source === g.source));
     const text = `确定删除分组 <b>${esc(g.name)}</b>？` +
-      (count ? `组内的 ${count} 个${KIND_LABEL[list.kind]}将移到 <b>${esc(def.name)}</b>。` : "");
+      (count ? `组内的 ${count} 个${KIND_LABEL[kind]}将移到 <b>${esc(def.name)}</b>。` : "");
     if (!(await confirmBox("删除分组", text, "删除", true))) return;
     await api("DELETE", `groups/${g.id}`);
-    collapsed.delete(`${list.kind}-${g.id}`);
+    collapsed.delete(`${kind}-${g.id}`);
     saveCollapsed();
     toast("分组已删除");
     refresh();
@@ -1645,7 +1645,7 @@ function drawManagedList(kind, rows, card, newAction, newLabel, hint, extraActio
   syncFilters();
 }
 
-const PROTOCOLS = {shadowsocks: "Shadowsocks", "vless-reality": "VLESS Reality", endpoint: "IP／域名＋端口"};
+const PROTOCOLS = {shadowsocks: "Shadowsocks", "vless-enc": "VLESS ENC", vless: "VLESS", vmess: "VMess", trojan: "Trojan", hysteria2: "Hysteria2", tuic: "TUIC", anytls: "AnyTLS", socks5: "SOCKS5", http: "HTTP/HTTPS", endpoint: "IP／域名＋端口"};
 async function targetList(request) {
   const data = await api("GET", "targets");
   if (request !== viewRequest) return;
@@ -1664,7 +1664,7 @@ function targetForm(t, imported = false) {
   openModal(`<h2>${t ? "编辑目标" : imported ? "导入目标" : "添加地址目标"}</h2><form data-form="target" data-id="${t?.id || ""}" data-imported="${imported}">
     <label><span>名称${imported ? "（留空使用链接名称）" : ""}</span><input name="name" value="${esc(t?.name)}" maxlength="64" ${imported ? "" : "required"}></label>
     ${groupSelect(list.data.groups, t?.group_id)}
-    ${imported ? `<label><span>分享链接</span><textarea name="uri" rows="5" maxlength="8192" class="mono" placeholder="ss://… 或 vless://…?security=reality…" required>${esc(t?.uri)}</textarea></label><p class="hint">支持 SS、SS2022 和 VLESS Reality，地址需为 IPv4 或域名。</p>` :
+    ${imported ? `<label><span>分享链接</span><textarea name="uri" rows="5" maxlength="8192" class="mono" placeholder="ss://… 或 vless://…?encryption=mlkem768x25519plus…" required>${esc(t?.uri)}</textarea></label><p class="hint">支持 SS、SS2022 和 VLESS ENC，地址需为 IPv4 或域名。</p>` :
       `<label><span>IPv4 或域名</span><input name="host" value="${esc(t?.host)}" required></label><label><span>端口</span><input name="port" type="number" min="1" max="65535" value="${t?.port || ""}" required></label>`}
     <section class="target-addresses"><h3>其他接入地址</h3><div data-target-address-list>${(t?.addresses||[]).filter(a=>a.id!=='main').map(targetAddressRow).join('')}</div><button type="button" class="small" data-action="target-address-add">＋ 接入地址</button><div class="form-error" data-error="addresses"></div></section>
     ${t?.configs.length ? `<p class="hint">被修改地址的引用配置将重新同步。</p>` : ""}

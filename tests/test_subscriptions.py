@@ -2,7 +2,7 @@ import base64
 import json
 import unittest
 from test_server import Fixture
-from test_imports import ss_uri, reality_uri
+from test_imports import ss_uri, enc_uri
 import configurations, database, subscriptions, target_config
 
 
@@ -48,7 +48,7 @@ class SubscriptionTests(Fixture, unittest.TestCase):
         self.assertIsNone(subscriptions.export(self.db, token, "v2ray"))
 
     def test_plain_target_and_unsupported_clash_do_not_break_exports(self):
-        n, t, ident, c, s = self.create(reality_uri())
+        n, t, ident, c, s = self.create(enc_uri())
         row = subscriptions.listing(self.db)
         self.assertTrue(row["configs"][0]["clash_error"])
         self.assertFalse(row["configs"][0]["error"])

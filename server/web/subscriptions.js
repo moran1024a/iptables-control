@@ -6,22 +6,22 @@ async function subscriptionList(request) {
   const url=(row,format)=>(d.public_url||location.origin)+row.path+'?format='+format;
   render(pageHead('订阅','<button class="primary" data-action="subscription-new">新增订阅</button>')+
     `<div class="collection">${d.subscriptions.map(s=>`<div class="collection-row" data-key="subscription-${s.id}">
-      <div class="collection-main inline-summary"><button class="plain-title" data-action="subscription-edit" data-id="${s.id}">${esc(s.name)}</button><div class="sub">${s.configuration_ids.length} 个配置 · Mihomo ${s.counts.clash} · v2rayN ${s.counts.v2ray}</div></div>
+      <div class="collection-main inline-summary"><button class="plain-title" data-action="subscription-edit" data-id="${s.id}">${esc(s.name)}</button><div class="sub">${s.configuration_ids.length+s.external_configuration_ids.length} 个配置 · Mihomo ${s.counts.clash} · v2rayN ${s.counts.v2ray}</div></div>
       <span class="badge ${s.enabled?'applied':'removing'}">${s.enabled?'已启用':'已禁用'}</span>
       <div class="row-actions"><button class="small" data-action="copy" data-text="${esc(url(s,'clash'))}" title="复制 Clash 订阅链接" aria-label="复制 Clash 订阅链接">Clash</button><button class="small" data-action="copy" data-text="${esc(url(s,'v2ray'))}" title="复制 v2rayN 订阅链接" aria-label="复制 v2rayN 订阅链接">v2rayN</button><button class="small" data-action="subscription-edit" data-id="${s.id}">编辑</button></div>
     </div>`).join('')||emptyState('⇅','暂无订阅')}</div>`);
 }
 
 function subscriptionForm(row) {
-  const d=subscriptionView,ids=row?.configuration_ids||[];
+  const d=subscriptionView,ids=new Set([...(row?.configuration_ids||[]).map(id=>'C'+id),...(row?.external_configuration_ids||[]).map(id=>'E'+id)]);
   openModal(`<form data-form="subscription" data-id="${row?.id||''}"><h2>${row?'编辑订阅':'新增订阅'}</h2>
     <div class="form-row"><label><span>名称</span><input name="name" value="${esc(row?.name||'')}" maxlength="64" required></label>
     <label><span>状态</span><select name="enabled"><option value="1">启用</option><option value="0" ${row&&!row.enabled?'selected':''}>禁用</option></select></label></div>
     <div class="subscription-heading"><h3>绑定配置</h3><label><input type="checkbox" data-subscription-all data-ignore-dirty>全选</label></div><div class="subscription-choices">${d.groups.map(g=>{
-      const items=d.configs.filter(c=>c.group_id===g.id);if(!items.length)return '';
-      return `<div class="subscription-group">${d.groups.length>1?`<strong>${esc(g.name)}</strong>`:''}${items.map(c=>`<label><input type="checkbox" name="configuration_id" value="${c.id}" ${ids.includes(c.id)?'checked':''} ${c.error&&!ids.includes(c.id)?'disabled':''}><span>${esc(c.name)}${c.code?` <span class="muted config-id">${esc(c.code)}</span>`:''}${c.error||c.clash_error?`<small class="muted">${esc(c.error||c.clash_error+'；可用于 v2rayN')}</small>`:''}</span></label>`).join('')}</div>`;
-    }).join('')||'<p class="muted">暂无配置，请先创建链路。</p>'}</div>
-    <p class="hint">绑定配置随链路更新。VLESS Reality 请使用 Mihomo 内核客户端。</p><div class="form-error"></div>
+      const items=d.configs.filter(c=>c.group_id===g.id).map(c=>({...c,key:(c.source==='external'?'E':'C')+c.id}));if(!items.length)return '';
+      return `<div class="subscription-group">${d.groups.length>1?`<strong>${g.source==='external'?'外部 · ':''}${esc(g.name)}</strong>`:''}${items.map(c=>`<label><input type="checkbox" name="configuration_id" value="${c.key}" ${ids.has(c.key)?'checked':''} ${c.error&&c.clash_error&&!ids.has(c.key)?'disabled':''}><span>${esc(c.name)}${c.code?` <span class="muted config-id">${esc(c.code)}</span>`:''}${c.error||c.clash_error?`<small class="muted">${esc([c.error?('v2rayN：'+c.error):'',c.clash_error?('Mihomo：'+c.clash_error):''].filter(Boolean).join('；'))}</small>`:''}</span></label>`).join('')}</div>`;
+    }).join('')||'<p class="muted">暂无配置，请先创建链路或导入配置。</p>'}</div>
+    <p class="hint">订阅跟随配置更新；不兼容的项目仅在对应格式中跳过。</p><div class="form-error"></div>
     <div class="form-actions">${row?`<button type="button" class="danger" data-action="subscription-delete" data-id="${row.id}">删除</button><button type="button" data-action="subscription-reset" data-id="${row.id}">重置链接</button>`:''}<button type="button" data-action="modal-close">取消</button><button class="primary">保存</button></div></form>`);
   updateSubscriptionSelection($('#modal form'));
 }
@@ -44,7 +44,8 @@ document.addEventListener('change',e=>{
 FORMS.subscription=async(form,data)=>{
   const id=form.dataset.id;
   await api(id?'PATCH':'POST',id?`subscriptions/${id}`:'subscriptions',{
-    name:data.name, enabled:data.enabled==='1', configuration_ids:[...form.querySelectorAll('[name=configuration_id]:checked')].map(x=>Number(x.value))
+    name:data.name, enabled:data.enabled==='1', configuration_ids:[...form.querySelectorAll('[name=configuration_id]:checked')].filter(x=>x.value.startsWith('C')).map(x=>Number(x.value.slice(1))),
+    external_configuration_ids:[...form.querySelectorAll('[name=configuration_id]:checked')].filter(x=>x.value.startsWith('E')).map(x=>Number(x.value.slice(1)))
   });
   closeModal();toast('订阅已保存');await refresh();
 };

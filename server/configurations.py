@@ -14,6 +14,7 @@ import target_config
 import target_addresses
 import topology
 import validation
+import external_configurations
 
 
 def get_topology(c, ident):
@@ -508,6 +509,7 @@ def configs(c):
         result.append(
             dict(
                 v,
+                source="topology",
                 topology_id=r["topology_id"],
                 topology_name=parent["name"],
                 group_id=parent["group_id"],
@@ -516,4 +518,7 @@ def configs(c):
                 target_name=target["name"],
             )
         )
-    return dict(configs=result, groups=database.get_groups(c, "topologies"))
+    return dict(configs=result + external_configurations.listing(c), groups=[
+        dict(g, source=source) for kind,source in (("topologies","topology"),("external_configurations","external"))
+        for g in database.get_groups(c, kind)
+    ])
