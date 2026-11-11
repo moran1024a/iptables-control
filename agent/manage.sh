@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.6.0"
+VERSION="0.6.1"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -19,6 +19,64 @@ read_identity() {
   [[ "$URL" =~ ^https?://[^[:space:]\"\\]+$ && "$KEY" =~ ^[0-9a-f]{64}$ ]] || { die '接入配置无效'; return 1; }
   derive_keys
 }
+# The management transport is explicit and never exported as a system proxy.
+proxy_client() {
+  if [ -n "${ICTL_CONTROL_CLIENT:-}" ] && [ -x "$ICTL_CONTROL_CLIENT" ]; then printf '%s' "$ICTL_CONTROL_CLIENT"
+  elif [ -x "$PKG/active" ]; then printf '%s' "$PKG/active"
+  else printf '%s' "$PKG/control-client"; fi
+}
+control_post() {
+  if [ -f /etc/ictl/proxy.json ] && { [ "${ICTL_ACTIVE_PROXY:-0}" = 1 ] || [ "${FROM:-}" = active ] || [ "$(cat "$LIB/agent-kind" 2>/dev/null)" = active ]; }; then
+    "$(proxy_client)" --proxy-action request --conf "$CONF" --server-url "$URL" \
+      --proxy-helper "$PKG/sslocal" --control-output "$2" --control-timeout "$3" < "$1"
+  else
+    curl --proxy '' --noproxy '*' -sS --connect-timeout 5 --max-time "$3" -o "$2" -w '%{http_code}' \
+      -H 'Content-Type: text/plain' --data-binary @"$1" "$URL" 2>/dev/null
+  fi
+}
+control_request() {
+  local out="$1" d code req_tag size
+  d="$(mktemp -d /run/ictl.XXXXXX)" || { echo 000; return; }
+  aes | tail -c +9 > "$d/msg"
+  req_tag="$(hmac_hex "$MK" < "$d/msg")"
+  { cat "$d/msg"; hex2bin "$req_tag"; } | openssl base64 -A > "$d/req"
+  code="$(control_post "$d/req" "$d/body" "${2:-15}")"
+  if [ "$code" = "200" ]; then
+    # 校验响应的 HMAC（绑定本次请求）后解密
+    code="bad"
+    openssl base64 -d -A < "$d/body" > "$d/resp" 2>/dev/null
+    size="$(wc -c < "$d/resp")"
+    if [ "$size" -ge 40 ]; then
+      head -c $((size - 32)) "$d/resp" > "$d/rmsg"
+      if [ "$({ hex2bin "$req_tag"; cat "$d/rmsg"; } | hmac_hex "$MK")" = "$(tail -c 32 "$d/resp" | bin2hex)" ]; then
+        { printf 'Salted__'; cat "$d/rmsg"; } | aes -d > "$out" && [ -s "$out" ] && code="200"
+      fi
+    fi
+  fi
+  rm -rf "$d"
+  echo "${code:-000}"
+}
+
+proxy_settings() {
+  local choice link client
+  [ "$(cat "$LIB/agent-kind" 2>/dev/null)" = active ] || { die '只有主动 Agent 可以设置管理代理'; return 1; }
+  [ ! -f "$WORK/transaction" ] || { die '请先完成当前交接，再修改代理'; return 1; }
+  client="$(proxy_client)"
+  "$client" --proxy-action status --conf "$CONF" || true
+  printf '1) 设置／修改 SS2022 代理\n2) 启用已保存代理\n3) 关闭代理，恢复直连\n0) 返回\n'
+  read -r -p '请选择：' choice
+  case "$choice" in
+    1) read -r -s -p 'SS2022 链接：' link; printf '\n'
+       printf '%s' "$link" | "$client" --proxy-action set --conf "$CONF" --proxy-helper "$PKG/sslocal" || return 1 ;;
+    2) "$client" --proxy-action enable --conf "$CONF" --proxy-helper "$PKG/sslocal" || return 1 ;;
+    3) "$client" --proxy-action disable --conf "$CONF" || return 1 ;;
+    *) return 0 ;;
+  esac
+  if systemctl is-active --quiet ictl-agent; then
+    systemctl kill --kill-who=main --signal=HUP ictl-agent || { die '代理已保存，管理连接重载失败，请重启 ictl-agent'; return 1; }
+  else systemctl start ictl-agent || return 1; fi
+  printf '管理代理已更新，转发规则保持不变。\n'
+}
 field() { sed -n "s/^$1=//p" <<< "$REPLY"; }
 network_inventory() {
   local addresses
@@ -33,7 +91,7 @@ rpc() {
   code="$({ printf 't=%s\nmanage=%s\nop=%s\ntarget=%s\narch=%s\nagent=%s\n%s\n' \
     "$(date +%s)" "$action" "$OP" "$TARGET" "$ARCH" "$NEW_VERSION" "${2:-}"
     case "$action" in prepare|commit|failed) network_inventory ;; esac
-  } | send_request "$WORK/response" 120)"
+  } | control_request "$WORK/response" 120)"
   [ "$code" = 200 ] || { die "服务端操作失败（$code），请检查接入、时间和服务端日志"; return 1; }
   REPLY="$(cat "$WORK/response")"
   [[ "$REPLY" == proto=2* ]] || { die '服务端协议不兼容'; return 1; }
@@ -42,7 +100,7 @@ fetch_component() {
   local name="$1" sha="$2" output="$3" code
   [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { die '组件校验和缺失'; return 1; }
   if [ -f "$output" ] && [ "$(sha256_hex < "$output")" = "$sha" ]; then return 0; fi
-  code="$(printf 't=%s\nmanage=asset\nname=%s\n' "$(date +%s)" "$name" | send_request "$output.download" 120)"
+  code="$(printf 't=%s\nmanage=asset\nname=%s\n' "$(date +%s)" "$name" | control_request "$output.download" 120)"
   [ "$code" = 200 ] && [ "$(sha256_hex < "$output.download")" = "$sha" ] || { rm -f "$output.download"; die "组件下载或校验失败：$name"; return 1; }
   chmod 755 "$output.download" && mv "$output.download" "$output"
 }
@@ -87,6 +145,13 @@ finish() {
   else
     rm -f "$LIB/active/enabled"
     printf 'passive\n' > "$LIB/mode"
+  fi
+  # Keep a request client available for a retry after active -> passive cleanup.
+  if [ -x "$PKG/active" ] && [ -f /etc/ictl/proxy.json ]; then
+    install -m 755 "$PKG/active" "$PKG/control-client.new" && mv "$PKG/control-client.new" "$PKG/control-client" || return 1
+  fi
+  if [ "$TARGET" = passive ] && [ -f /etc/ictl/proxy.json ]; then
+    "$(proxy_client)" --proxy-action disable --conf "$CONF" || return 1
   fi
   install_unit || return 1
   install -m 755 "$WORK/manage.sh" /usr/local/bin/ictl.new && mv /usr/local/bin/ictl.new /usr/local/bin/ictl || return 1
@@ -262,7 +327,7 @@ sync_transaction() {
     SYNC_WAKE_STOPPED=1
     systemctl stop ictl-wake || return 1
   fi
-  if [ "$FROM" = active ]; then "$PKG/active" --flush-traffic || return 1; fi
+  if [ "$FROM" = active ]; then "$(proxy_client)" --flush-traffic || return 1; fi
   exec 9>/run/ictl.lock
   flock -w 60 9 || { die '等待规则锁超时'; return 1; }
   local files=()
@@ -285,7 +350,7 @@ sync_transaction() {
       ICTL_LOCK_HELD=1 "$PKG/active" --clear || { rollback; return 1; }
       # The saved port projection remains reserved while the final upload runs.
       flock -u 9
-      if ! "$PKG/active" --flush-traffic; then
+      if ! "$(proxy_client)" --flush-traffic; then
         flock -w 60 9 || return 1
         rollback; return 1
       fi
@@ -327,7 +392,7 @@ commit() {
     # Upload the final counters before a deletion ACK removes the node identity.
     # Persist the upload receipt so a lost commit response can still be retried.
     if [ "$(cat "$WORK/traffic-receipt" 2>/dev/null)" != "$OP" ]; then
-      "$PKG/active" --flush-traffic || return 1
+      "$(proxy_client)" --flush-traffic || return 1
       printf '%s\n' "$OP" > "$WORK/traffic-receipt.tmp" && sync -f "$WORK/traffic-receipt.tmp" &&
         mv "$WORK/traffic-receipt.tmp" "$WORK/traffic-receipt" || return 1
     fi
@@ -395,9 +460,9 @@ main() {
   mkdir -p "$WORK"
   local action="${1:-}" choice
   if [ -z "$action" ]; then
-    printf 'ictl %s\n1) 同步更新／确认切换\n2) 本地状态\n3) 更新当前 Agent\n4) 卸载\n5) 被动节点远程唤醒设置\n6) 修改接入地址／密钥\n0) 退出\n' "$VERSION"
+    printf 'ictl %s\n1) 同步更新／确认切换\n2) 本地状态\n3) 更新当前 Agent\n4) 卸载\n5) 被动节点远程唤醒设置\n6) 修改接入地址／密钥\n7) 主动节点管理代理\n0) 退出\n' "$VERSION"
     read -r -p '请选择：' choice
-    case "$choice" in 1) action=--sync ;; 2) action=--status ;; 3) action=--update ;; 4) action=--uninstall ;; 5) action=--wake-settings ;; 6) action=--credentials ;; *) return 0 ;; esac
+    case "$choice" in 1) action=--sync ;; 2) action=--status ;; 3) action=--update ;; 4) action=--uninstall ;; 5) action=--wake-settings ;; 6) action=--credentials ;; 7) action=--proxy-settings ;; *) return 0 ;; esac
   fi
   if [ "$action" != --status ] && [ "${ICTL_MANAGER_LOCK_HELD:-0}" != 1 ]; then
     exec 8>/run/ictl-manager.lock
@@ -407,6 +472,7 @@ main() {
     read_identity || return 1
   fi
   case "$action" in
+    --proxy-settings) proxy_settings ;;
     --credentials) credentials ;;
     --wake-settings) wake_settings ;;
     --wake-sync) bash "$PKG/passive.sh" --wake-sync "${2:-}" ;;
@@ -447,7 +513,7 @@ main() {
         if [ -L "$old" ] && [ "$(readlink "$old")" = /usr/local/bin/ictl ]; then rm -f "$old"; fi
       done
       systemctl daemon-reload ;;
-    *) die '用法：ictl [--sync|--switch active/passive|--update|--status|--credentials|--wake-settings|--recover|--uninstall [-y]]'; return 1 ;;
+    *) die '用法：ictl [--sync|--switch active/passive|--update|--status|--credentials|--proxy-settings|--wake-settings|--recover|--uninstall [-y]]'; return 1 ;;
   esac
 }
 if [ "${ICTL_LIBRARY:-0}" != 1 ]; then main "$@"; fi

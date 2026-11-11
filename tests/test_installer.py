@@ -133,6 +133,64 @@ class InstallerTests(unittest.TestCase):
 
 
 class AgentInstallerTests(unittest.TestCase):
+    def test_proxy_preservation_disable_and_install_failure_rollback(self):
+        import hashlib
+        for scenario, extra, fail in (('preserve', [], False), ('disable', ['--proxy','off'], False),
+                                      ('rollback', ['--proxy','ss://test-secret@proxy:443'], True)):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                for name in ('bin','etc','pkg','lib','run','assets'):(root/name).mkdir()
+                key='ab'*32
+                identity=f'URL=https://old.invalid/sync\nKEY={key}\nAUTO_UPDATE=0\n'
+                (root/'etc/agent.conf').write_text(identity)
+                original_proxy='{"enabled":true,"password":"saved-secret"}\n'
+                (root/'etc/proxy.json').write_text(original_proxy)
+                (root/'pkg/control-client').write_text('previous client')
+                (root/'assets/manage.sh').write_text('#!/bin/bash\nexit '+('42' if fail else '0')+'\n')
+                (root/'assets/control.sh').write_text('#!/bin/bash\n')
+                binary='ictl-active-linux-amd64'
+                (root/'assets'/binary).write_text('''#!/bin/bash
+echo "$*" >> "$CASE_ROOT/proxy.log"
+if [ "$2" = set ]; then cat > "$CASE_ROOT/proxy-input"; fi
+printf '{"enabled":false}' > "$CASE_ROOT/etc/proxy.json"
+''')
+                (root/'assets/SHA256SUMS').write_text(''.join(
+                    hashlib.sha256((root/'assets'/name).read_bytes()).hexdigest()+'  '+name+'\n'
+                    for name in ('manage.sh','control.sh',binary)))
+                for name in ('systemctl','nft','ss','conntrack','ip','xz'):
+                    path=root/'bin'/name;path.write_text('#!/bin/sh\nexit 0\n');path.chmod(0o755)
+                for name, value in (('id','0'),('uname','x86_64')):
+                    path=root/'bin'/name;path.write_text('#!/bin/sh\necho '+value+'\n');path.chmod(0o755)
+                curl=root/'bin/curl'
+                curl.write_text('''#!/bin/bash
+for arg in "$@"; do
+  if [[ "$arg" == https://* ]]; then file="${arg##*/}"; fi
+  if [ "${prev:-}" = -o ]; then output="$arg"; fi
+  prev="$arg"
+done
+cp "$CASE_ROOT/assets/$file" "$output"
+''');curl.chmod(0o755)
+                source=(ROOT/'deploy/install-agent.sh').read_text()
+                for path,target in (('/etc/ictl','etc'),('/usr/local/lib/ictl','pkg'),('/var/lib/ictl','lib'),('/run/ictl-manager.lock','run/manager.lock')):
+                    source=source.replace(path,str(root/target))
+                script=root/'install';script.write_text(source)
+                result=subprocess.run(['bash',str(script),'--url','https://new.invalid/sync','--key',key]+extra,
+                    env={**os.environ,'CASE_ROOT':directory,'PATH':str(root/'bin')+':'+os.environ['PATH']},
+                    capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,42 if fail else 0,result.stderr)
+                if scenario in ('preserve','rollback'):
+                    self.assertEqual((root/'etc/proxy.json').read_text(),original_proxy)
+                else:
+                    self.assertEqual((root/'etc/proxy.json').read_text(),'{"enabled":false}')
+                if scenario=='preserve':
+                    self.assertFalse((root/'proxy.log').exists())
+                    self.assertIn('AUTO_UPDATE=0',(root/'etc/agent.conf').read_text())
+                if fail:
+                    self.assertEqual((root/'etc/agent.conf').read_text(),identity)
+                    self.assertEqual((root/'pkg/control-client').read_text(),'previous client')
+                    self.assertEqual((root/'proxy-input').read_text(),'ss://test-secret@proxy:443')
+                    self.assertNotIn('test-secret',(root/'proxy.log').read_text())
+
     def test_failed_preparation_restores_identity_and_entry_scripts(self):
         import hashlib
         with tempfile.TemporaryDirectory() as directory:

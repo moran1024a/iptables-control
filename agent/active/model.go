@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-const version = "0.6.0"
+const version = "0.6.1"
 const tableName = "ictl_active"
 
 type M = map[string]any
@@ -47,6 +47,8 @@ type Config struct {
 	Epoch      string `json:"epoch"`
 }
 type Agent struct {
+	proxyFile      string
+	proxyBinary    string
 	stateMu        *sync.Mutex // Serializes rule application and published state only.
 	maintenance    *maintenanceWork
 	prepareCtx     context.Context
@@ -213,7 +215,7 @@ func (a *Agent) lockedContext(ctx context.Context, fn func() error) error {
 	return fn()
 }
 func loadAgent(root, conf string) (*Agent, error) {
-	a := &Agent{root: root, usage: map[string]*Usage{}, autoUpdate: true}
+	a := &Agent{root: root, proxyFile: filepath.Join(filepath.Dir(conf), "proxy.json"), usage: map[string]*Usage{}, autoUpdate: true}
 	b, e := os.ReadFile(conf)
 	if e != nil {
 		return nil, e

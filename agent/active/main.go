@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -65,9 +66,14 @@ func keepControlAlive(ctx context.Context, ws *websocket.Conn, send func(M) erro
 
 func (a *Agent) session(ctx context.Context) error {
 	a.initRuntime()
+	client, closeClient, err := a.controlClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer closeClient()
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+a.key)
-	ws, _, e := websocket.Dial(ctx, "wss"+strings.TrimPrefix(a.url, "https")+"/v3/ws", &websocket.DialOptions{HTTPHeader: headers})
+	ws, _, e := websocket.Dial(ctx, "wss"+strings.TrimPrefix(a.url, "https")+"/v3/ws", &websocket.DialOptions{HTTPHeader: headers, HTTPClient: client})
 	if e != nil {
 		return e
 	}
@@ -345,6 +351,9 @@ func (a *Agent) daemon(ctx context.Context) error {
 	localDone := make(chan struct{})
 	go func() { defer close(localDone); a.maintain(localCtx, 10*time.Second) }()
 	defer func() { stopLocal(); <-localDone }()
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+	defer signal.Stop(reload)
 	backoff := []time.Duration{1, 2, 5, 10, 30}
 	attempt := 0
 	for {
@@ -355,12 +364,31 @@ func (a *Agent) daemon(ctx context.Context) error {
 			return nil
 		}
 		start := time.Now()
-		e = a.session(ctx)
+		sessionCtx, cancelSession := context.WithCancel(ctx)
+		watcherDone := make(chan struct{})
+		watcherExited := make(chan struct{})
+		go func() {
+			defer close(watcherExited)
+			select {
+			case <-reload:
+				cancelSession()
+			case <-watcherDone:
+			}
+		}()
+		e = a.session(sessionCtx)
+		close(watcherDone)
+		<-watcherExited
+		changed := sessionCtx.Err() != nil
+		cancelSession()
 		if ctx.Err() != nil {
 			return nil
 		}
 		if e == nil {
 			return nil
+		}
+		if changed {
+			attempt = 0
+			continue
 		}
 		log.Printf("管理连接断开: %v", e)
 		if time.Since(start) > time.Minute {
@@ -371,6 +399,8 @@ func (a *Agent) daemon(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-reload:
+			attempt = 0
 		case <-time.After(delay):
 		}
 	}
@@ -391,14 +421,33 @@ func main() {
 	recoverEmpty := flag.Bool("recover-empty-table", false, "repair an empty table from a recorded failed installation")
 	daemon := flag.Bool("daemon", false, "run active agent")
 	status := flag.Bool("status", false, "print local state")
+	proxyAction := flag.String("proxy-action", "", "local control proxy: status/set/enable/disable/request")
+	proxyFile := flag.String("proxy-file", "", "control proxy settings file")
+	proxyBinary := flag.String("proxy-helper", "/usr/local/lib/ictl/sslocal", "SS2022 client binary")
+	serverURL := flag.String("server-url", "", "Server URL for a management request")
+	controlOutput := flag.String("control-output", "", "encrypted management response file")
+	controlTimeout := flag.Int("control-timeout", 15, "management timeout in seconds")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
 		return
 	}
+	if *proxyAction != "" {
+		if *proxyFile == "" {
+			*proxyFile = filepath.Join(filepath.Dir(*conf), "proxy.json")
+		}
+		if err := proxyCommand(*proxyAction, *conf, *proxyFile, *serverURL, *proxyBinary, *controlOutput, *controlTimeout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	a, e := loadAgent(*root, *conf)
 	if e != nil {
 		log.Fatal(e)
+	}
+	a.proxyBinary = *proxyBinary
+	if *proxyFile != "" {
+		a.proxyFile = *proxyFile
 	}
 	if e = os.MkdirAll(a.path("active"), 0700); e != nil {
 		log.Fatal(e)
@@ -449,6 +498,13 @@ func (a *Agent) flushTraffic() error {
 	if err := a.locked(a.sample); err != nil {
 		return err
 	}
+	clientCtx, stopClient := context.WithCancel(context.Background())
+	defer stopClient()
+	client, closeClient, err := a.controlClient(clientCtx)
+	if err != nil {
+		return err
+	}
+	defer closeClient()
 	rows := a.traffic()
 	for start := 0; start < len(rows); start += 1000 {
 		body, err := json.Marshal(rows[start:min(start+1000, len(rows))])
@@ -463,7 +519,7 @@ func (a *Agent) flushTraffic() error {
 		}
 		req.Header.Set("Authorization", "Bearer "+a.key)
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			cancel()
 			return err

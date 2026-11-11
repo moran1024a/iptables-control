@@ -67,6 +67,94 @@ fetch_component() { if [ "$1" = manage.sh ]; then cp "$CASE_ROOT/manager" "$3"; 
         p=self.root/'pkg/active';p.write_bytes((self.root/'target').read_bytes());p.chmod(0o755)
         (self.root/'lib/active').mkdir();(self.root/'lib/active/enabled').write_text('confirmed')
 
+    def test_proxy_menu_reconnects_only_after_success_and_denies_passive(self):
+        self.existing()
+        client = self.root/'pkg/active'
+        client.write_text('''#!/bin/bash
+echo "$*" >> "$CASE_ROOT/proxy.log"
+case "$2" in
+ set) cat > "$CASE_ROOT/proxy-input"; [ ! -f "$CASE_ROOT/fail-proxy" ] ;;
+esac
+''')
+        for choice, action in (('1\nss://private-key@proxy:443\n', 'set'), ('2\n', 'enable'), ('3\n', 'disable')):
+            result = subprocess.run(['bash','-c',self.setup+'\nproxy_settings'],env=self.env,
+                                    input=choice,text=True,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn('--proxy-action '+action,(self.root/'proxy.log').read_text())
+        self.assertNotIn('private-key',(self.root/'proxy.log').read_text())
+        self.assertEqual((self.root/'proxy-input').read_text(),'ss://private-key@proxy:443')
+        log = (self.root/'tools.log').read_text()
+        self.assertEqual(log.count('kill --kill-who=main --signal=HUP ictl-agent'),3)
+        self.assertNotIn('restart', log)
+        (self.root/'fail-proxy').touch()
+        result = subprocess.run(['bash','-c',self.setup+'\nproxy_settings'],env=self.env,
+                                input='1\nss://invalid\n',text=True,capture_output=True)
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(log,(self.root/'tools.log').read_text())
+        (self.root/'lib/agent-kind').write_text('passive')
+        result = self.run_manager('proxy_settings')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('只有主动 Agent',result.stderr)
+
+    def test_proxy_transport_never_falls_back_and_survives_mode_handover(self):
+        self.existing()
+        (self.root/'etc/proxy.json').write_text('{"enabled":true}')
+        client = self.root/'pkg/active'
+        client.write_text('#!/bin/bash\necho proxy >> "$CASE_ROOT/requests"\nexit 7\n')
+        curl = self.root/'bin/curl'
+        curl.write_text('#!/bin/bash\necho direct >> "$CASE_ROOT/requests"\n'); curl.chmod(0o755)
+        (self.root/'request').write_text('encrypted request')
+        code = 'control_post "$CASE_ROOT/request" "$CASE_ROOT/response" 5'
+        result = self.run_manager(code)
+        self.assertEqual(result.returncode,7,result.stderr)
+        self.assertEqual((self.root/'requests').read_text(),'proxy\n')
+        client.rename(self.root/'pkg/control-client')
+        (self.root/'lib/agent-kind').write_text('passive')
+        result = self.run_manager('FROM=active; '+code)
+        self.assertEqual(result.returncode,7,result.stderr)
+        self.assertEqual((self.root/'requests').read_text(),'proxy\nproxy\n')
+        result = self.run_manager(code)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual((self.root/'requests').read_text(),'proxy\nproxy\ndirect\n')
+
+    def test_new_manager_ignores_old_control_transport(self):
+        # An old updater replaces manage.sh but leaves its old control.sh behind.
+        result = self.run_manager('''
+source "''' + str(ROOT/'agent/control.sh') + '''"
+send_request() { echo old-direct >> "$CASE_ROOT/requests"; }
+control_post() { echo explicit-transport >> "$CASE_ROOT/requests"; printf 503; }
+KEY=''' + 'ab'*32 + '''
+derive_keys
+printf 'info' | control_request "$CASE_ROOT/response"
+''')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual((self.root/'requests').read_text(),'explicit-transport\n')
+
+    def test_switch_to_passive_keeps_final_request_client_and_disables_proxy(self):
+        self.existing()
+        (self.root/'etc/proxy.json').write_text('{"enabled":true}')
+        result = self.run_manager()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('--proxy-action disable',(self.root/'backend.log').read_text())
+        self.assertTrue((self.root/'pkg/control-client').exists())
+        self.assertFalse((self.root/'pkg/active').exists())
+
+    def test_proxy_bootstrap_uploads_old_agent_statistics_without_direct_connection(self):
+        self.existing()
+        (self.root/'mode').write_text('active')
+        (self.root/'etc/proxy.json').write_text('{"enabled":true}')
+        old = self.root/'pkg/active'
+        old.write_text(old.read_text().replace('--flush-traffic) [ ! -e "$CASE_ROOT/fail-flush" ]',
+                                               '--flush-traffic) echo old-direct >&2; exit 88'))
+        client = self.root/'pkg/control-client'
+        client.write_text('#!/bin/bash\necho "bootstrap $*" >> "$CASE_ROOT/backend.log"\n')
+        client.chmod(0o755)
+        self.env.update(ICTL_CONTROL_CLIENT=str(client), ICTL_ACTIVE_PROXY='1')
+        result = self.run_manager()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertNotIn('old-direct',result.stderr)
+        self.assertEqual((self.root/'backend.log').read_text().count('bootstrap --flush-traffic'),2)
+
     def test_idle_menu_and_status_do_not_lock_sync_but_actions_do(self):
         (self.root/'pkg/control.sh').write_text('derive_keys() { :; }\n')
         (self.root/'etc/agent.conf').write_text('URL=https://test.invalid/sync\nKEY='+'ab'*32+'\nAUTO_UPDATE=1\n')

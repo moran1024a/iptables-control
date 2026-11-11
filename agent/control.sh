@@ -26,28 +26,3 @@ derive_keys() {
 aes() {
   ICTL_EK="$EK" openssl enc -aes-256-ctr -pbkdf2 -iter 1 -md sha256 -pass env:ICTL_EK "$@" 2>/dev/null
 }
-
-
-send_request() {
-  local out="$1" d code req_tag size
-  d="$(mktemp -d /run/ictl.XXXXXX)" || { echo 000; return; }
-  aes | tail -c +9 > "$d/msg"
-  req_tag="$(hmac_hex "$MK" < "$d/msg")"
-  { cat "$d/msg"; hex2bin "$req_tag"; } | openssl base64 -A > "$d/req"
-  code="$(curl -sS --connect-timeout 5 --max-time "${2:-15}" -o "$d/body" -w '%{http_code}' \
-    -H 'Content-Type: text/plain' --data-binary @"$d/req" "$URL" 2>/dev/null)"
-  if [ "$code" = "200" ]; then
-    # 校验响应的 HMAC（绑定本次请求）后解密
-    code="bad"
-    openssl base64 -d -A < "$d/body" > "$d/resp" 2>/dev/null
-    size="$(wc -c < "$d/resp")"
-    if [ "$size" -ge 40 ]; then
-      head -c $((size - 32)) "$d/resp" > "$d/rmsg"
-      if [ "$({ hex2bin "$req_tag"; cat "$d/rmsg"; } | hmac_hex "$MK")" = "$(tail -c 32 "$d/resp" | bin2hex)" ]; then
-        { printf 'Salted__'; cat "$d/rmsg"; } | aes -d > "$out" && [ -s "$out" ] && code="200"
-      fi
-    fi
-  fi
-  rm -rf "$d"
-  echo "${code:-000}"
-}

@@ -245,6 +245,11 @@ func (a *Agent) checkConflictsWith(c Config, native M) error {
 		for _, line := range strings.Split(string(data), "\n") {
 			host, port := socketPort(line)
 			ip := net.ParseIP(host)
+			// PREROUTING forwards incoming traffic, not local loopback connections.
+			// A management tunnel bound only to loopback does not own an ingress port.
+			if ip != nil && ip.IsLoopback() {
+				continue
+			}
 			if host == "*" || host == "::" || ip != nil && ip.To4() != nil {
 				sockets[p][port] = true
 			}
