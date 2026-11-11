@@ -139,6 +139,14 @@ func openControlClient(ctx context.Context, endpoint string, p controlProxy, bin
 	tr.DialTLSContext = nil
 	tr.DialTLS = nil
 	tr.ForceAttemptHTTP2 = false
+	// Clone can retain an initialized transport's h2 ALPN advertisement. Keep
+	// TLS negotiation and the HTTP parser aligned, including ordinary POSTs.
+	tr.Protocols = new(http.Protocols)
+	tr.Protocols.SetHTTP1(true)
+	tr.TLSNextProto = nil
+	if tr.TLSClientConfig != nil {
+		tr.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	}
 	tr.ResponseHeaderTimeout = 15 * time.Second
 	dial := (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	address := authority

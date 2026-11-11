@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.6.1"
+VERSION="0.6.2"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -24,6 +24,17 @@ proxy_client() {
   if [ -n "${ICTL_CONTROL_CLIENT:-}" ] && [ -x "$ICTL_CONTROL_CLIENT" ]; then printf '%s' "$ICTL_CONTROL_CLIENT"
   elif [ -x "$PKG/active" ]; then printf '%s' "$PKG/active"
   else printf '%s' "$PKG/control-client"; fi
+}
+flush_traffic() {
+  local client
+  client="$(proxy_client)"
+  # A new manager can still be finishing an upgrade with the 0.6.1 binary.
+  # Limit its ALPN workaround to this upload, without changing the daemon env.
+  if [ "$("$client" --version)" = 0.6.1 ]; then
+    GODEBUG="${GODEBUG:+$GODEBUG,}http2client=0" "$client" --flush-traffic
+  else
+    "$client" --flush-traffic
+  fi
 }
 control_post() {
   if [ -f /etc/ictl/proxy.json ] && { [ "${ICTL_ACTIVE_PROXY:-0}" = 1 ] || [ "${FROM:-}" = active ] || [ "$(cat "$LIB/agent-kind" 2>/dev/null)" = active ]; }; then
@@ -327,7 +338,7 @@ sync_transaction() {
     SYNC_WAKE_STOPPED=1
     systemctl stop ictl-wake || return 1
   fi
-  if [ "$FROM" = active ]; then "$(proxy_client)" --flush-traffic || return 1; fi
+  if [ "$FROM" = active ]; then flush_traffic || return 1; fi
   exec 9>/run/ictl.lock
   flock -w 60 9 || { die '等待规则锁超时'; return 1; }
   local files=()
@@ -350,7 +361,7 @@ sync_transaction() {
       ICTL_LOCK_HELD=1 "$PKG/active" --clear || { rollback; return 1; }
       # The saved port projection remains reserved while the final upload runs.
       flock -u 9
-      if ! "$(proxy_client)" --flush-traffic; then
+      if ! flush_traffic; then
         flock -w 60 9 || return 1
         rollback; return 1
       fi
@@ -392,7 +403,7 @@ commit() {
     # Upload the final counters before a deletion ACK removes the node identity.
     # Persist the upload receipt so a lost commit response can still be retried.
     if [ "$(cat "$WORK/traffic-receipt" 2>/dev/null)" != "$OP" ]; then
-      "$(proxy_client)" --flush-traffic || return 1
+      flush_traffic || return 1
       printf '%s\n' "$OP" > "$WORK/traffic-receipt.tmp" && sync -f "$WORK/traffic-receipt.tmp" &&
         mv "$WORK/traffic-receipt.tmp" "$WORK/traffic-receipt" || return 1
     fi

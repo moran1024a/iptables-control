@@ -2,7 +2,7 @@
 
 轻量的 IPv4 端口转发管理工具。通过 Web 面板管理多台服务器，也可使用 `ipt.sh` 独立管理单机转发。
 
-**当前版本：0.6.1**。支持可视化拓扑、多入口与多目标、主副 IP、权重灾备、订阅和 7 天网络质量图。主动节点使用 Go + nftables，被动节点使用 Bash + iptables。
+**当前版本：0.6.2**。支持可视化拓扑、多入口与多目标、主副 IP、权重灾备、订阅和 7 天网络质量图。主动节点使用 Go + nftables，被动节点使用 Bash + iptables。
 
 [下载版本](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -25,7 +25,7 @@
 在已安装并启动 Docker 的 Linux 服务器上执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.1/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.2/install-server.sh | bash
 ```
 
 打开安装结果中的**完整面板地址**，使用 `admin` / `admin_pass` 登录并按提示修改账号密码。
@@ -55,7 +55,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6
 不需要服务端或 Agent，在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.1/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.2/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -67,20 +67,27 @@ sudo bash /root/ipt.sh
 
 **先升级服务端，再升级节点。** 服务端重新执行安装命令即可；安装器保留升级前数据库备份，启动失败时尝试回退。相同版本需要重建时追加 `--force`。自定义 Docker Compose 部署请沿用原配置更换镜像版本。
 
-主动节点开启自动更新后会升级到 **0.6.1**。被动 Agent 保持 **0.6.0**。被动节点，或关闭自动更新的主动节点，需在本机执行：
+主动节点开启自动更新后会升级到 **0.6.2**。被动 Agent 保持 **0.6.0**。被动节点，或关闭自动更新的主动节点，需在本机执行：
 
 ```bash
 sudo ictl --update
 sudo ictl --sync
 ```
 
+**0.6.1 主动 Agent 修复：** 若出现 `malformed HTTP response` 或升级后离线，先在节点执行下面第一条命令补完确认。服务端升级至 0.6.2 后，两条依次执行可完成修复版升级；设置仅影响当前命令，节点身份、规则和统计保留。已离线节点需要本机恢复。
+
+```bash
+sudo env GODEBUG=http2client=0 ictl --sync
+sudo env GODEBUG=http2client=0 ictl --update
+```
+
 单机脚本重新执行其安装命令即可；自定义安装路径的用户请覆盖原路径。
 
 **升级数据说明：**
 
-- **0.6.0／0.6.0-rc.7 → 0.6.1**：保留全部数据，数据库仍为 603。
-- **0.6.0 RC1～RC6 → 0.6.1**：移除受管 VLESS Reality 目标及关联配置，其他数据保留。旧规则在节点同步成功后清理。
-- **0.5.3 → 0.6.1**：仅保留节点身份、IP、分组、模式、接入设置和管理员设置；目标、链路、配置、订阅及历史记录会清空。被动节点首次迁移需执行 `sudo ictl --sync`。更早版本请先升级至 0.5.3。
+- **0.6.0／0.6.1／0.6.0-rc.7 → 0.6.2**：保留全部数据，数据库仍为 603。
+- **0.6.0 RC1～RC6 → 0.6.2**：移除受管 VLESS Reality 目标及关联配置，其他数据保留。旧规则在节点同步成功后清理。
+- **0.5.3 → 0.6.2**：仅保留节点身份、IP、分组、模式、接入设置和管理员设置；目标、链路、配置、订阅及历史记录会清空。被动节点首次迁移需执行 `sudo ictl --sync`。更早版本请先升级至 0.5.3。
 
 Docker 升级备份位于数据卷内的 `/data/ictl.db.pre-deploy-*.bak`。回退须同时恢复旧数据库与旧镜像；详细变更见 [CHANGELOG](CHANGELOG.md)。
 
@@ -95,7 +102,7 @@ sudo ictl --uninstall
 **服务端：** 删除容器和镜像，保留数据卷：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.1/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.2/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷。卸载服务端不会清理远端节点规则。
@@ -180,4 +187,4 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 服务端使用 Python 3.10+，依赖见 [requirements.txt](server/requirements.txt)；Go 版本以 [go.mod](agent/active/go.mod) 为准。测试位于 [tests](tests/)，构建与发布见 [release.yml](.github/workflows/release.yml)。欢迎提交 Issue 或 PR，请隐去密钥、密码和订阅链接。
 
-服务端、主动 Agent 和管理器为 **0.6.1**，被动 Agent 为 **0.6.0**；独立组件版本见 [components.json](server/components.json)。项目采用 [MIT 许可证](LICENSE)。
+服务端、主动 Agent 和管理器为 **0.6.2**，被动 Agent 为 **0.6.0**；独立组件版本见 [components.json](server/components.json)。项目采用 [MIT 许可证](LICENSE)。

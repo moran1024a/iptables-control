@@ -155,6 +155,38 @@ printf 'info' | control_request "$CASE_ROOT/response"
         self.assertNotIn('old-direct',result.stderr)
         self.assertEqual((self.root/'backend.log').read_text().count('bootstrap --flush-traffic'),2)
 
+    def test_061_statistics_workaround_is_local_and_pending_receipt_can_complete(self):
+        self.existing()
+        (self.root/'mode').write_text('active')
+        (self.root/'fail-commit').touch()
+        self.assertNotEqual(self.run_manager().returncode,0)
+        old = self.root/'pkg/active'
+        old.write_text(old.read_text().replace('echo 0.4.0-rc.1', 'echo 0.6.1').replace(
+            '--flush-traffic) [ ! -e "$CASE_ROOT/fail-flush" ]',
+            '--flush-traffic) [ "${GODEBUG:-}" = http2debug=0,http2client=0 ] || exit 88'))
+        # Retry the statistics upload as well as the receipt, as on the failed node.
+        (self.root/'lib/switch-work/traffic-receipt').unlink()
+        (self.root/'fail-commit').unlink()
+        self.env['GODEBUG']='http2debug=0'
+        result=self.run_manager('perform_sync && [ "$GODEBUG" = http2debug=0 ]')
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.root/'lib/switch-work/transaction').exists())
+        self.assertTrue((self.root/'lib/active/enabled').exists())
+        self.assertEqual((self.root/'backend.log').read_text().count('--apply-file'),1)
+
+    def test_new_binary_upload_does_not_receive_legacy_workaround(self):
+        self.existing()
+        client=self.root/'pkg/active'
+        client.write_text('''#!/bin/bash
+case "$1" in
+ --version) echo 0.6.2 ;;
+ --flush-traffic) [ "${GODEBUG:-}" = http2debug=0 ] ;;
+esac
+''')
+        self.env['GODEBUG']='http2debug=0'
+        result=self.run_manager('flush_traffic')
+        self.assertEqual(result.returncode,0,result.stderr)
+
     def test_idle_menu_and_status_do_not_lock_sync_but_actions_do(self):
         (self.root/'pkg/control.sh').write_text('derive_keys() { :; }\n')
         (self.root/'etc/agent.conf').write_text('URL=https://test.invalid/sync\nKEY='+'ab'*32+'\nAUTO_UPDATE=1\n')

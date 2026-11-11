@@ -190,7 +190,7 @@ func TestSS2022ControlIntegration(t *testing.T) {
 	}
 	for _, method := range []string{"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305"} {
 		t.Run(method, func(t *testing.T) {
-			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/ws" {
 					ws, err := websocket.Accept(w, r, nil)
 					if err != nil {
@@ -207,10 +207,10 @@ func TestSS2022ControlIntegration(t *testing.T) {
 				}
 				io.Copy(w, r.Body)
 			}))
+			server.EnableHTTP2 = true
+			server.StartTLS()
 			defer server.Close()
-			old := http.DefaultClient
-			http.DefaultClient = server.Client()
-			defer func() { http.DefaultClient = old }()
+			useHTTP2DefaultClient(t, server)
 			size := 32
 			if strings.Contains(method, "128") {
 				size = 16
@@ -260,8 +260,8 @@ func TestSS2022ControlIntegration(t *testing.T) {
 			}
 			body, _ := io.ReadAll(response.Body)
 			response.Body.Close()
-			if string(body) != "control-body" {
-				t.Fatal(string(body))
+			if string(body) != "control-body" || response.ProtoMajor != 1 {
+				t.Fatal(string(body), response.Proto)
 			}
 			ws, _, err := websocket.Dial(ctx, "wss"+strings.TrimPrefix(server.URL, "https")+"/ws", &websocket.DialOptions{HTTPClient: client})
 			if err != nil {
