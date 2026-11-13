@@ -12,11 +12,11 @@
   <div class="flex flex-col gap-3">
     <Alert tone="warn">旧密钥已失效，{name} 在更新密钥前无法继续同步。</Alert>
     <div>
-      <p class="mb-1.5 text-[0.8125rem] text-fg-muted">1. 在节点上运行下面的命令：</p>
+      <p class="mb-1.5 text-[0.8667rem] text-fg-muted">1. 在节点上运行下面的命令：</p>
       <CommandBlock text="sudo ictl --credentials" prompt />
     </div>
     <div>
-      <p class="mb-1.5 text-[0.8125rem] text-fg-muted">2. 按提示填入新密钥：</p>
+      <p class="mb-1.5 text-[0.8667rem] text-fg-muted">2. 按提示填入新密钥：</p>
       <CommandBlock text={key} copyLabel="复制" />
     </div>
     <p class="text-xs text-fg-muted">之后仍可在节点页面的「接入信息」中查看此密钥，也可以直接重新执行一键接入命令。</p>

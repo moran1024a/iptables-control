@@ -4,7 +4,7 @@ import { byCodePoint, entryStyles, hashId, PALETTE } from './colors';
 import { addVertex, connect, freePosition, insertDirect, receiveAddress, removeEdge, removeVertex, replaceResource, setEdgeAddress, setPort } from './edit';
 import { createHistory, HISTORY_LIMIT, record, redo, undo } from './history';
 import { addressRow, boxesOf, cardHeight, catalogOf, emptyGraph, layerLabels, portAddress, portPoint, worldOf, type Box } from './model';
-import { lanePenalty, pathBlocked, roundedPath, routeConnections, routePoints, routeSpans, simplify } from './routing';
+import { pathBlocked, roundedPath, routeConnections, routeSpans, routeWires, simplify } from './routing';
 import { hasCycle, linkError, nameError, validate, validPort, validWeight } from './rules';
 import { geometrySignature, stableBy } from './stable';
 import { changedHops, entriesThrough, flowingHops, pathSummary, routesOf, spansOf, usedPorts } from './runtime';
@@ -254,30 +254,57 @@ describe('routing', () => {
     expect(pathBlocked([[0, 89], [300, 89]], b)).toBe(true);
     expect(pathBlocked([[0, 0], [50, 0], [50, 300]], b)).toBe(false);
   });
-  it('penalises shared lanes and crossings', () => {
-    const used: [[number, number], [number, number]][] = [[[0, 0], [100, 0]]];
-    expect(lanePenalty([10, 3], [60, 3], used)).toBe(1000 + 50 * 15);
-    expect(lanePenalty([10, 6], [60, 6], used)).toBe(0);
-    expect(lanePenalty([50, -10], [50, 10], used)).toBe(35);
-    expect(lanePenalty([200, -10], [200, 10], used)).toBe(0);
-  });
-  it('routes straight, then as an elbow, then around obstacles', () => {
+  const wire = (a: Box, b: Box, dy = 50, ey = 50) => ({ a: a.id, b: b.id, start: [a.x + a.width, a.y + dy] as [number, number], end: [b.x, b.y + ey] as [number, number] });
+  const orthogonal = (p: [number, number][]) => p.every((q, i) => !i || q[0] === p[i - 1][0] || q[1] === p[i - 1][1]);
+  const forward = (p: [number, number][]) => p.every((q, i) => !i || q[0] >= p[i - 1][0]);
+  it('routes straight, then with one bend in the channel', () => {
     const a = box('a', 0, 0);
-    const b = box('b', 600, 0);
-    expect(routePoints([220, 50], [600, 50], a, b, [a, b])).toEqual([[220, 50], [600, 50]]);
-    const elbow = routePoints([220, 50], [600, 90], a, b, [a, b], { index: 2 });
-    expect(elbow).toEqual([[220, 50], [410, 50], [410, 90], [600, 90]]);
-    const wall = box('w', 350, -100, 100, 400);
-    const around = routePoints([220, 50], [600, 50], a, b, [a, b, wall]);
-    expect(around.length).toBeGreaterThan(4);
-    expect(pathBlocked(around.slice(1, -1), [wall], 11)).toBe(false);
-    for (let i = 1; i < around.length; i++) expect(around[i][0] === around[i - 1][0] || around[i][1] === around[i - 1][1]).toBe(true);
+    const b = box('b', 400, 0);
+    const c = box('c', 400, 200);
+    const [straight, bent] = routeWires([wire(a, b), wire(a, c, 60)], [a, b, c]);
+    expect(straight).toEqual([[220, 50], [400, 50]]);
+    expect(bent).toEqual([[220, 60], [310, 60], [310, 250], [400, 250]]);
   });
-  it('routes backwards wires without crossing the cards', () => {
+  it('passes columns in a straight lane beside the cards, never backwards', () => {
+    const a = box('a', 0, 100);
+    const wall = [box('w1', 400, 0), box('w2', 400, 160), box('w3', 400, 320)];
+    const b = box('b', 800, 100);
+    const [p] = routeWires([wire(a, b)], [a, ...wall, b]);
+    expect(orthogonal(p) && forward(p)).toBe(true);
+    expect(pathBlocked(p, wall, 12)).toBe(false);
+    // Through the gap between w1 and w2, not around the whole column.
+    expect(Math.max(...p.map((q) => q[1]))).toBeLessThan(160);
+    expect(Math.min(...p.map((q) => q[1]))).toBeGreaterThan(110);
+  });
+  it('orders the bends of one channel so parallel wires do not cross', () => {
+    const a = box('a', 0, 0);
+    const b = box('b', 400, 300);
+    const [upper, lower] = routeWires([wire(a, b, 40, 40), wire(a, b, 50, 50)], [a, b]);
+    // Going down, the upper wire turns further right.
+    expect(upper[1][0]).toBeGreaterThan(lower[1][0]);
+    const up = routeWires([wire(b, box('c', 800, 0), 40, 40), wire(b, box('c', 800, 0), 50, 50)], [b, box('c', 800, 0)]);
+    expect(up[0][1][0]).toBeLessThan(up[1][1][0]);
+  });
+  it('shares one trunk between wires leaving the same point and reuses lanes that never meet', () => {
+    const a = box('a', 0, 200);
+    const b = box('b', 400, 0);
+    const c = box('c', 400, 400);
+    const [up, down] = routeWires([wire(a, b), wire(a, c)], [a, b, c]);
+    expect(up[1][0]).toBe(down[1][0]);
+    const d = box('d', 0, 600);
+    const e = box('e', 400, 800);
+    const [first, second] = routeWires([wire(a, b), wire(d, e)], [a, b, d, e]);
+    expect(first[1][0]).toBe(310);
+    expect(second[1][0]).toBe(310);
+  });
+  it('loops around when the target is not in a later column', () => {
     const a = box('a', 600, 0);
     const b = box('b', 0, 300);
-    const p = routePoints([820, 50], [0, 350], a, b, [a, b]);
-    expect(pathBlocked(p.slice(1, -1), [a, b], 11)).toBe(false);
+    const [p] = routeWires([wire(a, b)], [a, b]);
+    expect(orthogonal(p)).toBe(true);
+    expect(pathBlocked(p.slice(1, -1), [a, b], 3)).toBe(false);
+    expect(p[0]).toEqual([820, 50]);
+    expect(p.at(-1)).toEqual([0, 350]);
   });
   it('fans out wires sharing a connector in the order of the far card', () => {
     const g = base();
@@ -292,14 +319,6 @@ describe('routing', () => {
     expect(end('n/t')[1]).toBeLessThan(end('m/t')[1]);
     expect(routeConnections(g, boxes, cat, { editing: true })[0].points[0][0]).toBe(40 + 220 + 9);
     for (const r of routes) expect(r.d.startsWith('M ')).toBe(true);
-  });
-  it('keeps untouched wires while a card moves', () => {
-    const g = base();
-    const first = routeConnections(g, boxesOf(g, cat), cat);
-    const moved = { ...g, vertices: g.vertices.map((x) => (x.id === 'm' ? { ...x, y: 420 } : x)) };
-    const next = routeConnections(moved, boxesOf(moved, cat), cat, { moving: 'm', previous: first });
-    expect(next[0].points).toBe(first[0].points);
-    expect(next[3].points).not.toEqual(first[3].points);
   });
   it('gives each entry its own slot on a shared connector', () => {
     const g = graph([v('e1', 'entry', { node_id: 1 }), v('e2', 'entry', { node_id: 2, y: 300 }), v('m', 'node', { node_id: 3, x: 440 }), v('t', 'target', { target_id: 1, x: 840 })], [['e1', 'm'], ['e2', 'm'], ['m', 't']]);

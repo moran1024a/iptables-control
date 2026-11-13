@@ -156,7 +156,7 @@
     {/snippet}
   </Field>
 
-  <div class="-mt-2 rounded-md border bg-surface-2 px-3 py-2 text-[0.8125rem] {preview.state === 'error' && preview.invalid ? 'hidden' : ''}" aria-live="polite">
+  <div class="-mt-2 rounded-md border bg-surface-2 px-3 py-2 text-[0.8667rem] {preview.state === 'error' && preview.invalid ? 'hidden' : ''}" aria-live="polite">
     {#if preview.state === 'ok'}
       <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
         <dt class="text-fg-muted">协议</dt>

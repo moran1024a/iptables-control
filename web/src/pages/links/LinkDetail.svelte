@@ -238,7 +238,7 @@
 
       <section class="rounded-lg border bg-surface shadow-sm" aria-label="路径状态">
         <header class="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2.5">
-          <h2 class="text-[0.8125rem] font-semibold">路径状态</h2>
+          <h2 class="text-[0.8667rem] font-semibold">路径状态</h2>
           <span class="text-xs text-fg-muted">{counts.entries} 个入口 · {counts.targets} 个目标</span>
           <span class="flex-1"></span>
           <a href={href('configs')} class="inline-flex items-center gap-1 text-xs font-medium text-accent-text hover:underline">
@@ -246,7 +246,7 @@
           </a>
         </header>
         {#if !link.configurations.length}
-          <p class="px-4 py-6 text-center text-[0.8125rem] text-fg-muted">还没有配置。入口连通到目标并保存后，每对入口和目标生成一项配置。</p>
+          <p class="px-4 py-6 text-center text-[0.8667rem] text-fg-muted">还没有配置。入口连通到目标并保存后，每对入口和目标生成一项配置。</p>
         {:else}
           <ul class="divide-y">
             {#each link.configurations as c (c.id)}
@@ -255,7 +255,7 @@
               {@const next = c.pending_path.length > 1 && c.pending_path.join('/') !== c.active_path.join('/') ? pathSummary(c.pending_path, design!, cat) : null}
               {@const style = styles.get(c.entry)}
               {@const failover = failoverText(c)}
-              <li class="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-2.5 gap-y-0.5 px-4 py-2.5 text-[0.8125rem] lg:grid-cols-[auto_minmax(0,1.1fr)_minmax(0,1.4fr)_auto_auto] lg:items-center">
+              <li class="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-2.5 gap-y-0.5 px-4 py-2.5 text-[0.8667rem] lg:grid-cols-[auto_minmax(0,1.1fr)_minmax(0,1.4fr)_auto_auto] lg:items-center">
                 <span class="tabular mt-0.5 flex size-5 items-center justify-center rounded-full text-2xs font-bold text-white lg:mt-0" style:background={style?.color ?? 'var(--idle)'}>
                   {style?.ordinal ?? ''}
                 </span>
@@ -296,13 +296,13 @@
 
       <Disclosure title="切换记录" hint={link.events.length ? `最近 ${link.events.length} 条` : undefined} key="link-events-{link.id}">
         {#if link.events.length}
-          <ol class="flex flex-col gap-1 text-[0.8125rem]">
+          <ol class="flex flex-col gap-1 text-[0.8667rem]">
             {#each link.events as event, index (index)}
               <li class="flex gap-3"><time class="tabular shrink-0 text-fg-muted">{dateTime(event.ts)}</time><span class="min-w-0 break-words">{event.message}</span></li>
             {/each}
           </ol>
         {:else}
-          <p class="text-[0.8125rem] text-fg-muted">暂无记录</p>
+          <p class="text-[0.8667rem] text-fg-muted">暂无记录</p>
         {/if}
       </Disclosure>
     {/if}

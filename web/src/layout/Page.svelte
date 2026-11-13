@@ -30,7 +30,7 @@
         <h1 class="truncate text-xl leading-7 font-semibold tracking-tight">{title}</h1>
         {@render meta?.()}
       </div>
-      {#if subtitle}<p class="mt-0.5 text-[0.8125rem] text-fg-muted">{subtitle}</p>{/if}
+      {#if subtitle}<p class="mt-0.5 text-[0.8667rem] text-fg-muted">{subtitle}</p>{/if}
     </div>
     {#if actions}<div class="flex flex-wrap items-center gap-2">{@render actions()}</div>{/if}
   </header>

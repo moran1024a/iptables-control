@@ -15,7 +15,7 @@
   import { addVertex, connect, freePosition, insertDirect, moveVertex, newVertexId, outgoing, receiveAddress, removeEdge, removeVertex, setEntryAddress } from '$lib/topology/edit';
   import { amend, createHistory, record, redo, undo, type History } from '$lib/topology/history';
   import { addressesOf, boxesOf, catalogOf, emptyGraph, HEAD_HEIGHT, portAddress, portPoint, ROW_HEIGHT, vertexName, vertexOf, worldOf, type Edge, type Point } from '$lib/topology/model';
-  import { elbow, routeConnections, type WireRoute } from '$lib/topology/routing';
+  import { elbow, routeConnections } from '$lib/topology/routing';
   import { geometrySignature, stableBy } from '$lib/topology/stable';
   import { linkError, nameError, validate, type Issue } from '$lib/topology/rules';
   import { AUTO, type Graph, type PreviewResult, type Topology, type TopologyResources, type TopologySaved, type VertexId } from '$lib/types';
@@ -93,8 +93,7 @@
   const graph = $derived(drag ? moveVertex(doc.graph, drag.id, drag.x, drag.y) : doc.graph);
   const boxes = $derived(boxesOf(graph, geo));
   const bounds = $derived(worldOf(boxes.values()));
-  let lastWires: WireRoute[] = [];
-  const wires = $derived((lastWires = routeConnections(graph, boxes, geo, { editing: true, moving: drag?.id ?? null, previous: lastWires })));
+  const wires = $derived(routeConnections(graph, boxes, geo, { editing: true }));
   const issues = $derived<Issue[]>([...(serverIssue ? [serverIssue] : []), ...validate(doc.graph, cat)]);
   const errors = $derived(issues.filter((i) => i.level === 'error'));
   const warnings = $derived(issues.filter((i) => i.level === 'warn'));
@@ -655,14 +654,14 @@
           {#if !doc.graph.vertices.length}
             <div class="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1.5 px-6 text-center">
               <p class="text-sm font-medium">从资源库添加入口、节点和目标</p>
-              <p class="max-w-sm text-[0.8125rem] leading-relaxed text-fg-muted">点「添加」打开资源库，点击或拖入卡片；再从卡片右侧的连接点拖线到下一跳。每对连通的入口和目标会生成一项配置。</p>
+              <p class="max-w-sm text-[0.8667rem] leading-relaxed text-fg-muted">点「添加」打开资源库，点击或拖入卡片；再从卡片右侧的连接点拖线到下一跳。每对连通的入口和目标会生成一项配置。</p>
             </div>
           {/if}
           {#if flash}
             <div
               role={flash.tone === 'danger' ? 'alert' : 'status'}
               data-nopan
-              class="absolute top-2 left-1/2 z-40 flex max-w-[calc(100%-1rem)] -translate-x-1/2 cursor-default items-center gap-2 rounded-lg border px-3 py-1.5 text-[0.8125rem] shadow-md {flash.tone === 'danger'
+              class="absolute top-2 left-1/2 z-40 flex max-w-[calc(100%-1rem)] -translate-x-1/2 cursor-default items-center gap-2 rounded-lg border px-3 py-1.5 text-[0.8667rem] shadow-md {flash.tone === 'danger'
                 ? 'border-danger/30 bg-danger-soft text-danger-text'
                 : 'border-info/30 bg-info-soft text-info-text'}"
             >
@@ -678,7 +677,7 @@
     </div>
   </div>
 
-  <div class="border-t text-[0.8125rem]">
+  <div class="border-t text-[0.8667rem]">
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-1.5">
       {#if issues.length}
         <button type="button" class="inline-flex items-center gap-1.5 font-medium {errors.length ? 'text-danger-text' : 'text-warn-text'}" aria-expanded={issuesOpen} onclick={() => (issuesOpen = !issuesOpen)}>

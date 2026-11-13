@@ -122,7 +122,7 @@
       {@const usable = subscription.counts[format.id]}
       <div class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 sm:grid-cols-[7.5rem_minmax(0,1fr)_auto]">
         <label for="{uid}-{format.id}" title={format.hint}>
-          <span class="text-[0.8125rem] font-medium">{format.label}</span>
+          <span class="text-[0.8667rem] font-medium">{format.label}</span>
           {#if total}
             <span class="tabular ml-1 text-xs {usable < total ? 'text-warn-text' : 'text-fg-subtle'}">{usable}/{total}</span>
           {/if}

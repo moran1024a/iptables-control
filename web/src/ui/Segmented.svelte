@@ -13,7 +13,7 @@
         value = option.value;
         onchange?.(option.value);
       }}
-      class="inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[0.8125rem] font-medium whitespace-nowrap transition-colors {value === option.value
+      class="inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-[0.8667rem] font-medium whitespace-nowrap transition-colors {value === option.value
         ? 'bg-surface text-fg shadow-sm'
         : 'text-fg-muted hover:text-fg'}"
     >

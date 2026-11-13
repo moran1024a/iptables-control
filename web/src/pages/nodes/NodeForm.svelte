@@ -233,7 +233,7 @@
     </div>
 
     <fieldset class="flex min-w-0 flex-col gap-1.5">
-      <legend class="mb-1.5 text-[0.8125rem] font-medium">标签</legend>
+      <legend class="mb-1.5 text-[0.8667rem] font-medium">标签</legend>
       {#if tags.length}
         <div class="flex flex-wrap gap-x-4 gap-y-2">
           {#each tags as tag (tag.id)}
@@ -248,7 +248,7 @@
 
     <section class="flex flex-col gap-2">
       <div>
-        <h3 class="text-[0.8125rem] font-medium">IP 地址</h3>
+        <h3 class="text-[0.8667rem] font-medium">IP 地址</h3>
         <p class="mt-0.5 text-xs text-fg-muted">填写其他节点能连接到的地址。有多个出口或入口 IP 时添加副 IP，可在链路中按连线选用。</p>
       </div>
       <AddressEditor bind:rows={v.rows} network={node?.network} errors={shownRowErrors} bind:advanced error={form.errors.addresses} />

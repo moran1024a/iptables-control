@@ -1,8 +1,6 @@
-// Wire geometry: orthogonal polylines with rounded corners, routed around cards and away from each other.
+// Wire geometry: orthogonal polylines with rounded corners, routed through the channels between card columns.
 import { AUTO, type Graph, type VertexId } from '$lib/types';
 import { addressesOf, connections, portAddress, portPoint, type Box, type Catalog, type Edge, type Point, type Side } from './model';
-
-export type Segment = [Point, Point];
 
 const round = (n: number) => Math.round(n * 10) / 10;
 const xy = (p: Point) => `${round(p[0])} ${round(p[1])}`;
@@ -71,214 +69,244 @@ export function pathBlocked(points: Point[], boxes: Box[], padding = 12): boolea
   return false;
 }
 
-/** Cost of laying a segment next to or across already placed ones. */
-export function lanePenalty(a: Point, b: Point, used: Segment[], clearance = 6): number {
-  const horizontal = a[1] === b[1];
-  const axis = horizontal ? 0 : 1;
-  const other = 1 - axis;
-  let cost = 0;
-  for (const [c, d] of used) {
-    const same = horizontal === (c[1] === d[1]);
-    if (same) {
-      const overlap = Math.min(Math.max(a[axis], b[axis]), Math.max(c[axis], d[axis])) - Math.max(Math.min(a[axis], b[axis]), Math.min(c[axis], d[axis]));
-      if (overlap > 2 && Math.abs(a[other] - c[other]) < clearance) cost += 1000 + overlap * 15;
-    } else if (
-      c[axis] > Math.min(a[axis], b[axis]) &&
-      c[axis] < Math.max(a[axis], b[axis]) &&
-      a[other] > Math.min(c[other], d[other]) &&
-      a[other] < Math.max(c[other], d[other])
-    )
-      cost += 35;
+// ---- channel routing --------------------------------------------------------------------------------------------
+// Cards form columns (groups overlapping horizontally) with free channels between them. A wire runs left to
+// right: straight through every column it passes, changing height only inside channels. All vertical runs of
+// one channel are placed together, ordered so that they cross as little as possible.
+
+export interface WireEnds {
+  start: Point;
+  end: Point;
+  a: VertexId;
+  b: VertexId;
+}
+
+const CARD_GAP = 14;
+const BEND = 30;
+
+interface Column {
+  x0: number;
+  x1: number;
+  /** Free vertical intervals between the cards, top to bottom. */
+  free: [number, number][];
+}
+
+function columnsOf(boxes: Box[]): {
+  columns: Column[];
+  index: Map<VertexId, number>;
+} {
+  const columns: (Column & { boxes: Box[] })[] = [];
+  const index = new Map<VertexId, number>();
+  for (const b of [...boxes].sort((p, q) => p.x - q.x || p.y - q.y)) {
+    let c = columns[columns.length - 1];
+    if (!c || b.x >= c.x1 + 24) columns.push((c = { x0: b.x, x1: b.x + b.width, free: [], boxes: [] }));
+    c.x1 = Math.max(c.x1, b.x + b.width);
+    c.boxes.push(b);
+    index.set(b.id, columns.length - 1);
+  }
+  for (const c of columns) {
+    let top = -Infinity;
+    for (const b of c.boxes.sort((p, q) => p.y - q.y)) {
+      if (b.y - CARD_GAP >= top) c.free.push([top, b.y - CARD_GAP]);
+      top = Math.max(top, b.y + b.height + CARD_GAP);
+    }
+    c.free.push([top, Infinity]);
+  }
+  return { columns, index };
+}
+
+/** Heights at which a wire passes the columns between its ends: least vertical travel, then fewest bends. */
+function passHeights(from: number, to: number, columns: Column[]): number[] {
+  if (!columns.length) return [];
+  const values = [...new Set([from, to, ...columns.flatMap((c) => c.free.flat())])].filter(Number.isFinite).sort((p, q) => p - q);
+  const step = (p: number, q: number) => (p === q ? 0 : Math.abs(p - q) + BEND);
+  let prev = [{ y: from, cost: 0, path: [] as number[] }];
+  // Equal routes change height as late as possible, so wires leaving one connector stay together.
+  let late = columns.length;
+  for (const c of columns) {
+    late--;
+    const next: typeof prev = [];
+    for (const y of values) {
+      if (!c.free.some(([lo, hi]) => y >= lo && y <= hi)) continue;
+      let best = prev[0];
+      let cost = Infinity;
+      for (const p of prev) {
+        const total = p.cost + step(p.y, y) + (p.y === y ? 0 : late * 0.01 + 0.01);
+        if (total < cost) [best, cost] = [p, total];
+      }
+      next.push({ y, cost, path: [...best.path, y] });
+    }
+    prev = next;
+  }
+  return prev.reduce((p, q) => (q.cost + step(q.y, to) < p.cost + step(p.y, to) ? q : p)).path;
+}
+
+interface Net {
+  key: string;
+  /** Height on the left side of the channel and heights on the right side. */
+  s: number;
+  ts: number[];
+  lo: number;
+  hi: number;
+  lane: number;
+}
+
+/** Cost of net `n` turning left of net `m`: crossings, and a heavy charge for two wires on one line. */
+function sideCost(n: Net, m: Net): number {
+  let cost = n.lo + 1 < m.s && m.s < n.hi - 1 ? 1 : 0;
+  for (const t of n.ts) {
+    if (Math.abs(t - m.s) < 5) cost += 1000;
+    else if (m.lo + 1 < t && t < m.hi - 1) cost++;
   }
   return cost;
 }
 
-interface SearchNode {
-  x: number;
-  y: number;
-  dir: number;
-  cost: number;
-  rank: number;
-  prev: SearchNode | null;
-}
-
-/** Min-heap on `rank`. */
-class Heap {
-  private items: SearchNode[] = [];
-  get size() {
-    return this.items.length;
+/** Order the nets of one channel left to right and give nets that never meet the same lane. */
+function assignLanes(nets: Net[]): number {
+  const order: Net[] = [];
+  for (const n of [...nets].sort((p, q) => p.lo - q.lo || p.hi - q.hi || (p.key < q.key ? -1 : 1))) {
+    let cost = order.reduce((sum, m) => sum + sideCost(n, m), 0);
+    let best = cost;
+    let at = 0;
+    order.forEach((m, i) => {
+      cost += sideCost(m, n) - sideCost(n, m);
+      if (cost < best) [best, at] = [cost, i + 1];
+    });
+    order.splice(at, 0, n);
   }
-  push(node: SearchNode) {
-    const items = this.items;
-    let i = items.push(node) - 1;
-    while (i > 0) {
-      const parent = (i - 1) >> 1;
-      if (items[parent].rank <= items[i].rank) break;
-      [items[parent], items[i]] = [items[i], items[parent]];
-      i = parent;
-    }
-  }
-  pop(): SearchNode {
-    const items = this.items;
-    const top = items[0];
-    const last = items.pop()!;
-    if (items.length) {
-      items[0] = last;
-      for (let i = 0; ; ) {
-        const left = 2 * i + 1;
-        const right = left + 1;
-        let best = i;
-        if (left < items.length && items[left].rank < items[best].rank) best = left;
-        if (right < items.length && items[right].rank < items[best].rank) best = right;
-        if (best === i) break;
-        [items[best], items[i]] = [items[i], items[best]];
-        i = best;
+  for (let pass = 0; pass < 3; pass++) {
+    let swapped = false;
+    for (let i = 1; i < order.length; i++)
+      if (sideCost(order[i], order[i - 1]) < sideCost(order[i - 1], order[i])) {
+        [order[i - 1], order[i]] = [order[i], order[i - 1]];
+        swapped = true;
       }
-    }
-    return top;
+    if (!swapped) break;
   }
+  let lanes = 0;
+  order.forEach((n, i) => {
+    n.lane = 0;
+    for (let j = 0; j < i; j++) if (order[j].lo < n.hi + 8 && n.lo < order[j].hi + 8) n.lane = Math.max(n.lane, order[j].lane + 1);
+    lanes = Math.max(lanes, n.lane + 1);
+  });
+  return lanes;
 }
 
-interface Area {
-  x0: number;
-  x1: number;
-  y0: number;
-  y1: number;
-}
-
-/**
- * A* over a sparse orthogonal grid from `exit` to `enter`. Grid lines run beside every card and beside wires
- * already placed; a turn costs more than a short detour. With an `area`, only that part of the canvas is searched.
- */
-function search(exit: Point, enter: Point, allBoxes: Box[], allUsed: Segment[], gap: number, clearance: number, area: Area | null): Point[] | null {
-  const boxes = area ? allBoxes.filter((b) => b.x - gap <= area.x1 && b.x + b.width + gap >= area.x0 && b.y - gap <= area.y1 && b.y + b.height + gap >= area.y0) : allBoxes;
-  const used = area
-    ? allUsed.filter(([a, b]) => Math.min(a[0], b[0]) <= area.x1 && Math.max(a[0], b[0]) >= area.x0 && Math.min(a[1], b[1]) <= area.y1 && Math.max(a[1], b[1]) >= area.y0)
-    : allUsed;
-  const lines = (k: 0 | 1, own: number[]) => {
-    const lo = area ? (k === 0 ? area.x0 : area.y0) : -Infinity;
-    const hi = area ? (k === 0 ? area.x1 : area.y1) : Infinity;
-    const values = [
-      ...boxes.flatMap((b) => (k === 0 ? [b.x - gap, b.x + b.width + gap] : [b.y - gap, b.y + b.height + gap])),
-      ...used.flatMap(([a, b]) => (a[k] === b[k] ? [a[k] - 8, a[k] + 8] : [])),
-    ].filter((v) => v >= lo && v <= hi);
-    return [...new Set([...own, ...values])].sort((a, b) => a - b);
-  };
-  const xs = lines(0, [exit[0], enter[0]]);
-  const ys = lines(1, [exit[1], enter[1]]);
-  const sx = xs.indexOf(exit[0]);
-  const sy = ys.indexOf(exit[1]);
-  const tx = xs.indexOf(enter[0]);
-  const ty = ys.indexOf(enter[1]);
-  const key = (x: number, y: number, dir: number) => (x * ys.length + y) * 2 + dir;
-  // Length plus lane penalty of one grid edge (Infinity through a card); each edge is looked at from several states.
-  const edges = new Map<number, number>();
-  const edgeCost = (x: number, y: number, dir: number): number => {
-    const k = key(x, y, dir);
-    let cost = edges.get(k);
-    if (cost === undefined) {
-      const a: Point = [xs[x], ys[y]];
-      const b: Point = dir === 0 ? [xs[x + 1], ys[y]] : [xs[x], ys[y + 1]];
-      cost = pathBlocked([a, b], boxes) ? Infinity : Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + lanePenalty(a, b, used, clearance);
-      edges.set(k, cost);
-    }
-    return cost;
-  };
-  const open = new Heap();
-  open.push({ x: sx, y: sy, dir: 0, cost: 0, rank: 0, prev: null });
-  const costs = new Map<number, number>([[key(sx, sy, 0), 0]]);
-  for (let visits = 0; open.size && visits < 12000; visits++) {
-    const n = open.pop();
-    if (n.x === tx && n.y === ty) {
-      const path: Point[] = [];
-      for (let at: SearchNode | null = n; at; at = at.prev) path.push([xs[at.x], ys[at.y]]);
-      return path.reverse();
-    }
-    if (n.cost > (costs.get(key(n.x, n.y, n.dir)) ?? Infinity)) continue;
-    for (const [dx, dy, dir] of STEPS) {
-      const x = n.x + dx;
-      const y = n.y + dy;
-      if (x < 0 || y < 0 || x >= xs.length || y >= ys.length) continue;
-      const length = edgeCost(Math.min(x, n.x), Math.min(y, n.y), dir);
-      if (length === Infinity) continue;
-      const cost = n.cost + length + (dir !== n.dir ? 38 : 0);
-      const k = key(x, y, dir);
-      if (cost >= (costs.get(k) ?? Infinity)) continue;
-      costs.set(k, cost);
-      open.push({ x, y, dir, cost, prev: n, rank: cost + Math.abs(xs[x] - enter[0]) + Math.abs(ys[y] - enter[1]) });
-    }
-  }
-  return null;
-}
-const STEPS = [
-  [-1, 0, 0],
-  [1, 0, 0],
-  [0, -1, 1],
-  [0, 1, 1],
-] as const;
-
-export interface RouteOptions {
-  /** Lane index: spreads the stubs and bends of wires sharing a port. */
-  index?: number;
-  used?: Segment[];
-  clearance?: number;
-  /** Horizontal shift of the bend of a simple three-segment wire. */
-  bendOffset?: number | null;
-  /** Skip the grid search (used while a card is being dragged). */
-  quick?: boolean;
-}
-
-/**
- * Route one wire from an out connector to an in connector.
- * Tries a straight line, then a three-segment elbow, then an A* search over a sparse orthogonal grid,
- * and finally goes over the top of everything.
- */
-export function routePoints(start: Point, end: Point, source: Box, target: Box, boxes: Box[], options: RouteOptions = {}): Point[] {
-  const { index = 0, used = [], clearance = 6, bendOffset = null, quick = false } = options;
-  const penalty = (a: Point, b: Point) => lanePenalty(a, b, used, clearance);
-  const room = end[0] - start[0];
-  const lane = 24 + (index % 5) * 8;
-  const gap = room > 0 ? Math.min(lane, room / 3) : lane;
-  const exit: Point = [start[0] + gap, start[1]];
-  const enter: Point = [end[0] - gap, end[1]];
-  const obstacles = boxes.filter((b) => b.id !== source.id && b.id !== target.id);
-  if (end[0] > start[0] && start[1] === end[1] && !pathBlocked([start, end], obstacles) && penalty(start, end) === 0) return [start, end];
-  if (enter[0] >= exit[0]) {
-    const x = Math.max(exit[0], Math.min(enter[0], (exit[0] + enter[0]) / 2 + (bendOffset ?? ((index % 5) - 2) * 8)));
+/** A wire whose target is not in a later column: a plain elbow when it fits, else the shortest loop around. */
+function detour(w: WireEnds, index: number, boxes: Box[]): Point[] {
+  const { start, end } = w;
+  const others = boxes.filter((b) => b.id !== w.a && b.id !== w.b);
+  const shift = (index % 5) * 6;
+  if (end[0] - start[0] >= 36) {
+    const x = Math.max(start[0] + 12, Math.min(end[0] - 12, (start[0] + end[0]) / 2 + shift - 12));
     const p: Point[] = [start, [x, start[1]], [x, end[1]], end];
-    if (quick) return p;
-    if (!pathBlocked(p, obstacles) && p.slice(1).every((b, i) => penalty(p[i], b) === 0)) return p;
+    if (!pathBlocked(p, others, 6)) return p;
   }
-  if (!quick) {
-    // Most wires join neighbouring columns: search the area around both ends first, the whole canvas only if that fails.
-    const near = { x0: Math.min(exit[0], enter[0]) - 80, x1: Math.max(exit[0], enter[0]) + 80, y0: Math.min(exit[1], enter[1]) - 220, y1: Math.max(exit[1], enter[1]) + 220 };
-    const found = search(exit, enter, boxes, used, gap, clearance, near) ?? search(exit, enter, boxes, used, gap, clearance, null);
-    if (found) return [start, ...found, end];
+  const exit = start[0] + 20 + shift;
+  const enter = end[0] - 20 - shift;
+  let best: Point[] = [];
+  let least = Infinity;
+  for (const y of boxes.flatMap((b) => [b.y - 16 - shift, b.y + b.height + 16 + shift])) {
+    const middle: Point[] = [
+      [exit, start[1]],
+      [exit, y],
+      [enter, y],
+      [enter, end[1]],
+    ];
+    const cost = Math.abs(y - start[1]) + Math.abs(y - end[1]) + (pathBlocked(middle, boxes, 4) ? 5000 : 0);
+    if (cost < least) [best, least] = [middle, cost];
   }
-  const top = Math.min(...boxes.map((b) => b.y)) - gap;
-  return [start, exit, [exit[0], top], [enter[0], top], enter, end];
+  return [start, ...best, end];
 }
 
-function segmentsOf(points: Point[]): Segment[] {
-  const out: Segment[] = [];
-  for (let i = 1; i < points.length; i++) out.push([points[i - 1], points[i]]);
-  return out;
-}
-
-/** Midpoint along a polyline, for labels and buttons on a wire. */
-export function midpoint(points: Point[]): Point {
-  const segments = segmentsOf(points);
-  const total = segments.reduce((sum, [a, b]) => sum + Math.hypot(b[0] - a[0], b[1] - a[1]), 0);
-  let walked = 0;
-  for (const [a, b] of segments) {
-    const length = Math.hypot(b[0] - a[0], b[1] - a[1]);
-    if (walked + length >= total / 2 && length > 0) {
-      const t = (total / 2 - walked) / length;
-      return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+/** Route wires between cards. `start` lies on the right edge of card `a`, `end` on the left edge of card `b`. */
+export function routeWires(wires: WireEnds[], boxes: Box[]): Point[][] {
+  const { columns, index } = columnsOf(boxes);
+  // Per wire: its height in every column from the source to the target column, and the shared trunk so far.
+  const plans = wires.map((w) => {
+    const from = index.get(w.a)!;
+    const to = index.get(w.b)!;
+    if (!(from < to)) return null;
+    const ys = [w.start[1], ...passHeights(w.start[1], w.end[1], columns.slice(from + 1, to)), w.end[1]];
+    const trunks = [`${w.start[0]},${w.start[1]}`];
+    for (let i = 1; i < ys.length - 1; i++) trunks.push(`${trunks[i - 1]}>${ys[i]}`);
+    return { from, ys, trunks, bias: w.start[1] + w.end[1] };
+  });
+  // Wires passing a column at the same height are spread out; wires of one trunk stay together.
+  columns.forEach((column, c) => {
+    const tracks = new Map<string, { y: number; bias: number; set: (y: number) => void }>();
+    for (const p of plans) {
+      const i = p ? c - p.from : 0;
+      if (!p || i < 1 || i > p.ys.length - 2) continue;
+      const key = p.trunks[i];
+      const track = tracks.get(key) ?? {
+        y: p.ys[i],
+        bias: p.bias,
+        set: () => {},
+      };
+      const earlier = track.set;
+      track.set = (y) => (earlier(y), (p.ys[i] = y));
+      tracks.set(key, track);
     }
-    walked += length;
+    for (const [lo, hi] of column.free) {
+      const inside = [...tracks.values()].filter((t) => t.y >= lo && t.y <= hi).sort((p, q) => p.y - q.y || p.bias - q.bias);
+      const gap = Math.min(10, (hi - lo) / Math.max(1, inside.length - 1));
+      let last = -Infinity;
+      const ys = inside.map((t) => (last = Math.max(t.y, last + gap)));
+      inside.forEach((t, i) => t.set(Math.min(ys[i], hi - (inside.length - 1 - i) * gap)));
+    }
+  });
+  // Spreading leaves small steps between neighbouring columns; take them out where the next height is free here too.
+  const taken = columns.map(() => [] as number[]);
+  for (const p of plans) p?.ys.slice(1, -1).forEach((y, i) => taken[p.from + i + 1].push(y));
+  for (let round = 0; round < 4; round++)
+    for (const p of plans)
+      for (let i = (p?.ys.length ?? 0) - 3; p && i >= 1; i--) {
+        const c = p.from + i;
+        const [y, next] = [p.ys[i], p.ys[i + 1]];
+        if (y === next || Math.abs(y - next) > 24 || !columns[c].free.some(([lo, hi]) => next >= lo && next <= hi && y >= lo && y <= hi)) continue;
+        if (taken[c].some((other) => other !== y && Math.abs(other - next) < 6) || taken[c].filter((other) => other === y).length > 1) continue;
+        taken[c][taken[c].indexOf(y)] = p.ys[i] = next;
+      }
+  // Lanes: one vertical run per trunk and channel.
+  const lanes = new Map<string, number>();
+  for (let c = 0; c + 1 < columns.length; c++) {
+    const nets = new Map<string, Net>();
+    for (const p of plans) {
+      const i = p ? c - p.from : -1;
+      if (!p || i < 0 || i > p.ys.length - 2) continue;
+      const net = nets.get(p.trunks[i]) ?? {
+        key: p.trunks[i],
+        s: p.ys[i],
+        ts: [],
+        lo: p.ys[i],
+        hi: p.ys[i],
+        lane: 0,
+      };
+      net.ts.push(p.ys[i + 1]);
+      net.lo = Math.min(net.lo, p.ys[i + 1]);
+      net.hi = Math.max(net.hi, p.ys[i + 1]);
+      nets.set(net.key, net);
+    }
+    const bent = [...nets.values()].filter((n) => n.hi - n.lo > 0.5);
+    const count = assignLanes(bent);
+    const x0 = columns[c].x1;
+    const width = columns[c + 1].x0 - x0;
+    const margin = Math.min(22, width / 4);
+    const gap = Math.min(12, (width - 2 * margin) / Math.max(1, count - 1));
+    for (const n of bent) lanes.set(`${c}|${n.key}`, x0 + width / 2 + (n.lane - (count - 1) / 2) * gap);
   }
-  return points[0] ?? [0, 0];
+  return wires.map((w, n) => {
+    const p = plans[n];
+    if (!p) return simplify(detour(w, n, boxes));
+    const points: Point[] = [w.start];
+    for (let i = 0; i + 1 < p.ys.length; i++) {
+      const x = lanes.get(`${p.from + i}|${p.trunks[i]}`);
+      if (x !== undefined && Math.abs(p.ys[i] - p.ys[i + 1]) > 0.5) points.push([x, p.ys[i]], [x, p.ys[i + 1]]);
+    }
+    points.push(w.end);
+    return simplify(points);
+  });
 }
 
 interface End {
@@ -302,13 +330,8 @@ export interface WireRoute {
  * Route every design edge. Ends sharing one connector are fanned out vertically in the order of
  * the opposite card (y, then x, then edge index); wires are placed left to right so later ones avoid earlier lanes.
  */
-export function routeConnections(
-  g: Graph,
-  boxes: Map<VertexId, Box>,
-  cat: Catalog,
-  options: { editing?: boolean; moving?: VertexId | null; previous?: WireRoute[] } = {},
-): WireRoute[] {
-  const { editing = false, moving = null, previous = [] } = options;
+export function routeConnections(g: Graph, boxes: Map<VertexId, Box>, cat: Catalog, options: { editing?: boolean } = {}): WireRoute[] {
+  const { editing = false } = options;
   const byId = new Map(g.vertices.map((v) => [v.id, v]));
   type Draft = { a: VertexId; b: VertexId; i: number; out?: End; in?: End };
   const routes: Draft[] = connections(g)
@@ -341,37 +364,24 @@ export function routeConnections(
       p.r[p.side] = { point: p.point, spacing, lane: i, offset };
     });
   }
-  const order = [...routes].sort((p, q) => {
-    const x = boxes.get(p.a)!;
-    const y = boxes.get(q.a)!;
-    return x.x - y.x || x.y - y.y || p.i - q.i;
-  });
-  const all = [...boxes.values()];
-  const used: Segment[] = [];
-  const done = new Map<Draft, WireRoute>();
-  // While a card is dragged, wires that do not touch it stay where they were.
-  if (moving) {
-    const prior = new Map(previous.map((r) => [r.key, r]));
-    for (const r of order) {
-      const old = prior.get(`${r.a}/${r.b}`);
-      if (r.a === moving || r.b === moving || !old) continue;
-      done.set(r, { ...old, index: r.i });
-      used.push(...segmentsOf(old.points));
-    }
-  }
-  for (const r of order) {
-    if (done.has(r)) continue;
-    const spacing = Math.min(r.in!.spacing, r.out!.spacing);
-    const points = routePoints(r.out!.point, r.in!.point, boxes.get(r.a)!, boxes.get(r.b)!, all, {
-      index: r.i,
-      used,
-      clearance: Math.min(6, spacing * 0.8),
-      quick: !!moving,
-    });
-    done.set(r, { key: `${r.a}/${r.b}`, a: r.a, b: r.b, index: r.i, points, d: roundedPath(points), arrowHeight: Math.min(5, r.in!.spacing * 0.65) });
-    used.push(...segmentsOf(points));
-  }
-  return routes.map((r) => done.get(r)!);
+  const lines = routeWires(
+    routes.map((r) => ({
+      start: r.out!.point,
+      end: r.in!.point,
+      a: r.a,
+      b: r.b,
+    })),
+    [...boxes.values()],
+  );
+  return routes.map((r, n) => ({
+    key: `${r.a}/${r.b}`,
+    a: r.a,
+    b: r.b,
+    index: r.i,
+    points: lines[n],
+    d: roundedPath(lines[n]),
+    arrowHeight: Math.min(5, r.in!.spacing * 0.65),
+  }));
 }
 
 /** One hop of one entry's route as drawn in view mode. */
@@ -411,7 +421,11 @@ export function routeSpans(g: Graph, spans: Span[], boxes: Map<VertexId, Box>, c
       const address = span.addresses[side === 'out' ? 0 : 1] || (side === 'out' ? AUTO : '');
       const key = JSON.stringify([id, side, address]);
       if (!ports.has(key)) ports.set(key, []);
-      ports.get(key)!.push({ span, side, point: portPoint(boxes.get(id)!, v, addressesOf(g, v, cat), side, address) });
+      ports.get(key)!.push({
+        span,
+        side,
+        point: portPoint(boxes.get(id)!, v, addressesOf(g, v, cat), side, address),
+      });
     }
   for (const ends of ports.values()) {
     const slot = (c: { span: Draft; side: Side }): unknown => (c.side === 'out' ? JSON.stringify([c.span.entry, c.span.pending]) : c.span);
@@ -424,21 +438,16 @@ export function routeSpans(g: Graph, spans: Span[], boxes: Map<VertexId, Box>, c
       c.span[c.side] = { point: c.point, spacing, lane, offset };
     }
   }
-  const used: { entry: VertexId; pending: boolean; segment: Segment }[] = [];
-  const all = [...boxes.values()];
-  return list.map((span) => {
-    const start = span.out!.point;
-    const end = span.in!.point;
-    // Parallel colours need opposite bend offsets when going down or up, or they cross.
-    const bend = (-Math.sign(end[1] - start[1]) * (span.out!.offset + span.in!.offset)) / 2;
-    const points = routePoints(start, end, boxes.get(span.a)!, boxes.get(span.b)!, all, {
-      index: span.in!.lane,
-      used: used.filter((s) => s.entry !== span.entry || s.pending !== span.pending).map((s) => s.segment),
-      clearance: 6,
-      bendOffset: bend,
-    });
-    for (const segment of segmentsOf(points))
-      if (Math.hypot(segment[1][0] - segment[0][0], segment[1][1] - segment[0][1]) > 4) used.push({ entry: span.entry, pending: span.pending, segment });
+  const lines = routeWires(
+    list.map((span) => ({
+      start: span.out!.point,
+      end: span.in!.point,
+      a: span.a,
+      b: span.b,
+    })),
+    [...boxes.values()],
+  );
+  return list.map((span, n) => {
     const spacing = Math.min(span.out!.spacing, span.in!.spacing);
     return {
       a: span.a,
@@ -447,8 +456,8 @@ export function routeSpans(g: Graph, spans: Span[], boxes: Map<VertexId, Box>, c
       pending: span.pending,
       addresses: span.addresses,
       key: JSON.stringify([span.entry, span.a, span.b, span.addresses, span.pending]),
-      points,
-      d: roundedPath(points),
+      points: lines[n],
+      d: roundedPath(lines[n]),
       stroke: Math.min(2, Math.max(1.2, spacing * 0.45)),
       halo: Math.min(6, spacing * 0.75),
       arrowHeight: Math.min(6, span.in!.spacing * 0.65),

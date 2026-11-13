@@ -204,7 +204,7 @@
       <Card title="IP 地址" hint={extra.length ? `${node.addresses.length} 个` : undefined} flush>
         <ul class="divide-y">
           {#each node.addresses as address (address.id)}
-            <li class="flex flex-wrap items-center gap-x-2.5 gap-y-1 px-4 py-2.5 text-[0.8125rem]">
+            <li class="flex flex-wrap items-center gap-x-2.5 gap-y-1 px-4 py-2.5 text-[0.8667rem]">
               <span class="w-9 shrink-0 text-xs {address.primary ? 'font-medium text-accent-text' : 'text-fg-muted'}">{address.primary ? '主 IP' : '副 IP'}</span>
               <code class="font-mono break-all">{address.host}</code>
               {#if address.name}<span class="text-fg-muted">{address.name}</span>{/if}
@@ -215,7 +215,7 @@
               </span>
             </li>
           {:else}
-            <li class="px-4 py-2.5 text-[0.8125rem]"><code class="font-mono">{node.addr}</code></li>
+            <li class="px-4 py-2.5 text-[0.8667rem]"><code class="font-mono">{node.addr}</code></li>
           {/each}
         </ul>
         <p class="border-t px-4 py-2 text-xs text-fg-muted">
@@ -244,7 +244,7 @@
             </table>
           </div>
         {:else}
-          <p class="px-4 py-6 text-center text-[0.8125rem] text-fg-muted">{node.status === 'deleting' ? '正在删除，已下发空配置' : '没有转发规则'}</p>
+          <p class="px-4 py-6 text-center text-[0.8667rem] text-fg-muted">{node.status === 'deleting' ? '正在删除，已下发空配置' : '没有转发规则'}</p>
         {/if}
       </Card>
   {/snippet}
@@ -282,7 +282,7 @@
       <Alert tone="warn">刷新失败：{poll.error}。显示的是上一次的数据。</Alert>
     {/if}
     {#if node.note}
-      <p class="rounded-md border-l-2 border-border-strong bg-surface-2/60 px-3 py-2 text-[0.8125rem] leading-relaxed break-words whitespace-pre-wrap text-fg-muted">
+      <p class="rounded-md border-l-2 border-border-strong bg-surface-2/60 px-3 py-2 text-[0.8667rem] leading-relaxed break-words whitespace-pre-wrap text-fg-muted">
         <span class="sr-only">备注：</span>{node.note}
       </p>
     {/if}
@@ -335,7 +335,7 @@
       </Disclosure>
       <Disclosure title="事件记录" hint={detail.events.length ? `${detail.events.length} 条` : undefined} key="events-{id}">
         {#if detail.events.length}
-          <ol class="-my-1 max-h-96 divide-y divide-dashed overflow-y-auto text-[0.8125rem]">
+          <ol class="-my-1 max-h-96 divide-y divide-dashed overflow-y-auto text-[0.8667rem]">
             {#each detail.events as event, index (index)}
               <li class="flex flex-wrap gap-x-3 py-1.5">
                 <time class="tabular shrink-0 text-xs leading-5 text-fg-subtle">{dateTime(event.ts)}</time>
@@ -344,7 +344,7 @@
             {/each}
           </ol>
         {:else}
-          <p class="text-[0.8125rem] text-fg-muted">暂无事件</p>
+          <p class="text-[0.8667rem] text-fg-muted">暂无事件</p>
         {/if}
       </Disclosure>
     </div>

@@ -38,7 +38,7 @@
   };
   const sizes: Record<Size, string> = {
     xs: 'h-6 text-xs gap-1 rounded-sm',
-    sm: 'h-7 text-[0.8125rem] gap-1.5 rounded-md',
+    sm: 'h-7 text-[0.8667rem] gap-1.5 rounded-md',
     md: 'h-8 text-sm gap-1.5 rounded-md',
   };
   const pads: Record<Size, [string, string]> = { xs: ['px-2', 'w-6'], sm: ['px-2.5', 'w-7'], md: ['px-3', 'w-8'] };

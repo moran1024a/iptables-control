@@ -85,7 +85,7 @@
 <div class="flex min-h-0 flex-1 flex-col" data-scroll>
   <div class="flex flex-col gap-2 border-b p-2.5">
     <div class="flex items-center gap-2">
-      <h2 class="flex-1 text-[0.8125rem] font-semibold">资源库</h2>
+      <h2 class="flex-1 text-[0.8667rem] font-semibold">资源库</h2>
       <button type="button" class="flex size-6 items-center justify-center rounded-md text-fg-muted hover:bg-surface-3" aria-label="收起资源库" onclick={onclose}><X class="size-4" /></button>
     </div>
     <Segmented bind:value={kind} options={kinds} label="资源类型" class="w-full [&>button]:flex-1 [&>button]:justify-center [&>button]:px-1" />
@@ -97,7 +97,7 @@
         type="button"
         draggable="true"
         {disabled}
-        class="flex w-full items-center gap-2 rounded-full border border-dashed border-border-strong bg-surface px-3 py-2 text-left text-[0.8125rem] hover:border-accent hover:bg-surface-2 disabled:opacity-50"
+        class="flex w-full items-center gap-2 rounded-full border border-dashed border-border-strong bg-surface px-3 py-2 text-left text-[0.8667rem] hover:border-accent hover:bg-surface-2 disabled:opacity-50"
         ondragstart={(event) => dragstart(event, { kind: 'direct' })}
         onclick={() => onadd({ kind: 'direct' })}
       >
@@ -125,7 +125,7 @@
               >
                 <span class="flex w-full items-center gap-1.5">
                   {#if tile.dot}<span class="size-2 shrink-0 rounded-full {tile.dot}" title={tile.status}></span>{/if}
-                  <span class="min-w-0 flex-1 truncate text-[0.8125rem] font-medium">{tile.name}</span>
+                  <span class="min-w-0 flex-1 truncate text-[0.8667rem] font-medium">{tile.name}</span>
                   {#if tile.used}<span class="tabular shrink-0 text-2xs text-fg-subtle" title="已在画布上使用的次数">已用 {tile.used}</span>{/if}
                 </span>
                 <span class="flex w-full items-center gap-1 overflow-hidden">

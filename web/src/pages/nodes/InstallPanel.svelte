@@ -31,7 +31,7 @@
 {/snippet}
 
 {#snippet rows()}
-  <dl class="grid grid-cols-1 gap-x-4 gap-y-2.5 text-[0.8125rem] sm:grid-cols-[4.5rem_minmax(0,1fr)]">
+  <dl class="grid grid-cols-1 gap-x-4 gap-y-2.5 text-[0.8667rem] sm:grid-cols-[4.5rem_minmax(0,1fr)]">
     <dt class="text-fg-muted sm:pt-1.5">同步地址</dt>
     <dd class="min-w-0"><CommandBlock text={url} /></dd>
     <dt class="text-fg-muted sm:pt-1.5">密钥</dt>
@@ -61,7 +61,7 @@
         <div class="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent-text"><Terminal class="size-4.5" /></div>
         <div class="min-w-0">
           <h2 class="text-[0.9375rem] font-semibold">在节点上执行一键接入命令</h2>
-          <p class="mt-0.5 text-[0.8125rem] leading-relaxed text-fg-muted">
+          <p class="mt-0.5 text-[0.8667rem] leading-relaxed text-fg-muted">
             此节点尚未安装。登录这台服务器，粘贴并执行下面的命令；安装完成后本页会自动更新状态。
           </p>
         </div>

@@ -28,7 +28,7 @@
     class="flex min-h-11 w-full items-center gap-2 px-4 py-2 text-left"
   >
     <ChevronDown class="size-4 shrink-0 text-fg-subtle transition-transform {open ? '' : '-rotate-90'}" />
-    <span class="text-[0.8125rem] font-semibold">{title}</span>
+    <span class="text-[0.8667rem] font-semibold">{title}</span>
     {#if hint}<span class="truncate text-xs text-fg-muted">{hint}</span>{/if}
   </button>
   {#if open}

@@ -346,7 +346,7 @@
           <span class="inline-flex items-center gap-1.5 text-fg-muted">
             <span class="h-[3px] w-3 rounded-full {PROTOCOLS[row.protocol].swatch}"></span>{PROTOCOLS[row.protocol].name}
           </span>
-          <span class="tabular text-[0.8125rem] font-semibold">{ms(row.point?.mean)}</span>
+          <span class="tabular text-[0.8667rem] font-semibold">{ms(row.point?.mean)}</span>
         </div>
         <p class="leading-snug text-fg-subtle">{row.point ? detail(row.point) : '未采样'}</p>
       {/each}

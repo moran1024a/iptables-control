@@ -410,37 +410,59 @@ def references(c, nid, live_only=False):
 
 
 def arrange(graph):
-    """Rooted DAG layers; modifiers occupy wires, not forwarding columns."""
+    """Rooted DAG layers; modifiers occupy wires, not forwarding columns.
+
+    A wire that skips columns gets a placeholder in each of them, so cards leave it a straight lane;
+    a modifier on such a wire sits on that lane.
+    """
     graph = copy.deepcopy(graph)
     by = {v["id"]: v for v in graph["vertices"]}
     order, all_adj = topological_order(graph)
     real = [i for i in order if by[i]["kind"] != "direct"]
-    adj, parents = {i: [] for i in real}, {i: [] for i in real}
+    wires = []  # (source, target, modifier or None)
     for a in real:
         for b in all_adj[a]:
-            targets = all_adj[b] if by[b]["kind"] == "direct" else [b]
-            for target in targets:
-                adj[a].append(target)
-                parents[target].append(a)
+            if by[b]["kind"] == "direct":
+                wires += [(a, target, b) for target in all_adj[b]]
+            else:
+                wires.append((a, b, None))
     ranks = {i: 0 for i in real if by[i]["kind"] == "entry"}
     for a in real:
         if a in ranks:
-            for b in adj[a]:
-                ranks[b] = max(ranks.get(b, 0), ranks[a] + 1)
+            for x, b, _ in wires:
+                if x == a:
+                    ranks[b] = max(ranks.get(b, 0), ranks[a] + 1)
     terminal = max(ranks.values(), default=1)
     for i in list(ranks):
         if by[i]["kind"] == "target":
             ranks[i] = terminal
-    layers = {}
+    heights = {i: 62 + 24 * (max(1, len(graph.get("address_book", {}).get(i, {})))
+                                + bool(by[i].get("node_id"))) for i in real}
+    original = {i: by[i].get("y", 0) + heights[i] / 2 for i in real}
+    layers, adj, parents, after = {}, {}, {}, {}
     for i in real:
         by[i]["layer"] = ranks.get(i)
         if i in ranks:
             layers.setdefault(ranks[i], []).append(i)
-    heights = {i: 62 + 24 * (max(1, len(graph.get("address_book", {}).get(i, {})))
-                                + bool(by[i].get("node_id"))) for i in real}
-    original = {i: by[i].get("y", 0) for i in real}
+            adj[i], parents[i] = [], []
+    for n, (a, b, modifier) in enumerate(wires):
+        if a not in ranks:
+            continue
+        last, span = a, ranks[b] - ranks[a]
+        for step in range(1, span):
+            lane = (n, step)
+            heights[lane] = 56 if modifier and step == 1 else 0
+            original[lane] = original[a] + (original[b] - original[a]) * step / span
+            layers[ranks[a] + step].append(lane)
+            adj[lane], parents[lane] = [], [last]
+            adj[last].append(lane)
+            last = lane
+        adj[last].append(b)
+        parents[b].append(last)
+        if modifier:
+            after[modifier] = (a, adj[a][-1])
     for layer in layers.values():
-        layer.sort(key=lambda i: (original[i], i))
+        layer.sort(key=lambda i: (original[i], str(i)))
     # Repeated neighbour-median sweeps reduce crossings while retaining stable ties.
     def positions():
         return {i: (j + .5) / len(layer) for layer in layers.values() for j, i in enumerate(layer)}
@@ -456,33 +478,41 @@ def arrange(graph):
                     values = sorted(pos[p] for p in neighbours[i] if p in pos)
                     return (values[len(values)//2] if values else pos[i], old[i])
                 layers[rank].sort(key=score)
-    centers = {}
+    def room(i, j):
+        return 48 if i in by and j in by else 24
+    centers, columns = {}, {}
     if layers:
         anchor = max(layers, key=lambda r: sum(heights[i]+48 for i in layers[r]))
-        y = 60
-        for i in layers[anchor]:
-            centers[i] = y + heights[i]/2
-            y += heights[i] + 48
-        axis = sum(centers.values()) / len(centers)
         def align(rank, neighbours):
-            desired = {}
+            desired, bottom, last = {}, -math.inf, None
             for i in layers[rank]:
                 values = sorted(centers[p] for p in neighbours[i] if p in centers)
-                desired[i] = (values[(len(values)-1)//2]+values[len(values)//2])/2 if values else axis
-            bottom = -math.inf
+                desired[i] = (values[(len(values)-1)//2]+values[len(values)//2])/2 if values else None
+            known = [v for v in desired.values() if v is not None]
             for i in layers[rank]:
-                centers[i] = max(desired[i], bottom+48+heights[i]/2)
-                bottom = centers[i]+heights[i]/2
+                want = desired[i] if desired[i] is not None else sum(known)/len(known) if known else 0
+                desired[i] = want
+                centers[i] = want if last is None else max(want, bottom+room(last, i)+heights[i]/2)
+                bottom, last = centers[i]+heights[i]/2, i
             shift = sum(centers[i]-desired[i] for i in layers[rank])/len(layers[rank])
             for i in layers[rank]:
                 centers[i] -= shift
+        align(anchor, {i: [] for i in layers[anchor]})
         for rank in sorted(r for r in layers if r > anchor):
             align(rank, parents)
         for rank in sorted((r for r in layers if r < anchor), reverse=True):
             align(rank, adj)
+        # A column gap holding a modifier is wider, so wires still have room on both sides of it.
+        wide = {ranks[a] for a, _ in after.values()}
+        x = 40
+        for rank in range(max(layers)+1):
+            columns[rank] = x
+            x += 220 + (300 if rank in wide else 180)
         shift = 60-min(centers[i]-heights[i]/2 for i in ranks)
+        for i in centers:
+            centers[i] += shift
         for i, rank in ranks.items():
-            by[i].update(x=40+rank*400, y=round(centers[i]+shift-heights[i]/2))
+            by[i].update(x=columns[rank], y=round(centers[i]-heights[i]/2))
     bottom = max((by[i]["y"]+heights[i] for i in ranks), default=0)+130
     for j, i in enumerate(i for i in real if i not in ranks):
         by[i].update(x=40+(j%4)*400, y=bottom+(j//4)*180)
@@ -491,12 +521,10 @@ def arrange(graph):
         v = by[i]
         if v["kind"] != "direct":
             continue
-        incoming = [a for a, bs in all_adj.items() if i in bs]
-        outgoing = all_adj[i]
-        if incoming and outgoing:
-            a, b = by[incoming[0]], by[outgoing[0]]
-            x = (a["x"]+220+b["x"]-110)/2
-            y = (a["y"]+heights.get(a["id"],60)/2+b["y"]+heights.get(b["id"],60)/2)/2-28
+        if i in after:
+            a, b = after[i]
+            x = columns[ranks[a]]+220+95
+            y = (centers[b] if b not in by else (centers[a]+centers[b])/2)-28
         else:
             x, y = 40, bottom+180
         while any(x < px+w+12 and x+110 > px-12 and y < py+h+12 and y+56 > py-12 for px,py,w,h in placed):

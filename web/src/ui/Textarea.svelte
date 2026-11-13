@@ -11,6 +11,6 @@
   aria-invalid={invalid || undefined}
   class="w-full min-w-0 resize-y rounded-md border bg-surface px-2.5 py-1.5 text-sm text-fg shadow-sm transition-colors placeholder:text-fg-subtle hover:border-border-strong focus:border-accent focus:outline-2 focus:outline-offset-0 focus:outline-(--ring) {invalid
     ? 'border-danger'
-    : 'border-border-strong/70'} {mono ? 'font-mono text-[0.8125rem] break-all' : ''} {klass}"
+    : 'border-border-strong/70'} {mono ? 'font-mono text-[0.8667rem] break-all' : ''} {klass}"
   {...rest}
 ></textarea>

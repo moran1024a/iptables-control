@@ -42,7 +42,7 @@
       <Card title="外观" hint="只保存在当前浏览器">
         <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
           <div class="min-w-0">
-            <p id="theme-label" class="text-[0.8125rem] font-medium">主题</p>
+            <p id="theme-label" class="text-[0.8667rem] font-medium">主题</p>
             <p class="text-xs text-fg-muted">
               {theme.choice === 'auto' ? `跟随系统设置，当前为${theme.dark ? '深色' : '浅色'}。` : '选择后立即生效。'}
             </p>

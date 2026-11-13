@@ -101,7 +101,7 @@
   data-nopan
   data-scroll
   aria-label="属性"
-  class="absolute inset-x-2 bottom-2 z-40 flex max-h-[60%] cursor-default flex-col rounded-lg border bg-surface text-[0.8125rem] shadow-lg select-text sm:inset-x-auto sm:top-2 sm:right-2 sm:bottom-auto sm:max-h-[calc(100%-1rem)] sm:w-64"
+  class="absolute inset-x-2 bottom-2 z-40 flex max-h-[60%] cursor-default flex-col rounded-lg border bg-surface text-[0.8667rem] shadow-lg select-text sm:inset-x-auto sm:top-2 sm:right-2 sm:bottom-auto sm:max-h-[calc(100%-1rem)] sm:w-64"
 >
   <header class="flex items-center gap-2 border-b py-1.5 pr-1.5 pl-3">
     <p class="min-w-0 flex-1 truncate font-semibold">

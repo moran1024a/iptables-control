@@ -48,7 +48,7 @@
   data-nopan
   data-scroll
   aria-label="灾备预览"
-  class="absolute z-40 flex max-h-[min(22rem,80%)] cursor-default flex-col rounded-lg border bg-surface text-[0.8125rem] shadow-lg {sheet ? 'inset-x-2 bottom-2' : 'w-[340px]'}"
+  class="absolute z-40 flex max-h-[min(22rem,80%)] cursor-default flex-col rounded-lg border bg-surface text-[0.8667rem] shadow-lg {sheet ? 'inset-x-2 bottom-2' : 'w-[340px]'}"
   style:left={sheet ? undefined : `${state.left}px`}
   style:top={sheet ? undefined : `${state.top}px`}
   onpointerenter={onenter}

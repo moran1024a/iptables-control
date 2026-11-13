@@ -26,7 +26,7 @@
         {#each rows as row (row.name)}
           <tr>
             <td>
-              <span class="text-[0.8125rem] text-fg">{row.name}</span>
+              <span class="text-[0.8667rem] text-fg">{row.name}</span>
               <span class="block text-xs text-fg-subtle">{row.note}</span>
             </td>
             <td class="whitespace-nowrap"><code class="text-xs">{row.version || '-'}</code></td>
@@ -34,7 +34,7 @@
         {/each}
         <tr>
           <td>
-            <span class="text-[0.8125rem] text-fg">同步协议</span>
+            <span class="text-[0.8667rem] text-fg">同步协议</span>
             <span class="block text-xs text-fg-subtle">服务端与 Agent 之间的接口版本</span>
           </td>
           <td class="whitespace-nowrap">

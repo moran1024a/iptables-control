@@ -31,17 +31,9 @@
   import { configKey, configSearchText, type AnyConfig } from './model';
 
   let sorting = $state(false);
-  // Subscriptions are loaded alongside only to say which configurations they include and which they cannot export.
-  const list = usePoll(
-    async (signal) => {
-      const [configs, subscriptions] = await Promise.all([
-        get<ConfigsList>('configs', { signal }),
-        get<SubscriptionsList>('subscriptions', { signal }).catch(() => null),
-      ]);
-      return { ...configs, subscriptions };
-    },
-    { interval: 5000, paused: () => sorting },
-  );
+  const list = usePoll((signal) => get<ConfigsList>('configs', { signal }), { interval: 5000, paused: () => sorting });
+  // Subscriptions only say which configurations they include and which they cannot export; that rarely changes.
+  const subscriptions = usePoll((signal) => get<SubscriptionsList>('subscriptions', { signal }), { interval: 30000 });
   const filters = filtersFor('configs', { q: '', state: '', source: '', group: '' });
   const filtering = $derived(anyFilter(filters));
   const data = $derived(list.data);
@@ -62,10 +54,10 @@
   const externalTotals = $derived(Object.fromEntries(externalGroups.map((g) => [g.id, external.filter((c) => c.group_id === g.id).length])));
   const canSort = $derived(external.length > 1 || externalGroups.length > 1);
 
-  const candidates = $derived(new Map<string, SubscriptionCandidate>((data?.subscriptions?.configs ?? []).map((item) => [configKey(item), item])));
+  const candidates = $derived(new Map<string, SubscriptionCandidate>((subscriptions.data?.configs ?? []).map((item) => [configKey(item), item])));
   const usedBy = $derived.by(() => {
     const map = new Map<string, string[]>();
-    for (const subscription of data?.subscriptions?.subscriptions ?? []) {
+    for (const subscription of subscriptions.data?.subscriptions ?? []) {
       const keys = [...subscription.configuration_ids.map((id) => `C${id}`), ...subscription.external_configuration_ids.map((id) => `E${id}`)];
       for (const key of keys) map.set(key, [...(map.get(key) ?? []), subscription.name]);
     }
@@ -100,7 +92,7 @@
       title: '删除外部配置',
       body:
         `删除「${config.name}」（${config.code}）？` +
-        (used.length ? `\n它会同时从这些订阅中移除：${used.join('、')}。` : data?.subscriptions ? '\n没有订阅在使用它。' : '\n它也会从包含它的订阅中移除。'),
+        (used.length ? `\n它会同时从这些订阅中移除：${used.join('、')}。` : subscriptions.data ? '\n没有订阅在使用它。' : '\n它也会从包含它的订阅中移除。'),
       confirmLabel: '删除',
       danger: true,
     });
@@ -117,7 +109,7 @@
 
 {#snippet heading(title: string, count: number, total: number, note: string)}
   <div class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 px-1">
-    <h2 class="text-[0.8125rem] font-semibold">{title}</h2>
+    <h2 class="text-[0.8667rem] font-semibold">{title}</h2>
     <span class="tabular text-xs text-fg-subtle">{count !== total ? `${count} / ${total}` : total}</span>
     <span class="text-xs text-fg-muted">{note}</span>
   </div>
@@ -191,7 +183,7 @@
       <div class="flex justify-center py-16 text-fg-subtle"><Spinner class="size-5" /></div>
     {/if}
   {:else if sorting}
-    <p class="px-1 text-[0.8125rem] font-semibold">外部配置排序</p>
+    <p class="px-1 text-[0.8667rem] font-semibold">外部配置排序</p>
     <SortList
       kind="external_configurations"
       groups={externalGroups}
@@ -234,7 +226,7 @@
             {/snippet}
           </GroupedList>
         {:else}
-          <p class="rounded-lg border border-dashed bg-surface px-4 py-4 text-center text-[0.8125rem] text-fg-muted">
+          <p class="rounded-lg border border-dashed bg-surface px-4 py-4 text-center text-[0.8667rem] text-fg-muted">
             还没有链路生成的配置。<a class="font-medium text-accent-text hover:underline" href={href('routes')}>去链路页</a>保存一条链路后，每对入口和目标会在这里出现一条。
           </p>
         {/if}
@@ -258,7 +250,7 @@
             {/snippet}
           </GroupedList>
         {:else}
-          <p class="rounded-lg border border-dashed bg-surface px-4 py-4 text-center text-[0.8125rem] text-fg-muted">
+          <p class="rounded-lg border border-dashed bg-surface px-4 py-4 text-center text-[0.8667rem] text-fg-muted">
             还没有外部配置。
             <button type="button" class="font-medium text-accent-text hover:underline" onclick={importNew}>导入一条分享链接</button>
           </p>

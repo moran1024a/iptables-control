@@ -13,7 +13,7 @@
   };
 </script>
 
-<div class="flex items-start gap-2.5 rounded-lg border px-3 py-2.5 text-[0.8125rem] leading-relaxed {tones[tone]} {klass}" role={tone === 'danger' ? 'alert' : 'note'}>
+<div class="flex items-start gap-2.5 rounded-lg border px-3 py-2.5 text-[0.8667rem] leading-relaxed {tones[tone]} {klass}" role={tone === 'danger' ? 'alert' : 'note'}>
   {#if tone === 'info'}<Info class="mt-0.5 size-4 shrink-0" />
   {:else if tone === 'warn'}<TriangleAlert class="mt-0.5 size-4 shrink-0" />
   {:else}<CircleAlert class="mt-0.5 size-4 shrink-0" />{/if}

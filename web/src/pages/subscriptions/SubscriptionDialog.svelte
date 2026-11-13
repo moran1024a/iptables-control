@@ -66,7 +66,7 @@
       {/snippet}
     </Field>
     <div class="flex flex-col gap-1">
-      <label for="{uid}-enabled" class="text-[0.8125rem] font-medium">启用</label>
+      <label for="{uid}-enabled" class="text-[0.8667rem] font-medium">启用</label>
       <div class="flex h-8 items-center gap-2">
         <Switch id="{uid}-enabled" bind:checked={enabled} />
         <span class="text-xs text-fg-muted">{enabled ? '链接可访问' : '链接返回 404'}</span>
@@ -74,7 +74,7 @@
     </div>
   </div>
   <div class="flex flex-col gap-1.5">
-    <p class="text-[0.8125rem] font-medium">包含的配置</p>
+    <p class="text-[0.8667rem] font-medium">包含的配置</p>
     <ConfigPicker {catalog} {groups} bind:selected {locked} />
     {#if catalog.length && !selected.length}
       <p class="text-xs text-warn-text">还没有选择配置：可以保存，但客户端拉取到的订阅是空的。</p>

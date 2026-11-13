@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""检查独立组件清单与源码一致，不要求不同组件使用同一版本。"""
+"""检查组件清单与源码中的版本号一致。"""
 import json
 from pathlib import Path
 import re

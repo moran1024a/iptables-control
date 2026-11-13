@@ -9,7 +9,7 @@
   {#if title || actions}
     <header class="flex min-h-11 flex-wrap items-center justify-between gap-2 border-b px-4 py-2">
       <div class="flex min-w-0 items-baseline gap-2">
-        {#if title}<h2 class="text-[0.8125rem] font-semibold">{title}</h2>{/if}
+        {#if title}<h2 class="text-[0.8667rem] font-semibold">{title}</h2>{/if}
         {#if hint}<span class="truncate text-xs text-fg-muted">{hint}</span>{/if}
       </div>
       {#if actions}<div class="flex items-center gap-1.5">{@render actions()}</div>{/if}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import LayoutDashboard from '@lucide/svelte/icons/layout-dashboard';
   import FileKey from '@lucide/svelte/icons/file-key-2';
   import LogOut from '@lucide/svelte/icons/log-out';
   import Moon from '@lucide/svelte/icons/moon';
@@ -16,13 +17,14 @@
   import Tooltip from '$ui/Tooltip.svelte';
   import Logo from './Logo.svelte';
   import Spinner from '$ui/Spinner.svelte';
-  import Nodes from '../pages/nodes/Nodes.svelte';
+  import Overview from '../pages/overview/Overview.svelte';
 
   // The landing page ships in the main bundle; every other page loads on first visit.
   type Loader = () => Promise<{ default: Component }>;
   type Entry = { page: string; label: string; icon: Component<{ class?: string }>; load: Loader };
   const pages: Entry[] = [
-    { page: 'nodes', label: '节点', icon: Server, load: async () => ({ default: Nodes }) },
+    { page: 'overview', label: '总览', icon: LayoutDashboard, load: async () => ({ default: Overview }) },
+    { page: 'nodes', label: '节点', icon: Server, load: () => import('../pages/nodes/Nodes.svelte') },
     { page: 'targets', label: '目标', icon: Crosshair, load: () => import('../pages/targets/Targets.svelte') },
     { page: 'routes', label: '链路', icon: Waypoints, load: () => import('../pages/links/Links.svelte') },
     { page: 'configs', label: '配置', icon: FileKey, load: () => import('../pages/configs/Configs.svelte') },
@@ -38,7 +40,7 @@
   $effect(() => {
     // Old bookmarks: #/quality/topologies/<id> moved under the link itself.
     if (router.page === 'quality' && router.parts[1] === 'topologies' && router.id(2)) router.go(`routes/${router.id(2)}/quality`, { replace: true });
-    else if (!current) router.go('nodes', { replace: true });
+    else if (!current) router.go('overview', { replace: true });
   });
   $effect(() => {
     document.title = current ? `${current.label} · ictl` : 'ictl';
@@ -47,7 +49,7 @@
 
 <div class="flex min-h-dvh">
   <aside class="sticky top-0 hidden h-dvh w-52 shrink-0 flex-col border-r bg-surface lg:flex">
-    <a href={href('nodes')} class="flex h-14 items-center gap-2.5 px-4">
+    <a href={href('overview')} class="flex h-14 items-center gap-2.5 px-4">
       <Logo class="size-7" />
       <span class="text-[0.9375rem] font-semibold tracking-tight">ictl</span>
     </a>
@@ -70,7 +72,7 @@
     </nav>
     <div class="flex items-center gap-1 border-t px-2.5 py-2.5">
       <div class="min-w-0 flex-1 px-1.5">
-        <p class="truncate text-[0.8125rem] font-medium">{session.username}</p>
+        <p class="truncate text-[0.8667rem] font-medium">{session.username}</p>
         <p class="truncate text-2xs text-fg-subtle">v{session.version}</p>
       </div>
       <Tooltip text={theme.dark ? '切换到浅色' : '切换到深色'}>
@@ -117,7 +119,7 @@
           {:catch}
             <div class="flex flex-col items-center gap-3 px-6 py-24 text-center">
               <p class="text-sm font-medium">页面加载失败</p>
-              <p class="max-w-sm text-[0.8125rem] text-fg-muted">可能是网络中断，或面板刚刚升级。重试无效时请刷新页面。</p>
+              <p class="max-w-sm text-[0.8667rem] text-fg-muted">可能是网络中断，或面板刚刚升级。重试无效时请刷新页面。</p>
               <div class="flex gap-2">
                 <Button onclick={() => (failed = String(Date.now()))}>重试</Button>
                 <Button variant="primary" onclick={() => location.reload()}>刷新页面</Button>

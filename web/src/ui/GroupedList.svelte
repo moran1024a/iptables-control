@@ -81,7 +81,7 @@
               class="flex h-full min-w-0 flex-1 items-center gap-2 pl-3 text-left disabled:cursor-default"
             >
               <ChevronDown class="size-4 shrink-0 text-fg-subtle transition-transform {open ? '' : '-rotate-90'}" />
-              <span class="truncate text-[0.8125rem] font-semibold">{group.name}</span>
+              <span class="truncate text-[0.8667rem] font-semibold">{group.name}</span>
               <span class="shrink-0 text-xs text-fg-muted">{members.length} 个{#if summary}{@render summary(members)}{/if}</span>
             </button>
             {#if editable}
@@ -116,7 +116,7 @@
             {#if members.length}
               <div class="divide-y">{#each members as item (item.id)}{@render row(item)}{/each}</div>
             {:else}
-              <p class="px-4 py-5 text-center text-[0.8125rem] text-fg-subtle">空分组</p>
+              <p class="px-4 py-5 text-center text-[0.8667rem] text-fg-subtle">空分组</p>
             {/if}
           {/if}
         </section>

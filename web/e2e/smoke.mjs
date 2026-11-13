@@ -81,6 +81,11 @@ try {
   await page.getByRole('alert').waitFor();
   await page.getByLabel('密码').fill('ictl-demo-pass');
   await page.getByRole('button', { name: '登录' }).click();
+  await heading('总览').waitFor();
+
+  step = 'overview';
+  await page.getByRole('heading', { name: '需要处理' }).waitFor();
+  await page.getByRole('main').locator('a[href="#/nodes"]').first().click();
   await heading('节点').waitFor();
 
   step = 'nodes';
@@ -156,7 +161,7 @@ try {
 
   step = 'unknown route';
   await go('#/does-not-exist');
-  await heading('节点').waitFor();
+  await heading('总览').waitFor();
 
   step = 'mobile layout';
   await page.setViewportSize({ width: 390, height: 800 });

@@ -163,7 +163,7 @@
 
   <fieldset class="flex min-w-0 flex-col gap-2">
     <div class="flex items-baseline justify-between gap-2">
-      <legend class="float-left text-[0.8125rem] font-medium">其他接入地址</legend>
+      <legend class="float-left text-[0.8667rem] font-medium">其他接入地址</legend>
       <span class="text-xs text-fg-subtle">{draft.addresses.length} / {MAX_ADDRESSES}</span>
     </div>
     <p class="text-xs leading-relaxed text-fg-muted">同一目标的备用 IP 或端口，在链路画布的连线上可以选择具体走哪一个。</p>

@@ -4,7 +4,7 @@
 
 **当前版本：0.6.2**。支持可视化拓扑、多入口与多目标、主副 IP、权重灾备、订阅和 7 天网络质量图。主动节点使用 Go + nftables，被动节点使用 Bash + iptables。
 
-**测试版：0.6.3-rc.2** 已发布，面板全新重做，并包含一批稳定性修复，各组件版本统一；安装与升级说明见 [Releases](https://github.com/moran1024a/iptables-control/releases) 和[更新记录](CHANGELOG.md)。下文命令仍使用正式版 0.6.2。
+**测试版：0.6.3-rc.3** 已发布，面板全新重做并新增总览页，并包含一批稳定性修复，各组件版本统一；安装与升级说明见 [Releases](https://github.com/moran1024a/iptables-control/releases) 和[更新记录](CHANGELOG.md)。下文命令仍使用正式版 0.6.2。
 
 [下载版本](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 

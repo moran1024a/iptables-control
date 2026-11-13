@@ -80,7 +80,7 @@
 <section class="flex flex-col gap-3.5 rounded-lg border bg-surface p-4 shadow-sm">
   <div class="flex flex-col gap-1.5">
     <h2 class="text-[0.9375rem] font-semibold">{summary.title}</h2>
-    {#if summary.text}<p class="text-[0.8125rem] leading-relaxed text-fg-muted">{summary.text}</p>{/if}
+    {#if summary.text}<p class="text-[0.8667rem] leading-relaxed text-fg-muted">{summary.text}</p>{/if}
     {#if summary.command}<CommandBlock text={summary.command} prompt class="mt-1 max-w-md" />{/if}
     {#if node.status === 'deleting'}
       <div class="mt-1"><Button variant="danger-ghost" size="sm" class="border border-danger/30" disabled={busy} onclick={onforce}>强制删除</Button></div>

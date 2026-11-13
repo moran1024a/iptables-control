@@ -58,7 +58,7 @@
 <section class="rounded-lg border bg-surface shadow-sm" aria-label="{section.kind} {section.label}">
   <header class="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 border-b px-4 py-2.5">
     <Badge tone={section.kind === '全段' ? 'accent' : 'idle'}>{only ? '全段 · 仅一段' : section.kind}</Badge>
-    <h2 class="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[0.8125rem] font-semibold">
+    <h2 class="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[0.8667rem] font-semibold">
       {#each section.labels as label, index (index)}
         {#if index}<span class="font-normal text-fg-subtle" aria-hidden="true">→</span>{/if}
         <span class="inline-flex min-w-0 items-center gap-1.5">
@@ -76,7 +76,7 @@
     {#if blocked}
       <div class="flex items-start gap-3 rounded-lg bg-surface-2 px-4 py-3.5">
         <div class="flex size-9 shrink-0 items-center justify-center rounded-lg bg-surface-3 text-fg-muted"><Hourglass class="size-4" /></div>
-        <div class="min-w-0 text-[0.8125rem] leading-relaxed">
+        <div class="min-w-0 text-[0.8667rem] leading-relaxed">
           <p class="font-medium">{blocked.label}</p>
           <p class="text-fg-muted">{blocked.text} {@render action(blocked)}</p>
         </div>
@@ -87,7 +87,7 @@
           {@const summary = series.summary}
           <div class="flex min-w-0 flex-col rounded-lg border px-3.5 py-3 {info.applicable ? '' : 'bg-surface-2'}">
             <div class="flex items-center justify-between gap-2">
-              <span class="inline-flex items-center gap-2 text-[0.8125rem] font-semibold">
+              <span class="inline-flex items-center gap-2 text-[0.8667rem] font-semibold">
                 <span class="h-[3px] w-3.5 rounded-full {PROTOCOLS[series.protocol].swatch}"></span>{PROTOCOLS[series.protocol].name}
               </span>
               <span class="flex min-w-0 items-center gap-2">
@@ -101,12 +101,12 @@
                 <span class="text-xs text-fg-muted">最新延迟</span>
               </p>
               <dl class="mt-2 grid grid-cols-4 gap-x-3 text-xs">
-                <div><dt class="text-fg-muted">5 分钟平均</dt><dd class="tabular mt-0.5 text-[0.8125rem] font-medium">{ms(summary.mean)}</dd></div>
-                <div><dt class="text-fg-muted">P95</dt><dd class="tabular mt-0.5 text-[0.8125rem] font-medium">{ms(summary.p95)}</dd></div>
-                <div><dt class="text-fg-muted">波动</dt><dd class="tabular mt-0.5 text-[0.8125rem] font-medium">{ms(summary.jitter)}</dd></div>
+                <div><dt class="text-fg-muted">5 分钟平均</dt><dd class="tabular mt-0.5 text-[0.8667rem] font-medium">{ms(summary.mean)}</dd></div>
+                <div><dt class="text-fg-muted">P95</dt><dd class="tabular mt-0.5 text-[0.8667rem] font-medium">{ms(summary.p95)}</dd></div>
+                <div><dt class="text-fg-muted">波动</dt><dd class="tabular mt-0.5 text-[0.8667rem] font-medium">{ms(summary.jitter)}</dd></div>
                 <div>
                   <dt class="text-fg-muted">超时率</dt>
-                  <dd class="tabular mt-0.5 text-[0.8125rem] font-medium {(summary.loss ?? 0) > 0 ? 'text-warn-text' : ''}" title={summary.samples ? `${summary.lost} / ${summary.samples} 个样本` : undefined}>
+                  <dd class="tabular mt-0.5 text-[0.8667rem] font-medium {(summary.loss ?? 0) > 0 ? 'text-warn-text' : ''}" title={summary.samples ? `${summary.lost} / ${summary.samples} 个样本` : undefined}>
                     {pct(summary.loss)}
                   </dd>
                 </div>
@@ -157,7 +157,7 @@
         {#if visible.length}
           <LatencyChart series={visible} {now} {range} {focus} label={section.label} />
         {:else}
-          <p class="rounded-lg bg-surface-2 px-4 py-10 text-center text-[0.8125rem] text-fg-muted">所有曲线都已隐藏，点击上方的协议名称重新显示。</p>
+          <p class="rounded-lg bg-surface-2 px-4 py-10 text-center text-[0.8667rem] text-fg-muted">所有曲线都已隐藏，点击上方的协议名称重新显示。</p>
         {/if}
       </div>
     {/if}

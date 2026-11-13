@@ -9,6 +9,6 @@
     <div class="mb-1 flex size-11 items-center justify-center rounded-xl bg-surface-3 text-fg-muted"><Icon class="size-5" /></div>
   {/if}
   <p class="text-sm font-medium">{title}</p>
-  {#if text}<p class="max-w-sm text-[0.8125rem] leading-relaxed text-fg-muted">{text}</p>{/if}
+  {#if text}<p class="max-w-sm text-[0.8667rem] leading-relaxed text-fg-muted">{text}</p>{/if}
   {#if children}<div class="mt-2 flex flex-wrap justify-center gap-2">{@render children()}</div>{/if}
 </div>

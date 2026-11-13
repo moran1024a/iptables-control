@@ -112,7 +112,17 @@ def seed(fx):
     call("api_external_save", dict(uri=TROJAN))
     configs = [c["id"] for c in call("api_configs")["configs"] if c.get("source") == "topology"]
     call("api_subscription_save", dict(name="手机客户端", configuration_ids=configs[:2]))
+    # Forwarded traffic: the rules now on each node, plus counters left behind by rules that no longer exist.
     with db:
+        for rule in db.execute("SELECT id,node_id FROM rules").fetchall():
+            for k, protocol in enumerate(("tcp", "udp")):
+                db.execute("INSERT OR REPLACE INTO traffic_epochs VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           (rule["node_id"], rule["id"], protocol, "demo", str(5_300_000_000 // (k * 40 + 1) + rule["id"] * 977),
+                            str(41_000_000_000 // (k * 40 + 1)), "4100000", "29000000", now, "ok"))
+        for old in range(9001, 9008):
+            db.execute("INSERT OR REPLACE INTO traffic_epochs VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       (n_hk, old, "tcp", "demo", str(old * 1_300_000), str(old * 9_100_000), "1200", "8800", now - 86400,
+                        "ok" if old % 3 else "计数器曾重置，可能少计"))
         database.set_setting(db, "admin_user", "admin")
     return online[:3], n_kr, main
 

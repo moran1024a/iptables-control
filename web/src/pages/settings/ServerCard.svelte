@@ -78,7 +78,7 @@
           <div class="w-24 shrink-0">
             <Input {id} {invalid} bind:value={seconds} class="tabular" inputmode="numeric" maxlength={5} autocomplete="off" aria-describedby="{id}-unit" />
           </div>
-          <span id="{id}-unit" class="text-[0.8125rem] whitespace-nowrap text-fg-muted">
+          <span id="{id}-unit" class="text-[0.8667rem] whitespace-nowrap text-fg-muted">
             秒{#if parsedSeconds !== null && parsedSeconds >= 60 && parsedSeconds <= OFFLINE_MAX}<span class="text-fg-subtle">（{duration(parsedSeconds)}）</span>{/if}
           </span>
         </div>

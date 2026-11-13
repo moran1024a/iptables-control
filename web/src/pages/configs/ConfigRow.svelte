@@ -121,7 +121,7 @@
         {#if !plain}
           <span class="shrink-0 rounded-sm border bg-surface px-1 text-2xs leading-4 font-medium text-fg-muted">{protocolName(connection.protocol)}</span>
         {/if}
-        <code class="min-w-0 flex-1 truncate text-[0.8125rem] font-medium text-fg">{address}</code>
+        <code class="min-w-0 flex-1 truncate text-[0.8667rem] font-medium text-fg">{address}</code>
         <span class="flex shrink-0 items-center gap-1 text-xs font-medium {copied ? 'text-ok-text' : 'text-accent-text'}">
           {#if copied}<Check class="size-3.5" />已复制{:else}<Copy class="size-3.5" />{plain ? '复制地址' : '复制链接'}{/if}
         </span>

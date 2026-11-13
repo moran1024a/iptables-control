@@ -15,7 +15,7 @@
   {:else if session.status === 'offline'}
     <div class="flex h-dvh flex-col items-center justify-center gap-3 px-6 text-center">
       <p class="text-sm font-medium">无法连接服务端</p>
-      <p class="max-w-sm text-[0.8125rem] text-fg-muted">{session.error}</p>
+      <p class="max-w-sm text-[0.8667rem] text-fg-muted">{session.error}</p>
       <Button onclick={() => session.load()}>重试</Button>
     </div>
   {:else if session.status === 'ready'}

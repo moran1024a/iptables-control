@@ -98,7 +98,7 @@
     <header class="flex shrink-0 items-start justify-between gap-4 border-b px-5 py-3.5">
       <div class="min-w-0">
         <h2 id="{id}-title" class="truncate text-[0.9375rem] font-semibold">{title}</h2>
-        {#if description}<p id="{id}-desc" class="mt-0.5 text-[0.8125rem] text-fg-muted">{description}</p>{/if}
+        {#if description}<p id="{id}-desc" class="mt-0.5 text-[0.8667rem] text-fg-muted">{description}</p>{/if}
       </div>
       <button
         type="button"

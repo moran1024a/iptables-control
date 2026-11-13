@@ -65,7 +65,7 @@
     {/if}
     <div class="flex flex-col gap-3.5">
       {#if changing}
-        <p class="text-[0.8125rem] leading-relaxed text-fg-muted">默认账号仅用于首次登录。设置新的用户名和密码后才能使用面板。</p>
+        <p class="text-[0.8667rem] leading-relaxed text-fg-muted">默认账号仅用于首次登录。设置新的用户名和密码后才能使用面板。</p>
         {#if !carried}
           <Field label="当前密码" error={field === 'current_password' ? error : null}>
             {#snippet children({ id, invalid })}
@@ -101,7 +101,7 @@
         </Field>
       {/if}
       {#if error && !['username', 'password', 'repeat', 'current_password'].includes(field ?? '')}
-        <p class="text-[0.8125rem] text-danger-text" role="alert">{error}</p>
+        <p class="text-[0.8667rem] text-danger-text" role="alert">{error}</p>
       {/if}
       <Button type="submit" variant="primary" loading={busy} class="mt-1 w-full">{changing ? '保存并进入面板' : '登录'}</Button>
       {#if changing}

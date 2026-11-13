@@ -63,7 +63,7 @@
 </script>
 
 {#if !catalog.length}
-  <p class="rounded-md border border-dashed px-3 py-4 text-center text-[0.8125rem] text-fg-muted">
+  <p class="rounded-md border border-dashed px-3 py-4 text-center text-[0.8667rem] text-fg-muted">
     暂无配置，请先<a class="font-medium text-accent-text hover:underline" href={href('routes')}>创建链路</a>或<a
       class="font-medium text-accent-text hover:underline"
       href={href('configs')}>导入配置</a
@@ -78,7 +78,7 @@
       <div class="min-w-0 flex-1" onkeydown={(event) => event.key === 'Enter' && event.preventDefault()}>
         <SearchInput bind:value={q} placeholder="搜索名称或编号" label="搜索配置" class="w-full" />
       </div>
-      <label class="flex shrink-0 items-center gap-1.5 text-[0.8125rem] {overall.usable ? 'cursor-pointer' : 'opacity-60'}">
+      <label class="flex shrink-0 items-center gap-1.5 text-[0.8667rem] {overall.usable ? 'cursor-pointer' : 'opacity-60'}">
         <input
           type="checkbox"
           class={box}
@@ -143,7 +143,7 @@
         {/if}
       {/each}
       {#if !shown.length}
-        <p class="px-3 py-5 text-center text-[0.8125rem] text-fg-subtle">没有匹配的配置</p>
+        <p class="px-3 py-5 text-center text-[0.8667rem] text-fg-subtle">没有匹配的配置</p>
       {/if}
     </div>
     <p class="text-xs leading-relaxed text-fg-muted">

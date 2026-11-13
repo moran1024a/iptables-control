@@ -19,7 +19,7 @@
   {#if label || aside}
     <div class="flex items-baseline justify-between gap-2">
       {#if label}
-        <label for={id} class="text-[0.8125rem] font-medium text-fg">
+        <label for={id} class="text-[0.8667rem] font-medium text-fg">
           {label}{#if optional}<span class="ml-1 font-normal text-fg-subtle">可选</span>{/if}
         </label>
       {/if}

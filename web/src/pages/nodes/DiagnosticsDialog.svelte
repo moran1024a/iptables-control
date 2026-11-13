@@ -84,7 +84,7 @@
       {/if}
     </div>
     {#if busy}
-      <p class="text-[0.8125rem] text-fg-muted" role="status">正在等待节点返回结果，最长约 {kind === 'diagnose' ? 32 : 12} 秒…</p>
+      <p class="text-[0.8667rem] text-fg-muted" role="status">正在等待节点返回结果，最长约 {kind === 'diagnose' ? 32 : 12} 秒…</p>
     {/if}
     {#if error}<Alert tone="danger">{error}</Alert>{/if}
     {#if warning}<Alert tone="warn" title="节点返回错误">{warning}</Alert>{/if}

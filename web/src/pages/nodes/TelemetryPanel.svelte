@@ -1,4 +1,10 @@
+<script lang="ts" module>
+  // Nodes whose retired-rule traffic rows are expanded; kept for this tab so a refresh does not fold them again.
+  const expanded = new Set<number>();
+</script>
+
 <script lang="ts">
+  import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import Stethoscope from '@lucide/svelte/icons/stethoscope';
   import { bytes, clock, dateTime, percent, rate } from '$lib/format';
   import type { NodeDetail } from '$lib/types';
@@ -33,6 +39,28 @@
   const interfaces = $derived(Object.entries(metrics.interfaces ?? {}));
   const ports = $derived(t.ports?.rows ?? []);
   const key = $derived(String(node.id));
+
+  // Traffic of rules still on the node, by name; rows of rules that no longer exist are folded away by default.
+  const currentTraffic = $derived(
+    (t.traffic ?? []).filter((row) => ruleName.has(row.rule_id)).sort((a, b) => ruleName.get(a.rule_id)!.localeCompare(ruleName.get(b.rule_id)!, 'zh') || a.rule_id - b.rule_id || a.protocol.localeCompare(b.protocol)),
+  );
+  const oldTraffic = $derived((t.traffic ?? []).filter((row) => !ruleName.has(row.rule_id)));
+  const total = (rows: typeof oldTraffic, field: 'up' | 'down') => {
+    try {
+      return rows.reduce((sum, row) => sum + BigInt(row[field] || 0), 0n);
+    } catch {
+      return null;
+    }
+  };
+  let showOld = $state(false);
+  $effect(() => {
+    showOld = expanded.has(node.id);
+  });
+  function toggleOld() {
+    showOld = !showOld;
+    if (showOld) expanded.add(node.id);
+    else expanded.delete(node.id);
+  }
 </script>
 
 <Card title="系统与流量" hint="主动 Agent 采集 · 最近采样 {dateTime(t.metrics_at)}">
@@ -92,7 +120,7 @@
     </p>
 
     <div>
-      <h3 class="text-[0.8125rem] font-semibold">转发累计流量</h3>
+      <h3 class="text-[0.8667rem] font-semibold">转发累计流量</h3>
       <p class="mt-0.5 mb-2 text-xs leading-relaxed text-fg-muted">
         按本节点每条规则的 IPv4 转发字节计数，包含协议头及重传；多跳分别计数。上行为入口到目标，下行为目标返回。主机网卡流量见「网卡与端口」。
       </p>
@@ -100,17 +128,38 @@
         <table class="data-table">
           <thead><tr><th>规则</th><th>协议</th><th class="num">上行</th><th class="num">下行</th><th>计数状态</th></tr></thead>
           <tbody>
-            {#each t.traffic ?? [] as row (`${row.rule_id}-${row.protocol}`)}
+            {#snippet line(row: (typeof oldTraffic)[number], name: string)}
               <tr>
-                <td>{ruleName.get(row.rule_id) ?? `历史规则 ${row.rule_id}`}</td>
+                <td>{name}</td>
                 <td class="uppercase">{row.protocol}</td>
                 <td class="num" title="{row.up} 字节">{bytes(row.up)}</td>
                 <td class="num" title="{row.down} 字节">{bytes(row.down)}</td>
                 <td class={row.quality === 'ok' ? 'text-fg-muted' : 'text-warn-text'}>{row.quality === 'ok' ? '正常' : row.quality}</td>
               </tr>
+            {/snippet}
+            {#each currentTraffic as row (`${row.rule_id}-${row.protocol}`)}
+              {@render line(row, ruleName.get(row.rule_id)!)}
             {:else}
-              <tr><td colspan="5" class="text-center text-fg-muted">等待采集</td></tr>
+              <tr><td colspan="5" class="text-center text-fg-muted">{oldTraffic.length ? '当前没有规则' : '等待采集'}</td></tr>
             {/each}
+            {#if oldTraffic.length}
+              {@const up = total(oldTraffic, 'up')}
+              {@const down = total(oldTraffic, 'down')}
+              <tr>
+                <td colspan="5" class="!p-0">
+                  <button type="button" aria-expanded={showOld} onclick={toggleOld} class="flex w-full items-center gap-1.5 px-4 py-2 text-left text-xs text-fg-muted hover:bg-surface-2 hover:text-fg">
+                    <ChevronDown class="size-3.5 shrink-0 transition-transform {showOld ? '' : '-rotate-90'}" />
+                    <span class="font-medium">历史规则</span>
+                    <span class="tabular">{oldTraffic.length} 条{#if up !== null && down !== null}{" · "}合计上行 {bytes(up)} / 下行 {bytes(down)}{/if}</span>
+                  </button>
+                </td>
+              </tr>
+              {#if showOld}
+                {#each oldTraffic as row (`${row.rule_id}-${row.protocol}`)}
+                  {@render line(row, `历史规则 ${row.rule_id}`)}
+                {/each}
+              {/if}
+            {/if}
           </tbody>
         </table>
       </div>

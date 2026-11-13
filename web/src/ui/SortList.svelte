@@ -126,7 +126,7 @@
 {/snippet}
 
 <div class="sticky top-12 z-20 -mx-1 flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-accent-soft px-3 py-2 lg:top-2" inert={saving}>
-  <p class="text-[0.8125rem] text-accent-text">
+  <p class="text-[0.8667rem] text-accent-text">
     {grouped
       ? '拖动手柄调整分组和组内顺序，完成后保存。更换分组请在编辑中选择。'
       : '拖动左侧手柄调整顺序，完成后保存。'}
@@ -152,7 +152,7 @@
             (event) => startDrag(event, 'g' + section.group.id, '[data-sort-group]', moveGroup),
             (event) => keyMove(event, sectionIndex, moveGroup),
           )}
-          <span class="truncate text-[0.8125rem] font-semibold">{section.group.name}</span>
+          <span class="truncate text-[0.8667rem] font-semibold">{section.group.name}</span>
           <span class="ml-2 text-xs text-fg-muted">{section.items.length} 个</span>
         </header>
       {/if}
@@ -172,7 +172,7 @@
             <div class="flex min-w-0 flex-1 items-center gap-2 py-1.5 pr-3">{@render row(item)}</div>
           </div>
         {:else}
-          <p class="px-4 py-4 text-center text-[0.8125rem] text-fg-subtle">空分组</p>
+          <p class="px-4 py-4 text-center text-[0.8667rem] text-fg-subtle">空分组</p>
         {/each}
       </div>
     </section>

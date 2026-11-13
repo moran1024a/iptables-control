@@ -64,6 +64,6 @@ it('routes a 40-vertex, 80-edge graph quickly and without crossing cards', () =>
   const t1 = performance.now();
   const overlay = routeSpans(g, spans, boxes, cat);
   const spent = performance.now() - t1;
-  expect(elapsed).toBeLessThan(250);
-  expect(spent).toBeLessThan(100);
+  expect(elapsed).toBeLessThan(60);
+  expect(spent).toBeLessThan(60);
 });

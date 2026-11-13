@@ -339,7 +339,7 @@
         <span class="tabular flex size-5 shrink-0 items-center justify-center rounded-full text-2xs font-bold text-white" style:background={styles.get(choice.entry)?.color}>
           {styles.get(choice.entry)?.ordinal}
         </span>
-        <p class="min-w-0 text-[0.8125rem]">
+        <p class="min-w-0 text-[0.8667rem]">
           <strong class="font-semibold">{choice.prefix.map(nameOf).join(' → ')}</strong>
           <span class="text-fg-muted"> · 点击下一跳{choice.options.length ? '' : '，或用自动补全完成'}</span>
         </p>
@@ -354,7 +354,7 @@
         {#each legend as item (item.id)}
           <button
             type="button"
-            class="inline-flex h-7 max-w-56 items-center gap-1.5 rounded-full border bg-surface pr-2.5 pl-1 text-[0.8125rem] font-medium hover:bg-surface-2 disabled:opacity-60"
+            class="inline-flex h-7 max-w-56 items-center gap-1.5 rounded-full border bg-surface pr-2.5 pl-1 text-[0.8667rem] font-medium hover:bg-surface-2 disabled:opacity-60"
             title="从 {item.name} 选择线路"
             disabled={locked}
             onclick={() => startChoice(item.id)}

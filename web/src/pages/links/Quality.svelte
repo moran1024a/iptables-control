@@ -131,7 +131,7 @@
         {#snippet actions()}<Button size="sm" onclick={() => poll.refresh()}><RefreshCw class="size-3.5" />重试</Button>{/snippet}
       </Alert>
     {:else}
-      <div class="flex items-center justify-center gap-2 py-20 text-[0.8125rem] text-fg-muted"><Spinner />正在加载…</div>
+      <div class="flex items-center justify-center gap-2 py-20 text-[0.8667rem] text-fg-muted"><Spinner />正在加载…</div>
     {/if}
   {:else}
     {#if poll.error}
