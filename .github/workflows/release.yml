@@ -39,16 +39,31 @@ jobs:
           go-version-file: agent/active/go.mod
           cache-dependency-path: agent/active/go.sum
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建并检查面板
+        working-directory: web
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run build
+          node dev/size-check.mjs ../server/web
+          mkdir -p "$RUNNER_TEMP/web-assets/out"
+          cp -r ../server/web/. "$RUNNER_TEMP/web-assets/out/"
+
       - name: 验证与打包
         run: |
           python3 -m pip install -r server/requirements.txt
           python3 -m unittest discover -s tests
-          node --check server/web/app.js
-          node --check server/web/routes.js
-          node --check server/web/topology.js
-          node --check server/web/topology_paths.js
-          node --check server/web/subscriptions.js
           for file in agent/*.sh deploy/*.sh ipt.sh; do bash -n "$file"; done
+          # 用真实服务端和浏览器走一遍面板的主要流程。
+          if command -v google-chrome >/dev/null; then (cd web && npm run e2e)
+          else (cd web && npx playwright-core install --with-deps chromium && ICTL_BROWSER_CHANNEL=bundled npm run e2e); fi
           mkdir -p dist
           (cd agent/active && go test ./...)
           (cd agent/wake && go test ./...)
@@ -87,7 +102,9 @@ jobs:
         with:
           context: .
           # 复用已打包和验证的二进制，覆盖 Dockerfile 中同名的编译阶段。
-          build-contexts: agent-build=${{ runner.temp }}/agent-assets
+          build-contexts: |
+            agent-build=${{ runner.temp }}/agent-assets
+            web-build=${{ runner.temp }}/web-assets
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.version.outputs.tags }}

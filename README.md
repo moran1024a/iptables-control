@@ -4,7 +4,7 @@
 
 **当前版本：0.6.2**。支持可视化拓扑、多入口与多目标、主副 IP、权重灾备、订阅和 7 天网络质量图。主动节点使用 Go + nftables，被动节点使用 Bash + iptables。
 
-**测试版：0.6.3-rc.1** 已发布，包含一批稳定性修复，各组件版本统一；安装与升级说明见 [Releases](https://github.com/moran1024a/iptables-control/releases) 和[更新记录](CHANGELOG.md)。下文命令仍使用正式版 0.6.2。
+**测试版：0.6.3-rc.2** 已发布，面板全新重做，并包含一批稳定性修复，各组件版本统一；安装与升级说明见 [Releases](https://github.com/moran1024a/iptables-control/releases) 和[更新记录](CHANGELOG.md)。下文命令仍使用正式版 0.6.2。
 
 [下载版本](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -187,6 +187,15 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 
 ## 开发与许可证
 
-服务端使用 Python 3.10+，依赖见 [requirements.txt](server/requirements.txt)；Go 版本以 [go.mod](agent/active/go.mod) 为准。测试位于 [tests](tests/)，构建与发布见 [release.yml](.github/workflows/release.yml)。欢迎提交 Issue 或 PR，请隐去密钥、密码和订阅链接。
+服务端使用 Python 3.10+，依赖见 [requirements.txt](server/requirements.txt)；Go 版本以 [go.mod](agent/active/go.mod) 为准。测试位于 [tests](tests/)，构建与发布见 [release.yml](.github/workflows/release.yml)。
+
+面板源码在 [web](web/)（Svelte + TypeScript + Vite），构建产物输出到 `server/web/`，不入库。从源码运行服务端前先构建面板：
+
+```bash
+cd web && npm ci && npm run build      # 构建面板
+npm run check && npm test              # 类型检查与单元测试
+npm run e2e                            # 用演示数据和本机 Chrome 走一遍主要流程
+python3 dev/demo_server.py             # 带样例数据和模拟节点的演示服务端，仅用于开发
+```欢迎提交 Issue 或 PR，请隐去密钥、密码和订阅链接。
 
 服务端、主动 Agent 和管理器为 **0.6.2**，被动 Agent 为 **0.6.0**；独立组件版本见 [components.json](server/components.json)。项目采用 [MIT 许可证](LICENSE)。

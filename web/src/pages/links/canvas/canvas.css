@@ -1,0 +1,32 @@
+/* Wire styles shared by the view canvas and the editor. Colours come from the theme tokens. */
+.wire {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.wire-halo {
+  fill: none;
+  stroke: var(--surface-2);
+  stroke-linecap: round;
+}
+.wire-flow {
+  fill: none;
+  stroke: var(--surface);
+  stroke-opacity: 0.85;
+  stroke-linecap: round;
+  stroke-dasharray: 3 25;
+  animation: wire-flow 1.4s linear infinite;
+}
+@keyframes wire-flow {
+  from {
+    stroke-dashoffset: 28;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wire-flow {
+    display: none;
+  }
+}

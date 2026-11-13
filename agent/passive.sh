@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.6.3-rc.1"
+VERSION="0.6.3-rc.2"
 BIN="/usr/local/lib/ictl/passive.sh"
 CONF_DIR="/etc/ictl"
 CONF="$CONF_DIR/agent.conf"

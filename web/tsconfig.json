@@ -1,0 +1,17 @@
+{
+  "extends": "@tsconfig/svelte/tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["svelte", "vite/client", "node"],
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "allowJs": false,
+    "isolatedModules": true,
+    "paths": { "$lib/*": ["./src/lib/*"], "$ui/*": ["./src/ui/*"] }
+  },
+  "include": ["src/**/*.ts", "src/**/*.svelte", "vite.config.ts"]
+}

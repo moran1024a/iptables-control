@@ -3,6 +3,10 @@
 !server/**
 !agent/
 !agent/**
+!web/
+!web/**
+web/node_modules/
+server/web/
 **/__pycache__/
 **/*.pyc
 **/*.test

@@ -9,6 +9,7 @@ import errors
 import migrations
 import security
 import settings
+import static_files
 
 
 def print_info(conn, listen=None):
@@ -25,9 +26,8 @@ def print_info(conn, listen=None):
 def cmd_serve(args):
     if not shutil.which("openssl"):
         raise errors.UserError("缺少依赖：openssl")
-    missing = [f for f in settings.STATIC if not os.path.isfile(os.path.join(settings.WEB_DIR, f))]
-    if missing:
-        raise errors.UserError(f"缺少面板文件：{', '.join(missing)}（应位于 {settings.WEB_DIR}）")
+    if "index.html" not in static_files.files():
+        raise errors.UserError(f"缺少面板文件（应位于 {settings.WEB_DIR}）；从源码运行请先在 web/ 目录执行 npm ci && npm run build")
     if sqlite3.sqlite_version_info < (3, 35, 0):
         raise errors.UserError("需要 SQLite 3.35 或以上版本")
     conn = migrations.init_db()

@@ -3,7 +3,7 @@
 import json
 import os
 
-VERSION = "0.6.3-rc.1"
+VERSION = "0.6.3-rc.2"
 DATABASE_VERSION = 603
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
@@ -28,15 +28,6 @@ LOGIN_LOCK = 300
 DEFAULT_USER = "admin"
 DEFAULT_PASS = "admin_pass"
 NOT_FOUND = "404 page not found\n"
-STATIC = {
-    "index.html": "text/html; charset=utf-8",
-    "app.js": "text/javascript; charset=utf-8",
-    "topology.js": "text/javascript; charset=utf-8",
-    "topology_paths.js": "text/javascript; charset=utf-8",
-    "routes.js": "text/javascript; charset=utf-8",
-    "subscriptions.js": "text/javascript; charset=utf-8",
-    "style.css": "text/css; charset=utf-8",
-}
 HEALTH = {"ok": "正常", "error": "故障", "skew": "时间不一致"}
 KINDS = ("nodes", "targets", "topologies", "external_configurations")
 DEFAULT_GROUP = "默认分组"

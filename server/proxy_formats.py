@@ -21,7 +21,11 @@ def canonical(value):
 
 
 def decode64(value):
-    return base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+    try:
+        return base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+    except ValueError:
+        # binascii's English message is not something to show in the panel.
+        raise ValueError("分享链接中的 Base64 内容无效") from None
 
 
 def clean(value):

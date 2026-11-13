@@ -11,6 +11,13 @@ RUN cd /wake && for arch in amd64 arm64; do \
     CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags='-s -w' -o /out/ictl-wake-linux-$arch .; \
     done
 
+FROM --platform=$BUILDPLATFORM node:24-alpine AS web-build
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN ICTL_WEB_OUT=/out npm run build
+
 FROM python:3.12-alpine
 
 LABEL org.opencontainers.image.source="https://github.com/moran1024a/iptables-control"
@@ -22,7 +29,7 @@ WORKDIR /app
 COPY server/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server/*.py server/components.json server/schema.sql ./
-COPY server/web ./web
+COPY --from=web-build /out/ ./web/
 COPY agent/passive.sh agent/manage.sh agent/control.sh agent/wake.sh ./agent/
 COPY --from=agent-build /out/ ./assets/
 

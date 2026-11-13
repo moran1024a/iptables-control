@@ -12,6 +12,7 @@ import errors
 import passive_sync
 import resources
 import settings
+import static_files
 import subscriptions
 
 
@@ -108,11 +109,11 @@ class Request:
         return source_address(self.client_address[0], self.headers.get("X-Forwarded-For"))
 
     def static(self, name):
-        if name not in settings.STATIC:
+        found = static_files.response(name, self.headers.get("Accept-Encoding", ""))
+        if found is None:
             return self.not_found()
-        with open(os.path.join(settings.WEB_DIR, name), "rb") as f:
-            data = f.read()
-        self.reply(200, data, settings.STATIC[name], [("Cache-Control", "no-cache")])
+        data, ctype, headers = found
+        self.reply(200, data, ctype, headers)
 
     def api(self, method, route, query):
         conn = database.db()
