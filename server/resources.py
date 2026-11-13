@@ -299,15 +299,21 @@ class Resources:
     def api_node_del(self, conn, body, node_id):
         n = database.get_node(conn, node_id)
         table = database.node_table(n["kind"])
-        used = topology.references(conn, node_id)
+        force = self.query.get("force") == ["1"]
+        if force:
+            # A node lost for good can never confirm its cleanup. Abandon that
+            # work; links that still use the node keep blocking the delete.
+            execution.forget_node(conn, node_id)
+        used = topology.references(conn, node_id, live_only=force)
+        # field="force" tells the panel that only pending cleanup blocks the delete.
+        forceable = None if force or topology.references(conn, node_id, live_only=True) else "force"
         if used:
-            raise errors.UserError("节点仍被引用：" + "、".join(used), status=409)
+            raise errors.UserError("节点仍被引用：" + "、".join(used), forceable, status=409)
         if conn.execute(
             "SELECT 1 FROM rules WHERE node_id=? UNION SELECT 1 FROM retirements WHERE node_id=?",
             (node_id, node_id),
         ).fetchone():
-            raise errors.UserError("节点仍有待清理的转发，请完成同步后删除", status=409)
-        force = self.query.get("force") == ["1"]
+            raise errors.UserError("节点仍有待清理的转发，请完成同步后删除", forceable, status=409)
         if force or not n["first_seen"]:
             lifecycle.delete_node(conn, node_id)
             return {"deleted": True}
@@ -425,7 +431,7 @@ class Resources:
                 parsed["port"],
                 target_config.canonical(parsed["params"]),
             )
-            fallback = old["name"] if old else parsed["name"]
+            fallback = old["name"] if old else parsed["name"][:64]
         elif old and old["type"] != "endpoint":
             if any((k in body for k in ("host", "port", "type", "params"))):
                 raise errors.UserError("SS／VLESS 的连接参数请通过分享链接修改", "uri")

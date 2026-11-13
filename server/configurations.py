@@ -87,6 +87,8 @@ def preview(c, body):
         for x in (prefix, required)
     ):
         topology.fail("无效路径选择")
+    if body.get("id") is not None and (type(body["id"]) is not int or not 0 < body["id"] < 2**63):
+        topology.fail("无效的拓扑 ID")
     existing = members(c, body["id"]) if body.get("id") else []
     entry = body.get("entry") or (prefix[0] if prefix else None)
     selected = plans(c, graph, existing, prefix, required, entry)
@@ -169,7 +171,7 @@ def warnings(graph):
 
 
 def save_topology(c, body, ident=None):
-    old = get_topology(c, ident) if ident else None
+    old = get_topology(c, ident) if ident is not None else None
     if old and old["deleted"]:
         raise errors.UserError("拓扑正在删除", status=409)
     if old and body.get("revision") != old["revision"]:

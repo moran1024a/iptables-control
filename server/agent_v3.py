@@ -188,7 +188,8 @@ def save_snapshot(conn, nid, kind, data):
             raise errors.UserError("无效的网卡采集信息")
         values = [data[k] for k in ("cpu_percent", "agent_rss") if k in data]
         values += list(data.get("memory", {}).values())
-        if any(type(value) not in (int, float) or value < 0 for value in values):
+        # The upper bound also rejects inf/nan, which would poison stored aggregates.
+        if any(type(value) not in (int, float) or not 0 <= value <= 1e15 for value in values):
             raise errors.UserError("无效的 CPU 或内存数值")
     now = int(time.time())
     conn.execute("INSERT OR IGNORE INTO node_snapshots(node_id) VALUES (?)", (nid,))
@@ -436,7 +437,8 @@ def manage(conn, node, data):
                 data.get("error", "本机交接失败，已尝试恢复原配置") if action == "failed" else ""
             ),
             "held_ports": json.loads(data.get("held_ports", "[]")),
-            "version": data.get("agent", ""),
+            # A failed handover restored the old program; keep its recorded version.
+            "version": data.get("agent", "") if action == "commit" else node["agent"] or "",
         },
         "manual",
     ).get("result")

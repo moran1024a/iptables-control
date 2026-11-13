@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -23,7 +24,7 @@ import (
 	"time"
 )
 
-const version = "0.6.2"
+const version = "0.6.3-rc.1"
 const tableName = "ictl_active"
 
 type M = map[string]any
@@ -162,16 +163,19 @@ func command(ctx context.Context, input []byte, name string, args ...string) ([]
 	return out.Bytes(), nil
 }
 
-type cappedBuffer struct{ bytes.Buffer }
+// The buffer is a named field, not embedded: an embedded bytes.Buffer would
+// expose ReadFrom, and io.Copy would then bypass the cap in Write.
+type cappedBuffer struct{ buf bytes.Buffer }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
 	n := len(p)
-	if b.Len() < 4*1024*1024 {
-		keep := min(n, 4*1024*1024-b.Len())
-		_, _ = b.Buffer.Write(p[:keep])
+	if b.buf.Len() < 4*1024*1024 {
+		keep := min(n, 4*1024*1024-b.buf.Len())
+		_, _ = b.buf.Write(p[:keep])
 	}
 	return n, nil
 }
+func (b *cappedBuffer) Bytes() []byte { return b.buf.Bytes() }
 func run(input []byte, name string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -358,6 +362,7 @@ func (a *Agent) resolve(c *Config) error {
 			cached[route.Listen] = old.ListenIP
 		}
 	}
+	dnsDown := false
 	lookup := func(host string) (string, error) {
 		if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
 			return ip.To4().String(), nil
@@ -369,7 +374,16 @@ func (a *Agent) resolve(c *Config) error {
 			resolved[host] = entry.ip
 			return entry.ip, nil
 		}
-		ips, e := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+		var ips []net.IP
+		e := errors.New("DNS 不可用")
+		if !dnsDown {
+			// Bounded below the 5 s maintenance budget, so a dead resolver
+			// still leaves time to fall back to the address in use.
+			lookupCtx, stop := context.WithTimeout(ctx, 3*time.Second)
+			ips, e = net.DefaultResolver.LookupIP(lookupCtx, "ip4", host)
+			dnsDown = e != nil && lookupCtx.Err() != nil
+			stop()
+		}
 		if e == nil && len(ips) > 0 {
 			resolved[host] = ips[0].To4().String()
 			a.dns[host] = dnsResult{resolved[host], time.Now().Add(time.Minute)}
@@ -381,7 +395,8 @@ func (a *Agent) resolve(c *Config) error {
 		if net.ParseIP(cached[host]).To4() == nil {
 			return "", fmt.Errorf("DNS 解析失败: %s", host)
 		}
-		a.stateError = "DNS 解析失败，使用缓存: " + host
+		// Forwarding keeps working on the address in use: a warning, not a node fault.
+		log.Printf("DNS 解析失败，使用缓存: %s -> %s", host, cached[host])
 		resolved[host] = cached[host]
 		return cached[host], nil
 	}

@@ -91,6 +91,10 @@ def parse(uri):
     clean(uri)
     if re.search(r"%(?![0-9a-fA-F]{2})", uri):
         raise ValueError("无效的百分号编码")
+    # SIP002 userinfo may be standard Base64; a "/" there would end the authority.
+    m = re.match(r"(?i)(ss://)([A-Za-z0-9+/_=-]*/[A-Za-z0-9+/_=-]*)(@.*)", uri, re.S)
+    if m:
+        uri = m[1] + m[2].replace("/", "_").replace("+", "-") + m[3]
     try:
         u = urlsplit(uri)
         uri = u.scheme + uri[uri.index(":"):]
@@ -172,7 +176,7 @@ def parse(uri):
                 flag(q[key])
         return dict(name=clean(unquote(u.fragment, errors="strict")) or host, host=host, port=port,
                     protocol=protocol, params=p, uri=uri)
-    except (KeyError, TypeError, UnicodeError, OverflowError, RecursionError) as exc:
+    except (KeyError, IndexError, TypeError, UnicodeError, OverflowError, RecursionError) as exc:
         raise ValueError("分享链接无效：请检查地址、端口和认证信息") from None
 
 
@@ -362,7 +366,7 @@ def mihomo(node, name):
                 nums = part.split("-")
                 if len(nums) > 2 or number(nums[0]) > number(nums[-1]):
                     raise ValueError("无效的跳跃端口")
-            out["ports"] = q["mport"].replace("-", ":")
+            out["ports"] = q["mport"]
     elif protocol == "tuic":
         out["uuid"] = p["uuid"]
         for key, dest, choices in (("congestion_control", "congestion-controller", ("cubic", "new_reno", "bbr")),

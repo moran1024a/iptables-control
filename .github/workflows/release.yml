@@ -19,6 +19,12 @@ jobs:
         run: |
           v="${GITHUB_REF_NAME#v}"
           python3 deploy/check-versions.py "$v"
+          # 在推送镜像之前确认 CHANGELOG 有本版本的说明，避免只发布镜像而没有 Release 文件。
+          awk -v version="$v" '
+            /^## / { if (found) exit; if ($2 == version) found = 1; next }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          test -s "$RUNNER_TEMP/release-notes.md"
           echo "version=$v" >> "$GITHUB_OUTPUT"
           if [[ "$v" == *-rc.* ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
@@ -93,11 +99,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          awk -v version="${GITHUB_REF_NAME#v}" '
-            /^## / { if (found) exit; if ($2 == version) found = 1; next }
-            found { print }
-          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
-          test -s "$RUNNER_TEMP/release-notes.md"
           args=(--title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md")
           if [ "${{ steps.version.outputs.prerelease }}" = true ]; then
             args+=(--prerelease --latest=false)

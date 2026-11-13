@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-VERSION=3.2.3
+VERSION=0.6.3-rc.1
 SELF_PATH="$(readlink -f -- "$0")"
 
 error() { printf '错误：%s\n' "$*" >&2; }
@@ -520,6 +520,9 @@ def sockets(proto):
         offset = 1 if fields and fields[0] in ('tcp', 'udp') else 0
         if len(fields) < 5 + offset:
             raise Failure('无法解析本机端口状态，已停止操作：' + line)
+        # 已连接的 UDP 套接字是本机发起的客户端连接，不占用入站端口。
+        if fields[offset] == 'ESTAB':
+            continue
         address, port = fields[3 + offset].rsplit(':', 1)
         address = address.strip('[]').split('%', 1)[0]
         if ':' in address:

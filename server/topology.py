@@ -378,11 +378,13 @@ def compile_plan(graph, path, port=None):
     )
 
 
-def documents(c, include_pending=True):
+def documents(c, include_pending=True, live_only=False):
+    # live_only skips topologies and configurations that are already being deleted.
+    live = " WHERE deleted=0" if live_only else ""
     if include_pending:
-        for r in c.execute("SELECT name,graph FROM topologies"):
+        for r in c.execute("SELECT name,graph FROM topologies" + live):
             yield r["name"], dict(graph=json.loads(r["graph"]))
-    for r in c.execute("SELECT name,desired,applied FROM configurations"):
+    for r in c.execute("SELECT name,desired,applied FROM configurations" + live):
         for k in (("desired", "applied") if include_pending else ("applied",)):
             if r[k]:
                 d = json.loads(r[k])
@@ -390,13 +392,18 @@ def documents(c, include_pending=True):
     for r in c.execute("SELECT payload FROM jobs"):
         d = json.loads(r[0])
         yield "执行中的配置", d["plan"]
+        if live_only:
+            # Rules being replaced still need this node until the job finishes.
+            yield "执行中的配置", dict(
+                graph=dict(vertices=[dict(node_id=x["node_id"]) for x in d["new"] + d["old"]])
+            )
 
 
-def references(c, nid):
+def references(c, nid, live_only=False):
     return list(
         dict.fromkeys(
             name
-            for name, d in documents(c)
+            for name, d in documents(c, live_only=live_only)
             if any(v.get("node_id") == nid for v in d.get("graph", {}).get("vertices", []))
         )
     )

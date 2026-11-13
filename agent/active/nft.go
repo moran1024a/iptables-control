@@ -392,6 +392,26 @@ func executeNFT(data M, check bool) error {
 	_, e = run(b, "nft", args...)
 	return e
 }
+
+// routeOnlyChange reports a retired rule whose connections are indistinguishable
+// from a live rule's: same ID, port and target, different route. The live rule
+// already owns those connections, so keeping the old copy would only pin its
+// address and routing profile for as long as the rule carries traffic.
+func routeOnlyChange(r Rule, live []Rule) bool {
+	for _, l := range live {
+		if l.ID != r.ID || l.Port != r.Port || l.IP != r.IP || l.TargetPort != r.TargetPort {
+			continue
+		}
+		covered := true
+		for _, p := range protocols(r) {
+			covered = covered && slices.Contains(protocols(l), p)
+		}
+		if covered {
+			return true
+		}
+	}
+	return false
+}
 func flowKey(r Rule) Rule {
 	return Rule{Route: r.Route, ID: r.ID, Protocol: r.Protocol, Port: r.Port, IP: r.IP, TargetPort: r.TargetPort}
 }
@@ -500,7 +520,7 @@ func (a *Agent) applyContext(ctx context.Context, c Config) error {
 		checked := map[connectionKey]connectionResult{}
 		retired := map[Rule]bool{}
 		for _, r := range c.Retired {
-			if !ids[r.ID] || retired[r] {
+			if !ids[r.ID] || retired[r] || routeOnlyChange(r, c.Rules) {
 				continue
 			}
 			retired[r] = true

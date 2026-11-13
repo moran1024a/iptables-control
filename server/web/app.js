@@ -1244,7 +1244,15 @@ const ACTIONS = {
         ? `确定删除节点 ${nodeLabel(n)}？`
         : `将向节点 ${nodeLabel(n)} 下发空配置，节点确认清空规则后自动删除。`;
     if (!(await confirmBox(force ? "强制删除节点" : "删除节点", text, "删除", true))) return;
-    const r = await api("DELETE", `nodes/${n.id}${force ? "?force=1" : ""}`);
+    let r;
+    try {
+      r = await api("DELETE", `nodes/${n.id}${force ? "?force=1" : ""}`);
+    } catch (err) {
+      // Only cleanup that this node must confirm is in the way: a lost node may be removed anyway.
+      if (force || err.status !== 409 || err.field !== "force") throw err;
+      if (!(await confirmBox("强制删除节点", `${err.message}。如果节点 ${nodeLabel(n)} 已永久失联，可以强制删除：记录会直接删除，节点上的规则不会被清理。`, "强制删除", true))) return;
+      r = await api("DELETE", `nodes/${n.id}?force=1`);
+    }
     if (r.deleted) {
       toast("已删除");
       location.hash = "#/nodes";

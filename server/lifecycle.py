@@ -12,6 +12,10 @@ def delete_node(conn, node_id):
         (node_id, node["name"], int(time.time())),
     )
     conn.execute("DELETE FROM retired_ports WHERE node_id = ?", (node_id,))
+    # Only cleanup of links that are already being deleted can remain here.
+    conn.execute("DELETE FROM retirements WHERE node_id = ?", (node_id,))
+    conn.execute("DELETE FROM rules WHERE node_id = ?", (node_id,))
+    conn.execute("DELETE FROM traffic_epochs WHERE node_id = ?", (node_id,))
     conn.execute("DELETE FROM sync_ops WHERE node_id = ?", (node_id,))
     conn.execute(f"DELETE FROM {table} WHERE id = ?", (node_id,))
     conn.execute("DELETE FROM windows WHERE node_id = ?", (node_id,))

@@ -15,7 +15,7 @@
 set -euo pipefail
 umask 077
 
-VERSION="0.6.2"
+VERSION="0.6.3-rc.1"
 REGISTRY="ghcr.io"
 MIRROR_REGISTRY="ghcr.nju.edu.cn"
 REPO="moran1024a/ictl-server"
@@ -190,7 +190,7 @@ if reasons:
 fi
 
 rollback() {
-  trap - ERR INT TERM
+  trap - ERR INT TERM HUP
   echo "升级失败，正在恢复旧容器及升级前数据库。" >&2
   # Never restore a database while the new process could still be writing it.
   if docker container inspect "$NAME" >/dev/null 2>&1; then
@@ -224,12 +224,14 @@ if [ -n "$OLD_NAME" ]; then
     0.6.*) echo "升级前自动备份数据库。" ;;
     *) die "请先升级到 0.5.3，再安装此版本。" ;;
   esac
+  # Until the rollback trap is armed, an interrupt must not leave the old container stopped.
+  trap 'docker rename "$OLD_NAME" "$NAME" >/dev/null 2>&1 || true; docker start "$NAME" >/dev/null 2>&1 || true; exit 1' INT TERM HUP
   docker stop "$NAME" >/dev/null
   if ! docker rename "$NAME" "$OLD_NAME"; then
     docker start "$NAME" >/dev/null
     die "无法保留原容器，升级取消"
   fi
-  trap rollback ERR INT TERM
+  trap rollback ERR INT TERM HUP
   docker run --rm --network none -v "$DATA_MOUNT" --entrypoint python3 "$IMAGE" -c '
 import os, sqlite3, sys
 os.umask(0o077)
@@ -243,11 +245,14 @@ os.chmod(path,0o600)
 ' "$BACKUP"
   RESTORE_NEEDED=1
 else
-  trap rollback ERR INT TERM
+  trap rollback ERR INT TERM HUP
 fi
 
+# Docker needs brackets around an IPv6 bind address.
+bind_prefix=""
+case "$BIND_IP" in "") ;; *:*) bind_prefix="[$BIND_IP]:" ;; *) bind_prefix="$BIND_IP:" ;; esac
 docker run -d --name "$NAME" --restart unless-stopped \
-  -p "${BIND_IP:+$BIND_IP:}$PORT:8730" -v "$DATA_MOUNT" "$IMAGE" >/dev/null
+  -p "$bind_prefix$PORT:8730" -v "$DATA_MOUNT" "$IMAGE" >/dev/null
 
 healthy=0 health_error=""
 for _ in $(seq 1 40); do
@@ -258,7 +263,7 @@ if [ "$healthy" -ne 1 ]; then
   printf '新容器健康检查失败：\n%s\n' "${health_error:-未返回错误详情}" >&2
   rollback
 fi
-trap - ERR INT TERM
+trap - ERR INT TERM HUP
 [ -z "$OLD_NAME" ] || docker rm "$OLD_NAME" >/dev/null
 
 echo

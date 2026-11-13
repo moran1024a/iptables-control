@@ -4,7 +4,7 @@
 set -u
 umask 077
 
-VERSION="0.6.0"
+VERSION="0.6.3-rc.1"
 BIN="/usr/local/lib/ictl/passive.sh"
 CONF_DIR="/etc/ictl"
 CONF="$CONF_DIR/agent.conf"
@@ -682,6 +682,9 @@ check_port_conflicts() {
       [ "${#columns[@]}" -gt 0 ] || continue
       p=3; [[ "${columns[0]}" != tcp && "${columns[0]}" != udp ]] || p=4
       if [ "${#columns[@]}" -le "$p" ]; then error='端口检查失败：本机端口输出格式无效'; break; fi
+      # A connected UDP socket is an outbound client on an ephemeral port; its
+      # replies belong to an existing flow and never reach the DNAT rule.
+      [ "${columns[$((p-3))]}" != ESTAB ] || continue
       address="${columns[$p]}"; port="${address##*:}"; ip="${address%:*}"
       ip="${ip#\[}"; ip="${ip%\]}"; ip="${ip%%%*}"
       [[ "${ICTL_WAKE_IPV6:-0}" = 1 || "$ip" != *:* || "$ip" = :: || "$ip" = ::ffff:* ]] || continue
@@ -731,14 +734,15 @@ render() {
         ERRS+=("rule $id resolve failed: $host")
         continue
       fi
-      [ "$RSTALE" -eq 1 ] && ERRS+=("rule $id resolve failed: $host, using cached $RIP")
+      # The address in use keeps forwarding; a DNS outage must not reject the whole apply.
+      [ "$RSTALE" -eq 1 ] && printf '提示：规则 %s 域名解析失败，沿用缓存地址：%s -> %s\n' "$id" "$host" "$RIP" >&2
       incoming=('-m addrtype --dst-type LOCAL'); snat="MASQUERADE"; in_mark=""; out_mark=""
       if [ -n "$route" ]; then
         route_fields "$route" || { ERRS+=('无效的地址路由配置'); continue; }
         if [ -n "$R_LISTEN" ]; then
           next_ip="$RIP"
           if ! resolve "$R_LISTEN"; then ERRS+=("rule $id receive address resolve failed: $R_LISTEN"); continue; fi
-          [ "$RSTALE" -eq 1 ] && ERRS+=("rule $id receive address using cache: $R_LISTEN")
+          [ "$RSTALE" -eq 1 ] && printf '提示：规则 %s 接收地址解析失败，沿用缓存地址：%s -> %s\n' "$id" "$R_LISTEN" "$RIP" >&2
           listen_ip="$RIP"; RIP="$next_ip"
           if [ "$addresses_read" = 0 ]; then
             if ! local_addresses="$(ip -o -4 address show)"; then ERRS+=('无法读取本机地址'); continue; fi
@@ -895,8 +899,9 @@ clear_changed_connections() {
     [[ "$line" = '-A ICTL-PRE '* ]] || continue
     if [[ "$line" =~ -p[[:space:]](tcp|udp).*--dport[[:space:]]([0-9]+).*--to-destination[[:space:]]([0-9.]+):([0-9]+) ]]; then
       proto="${BASH_REMATCH[1]}" port="${BASH_REMATCH[2]}" ip="${BASH_REMATCH[3]}" target="${BASH_REMATCH[4]}"
-      old_post="$(grep -E "^-A ICTL-POST -p $proto .*--ctorigdstport $port( |$)" <<< "$previous")"
-      new_post="$(grep -E "^-A ICTL-POST -p $proto .*--ctorigdstport $port( |$)" <<< "$current")"
+      # iptables-save prints -d before -p, so the protocol is not always first.
+      old_post="$(grep -E "^-A ICTL-POST (.* )?-p $proto .*--ctorigdstport $port( |$)" <<< "$previous")"
+      new_post="$(grep -E "^-A ICTL-POST (.* )?-p $proto .*--ctorigdstport $port( |$)" <<< "$current")"
       if grep -Fxq -- "$line" <<< "$current" && [ "$old_post" = "$new_post" ]; then continue; fi
       command -v conntrack >/dev/null || { ERRS+=('切换规则需要 conntrack，请安装 conntrack 后重试'); return 1; }
       if ! out="$(conntrack -D -f ipv4 -p "$proto" --orig-port-dst "$port" --reply-src "$ip" --reply-port-src "$target" --dst-nat 2>&1)"; then
@@ -1312,7 +1317,10 @@ main() {
     --apply-file)
       need_root || return 1
       MODE=passive
-      with_lock apply_snapshot "$(cat "$2")" "$3" passive || { printf '%s\n' "${ERRS[@]}" >&2; return 1; }
+      ERRS=()
+      # The handover path gets the same validation as a regular sync.
+      valid_config "$(cat "$2")" || { printf '配置内容无效\n' >&2; return 1; }
+      with_lock apply_snapshot "$(cat "$2")" "$3" passive || { printf '%s\n' "${ERRS[@]+"${ERRS[@]}"}" >&2; return 1; }
       save_state
       return $? ;;
     --clear-owned) need_root && with_lock remove_rules && with_lock clean_legacy_persistence; return $? ;;

@@ -15,6 +15,12 @@ import settings
 import wake
 
 
+# After an update notice: time left for the updater to stop the agent, and how
+# long an agent that is still running keeps being served before being asked again.
+UPDATE_GRACE = 60
+UPDATE_RETRY = 600
+
+
 class Hub:
     def __init__(self):
         self.sessions = {}
@@ -149,10 +155,11 @@ class Hub:
             "state": "ok",
         }
         inflight = None
+        update_sent = None
         latest_applied = status["generation"] if type(status["generation"]) is int else 0
 
         async def reconcile(received=False):
-            nonlocal inflight
+            nonlocal inflight, update_sent
 
             def prepare(c):
                 if self.sessions.get(nid) is not session:
@@ -173,7 +180,13 @@ class Hub:
                 if status.get("auto_update") and agent_v3.newer(
                     settings.COMPONENTS["active_agent"], status["version"]
                 ):
-                    return {"action": "update"}
+                    # Give a started update time to take over, then keep serving
+                    # the old agent and ask again later if it is still running.
+                    elapsed = None if update_sent is None else time.monotonic() - update_sent
+                    if elapsed is None or elapsed >= UPDATE_RETRY:
+                        return {"action": "update"}
+                    if elapsed < UPDATE_GRACE:
+                        return {"action": "waiting"}
                 if "held_ports" in status:
                     agent_v3.refresh_held_ports(c, n, status)
                 return agent_v3.packet(c, n, status=status, observe=False)
@@ -181,6 +194,7 @@ class Hub:
             result = await self.database(prepare)
             action = result.get("action")
             if action == "update":
+                update_sent = time.monotonic()
                 await send({"type": "update", "version": settings.COMPONENTS["active_agent"]})
             elif action == "apply":
                 inflight = {k: result[k] for k in ("op", "generation", "hash")}
@@ -390,7 +404,10 @@ def create_app():
 
     async def final_traffic(request):
         node = await hub.authenticate(request)
-        data = await request.json()
+        try:
+            data = await request.json()
+        except ValueError:
+            return web.json_response({"error": "无效的 JSON"}, status=400)
         try:
             result = await hub.database(lambda c: agent_v3.accept_traffic(c, node["id"], data))
         except errors.UserError as exc:
@@ -462,7 +479,7 @@ def create_app():
                 response.headers.add(key, value)
             else:
                 response.headers[key] = value
-        if request.method != "GET":
+        if request.method != "GET" and code < 400:
             hub.notify()
         return response
 

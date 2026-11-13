@@ -81,6 +81,7 @@ def check_group(conn, kind, group_id):
         return default_group(conn, kind)
     if (
         isinstance(group_id, int)
+        and 0 < group_id < 2**63
         and conn.execute(
             "SELECT 1 FROM item_groups WHERE id = ? AND kind = ?", (group_id, kind)
         ).fetchone()
@@ -95,7 +96,7 @@ def ordered(kind, where=""):
 
 
 def get_node(conn, node_id):
-    if type(node_id) is not int or node_id <= 0:
+    if type(node_id) is not int or not 0 < node_id < 2**63:
         raise errors.UserError("无效的对象 ID", "node_id")
     node = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
     if not node:

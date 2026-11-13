@@ -112,7 +112,8 @@ class Engine:
             if not old or old["state"] != state or old["boot"] != n["boot_id"] or (seen or 0)-(old["seen"] or 0) >= 30:
                 old = dict(state=state, since=now, boot=n["boot_id"], seen=seen)
             observed[nid] = dict(old, seen=seen)
-            if seen is not None and now-seen >= offline:
+            # Reports missed while the server itself was down do not count as node downtime.
+            if seen is not None and now-max(seen, self.started) >= offline:
                 bad[nid] = "持续失联"
             elif state == "error" and now-old["since"] >= FAULT:
                 bad[nid] = n["runtime_error"] or "运行中的转发规则异常"

@@ -433,17 +433,31 @@ func (q *qualityMonitor) probeWithAgent(a *Agent, body M) {
 	} else if body["protocol"] == "tcp-connect-v1" {
 		return
 	}
+	// Probes are paced one per second; network jitter or a busy control loop
+	// can deliver two together. Space them out instead of losing one.
 	q.mu.Lock()
-	if time.Since(q.last) < 900*time.Millisecond {
+	start := q.last.Add(900 * time.Millisecond)
+	if now := time.Now(); start.Before(now) {
+		start = now
+	}
+	wait := time.Until(start)
+	if wait > 3*time.Second {
 		q.mu.Unlock()
 		return
 	}
-	q.last = time.Now()
+	q.last = start
 	q.mu.Unlock()
 	select {
 	case q.workers <- struct{}{}:
 		go func() {
 			defer func() { <-q.workers }()
+			if wait > 0 {
+				select {
+				case <-time.After(wait):
+				case <-q.ctx.Done():
+					return
+				}
+			}
 			port := int(number(body["port"]))
 			key, err := hex.DecodeString(fmt.Sprint(body["key"]))
 			host, _ := body["host"].(string)

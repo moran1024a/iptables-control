@@ -297,6 +297,41 @@ perform_sync
                         (self.root/'backend.log').read_text().index('commit'))
         self.assertTrue((self.root/'lib/active/enabled').exists())
 
+    def scheduler(self):
+        p=self.root/'bin/systemd-run';p.write_text('#!/bin/bash\necho "systemd-run $*" >> "$CASE_ROOT/tools.log"\n');p.chmod(0o755)
+
+    def test_auto_update_retries_a_lost_receipt_until_confirmed(self):
+        self.existing();self.scheduler();(self.root/'mode').write_text('active');(self.root/'fail-commit').touch()
+        journal=self.root/'lib/switch-work/transaction'
+        self.assertNotEqual(self.run_manager('auto_update').returncode,0)
+        self.assertIn('PHASE=installed',journal.read_text());self.assertIn('FROM=active',journal.read_text())
+        self.assertIn('--on-active=300',(self.root/'tools.log').read_text())
+        self.assertIn('--auto-update',(self.root/'tools.log').read_text())
+        # The agent is stopped, so the scheduled run is the only retry: it must not be skipped.
+        self.assertNotEqual(self.run_manager('auto_update').returncode,0)
+        self.assertEqual((self.root/'backend.log').read_text().splitlines().count('commit'),2)
+        self.assertEqual((self.root/'tools.log').read_text().count('--on-active=300'),2)
+        (self.root/'fail-commit').unlink()
+        r=self.run_manager('auto_update');self.assertEqual(r.returncode,0,r.stdout+r.stderr)
+        self.assertFalse(journal.exists());self.assertTrue((self.root/'lib/active/enabled').exists())
+        self.assertIn('start ictl-agent',(self.root/'tools.log').read_text())
+        self.assertEqual((self.root/'backend.log').read_text().count('--apply-file'),1)
+
+    def test_auto_update_never_confirms_a_pending_mode_switch(self):
+        self.scheduler();(self.root/'mode').write_text('active');(self.root/'fail-commit').touch()
+        self.assertNotEqual(self.run_manager().returncode,0)
+        (self.root/'fail-commit').unlink()
+        previous=(self.root/'backend.log').read_text()
+        self.assertEqual(self.run_manager('auto_update').returncode,0)
+        self.assertEqual((self.root/'backend.log').read_text(),previous)
+        self.assertIn('PHASE=installed',(self.root/'lib/switch-work/transaction').read_text())
+
+    def test_failed_switch_to_passive_before_handover_is_reported(self):
+        self.existing();(self.root/'fail-flush').touch()
+        r=self.run_manager();self.assertNotEqual(r.returncode,0)
+        self.assertIn('切换未完成',r.stderr)
+        self.assertFalse((self.root/'lib/switch-work/transaction').exists())
+
     def test_final_traffic_failure_prevents_commit(self):
         (self.root/'mode').write_text('active');(self.root/'fail-flush').touch()
         self.assertNotEqual(self.run_manager().returncode,0)

@@ -176,6 +176,31 @@ restore_owned "$snapshot" $'1\n1\n1\n1' && jumps_ok
         self.assertShell("ICTL_WAKE_CHECK=1; check_port_conflicts $'v=check\\n1 udp 61024 127.0.0.1 1'")
         self.assertShell("ICTL_WAKE_CHECK=1; ICTL_WAKE_IPV6=1; ! check_port_conflicts $'v=check\\n1 udp 61024 127.0.0.1 1'")
 
+    def test_connected_udp_client_socket_is_not_a_port_conflict(self):
+        (self.root/'udp.sockets').write_text('ESTAB 0 0 203.0.113.5:41234 198.51.100.9:443\nUNCONN 0 0 0.0.0.0:41235 0.0.0.0:*\n')
+        self.assertShell("check_port_conflicts $'v=check\\n1 udp 41234 192.0.2.1 443'")
+        self.assertShell("! check_port_conflicts $'v=check\\n1 udp 41235 192.0.2.1 443'")
+
+    def test_dns_outage_keeps_forwarding_on_the_cached_address(self):
+        getent = self.bin/'getent'
+        getent.write_text('#!/bin/sh\nexit 2\n'); getent.chmod(0o755)
+        r = self.assertShell("""printf 'v=abc\\n1 tcp 30001 target.example 443\\n' > "$CONFIG"
+printf 'target.example 192.0.2.1\\n' > "$RESOLVED"
+with_lock local_apply
+[ "$R_STATE" = ok ] || { echo "$R_STATE $R_ERR"; exit 1; }
+owned_snapshot | grep -q -- '--to-destination 192.0.2.1:443'
+""")
+        self.assertIn('沿用缓存地址', r.stderr)
+
+    def test_snat_source_change_flushes_connections_in_saved_rule_order(self):
+        self.assertShell("""ERRS=()
+prev=$'-A ICTL-PRE -p tcp -m addrtype --dst-type LOCAL -m tcp --dport 30001 -j DNAT --to-destination 192.0.2.1:443\\n-A ICTL-POST -d 192.0.2.1/32 -p tcp -m tcp --dport 443 -m conntrack --ctstate DNAT --ctorigdstport 30001 -j MASQUERADE'
+clear_changed_connections "$prev" "$prev" || exit 1
+! grep -q conntrack "$MOCK_ROOT/commands" 2>/dev/null || exit 1
+clear_changed_connections "$prev" "${prev/-j MASQUERADE/-j SNAT --to-source 10.0.0.2}" || exit 1
+grep -q 'conntrack -D .*--orig-port-dst 30001' "$MOCK_ROOT/commands"
+""")
+
     def test_reboot_restores_rules_without_dns_or_control_requests(self):
         self.assertShell('printf "v=abc\\n1 both 10001 192.0.2.1 443\\n" > "$CONFIG"\nlocal_apply\n[ "$R_STATE" = ok ]')
         r=self.assertShell('''curl() { echo forbidden >&2; return 1; }

@@ -27,8 +27,8 @@ def assign(c, nid, ids):
 
 
 def save(c, body, ident=None):
-    old = c.execute("SELECT * FROM tags WHERE id=?", (ident,)).fetchone() if ident else None
-    if ident and not old:
+    old = c.execute("SELECT * FROM tags WHERE id=?", (ident,)).fetchone() if ident is not None else None
+    if ident is not None and not old:
         raise errors.UserError("标签不存在", status=404)
     name = validation.check_remark(body.get("name", old["name"] if old else None), "name", "标签名称")
     color = body.get("color", old["color"] if old else "#3b82f6")

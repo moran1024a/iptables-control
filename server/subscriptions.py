@@ -69,7 +69,7 @@ def listing(c):
 
 
 def save(c, body, ident=None):
-    old = get(c, ident) if ident else None
+    old = get(c, ident) if ident is not None else None
     name = validation.check_remark(body.get('name', old['name'] if old else ''), 'name', '名称')
     enabled = body.get('enabled', bool(old['enabled']) if old else True)
     if type(enabled) is not bool:
@@ -107,7 +107,7 @@ def export(c, token, fmt):
     if row is None:
         return None
     items, _ = catalog(c)
-    names = {'DIRECT','REJECT','GLOBAL','订阅节点'}
+    names = {'DIRECT','REJECT','REJECT-DROP','PASS','COMPATIBLE','GLOBAL','订阅节点'}
     links, proxies = [], []
     for item in selected(items,selections(c,row['id'])):
         if item['clash_error' if fmt=='clash' else 'error']:
@@ -123,7 +123,7 @@ def export(c, token, fmt):
     if fmt=='v2ray':
         return base64.b64encode('\n'.join(links).encode()).decode()+'\n','text/plain; charset=utf-8'
     group = dict(name='订阅节点',type='select',proxies=[p['name'] for p in proxies] or ['REJECT'])
-    encode = lambda obj: json.dumps(obj,ensure_ascii=True,separators=(',',':'))
+    encode = lambda obj: json.dumps(obj,ensure_ascii=False,separators=(',',':'))
     body = 'mixed-port: 7890\nallow-lan: false\nmode: rule\nproxies:'
     body += '\n'+''.join('  - '+encode(p)+'\n' for p in proxies) if proxies else ' []\n'
     body += 'proxy-groups:\n  - '+encode(group)+'\nrules:\n  - '+encode('MATCH,订阅节点')+'\n'

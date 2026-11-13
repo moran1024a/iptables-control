@@ -119,7 +119,8 @@ class Monitor:
                 try:
                     with socket.socket(family, kind, proto) as sock:
                         sock.setblocking(False)
-                        await loop.sock_sendto(sock, data, address)
+                        # One datagram on a fresh socket does not block; this also runs on Python 3.10.
+                        sock.sendto(data, address)
                         sent = True
                 except OSError as exc:
                     failure = exc

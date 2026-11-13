@@ -243,6 +243,11 @@ func (a *Agent) checkConflictsWith(c Config, native M) error {
 		}
 		sockets[p] = map[int]bool{}
 		for _, line := range strings.Split(string(data), "\n") {
+			// A connected UDP socket is an outbound client on an ephemeral port.
+			// Its replies belong to an existing flow and never reach the DNAT rule.
+			if strings.HasPrefix(line, "ESTAB") {
+				continue
+			}
 			host, port := socketPort(line)
 			ip := net.ParseIP(host)
 			// PREROUTING forwards incoming traffic, not local loopback connections.
@@ -401,16 +406,18 @@ func (chains legacyPortRules) conflict(p string, port int) string {
 					continue
 				}
 				next := f[i+1]
+				// "!" applies to the option right after it and to nothing later.
+				negated := neg
+				neg = false
 				switch v {
 				case "--comment":
 					i++
 				case "-p", "--protocol":
 					ok := next == p || (next == "6" && p == "tcp") || (next == "17" && p == "udp") || next == "all"
-					if neg {
+					if negated {
 						ok = !ok
 					}
 					possible = possible && ok
-					neg = false
 					i++
 				case "--dport", "--destination-port", "--dports":
 					ok := false
@@ -423,11 +430,10 @@ func (chains legacyPortRules) conflict(p string, port int) string {
 						}
 						ok = ok || port >= lo && port <= hi
 					}
-					if neg {
+					if negated {
 						ok = !ok
 					}
 					possible = possible && ok
-					neg = false
 					i++
 				case "-j", "-g", "--jump", "--goto":
 					target = next

@@ -152,6 +152,24 @@ def retire(c, ident, rules):
         )
 
 
+def forget_node(c, nid):
+    """Drop cleanup work that only a permanently lost node could confirm."""
+    for row in c.execute(
+        "SELECT j.configuration_id,j.payload FROM jobs j JOIN configurations g "
+        "ON g.id=j.configuration_id WHERE g.deleted=1"
+    ).fetchall():
+        job = json.loads(row["payload"])
+        if nid in job["wait"] or any(r["node_id"] == nid for r in job["new"] + job["old"]):
+            retire(c, row["configuration_id"], job["new"])
+            c.execute("DELETE FROM jobs WHERE configuration_id=?", (row["configuration_id"],))
+    c.execute(
+        "DELETE FROM rules WHERE node_id=? AND configuration_id IN "
+        "(SELECT id FROM configurations WHERE deleted=1)",
+        (nid,),
+    )
+    c.execute("DELETE FROM retirements WHERE node_id=?", (nid,))
+
+
 def make_rules(c, config, plan, now):
     plan = copy.deepcopy(plan)
     g, path = topology.wire_graph(plan["graph"], plan["graph_path"])

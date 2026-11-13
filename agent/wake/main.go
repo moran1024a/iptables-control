@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const version = "0.4.3"
+const version = "0.6.3-rc.1"
 const configPath = "/etc/ictl/wake.conf"
 const replayPath = "/var/lib/ictl/wake-replay.json"
 
@@ -140,6 +140,10 @@ func openGuard(path string) (*replayGuard, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	// A power loss can leave the file empty; that is an empty cache, not a fatal error.
+	if len(b) == 0 {
+		return g, nil
 	}
 	if err = json.Unmarshal(b, &g.seen); err != nil {
 		return nil, err

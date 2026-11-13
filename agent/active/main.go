@@ -21,6 +21,9 @@ import (
 	"github.com/coder/websocket"
 )
 
+// The server repeats an update notice about every ten minutes while the agent stays outdated.
+const updateRetry = 9 * time.Minute
+
 // Control reads must keep draining ping/pong frames while rule operations run.
 func readControl(ctx context.Context, ws *websocket.Conn, receive chan<- M) error {
 	for {
@@ -37,6 +40,11 @@ func readControl(ctx context.Context, ws *websocket.Conn, receive chan<- M) erro
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			// Probes are periodic and expendable; a long rule operation must not
+			// cost the session and its pending apply result.
+			if m["type"] == "quality_probe" {
+				continue
+			}
 			return errors.New("control queue full")
 		}
 	}
@@ -122,11 +130,12 @@ func (a *Agent) session(ctx context.Context) error {
 	send, report := messageWriter(child, write)
 	monitor := newQualityMonitor(qualityCtx, report)
 	reportFailure := func(err error) {
-		stop()
+		// Record the cause before cancelling, or the session only ever reports "context canceled".
 		select {
 		case fail <- err:
 		default:
 		}
+		stop()
 	}
 	go func() { reportFailure(readControl(child, ws, receive)) }()
 	go func() { reportFailure(keepControlAlive(child, ws, send, 10*time.Second)) }()
@@ -149,6 +158,11 @@ func (a *Agent) session(ctx context.Context) error {
 		case err := <-fail:
 			return err
 		case <-child.Done():
+			select {
+			case err := <-fail:
+				return err
+			default:
+			}
 			return child.Err()
 		case msg := <-receive:
 			if msg["session"] != session {
@@ -163,7 +177,9 @@ func (a *Agent) session(ctx context.Context) error {
 					return err
 				}
 			case "update":
-				if a.autoUpdate && time.Since(lastUpdate) > time.Hour {
+				// A working update stops this process within seconds. Still running
+				// means it failed, so try again soon instead of once an hour.
+				if a.autoUpdate && time.Since(lastUpdate) > updateRetry {
 					lastUpdate = time.Now()
 					go func() {
 						runCtx, cancel := context.WithTimeout(child, 10*time.Second)
@@ -340,6 +356,10 @@ func (a *Agent) daemon(ctx context.Context) error {
 	if _, e = os.Stat(a.path("paused")); e == nil {
 		return nil
 	}
+	// Registered before the restore: a settings reload during startup must not kill the process.
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+	defer signal.Stop(reload)
 	if a.config.Hash != "" {
 		if e = a.restore(); e != nil {
 			a.stateError = e.Error()
@@ -351,9 +371,6 @@ func (a *Agent) daemon(ctx context.Context) error {
 	localDone := make(chan struct{})
 	go func() { defer close(localDone); a.maintain(localCtx, 10*time.Second) }()
 	defer func() { stopLocal(); <-localDone }()
-	reload := make(chan os.Signal, 1)
-	signal.Notify(reload, syscall.SIGHUP)
-	defer signal.Stop(reload)
 	backoff := []time.Duration{1, 2, 5, 10, 30}
 	attempt := 0
 	for {

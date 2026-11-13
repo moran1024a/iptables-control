@@ -37,7 +37,7 @@ def check_remark(s, field="remark", label="别名"):
     s = str(s or "").strip()
     if not s:
         raise errors.UserError(f"{label}不能为空", field)
-    if len(s) > 64 or "\n" in s:
+    if len(s) > 64 or any(ord(ch) < 32 or ord(ch) == 127 for ch in s):
         raise errors.UserError(f"{label}最长 64 个字符，且不能换行", field)
     return s
 

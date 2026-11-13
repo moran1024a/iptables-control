@@ -159,7 +159,8 @@ class FailoverTests(Fixture, unittest.TestCase):
         self.ident = self.save(g, paths=[self.original], failover_enabled=True)
         self.settle()
         self.now = int(time.time())
-        self.engine = failover.Engine(self.now)
+        # The server has been running longer than the offline wait.
+        self.engine = failover.Engine(self.now-61)
         self.dead = {self.f}
         self.db.execute('UPDATE nodes SET last_seen=? WHERE id=?', (self.now-61, self.f))
         self.db.commit()

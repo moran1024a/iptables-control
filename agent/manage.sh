@@ -2,7 +2,7 @@
 # ictl installation manager: identity survives component replacement.
 set -uo pipefail
 umask 077
-VERSION="0.6.2"
+VERSION="0.6.3-rc.1"
 PKG=/usr/local/lib/ictl
 LIB=/var/lib/ictl
 CONF=/etc/ictl/agent.conf
@@ -237,6 +237,8 @@ sync_cleanup() {
   if [ "$result" != 0 ] && [ "$SYNC_PREPARED" = 1 ] && [ "$SYNC_HANDOVER" = 0 ]; then
     # No rules have been handed over yet. Release the server reservation and
     # restore the old service even when upload, checkpoint or backup failed.
+    # After an active -> passive request the old manager stays offline; its
+    # installed rules keep forwarding.
     flock -u 9 2>/dev/null || true
     exec 9>&-
     rpc abort || true
@@ -244,6 +246,8 @@ sync_cleanup() {
     if [ "$SYNC_STOPPED" = 1 ] && [ "$FROM" != none ]; then
       if [ "$FROM" = passive ] || [ "$TARGET" = active ]; then
         systemctl start ictl-agent || die '旧服务恢复启动失败，请检查 journalctl -u ictl-agent'
+      else
+        die '切换未完成：现有转发规则保持不变，主动 Agent 保持停止；请排除错误后重新执行 sudo ictl --sync' || true
       fi
     fi
     if [ "$SYNC_WAKE_STOPPED" = 1 ]; then systemctl start ictl-wake || true; fi
@@ -257,6 +261,27 @@ perform_sync() (
   trap 'exit 143' TERM
   sync_transaction "$@"
 )
+# An applied active update whose receipt was lost changes no mode and needs no
+# operator decision. The agent stays stopped until the server confirms, so
+# nothing else would ever retry it.
+pending_active_update() {
+  [ -f "$WORK/transaction" ] || return 1
+  ( load_journal && [ "$FROM" = active ] && [ "$TARGET" = active ] && [[ "$PHASE" =~ ^(installed|confirmed)$ ]] )
+}
+auto_update() {
+  [ "$AUTO_UPDATE" = 1 ] || return 0
+  [ "$(cat "$LIB/agent-kind" 2>/dev/null)" = active ] || return 0
+  if [ -e "$WORK/transaction" ]; then
+    pending_active_update || return 0
+    perform_sync active && return 0
+  else
+    UPDATE_ONLY=1 perform_sync active && return 0
+  fi
+  if pending_active_update && command -v systemd-run >/dev/null; then
+    systemd-run --quiet --collect --on-active=300 -- /usr/local/bin/ictl --auto-update || true
+  fi
+  return 1
+}
 component_matches() {
   [[ "$2" =~ ^[0-9a-f]{64}$ ]] && [ -f "$1" ] && [ "$(sha256_hex < "$1")" = "$2" ]
 }
@@ -489,11 +514,7 @@ main() {
     --wake-sync) bash "$PKG/passive.sh" --wake-sync "${2:-}" ;;
     --sync|--install) perform_sync ;;
     --update) UPDATE_ONLY=1 perform_sync ;;
-    --auto-update)
-      [ "$AUTO_UPDATE" = 1 ] || return 0
-      [ ! -e "$WORK/transaction" ] || return 0
-      [ "$(cat "$LIB/agent-kind" 2>/dev/null)" = active ] || return 0
-      UPDATE_ONLY=1 perform_sync active ;;
+    --auto-update) auto_update ;;
     --switch) perform_sync "${2:-}" ;;
     --status)
       printf '已安装：'; cat "$LIB/agent-kind" 2>/dev/null || printf '旧版\n'
@@ -512,10 +533,14 @@ main() {
     --uninstall)
       if [ "${2:-}" != -y ]; then read -r -p '删除本节点 Agent、身份和转发？[y/N] ' choice; [ "$choice" = y ] || return 0; fi
       if [ -f "$PKG/wake.sh" ]; then bash "$PKG/wake.sh" --remove || return 1; fi
-      systemctl stop ictl-agent || return 1
-      local kind; read -r kind < "$LIB/agent-kind"
-      if [ "$kind" = active ]; then "$PKG/active" --clear || return 1; else bash "$PKG/passive.sh" --clear-owned || return 1; fi
-      systemctl disable ictl-agent || return 1
+      # A half-installed node (no unit or no kind marker yet) must still be removable.
+      systemctl stop ictl-agent 2>/dev/null || { [ ! -f "$UNIT" ] || return 1; }
+      local kind=''
+      if [ -f "$LIB/agent-kind" ]; then read -r kind < "$LIB/agent-kind" || true; fi
+      if [ "$kind" = active ]; then "$PKG/active" --clear || return 1
+      elif [ "$kind" = passive ] || [ -f "$PKG/passive.sh" ]; then bash "$PKG/passive.sh" --clear-owned || return 1
+      elif [ -x "$PKG/active" ]; then "$PKG/active" --clear || return 1; fi
+      systemctl disable ictl-agent 2>/dev/null || { [ ! -f "$UNIT" ] || return 1; }
       rm -f "$UNIT" /etc/sysctl.d/99-ictl.conf
       rm -rf "$PKG" /etc/ictl "$LIB"
       rm -f /usr/local/bin/ictl

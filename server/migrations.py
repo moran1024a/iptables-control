@@ -13,7 +13,8 @@ import settings
 
 
 def create(conn):
-    conn.executescript(Path(__file__).with_name("schema.sql").read_text())
+    # One transaction: an interrupted first start must not leave a half-built database.
+    conn.executescript("BEGIN IMMEDIATE;\n" + Path(__file__).with_name("schema.sql").read_text())
     with conn:
         for kind in settings.KINDS:
             conn.execute(
@@ -98,6 +99,11 @@ def init_db():
     conn = database.db()
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version == settings.DATABASE_VERSION:
+        return conn
+    if version == 0 and not conn.execute("SELECT 1 FROM sqlite_master").fetchone():
+        # An interrupted first start left an empty file: start over.
+        create(conn)
+        os.chmod(path, 0o600)
         return conn
     if version == 600:
         database.backup_database(conn, str(path) + ".pre-0.6.0-rc.2.bak")
