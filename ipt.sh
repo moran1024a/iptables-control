@@ -3,7 +3,7 @@
 set -u
 set -o pipefail
 
-VERSION=0.6.3-rc.3
+VERSION=0.6.3
 SELF_PATH="$(readlink -f -- "$0")"
 
 error() { printf '错误：%s\n' "$*" >&2; }
