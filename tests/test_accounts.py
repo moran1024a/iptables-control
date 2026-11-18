@@ -57,6 +57,59 @@ class AccountTests(Fixture, unittest.TestCase):
         revision = self.db.execute("SELECT revision FROM accounts WHERE id=?", (ident,)).fetchone()[0]
         return self.call_api("PATCH", f"accounts/{ident}", self.admin, dict(revision=revision, **fields))
 
+    def test_admin_can_replace_only_current_session_with_scoped_child_session(self):
+        shared, private = self.node("shared"), self.node("private")
+        aid, existing = self.create("member", [shared])
+        route = f"accounts/{aid}/login"
+        revision = dict(revision=1)
+        with self.db:
+            self.db.execute("UPDATE sessions SET expires=unixepoch()+600 WHERE account_id IS NULL")
+        other_admin = self.login("admin", settings.DEFAULT_PASS)
+        self.call_api("POST", route, None, revision, expect=401)
+        self.call_api("POST", route, existing, revision, expect=403)
+        self.call_api("POST", route, self.admin, dict(revision=2), expect=409)
+        self.call_api("POST", f"accounts/{aid+100}/login", self.admin, revision, expect=404)
+        status, _, headers = self.request("POST", self.panel + "/api/" + route, self.admin, revision)
+        self.assertEqual(status, 200)
+        switched = headers["Set-Cookie"].split(";")[0]
+        self.assertNotIn(switched, (self.admin, existing, other_admin))
+        self.call_api("GET", "me", self.admin, expect=401)
+        me = self.call_api("GET", "me", switched)
+        self.assertEqual((me["admin"], me["username"]), (False, "member"))
+        self.assertEqual([n["id"] for n in self.call_api("GET", "nodes", switched)["nodes"]], [shared])
+        self.call_api("GET", f"nodes/{private}", switched, expect=404)
+        self.call_api("GET", "accounts", switched, expect=403)
+        self.call_api("POST", route, switched, revision, expect=403)
+        self.call_api("POST", "logout", switched)
+        self.call_api("GET", "me", switched, expect=401)
+        self.call_api("GET", "me", existing)
+        self.assertTrue(self.call_api("GET", "me", other_admin)["admin"])
+
+    def test_login_as_child_rejects_disabled_expired_and_deleting_accounts(self):
+        aid, _ = self.create("member", [])
+        self.account(aid, enabled=False)
+        route = f"accounts/{aid}/login"
+        self.call_api("POST", route, self.admin, dict(revision=2), expect=409)
+        self.account(aid, enabled=True)
+        with self.db:
+            self.db.execute("UPDATE accounts SET expires_at=unixepoch() WHERE id=?", (aid,))
+        self.call_api("POST", route, self.admin, dict(revision=3), expect=409)
+        self.call_api("DELETE", f"accounts/{aid}", self.admin, dict(revision=3))
+        self.call_api("POST", route, self.admin, dict(revision=4), expect=409)
+        self.assertTrue(self.call_api("GET", "me", self.admin)["admin"])
+
+    def test_delete_disabled_account_requires_admin_and_current_revision(self):
+        aid, user = self.create("member", [])
+        route = f"accounts/{aid}"
+        self.call_api("DELETE", route, None, dict(revision=1), expect=401)
+        self.call_api("DELETE", route, user, dict(revision=1), expect=403)
+        self.account(aid, enabled=False)
+        self.call_api("DELETE", route, self.admin, dict(revision=1), expect=409)
+        self.assertFalse(self.call_api("GET", "accounts", self.admin)["accounts"][0]["expiring"])
+        self.call_api("DELETE", route, self.admin, dict(revision=2))
+        self.tick()
+        self.assertEqual(self.call_api("GET", "accounts", self.admin)["accounts"], [])
+
     def report(self, node, rule, up, down=0, epoch="a" * 32):
         with database.atomic(self.db):
             agent_v3.accept_traffic(self.db, node, [dict(rule_id=rule, protocol="tcp", epoch=epoch,
@@ -306,6 +359,12 @@ class AccountTests(Fixture, unittest.TestCase):
         self.check_switch_quota("commit")
 
     def test_expiry_denies_access_then_waits_for_cleanup_across_restart(self):
+        self.check_cleanup_across_restart(manual=False)
+
+    def test_manual_deletion_revokes_access_then_waits_for_cleanup_across_restart(self):
+        self.check_cleanup_across_restart(manual=True)
+
+    def check_cleanup_across_restart(self, manual):
         shared, passive = self.node("shared"), self.node("passive")
         self.ready(shared)
         self.ready(passive, mode="passive")
@@ -323,15 +382,20 @@ class AccountTests(Fixture, unittest.TestCase):
             return list(self.db.execute("SELECT * FROM rules WHERE configuration_id=?", (admin_config,)))
         rules = admin_rules()
         self.assertTrue(rules)
-        self.account(aid, expires_at=int(time.time()) + 3600)
         self.assertEqual(self.request("GET", url)[0], 200)
-        with self.db:
-            self.db.execute("UPDATE accounts SET expires_at=unixepoch() WHERE id=?", (aid,))
+        if manual:
+            self.call_api("DELETE", f"accounts/{aid}", self.admin, dict(revision=1))
+            self.call_api("DELETE", f"accounts/{aid}", self.admin, dict(revision=1))
+        else:
+            self.account(aid, expires_at=int(time.time()) + 3600)
+            with self.db:
+                self.db.execute("UPDATE accounts SET expires_at=unixepoch() WHERE id=?", (aid,))
         self.call_api("GET", "me", user, expect=401)
         self.call_api("POST", "login", None, dict(username="member", password="temporary-password"), expect=401)
         self.assertEqual(self.request("GET", url)[0], 404)
         self.call_api("PATCH", f"accounts/{aid}", self.admin, dict(revision=2, expires_at=None), expect=409)
-        self.assertTrue(self.tick())
+        if not manual:
+            self.assertTrue(self.tick())
         self.assertEqual(database.allowed_nodes(self.db, aid), set())
         self.assertEqual(admin_rules(), rules)
         self.ack(shared)

@@ -1,10 +1,11 @@
 <script lang="ts">
   import Plus from '@lucide/svelte/icons/plus';
-  import { get, patch, post } from '$lib/api';
+  import { api, errorMessage, get, patch, post } from '$lib/api';
   import { confirm } from '$lib/confirm.svelte';
   import { FieldError, FormState } from '$lib/form.svelte';
   import { dateTime, gigabytes } from '$lib/format';
   import { usePoll } from '$lib/poll.svelte';
+  import { session } from '$lib/session.svelte';
   import { MODE_LABEL } from '$lib/status';
   import { toast } from '$lib/toast.svelte';
   import type { TrafficQuota } from '$lib/types';
@@ -27,6 +28,7 @@
   let open = $state(false);
   let original = $state<Account | null>(null);
   let showPassword = $state(false);
+  let busy = $state(false);
   let draft = $state({ username: '', password: '', enabled: true, node_ids: [] as number[],
     hidden_node_ids: [] as number[], max_configs: '', expiry: '', limits: {} as Record<number, string>, resets: [] as number[] });
   const expiryInput = (account: Account | null) => account?.expires_at ? dateTime(account.expires_at).replace(' ', 'T') : '';
@@ -50,6 +52,29 @@
       limits: Object.fromEntries(Object.entries(account?.traffic ?? {}).map(([id, q]) => [id, String(q.limit_gb ?? '')])),
       resets: [] };
     open = true;
+  }
+
+  async function manage(account: Account, action: 'login' | 'delete') {
+    if (busy) return;
+    busy = true;
+    try {
+      if (action === 'login') {
+        if (await confirm({ title: `登录子账户「${account.username}」？`, confirmLabel: '切换登录',
+          body: '当前浏览器将使用该子账户的权限。返回管理员面板时需重新登录。' })) {
+          await session.loginAsChild(account.id, account.revision);
+        }
+      } else if (await confirm({ title: `删除子账户「${account.username}」？`, confirmLabel: '删除子账户', danger: true,
+        body: '登录和订阅将立即失效。节点确认清除该账户的转发规则后，其链路、目标、配置和账户将永久删除。' })) {
+        await api('DELETE', `accounts/${account.id}`, { revision: account.revision });
+        toast.ok('已开始清理子账户');
+        await list.refresh();
+      }
+    } catch (err) {
+      toast.error(errorMessage(err));
+      await list.refresh();
+    } finally {
+      busy = false;
+    }
   }
 
   function grant(id: number, enabled: boolean) {
@@ -116,11 +141,19 @@
       {#each list.data.accounts as account (account.id)}
         <li class="flex flex-wrap items-center gap-2 py-2 first:pt-0 last:pb-0">
           <span class="break-all text-sm font-medium">{account.username}</span>
-          <Badge tone={account.expiring ? 'warn' : account.enabled ? 'ok' : 'idle'}>{account.expiring ? '到期清理中' : account.enabled ? '已启用' : '已停用'}</Badge>
+          <Badge tone={account.expiring ? 'warn' : account.enabled ? 'ok' : 'idle'}>{account.expiring ? '清理中' : account.enabled ? '已启用' : '已停用'}</Badge>
           {#if account.expires_at}<span class="text-xs text-fg-muted">{dateTime(account.expires_at)} 到期</span>{/if}
           <span class="text-xs text-fg-muted">{account.node_ids.length} 个节点{account.cleanup_nodes ? ` · ${account.cleanup_nodes} 个节点待清理` : ''}</span>
           <span class="text-xs text-fg-muted">配置 {account.config_count}{account.max_configs === null ? '' : ` / ${account.max_configs}`}</span>
-          <Button size="sm" class="ml-auto" disabled={account.expiring} onclick={() => edit(account)}>编辑</Button>
+          {#if !account.expiring}
+            <div class="ml-auto flex items-center gap-1">
+              {#if account.enabled}
+                <Button size="sm" disabled={busy} onclick={() => manage(account, 'login')}>以此账户登录</Button>
+              {/if}
+              <Button size="sm" disabled={busy} onclick={() => edit(account)}>编辑</Button>
+              <Button size="sm" variant="danger-ghost" disabled={busy} onclick={() => manage(account, 'delete')}>删除</Button>
+            </div>
+          {/if}
         </li>
       {/each}
     </ul>

@@ -88,6 +88,29 @@ def credentials(conn, username):
     return tuple(row) if row else (None, DUMMY_HASH, False)
 
 
+def issue_session(self, conn, account_id):
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        "INSERT INTO sessions(token_hash,expires,account_id) VALUES (?,?,?)",
+        (hashlib.sha256(token.encode()).hexdigest(), int(time.time()) + settings.SESSION_TTL, account_id),
+    )
+    return session_cookie(self, token, settings.SESSION_TTL)
+
+
+def login_as_child(self, session, conn, body, ident):
+    self.require_admin(session)
+    account = conn.execute(f"SELECT revision,({accounts.ACTIVE_SQL}) AS active FROM accounts a WHERE id=?",
+                           (ident,)).fetchone()
+    if account is None:
+        raise errors.UserError("子账户不存在", status=404)
+    if not account["active"]:
+        raise errors.UserError("只能登录已启用且未到期的子账户", status=409)
+    accounts.check_revision(account, body)
+    conn.execute("DELETE FROM sessions WHERE token_hash=?", (session.token_hash,))
+    self.cookies.append(issue_session(self, conn, ident))
+    return {}
+
+
 def api_login(self, conn, body):
     global LOGIN_PENDING
     ip = self.source_ip()
@@ -130,16 +153,12 @@ def api_login(self, conn, body):
                     fails["locked_until"] = fails["expires"]
     if not authenticated:
         return self.send_json(401, {"error": "用户名或密码错误"})
-    token = secrets.token_urlsafe(32)
     with database.atomic(conn):
         # Password resets and disablement may have raced the expensive verification.
         if credentials(conn, username) != (account_id, stored, enabled):
             return self.send_json(401, {"error": "用户名或密码错误"})
-        conn.execute(
-            "INSERT INTO sessions(token_hash,expires,account_id) VALUES (?,?,?)",
-            (hashlib.sha256(token.encode()).hexdigest(), int(now) + settings.SESSION_TTL, account_id),
-        )
-    self.cookies.append(session_cookie(self, token, settings.SESSION_TTL))
+        cookie = issue_session(self, conn, account_id)
+    self.cookies.append(cookie)
     self.send_json(200, {"must_change": account_id is None and database.setting(conn, "must_change") == "1"})
 
 

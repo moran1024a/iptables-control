@@ -55,7 +55,8 @@ const browser = await chromium.launch({ channel: channel === 'bundled' ? undefin
 const problems = [];
 let step = 'start';
 try {
-  const page = await browser.newPage({ viewport: { width: 1366, height: 900 } });
+  const context = await browser.newContext({ viewport: { width: 1366, height: 900 } });
+  const page = await context.newPage();
   page.setDefaultTimeout(10000);
   page.on('pageerror', (error) => problems.push(`[${step}] page error: ${error.message}`));
   page.on('console', (message) => {
@@ -216,6 +217,33 @@ try {
   } finally {
     await member.close();
   }
+
+  step = 'admin login as member';
+  const memberRow = page.getByRole('listitem').filter({ hasText: 'smoke-member' });
+  const settingsTab = await context.newPage();
+  await settingsTab.goto(server.url + '#/settings');
+  await settingsTab.getByRole('button', { name: '新建子账户' }).waitFor();
+  await memberRow.getByRole('button', { name: '以此账户登录' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: '切换登录' }).click();
+  await heading('总览').waitFor();
+  await settingsTab.locator('aside').getByText('smoke-member', { exact: true }).waitFor();
+  assert(!(await settingsTab.getByRole('button', { name: '新建子账户' }).count()), 'other tab drops admin controls');
+  await settingsTab.close();
+  const me = await (await page.request.get(server.url + 'api/me')).json();
+  assert(me.username === 'smoke-member' && !me.admin, 'browser uses an ordinary member session');
+  await page.getByRole('button', { name: '退出登录' }).first().click();
+  await page.getByLabel('用户名').fill('admin');
+  await page.getByLabel('密码').fill('ictl-demo-pass');
+  await page.getByRole('button', { name: '登录' }).click();
+  await heading('总览').waitFor();
+
+  step = 'delete subaccount';
+  await go('#/settings');
+  await memberRow.getByRole('button', { name: '删除' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: '取消' }).click();
+  await memberRow.getByRole('button', { name: '删除' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: '删除子账户' }).click();
+  await memberRow.waitFor({ state: 'detached' });
 
   step = 'unknown route';
   await go('#/does-not-exist');

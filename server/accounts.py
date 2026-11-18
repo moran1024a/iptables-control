@@ -61,13 +61,18 @@ def listing(c):
     return dict(accounts=result, nodes=nodes)
 
 
+def check_revision(row, body):
+    if type(body.get("revision")) is not int or body["revision"] != row["revision"]:
+        raise errors.UserError("账户已变更，请刷新后重试", status=409)
+
+
 def save(c, body, ident=None):
     old = child(c, ident) if ident is not None else None
     now = int(time.time())
     if old and (old["expiring"] or old["expires_at"] is not None and old["expires_at"] <= now):
-        raise errors.UserError("账户已到期，正在清理", status=409)
-    if old and (type(body.get("revision")) is not int or body["revision"] != old["revision"]):
-        raise errors.UserError("账户已变更，请刷新后重新编辑", status=409)
+        raise errors.UserError("账户正在清理", status=409)
+    if old:
+        check_revision(old, body)
     name = username(body.get("username", old["username"] if old else None))
     reserved = (settings.DEFAULT_USER, database.setting(c, "admin_user"))
     if name.lower() in {x.lower() for x in reserved} or c.execute(
@@ -189,22 +194,33 @@ def suspend(c, account_id, removed):
     return node_sync.finish_mutation(c, before)
 
 
+def start_deletion(c, uid):
+    c.execute("UPDATE accounts SET enabled=0,expiring=1,revision=revision+1 WHERE id=?", (uid,))
+    c.execute("DELETE FROM sessions WHERE account_id=?", (uid,))
+    c.execute("DELETE FROM subscriptions WHERE account_id=?", (uid,))
+    changed = suspend(c, uid, None)
+    c.execute("DELETE FROM account_nodes WHERE account_id=?", (uid,))
+    for link in list(topologies(c, uid)):
+        tid = link["id"]
+        c.execute("DELETE FROM probe_bindings WHERE scope='topologies' AND owner_id=?", (tid,))
+        c.execute("UPDATE topologies SET deleted=1 WHERE id=?", (tid,))
+        c.execute("UPDATE configurations SET deleted=1,desired=NULL,state='deleting' WHERE topology_id=?", (tid,))
+    return changed
+
+
+def delete(c, body, ident):
+    account = child(c, ident)
+    if not account["expiring"]:
+        check_revision(account, body)
+        start_deletion(c, ident)
+    return {}
+
+
 def expire_due(c, now):
-    """Durably withdraw only the expired owner's rules before the executor schedules more work."""
     due = c.execute("SELECT id FROM accounts WHERE expiring=0 AND expires_at<=?", (now,)).fetchall()
     changed = False
     for row in due:
-        uid = row["id"]
-        c.execute("UPDATE accounts SET enabled=0,expiring=1,revision=revision+1 WHERE id=?", (uid,))
-        c.execute("DELETE FROM sessions WHERE account_id=?", (uid,))
-        c.execute("DELETE FROM subscriptions WHERE account_id=?", (uid,))
-        changed = suspend(c, uid, None) or changed
-        c.execute("DELETE FROM account_nodes WHERE account_id=?", (uid,))
-        for link in list(topologies(c, uid)):
-            tid = link["id"]
-            c.execute("DELETE FROM probe_bindings WHERE scope='topologies' AND owner_id=?", (tid,))
-            c.execute("UPDATE topologies SET deleted=1 WHERE id=?", (tid,))
-            c.execute("UPDATE configurations SET deleted=1,desired=NULL,state='deleting' WHERE topology_id=?", (tid,))
+        changed = start_deletion(c, row["id"]) or changed
     return changed
 
 

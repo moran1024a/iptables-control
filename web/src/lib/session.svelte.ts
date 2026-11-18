@@ -8,8 +8,12 @@ class Session {
   admin = $state(false);
   version = $state('');
   error = $state('');
+  private changes = typeof window !== 'undefined' && typeof BroadcastChannel !== 'undefined'
+    ? new BroadcastChannel('ictl-session:' + window.location.pathname)
+    : null;
 
   constructor() {
+    if (this.changes) this.changes.onmessage = () => location.reload();
     onUnauthorized((mustChange) => {
       this.status = mustChange ? 'must-change' : 'anonymous';
     });
@@ -33,12 +37,21 @@ class Session {
 
   async login(username: string, password: string) {
     await api('POST', 'login', { username, password }, { quiet: true });
+    this.changes?.postMessage('changed');
     await this.load();
+  }
+
+  async loginAsChild(id: number, revision: number) {
+    await api('POST', `accounts/${id}/login`, { revision });
+    this.changes?.postMessage('changed');
+    history.replaceState(null, '', '#/');
+    location.reload();
   }
 
   async logout() {
     try {
       await api('POST', 'logout', {}, { quiet: true });
+      this.changes?.postMessage('changed');
     } finally {
       this.status = 'anonymous';
     }

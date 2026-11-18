@@ -1,4 +1,5 @@
 from email.message import Message
+from functools import partial
 import io
 import ipaddress
 import json
@@ -177,7 +178,10 @@ class Request:
             handler = {"GET": self.resources.api_accounts, "POST": self.resources.api_account_save}.get(method)
         elif len(parts) == 2 and parts[0] == "accounts" and re.fullmatch(r"[0-9]+", parts[1]):
             self.require_admin(session)
-            handler = {"PATCH": self.resources.api_account_save}.get(method)
+            handler = {"PATCH": self.resources.api_account_save, "DELETE": self.resources.api_account_delete}.get(method)
+        elif (len(parts) == 3 and parts[0] == "accounts" and re.fullmatch(r"[0-9]+", parts[1])
+              and parts[2] == "login" and method == "POST"):
+            handler = partial(authentication.login_as_child, self, session)
         elif parts == ["nodes"]:
             handler = {"GET": self.resources.api_nodes, "POST": self.resources.api_node_add}.get(method)
         elif len(parts) == 2 and parts[0] == "nodes" and re.fullmatch(r"[0-9]+", parts[1]):

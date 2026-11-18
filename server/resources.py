@@ -57,6 +57,9 @@ class Resources:
     def api_account_save(self, conn, body, ident=None):
         return accounts.save(conn, body, ident)
 
+    def api_account_delete(self, conn, body, ident):
+        return accounts.delete(conn, body, ident)
+
     def node_brief(self, conn, n, now):
         return {
             "id": n["id"],
