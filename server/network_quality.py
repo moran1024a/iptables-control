@@ -5,6 +5,7 @@ import time
 import database
 import errors
 import link_quality
+import node_visibility
 import probe_store
 import agent_v3
 
@@ -17,7 +18,7 @@ PROTOCOLS = ("udp-echo-v1", "icmp-echo-v1")
 
 def paths(conn):
     result = {}
-    for r in conn.execute("SELECT id,graph FROM topologies WHERE deleted=0"):
+    for r in conn.execute("SELECT id,graph FROM topologies WHERE deleted=0 AND suspended=0"):
         result["topologies", r["id"]] = list(
             dict.fromkeys(
                 v["node_id"] for v in json.loads(r["graph"])["vertices"] if v.get("node_id")
@@ -171,21 +172,23 @@ def summarize(rows, seconds, now):
     return dict(points=points, step=step, summary=aggregate(recent), latest=latest)
 
 
-async def view(monitor, body):
+async def view(monitor, body, authorize=None):
     scope, ident = (body.get("scope"), body.get("id"))
     seconds = body.get("range", 900)
     if (
         scope != "topologies"
         or type(ident) is not int
+        or not 0 < ident < 2**63
         or type(seconds) is not int
         or (seconds not in HISTORY_STEPS)
     ):
         raise errors.UserError("无效的链路或时间范围")
     now = int(time.time())
     if scope == "topologies" and "source" not in body and ("target" not in body):
-        return await link_quality.view(monitor, body, now)
+        return await link_quality.view(monitor, body, now, authorize)
 
     def read(conn):
+        visible = authorize(conn, ident) if authorize else None
         ids = paths(conn).get((scope, ident))
         if ids is None:
             raise errors.UserError("链路不存在", status=404)
@@ -205,13 +208,19 @@ async def view(monitor, body):
         for protocol in PROTOCOLS:
             pair = ensure_pair(conn, nodes, a, b, protocol)
             why = monitor.unavailable(nodes, pair)
+            metrics = history(conn, pair["id"], seconds, now)
+            if visible is not None:
+                metrics = node_visibility.history(metrics)
+            if visible is not None and (a not in visible or b not in visible):
+                pair = dict(pair, port=0, source_addr="" if a not in visible else pair["source_addr"],
+                            target_addr="" if b not in visible else pair["target_addr"])
             series.append(
                 dict(
                     protocol=protocol,
                     pair=pair,
                     state=why[0] if why else "collecting",
-                    note=why[1] if why else "",
-                    **history(conn, pair["id"], seconds, now),
+                    note=("探测异常" if visible is not None and why[0] == "error" else why[1]) if why else "",
+                    **metrics,
                 )
             )
         return dict(

@@ -33,11 +33,11 @@
   }
 </script>
 
-<Card title="账号" hint="登录面板使用的管理员账号">
+<Card title="账号">
   <form onsubmit={submit} class="flex flex-col gap-3.5" inert={form.busy} aria-busy={form.busy} novalidate>
     <Field label="用户名" hint="1-32 位字母、数字或 _ . @ -" error={form.errors.username}>
       {#snippet children({ id, invalid })}
-        <Input {id} {invalid} bind:value={draft.username} autocomplete="username" maxlength={32} spellcheck={false} autocapitalize="off" />
+        <Input {id} {invalid} bind:value={draft.username} readonly={!session.admin} autocomplete="username" maxlength={32} spellcheck={false} autocapitalize="off" />
       {/snippet}
     </Field>
     <div class="grid gap-3.5 sm:grid-cols-2">

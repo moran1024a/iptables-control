@@ -12,7 +12,7 @@ def reset_admin(conn):
     database.set_setting(conn, "admin_user", settings.DEFAULT_USER)
     database.set_setting(conn, "admin_hash", hash_password(settings.DEFAULT_PASS))
     database.set_setting(conn, "must_change", "1")
-    conn.execute("DELETE FROM sessions")
+    conn.execute("DELETE FROM sessions WHERE account_id IS NULL")
 
 
 def hash_password(password, salt=None):

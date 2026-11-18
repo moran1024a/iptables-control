@@ -6,6 +6,7 @@ import time
 import agent_v3
 import api
 import authentication
+import configurations
 import lifecycle
 import database
 import errors
@@ -429,15 +430,29 @@ def create_app():
         if request.path == panel_path + "/api/quality":
             if request.method != "POST" or request.content_type != "application/json":
                 raise web.HTTPBadRequest()
-            if not await hub.database(
-                lambda c: authentication.auth(h, c) and database.setting(c, "must_change") != "1"
-            ):
+            session = await hub.database(lambda c: authentication.auth(h, c), readonly=True)
+            if not session or session.must_change:
                 return web.json_response({"error": "未登录或需要修改默认密码"}, status=401)
+            caller = None
+
+            def authorize(c, ident):
+                nonlocal caller
+                session = authentication.auth(h, c)
+                if not session or session.must_change:
+                    raise errors.UserError("未登录或需要修改默认密码", status=401)
+                database.require_owner(c, "topologies", ident, session.account_id)
+                if configurations.get_topology(c, ident)["suspended"]:
+                    raise errors.UserError("链路已停用", status=409)
+                caller = session
+                return database.visible_address_nodes(c, session.account_id)
             try:
                 payload = json.loads(body)
                 if not isinstance(payload, dict):
                     raise ValueError()
-                response = web.json_response(await hub.quality.view(payload))
+                response = web.json_response(await hub.quality.view(payload, authorize))
+                if caller and authentication.needs_renewal(caller):
+                    await hub.database(lambda c: authentication.renew(h, c, caller))
+                response.headers["Cache-Control"] = "no-store"
                 for cookie in h.cookies:
                     response.headers.add("Set-Cookie", cookie)
                 return response
@@ -450,15 +465,16 @@ def create_app():
             request.path.startswith(panel_path + "/api/")
             and len(parts) == 3
             and (parts[0] == "nodes")
-            and parts[1].isdigit()
+            and len(parts[1]) <= 19 and parts[1].isascii() and parts[1].isdigit()
+            and 0 < int(parts[1]) < 2**63
             and (parts[2] == "query")
         ):
 
-            def authorized(c):
-                return authentication.auth(h, c) and database.setting(c, "must_change") != "1"
-
-            if not await hub.database(authorized):
+            session = await hub.database(lambda c: authentication.auth(h, c), readonly=True)
+            if not session or session.must_change:
                 return web.json_response({"error": "未登录或需要修改默认密码"}, status=401)
+            if not session.admin:
+                return web.json_response({"error": "仅管理员可操作"}, status=403)
             if request.method != "POST" or request.content_type != "application/json":
                 raise web.HTTPBadRequest()
             try:
@@ -468,6 +484,8 @@ def create_app():
             except ValueError as exc:
                 raise web.HTTPBadRequest() from exc
             response = await hub.query(int(parts[1]), query)
+            if authentication.needs_renewal(session):
+                await hub.database(lambda c: authentication.renew(h, c, session))
             for cookie in h.cookies:
                 response.headers.add("Set-Cookie", cookie)
             return response

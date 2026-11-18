@@ -2,6 +2,7 @@
   import { get } from '$lib/api';
   import { usePoll } from '$lib/poll.svelte';
   import { router } from '$lib/router.svelte';
+  import { session } from '$lib/session.svelte';
   import { theme, type ThemeChoice } from '$lib/theme.svelte';
   import type { Settings } from '$lib/types';
   import Alert from '$ui/Alert.svelte';
@@ -12,10 +13,11 @@
   import Page from '../../layout/Page.svelte';
   import AboutCard from './AboutCard.svelte';
   import AccountCard from './AccountCard.svelte';
+  import AccountsCard from './AccountsCard.svelte';
   import ServerCard from './ServerCard.svelte';
 
   // Loaded once: nothing here changes on its own, and the cards keep their own unsaved input.
-  const settings = usePoll((signal) => get<Settings>('settings', { signal }), { interval: 0 });
+  const settings = usePoll((signal) => session.admin ? get<Settings>('settings', { signal }) : Promise.resolve(undefined), { interval: 0 });
   let accountDirty = $state(false);
   let serverDirty = $state(false);
 
@@ -51,7 +53,9 @@
         </div>
       </Card>
     </div>
+    {#if session.admin}
     <div class="flex min-w-0 flex-col gap-4">
+      <AccountsCard />
       {#if settings.data}
         {#if settings.error}<Alert tone="warn">刷新失败：{settings.error}。显示的是上一次的数据。</Alert>{/if}
         <ServerCard settings={settings.data} bind:dirty={serverDirty} onsaved={settings.refresh} />
@@ -65,5 +69,6 @@
         <div class="flex justify-center rounded-lg border bg-surface py-16 text-fg-subtle"><Spinner class="size-5" /></div>
       {/if}
     </div>
+    {/if}
   </div>
 </Page>

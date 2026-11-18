@@ -1,14 +1,104 @@
 """Reachable endpoints of one target, with address choices owned by each edge."""
 
 import json
+import ipaddress
 import re
+import socket
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from urllib.parse import urlsplit
 import database
 import errors
 import validation
+import node_addresses
+
+
+DNS_SLOTS = threading.BoundedSemaphore(4)
+DNS_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="target-dns")
+
+
+def protected_hosts(c):
+    try:
+        public = urlsplit(database.setting(c, "public_url", "")).hostname
+    except ValueError:
+        raise errors.UserError("请管理员修正服务端对外地址", "host") from None
+    hosts = {public} if public else set()
+    for node in c.execute("SELECT id,addr,src_ip FROM nodes"):
+        hosts.add(node["addr"])
+        if node["src_ip"]:
+            hosts.add(node["src_ip"])
+        for a in node_addresses.listing(c, node):
+            hosts.update(a[k] for k in ("host", "local", "gateway") if a.get(k))
+        hosts.update(a["local"] for a in node_addresses.network(c, node["id"])["addresses"])
+    return hosts
+
+
+def literal(host):
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+
+def resolve_hosts(hosts):
+    results = {h: {literal(h)} for h in hosts if literal(h) is not None}
+    pending = sorted(hosts - results.keys())
+    if not pending:
+        return results
+    if not DNS_SLOTS.acquire(blocking=False):
+        raise errors.UserError("目标域名解析繁忙，请稍后重试", status=503)
+    deadline = time.monotonic() + 3
+
+    def lookup():
+        for host in pending:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                rows = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+            except socket.gaierror as exc:
+                if exc.errno in {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)}:
+                    results[host] = set()
+                continue
+            except OSError:
+                continue
+            results[host] = {ipaddress.IPv4Address(row[4][0]) for row in rows}
+        return results
+
+    future = DNS_POOL.submit(lookup)
+    future.add_done_callback(lambda _: DNS_SLOTS.release())
+    try:
+        return future.result(timeout=max(0, deadline - time.monotonic()))
+    except TimeoutError:
+        raise errors.UserError("目标域名解析超时，请稍后重试", "host") from None
+
+
+def public_ip(ip):
+    return isinstance(ip, ipaddress.IPv4Address) and ip.is_global and not ip.is_multicast and not ip.is_reserved
+
+
+def pin(c, target, addresses, resolved):
+    protected = protected_hosts(c)
+    if not protected <= resolved.keys():
+        raise errors.UserError("暂时无法校验管理地址，请稍后重试", "host")
+    blocked = set().union(*(resolved[h] for h in protected))
+    pins = {}
+    for addr in listing(target)[:1] + addresses:
+        host = addr["host"]
+        values = resolved.get(host)
+        if host in protected or not values or any(not public_ip(ip) or ip in blocked for ip in values):
+            raise errors.UserError("子账户目标必须解析到可用的公网 IPv4，并避开节点和管理地址", "host")
+        pins[addr["id"]] = str(min(values))
+    return json.dumps(pins, ensure_ascii=False)
 
 
 def listing(target):
-    return [dict(id="main", name="默认", host=target["host"], port=target["port"])] + json.loads(target["addresses"])
+    result = [dict(id="main", name="默认", host=target["host"], port=target["port"])] + json.loads(target["addresses"])
+    pins = json.loads(dict(target).get("pins", "{}"))
+    for addr in result:
+        if addr["id"] in pins:
+            addr["forward_ip"] = pins[addr["id"]]
+    return result
 
 
 def selected(plan):
@@ -18,14 +108,19 @@ def selected(plan):
 
 def resolve(c, plan, *, current=False):
     target = dict(database.get_target(c, plan["target"]))
+    child = database.group_owner(c, target["group_id"]) is not None
     ident = selected(plan)
     book = {a["id"]: a for a in listing(target)} if current else plan["graph"].get("address_book", {}).get(plan["graph_path"][-1], {})
     # RC1/RC2 snapshots predate target address bindings and use the imported address.
-    if not book and ident == "main":
+    if not child and not book and ident == "main":
         return target
     if ident not in book:
         raise errors.UserError("目标地址已不存在，请重新选择", "addresses")
-    return dict(target, host=book[ident]["host"], port=book[ident]["port"])
+    address = book[ident]
+    host = address.get("forward_ip", address["host"])
+    if child and not public_ip(literal(address.get("forward_ip"))):
+        raise errors.UserError("目标地址未经校验，请重新保存目标", "host")
+    return dict(target, host=host, port=address["port"])
 
 
 def describe(c, plan, target):
@@ -34,18 +129,18 @@ def describe(c, plan, target):
     snapshot = plan["graph"].get("address_book", {}).get(plan["graph_path"][-1], {}).get(ident, {})
     address = next(
         (a for a in listing(database.get_target(c, plan["target"]))
-         if a["id"] == ident and (a["host"], a["port"]) == (target["host"], target["port"])),
+         if a["id"] == ident and (a.get("forward_ip", a["host"]), a["port"]) == (target["host"], target["port"])),
         snapshot,
     )
     return dict(
         id=ident,
         name=address.get("name") or f"{target['host']}:{target['port']}",
-        host=target["host"],
+        host=address.get("host", target["host"]),
         port=target["port"],
     )
 
 
-def save(c, target, values):
+def save(c, target, values, resolved=None):
     if not isinstance(values, list) or len(values) > 32:
         raise errors.UserError("每个目标最多添加 32 个接入地址", "addresses")
     result, ids, endpoints = [], {"main"}, {(target["host"], target["port"])}
@@ -73,7 +168,9 @@ def save(c, target, values):
             if any(v.get("target_id") == target["id"] and used.get(v["id"], set()) & removed
                    for v in graph.get("vertices", [])):
                 raise errors.UserError(f"目标地址仍被「{name}」引用，请先替换连线并等待同步完成", "addresses")
-    c.execute("UPDATE targets SET addresses=? WHERE id=?", (json.dumps(result, ensure_ascii=False), target["id"]))
+    c.execute("UPDATE targets SET addresses=?,pins=? WHERE id=?",
+              (json.dumps(result, ensure_ascii=False),
+               pin(c, target, result, resolved) if resolved is not None else "{}", target["id"]))
 
 
 def refresh(c, old, target):
@@ -81,8 +178,8 @@ def refresh(c, old, target):
     import execution
     book = {a["id"]: a for a in listing(target)}
     previous = {a["id"]: a for a in listing(old)}
-    changed = {i for i, a in book.items() if i not in previous or
-               (a["host"], a["port"]) != (previous[i]["host"], previous[i]["port"])}
+    endpoint = lambda a: (a.get("forward_ip", a["host"]), a["port"])
+    changed = {i for i, a in book.items() if i not in previous or endpoint(a) != endpoint(previous[i])}
 
     def update(graph):
         dirty = False

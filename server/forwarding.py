@@ -59,7 +59,8 @@ def reserved(c, nid, exclude_configuration=None, *, allow_owned_retired=False):
             result.add(row[0])
 
     for row in c.execute(
-        "SELECT id,desired FROM configurations WHERE deleted=0 AND desired IS NOT NULL"
+        "SELECT f.id,f.desired FROM configurations f JOIN topologies t ON t.id=f.topology_id "
+        "WHERE f.deleted=0 AND t.suspended=0 AND f.desired IS NOT NULL"
     ):
         plan = json.loads(row["desired"])
         if row["id"] != exclude_configuration and plan["entry"] == nid and plan.get("port"):

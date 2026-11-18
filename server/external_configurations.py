@@ -2,6 +2,7 @@
 import database
 import errors
 import proxy_formats
+import quotas
 import validation
 
 
@@ -24,7 +25,9 @@ def preview(body):
     return {k:node[k] for k in ("name", "protocol", "host", "port")}
 
 
-def save(c, body, ident=None):
+def save(c, body, ident=None, account_id=None):
+    if ident is not None:
+        database.require_owner(c, "external_configurations", ident, account_id)
     old = get(c, ident) if ident is not None else None
     if old and (type(body.get("revision")) is not int or body["revision"] != old["revision"]):
         raise errors.UserError("配置已变化，请重新打开编辑", status=409)
@@ -34,26 +37,30 @@ def save(c, body, ident=None):
         proxy_formats.clean(name)
     except ValueError:
         raise errors.UserError("名称不能含有控制字符", "name") from None
-    group = database.check_group(c, "external_configurations", body.get("group_id", old["group_id"] if old else None))
+    group = database.check_group(c, "external_configurations", body.get("group_id", old["group_id"] if old else None), account_id)
     if old:
         c.execute("UPDATE external_configurations SET name=?,uri=?,revision=revision+1 WHERE id=?", (name,node["uri"],ident))
         if group != old["group_id"]:
             database.move_group(c, "external_configurations", ident, group)
     else:
+        limit = quotas.config_limit(c, account_id)
+        if limit is not None:
+            before = quotas.config_count(c, account_id)
+            quotas.check_config_limit(limit, before, before + 1)
         ident = c.execute("INSERT INTO external_configurations(name,uri,group_id,sort) VALUES (?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM external_configurations))",
                           (name,node["uri"],group)).lastrowid
     return dict(id=ident, code=f"E{ident:04d}")
 
 
-def delete(c, ident):
-    get(c, ident)
+def delete(c, ident, account_id=None):
+    database.require_owner(c, "external_configurations", ident, account_id)
     c.execute("DELETE FROM external_configurations WHERE id=?", (ident,))
     return dict(deleted=True)
 
 
-def listing(c):
+def listing(c, account_id=None):
     result = []
-    for row in c.execute(database.ordered("external_configurations")):
+    for row in database.owned_rows(c, "external_configurations", account_id):
         node = proxy_formats.parse(row["uri"])
         result.append(dict(row, source="external", code=f"E{row['id']:04d}", state="imported", error="",
                            connection=dict(protocol=node["protocol"], host=node["host"], port=node["port"],

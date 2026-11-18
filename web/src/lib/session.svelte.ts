@@ -5,6 +5,7 @@ export type SessionStatus = 'loading' | 'offline' | 'anonymous' | 'must-change' 
 class Session {
   status = $state<SessionStatus>('loading');
   username = $state('');
+  admin = $state(false);
   version = $state('');
   error = $state('');
 
@@ -16,8 +17,9 @@ class Session {
 
   async load() {
     try {
-      const me = await api<{ username: string; version: string; must_change: boolean }>('GET', 'me', undefined, { quiet: true });
+      const me = await api<{ username: string; version: string; must_change: boolean; admin: boolean }>('GET', 'me', undefined, { quiet: true });
       this.username = me.username;
+      this.admin = me.admin;
       this.version = me.version;
       this.status = me.must_change ? 'must-change' : 'ready';
     } catch (err) {
@@ -42,7 +44,7 @@ class Session {
     }
   }
 
-  /** Change the administrator account; the server keeps this session and drops the others. */
+  /** The server keeps this session and drops the account's other sessions. */
   async changeAccount(body: { current_password: string; username: string; password: string }) {
     const result = await api<{ username: string }>('POST', 'account', body, { quiet: true });
     this.username = result.username;

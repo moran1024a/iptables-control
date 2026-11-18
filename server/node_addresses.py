@@ -303,7 +303,7 @@ def save(c, node, values, *, addr=None):
 
         # Deleting a referenced address would break the saved graph. Corrections
         # are allowed until an applied or in-flight snapshot actually uses it.
-        for name, doc in topology.documents(c):
+        for name, doc in topology.documents(c, include_suspended=False):
             graph = doc.get("graph", {})
             used = references(graph)
             if any(
@@ -350,7 +350,7 @@ def update_pending(c, nid, addresses):
                 dirty = True
         return dirty
 
-    for row in c.execute("SELECT id,graph FROM topologies").fetchall():
+    for row in c.execute("SELECT id,graph FROM topologies WHERE suspended=0").fetchall():
         graph = json.loads(row["graph"])
         if update(graph):
             c.execute(
@@ -358,7 +358,8 @@ def update_pending(c, nid, addresses):
                 (execution.dump(graph), row["id"]),
             )
     for row in c.execute(
-        "SELECT id,desired FROM configurations WHERE desired IS NOT NULL"
+        "SELECT f.id,f.desired FROM configurations f JOIN topologies t ON t.id=f.topology_id "
+        "WHERE f.desired IS NOT NULL AND t.suspended=0"
     ).fetchall():
         plan = json.loads(row["desired"])
         before = execution.operational(plan)

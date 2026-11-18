@@ -23,10 +23,15 @@ export const LINK_STATE: Record<string, { label: string; tone: Tone; live?: bool
   deleting: { label: '删除中', tone: 'idle', live: true },
   error: { label: '异常', tone: 'danger', live: true },
   imported: { label: '已导入', tone: 'info' },
+  suspended: { label: '已停用', tone: 'idle' },
+  quota: { label: '额度已用完', tone: 'warn' },
+  quota_cleaning: { label: '超额 · 等待停用', tone: 'warn', live: true },
+  quota_waiting: { label: '新路径额度不足', tone: 'warn' },
 };
 /** Bucket used by state filters. */
 export function linkStateGroup(state: string): string {
   if (['error', 'timeout', 'failed', 'offline'].includes(state)) return 'error';
   if (['preparing', 'switching', 'pending', 'waiting', 'manual'].includes(state)) return 'pending';
+  if (['quota_cleaning', 'quota_waiting'].includes(state)) return 'quota';
   return state;
 }

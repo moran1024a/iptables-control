@@ -115,6 +115,7 @@
           { value: 'active', label: '已生效' },
           { value: 'pending', label: '同步中' },
           { value: 'error', label: '异常' },
+          { value: 'quota', label: '流量额度' },
           { value: 'deleting', label: '删除中' },
         ]}
       />

@@ -3,8 +3,8 @@
 import json
 import os
 
-VERSION = "0.6.3"
-DATABASE_VERSION = 603
+VERSION = "0.6.4"
+DATABASE_VERSION = 607
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BASE_DIR, "components.json")) as _f:
     COMPONENTS = json.load(_f)

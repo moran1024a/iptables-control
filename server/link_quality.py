@@ -5,6 +5,7 @@ import execution
 import configurations
 import topology
 import node_addresses
+import node_visibility
 import node_tags
 import target_addresses
 import probe_store
@@ -216,10 +217,11 @@ def reason(monitor, spec, nodes):
     return None
 
 
-async def view(monitor, body, now):
+async def view(monitor, body, now, authorize=None):
     import network_quality as q
 
     def read(c):
+        visible = authorize(c, body["id"]) if authorize else None
         link = configurations.get_topology(c, body["id"])
         nodes = {r["id"]: dict(r) for r in c.execute("SELECT * FROM nodes")}
         members = {m["id"]: m for m in configurations.members(c, link["id"]) if not m["deleted"]}
@@ -265,11 +267,13 @@ async def view(monitor, body, now):
                         if now - 300 <= r["slot"] <= now and r["path_key"] == spec["path_key"]
                     ]
                 )
+                if visible is not None:
+                    history = node_visibility.history(history)
                 series.append(
                     dict(
                         protocol=spec["protocol"],
                         state=why[0] if why else "collecting",
-                        note=why[1] if why else "",
+                        note=("探测异常" if visible is not None and why[0] == "error" else why[1]) if why else "",
                         path_key=spec["path_key"],
                         **history,
                     )

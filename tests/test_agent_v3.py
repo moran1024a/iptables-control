@@ -226,7 +226,7 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
         token = 'query-session'
         with self.db:
             database.set_setting(self.db, 'must_change', '0')
-            self.db.execute('INSERT INTO sessions VALUES (?,?)',
+            self.db.execute('INSERT INTO sessions(token_hash,expires) VALUES (?,?)',
                             (hashlib.sha256(token.encode()).hexdigest(), int(time.time()) + 100))
         query = asyncio.create_task(self.client.post(
             http_harness.Handler.panel_path+f'/api/nodes/{nid}/query',
@@ -361,7 +361,7 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
         token = 'quality-session'
         with self.db:
             database.set_setting(self.db, 'must_change', '0')
-            self.db.execute('INSERT INTO sessions VALUES (?,?)',
+            self.db.execute('INSERT INTO sessions(token_hash,expires) VALUES (?,?)',
                             (hashlib.sha256(token.encode()).hexdigest(), int(time.time()) + 100))
         headers = {'Cookie': settings.SESSION_COOKIE + '=' + token}
         response = await self.client.post(path, json=payload, headers=headers)
@@ -376,6 +376,64 @@ class TransportTests(Fixture, unittest.IsolatedAsyncioTestCase):
         response = await self.client.post(path, json=dict(scope='topologies', id=rid, configuration=999), headers=headers)
         self.assertEqual(response.status, 400)
         self.assertEqual((await response.json())['field'], 'configuration')
+
+    async def test_child_cannot_read_other_topology_quality_or_run_node_query(self):
+        a, b = self.node(), self.node()
+        topology_id = self.save(self.graph([a, b]))
+        child = self.call("api_account_save", dict(username="child", password="test-password", node_ids=[a, b]))["id"]
+        token = "child-session"
+        with self.db:
+            self.db.execute(
+                "INSERT INTO sessions(token_hash,expires,account_id) VALUES (?,?,?)",
+                (hashlib.sha256(token.encode()).hexdigest(), int(time.time()) + 100, child),
+            )
+        headers = {"Cookie": settings.SESSION_COOKIE + "=" + token}
+        prefix = http_harness.Handler.panel_path + "/api/"
+        body = dict(scope="topologies", id=topology_id)
+        for selection in ({}, dict(source=a, target=b)):
+            response = await self.client.post(prefix + "quality", json={**body, **selection}, headers=headers)
+            self.assertEqual(response.status, 404)
+        response = await self.client.post(prefix + f"nodes/{a}/query", json=dict(kind="logs"), headers=headers)
+        self.assertEqual(response.status, 403)
+
+    async def test_hidden_relay_never_returns_probe_addresses_or_error_details(self):
+        a, b = self.node("entry"), self.node("private relay")
+        private_ip = database.get_node(self.db, b)["addr"]
+        other_ip = "10.42.2.3"  # Resolved address from an older sample.
+        ident = self.call("api_account_save", dict(username="relay-user", password="test-password",
+                                                    node_ids=[a, b], hidden_node_ids=[b]))["id"]
+        token = "relay-session"
+        with self.db:
+            self.db.execute("INSERT INTO sessions(token_hash,expires,account_id) VALUES (?,?,?)",
+                            (hashlib.sha256(token.encode()).hexdigest(), int(time.time()) + 100, ident))
+        headers = {"Cookie": settings.SESSION_COOKIE + "=" + token}
+        prefix = http_harness.Handler.panel_path + "/api/"
+        response = await self.client.post(prefix + "targets",
+                                          json=dict(name="target", host="1.1.1.1", port=443), headers=headers)
+        self.assertEqual(response.status, 200)
+        target = (await response.json())["id"]
+        response = await self.client.post(prefix + "topologies",
+                                          json=dict(name="relay", graph=self.graph([a, b], target)), headers=headers)
+        self.assertEqual(response.status, 200)
+        topology_id = (await response.json())["id"]
+        sample = dict(slot=int(time.time()) - 1, status="ok", rtt=12.3, resolved_ip=other_ip,
+                      error=f"diagnostic for {private_ip}:33445")
+        def link_rows(_conn, spec, *_args, **_kwargs):
+            return [dict(sample, path_key=spec["path_key"])]
+        with patch("probe_store.pair_rows", return_value=[dict(sample)]), patch("probe_store.link_rows", side_effect=link_rows):
+            for selection in ({}, dict(source=a, target=b), dict(source=b, target=a)):
+                response = await self.client.post(prefix + "quality",
+                                                  json=dict(scope="topologies", id=topology_id, **selection), headers=headers)
+                self.assertEqual(response.status, 200)
+                data = await response.json()
+                payload = json.dumps(data)
+                self.assertNotIn(private_ip, payload)
+                self.assertNotIn(other_ip, payload)
+                self.assertIn("12.3", payload)
+                if selection:
+                    self.assertEqual(data["pair"]["port"], 0)
+                    label = "source_addr" if selection["source"] == b else "target_addr"
+                    self.assertEqual(data["pair"][label], "")
 
     async def test_seventy_idle_sessions_do_not_exhaust_http_workers(self):
         nodes=[self.node(str(i)) for i in range(70)]

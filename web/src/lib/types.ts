@@ -41,7 +41,19 @@ export type NodeStatus = 'new' | 'offline' | 'skew' | 'syncing' | 'synced' | 'er
 // syncing: generation/rules not yet confirmed, or waiting for manual sync / wake · error: port conflict,
 // failed/timed-out wake, runtime rule fault · deleting: waiting for the agent to clear rules
 
-export interface NodesList { now: Epoch; kind: 'forward'; groups: Group[]; nodes: (NodeBrief & { bar: NodeBar })[]; tags: Tag[] }
+export interface NodesList { now: Epoch; kind: 'forward'; groups: Group[]; nodes: NodeSummary[]; tags: Tag[] }
+
+export type TrafficQuota = { limit_gb: number | null; used: string; remaining: string | null; exhausted: boolean };
+
+export type NodeSummary = Pick<NodeBrief, 'id' | 'name' | 'note' | 'weight' | 'tags' | 'addr' | 'group_id' | 'status' | 'last_seen' | 'desired_mode'> & {
+  addresses: Pick<NodeAddress, 'id' | 'name' | 'host' | 'primary'>[];
+  bar: NodeBar;
+  manual_required?: boolean;
+  err?: string;
+  wake?: NodeBrief['wake'];
+  traffic_quota?: TrafficQuota | null;
+  addresses_hidden?: boolean;
+};
 
 export interface NodeBrief {
   id: number; kind: 'forward';
@@ -239,6 +251,7 @@ export interface TopologyResources {
   targets: PaletteTarget[];        // ALL targets
 }
 export interface PaletteNode {
+  addresses_hidden?: boolean;
   id: number; name: string; addr: string; weight: number; group_id: number; tags: Tag[];
   addresses: NodeAddress[];
   network: { addresses: { local: string; device: string }[]; sampled_at: Epoch | null; complete: boolean };
@@ -251,6 +264,7 @@ export interface PaletteTarget {          // raw row: NOTE params is a JSON *str
 export interface TopologiesList extends TopologyResources { topologies: Topology[] }   // includes topologies being deleted
 
 export interface Topology {
+  suspended: 0 | 1;
   id: number; name: string; group_id: number; sort: number;
   revision: number;                // echo on every write
   deleted: 0 | 1; failover_enabled: 0 | 1;
@@ -260,11 +274,12 @@ export interface Topology {
   state: TopologyState;            // 'deleting' if deleted; else first config in 'error', else first non-'active' config state, else 'active'; 'pending' if no configs
   error: string;                   // first non-empty configuration error
   events: { ts: Epoch; message: string }[];     // newest first, max 30 (key is `message`, node events use `text`)
-  cleanup: { configuration_id: number; node_id: number; port: number }[];   // ports awaiting release on nodes
+  cleanup: { configuration_id: number; node_id: number; port: number | null }[];   // ports awaiting release on nodes
   sync: { retry: boolean; state: TopologyState };   // retry: show the "retry sync" action (state here ignores `deleted`)
   warnings: { vertex: VertexId; message: string }[];   // vertices not on any entry->target path
 }
-export type ConfigState = 'pending' | 'preparing' | 'switching' | 'waiting' | 'error' | 'active' | 'deleting';
+export type ConfigState = 'pending' | 'preparing' | 'switching' | 'waiting' | 'error' | 'active' | 'deleting' | 'suspended'
+  | 'quota' | 'quota_cleaning' | 'quota_waiting';
 // pending: queued · preparing: downstream rules being installed · switching: entry rule being swapped ·
 // waiting: blocked on a node (offline, upgrading, manual sync…), `error` says why · error: needs user action / retry ·
 // active: applied; reported as 'error' ("路径节点异常或离线") when any hop node is error/offline/skew
@@ -328,6 +343,7 @@ export interface TopologySave {
   failover_enabled?: boolean;      // default: keep / false. Must be a real boolean
   paths?: VertexId[][];            // explicit path per (entry,target) pair, <=64, one per pair; others get the best path
   switch_only?: boolean;           // update only: change paths without touching the design
+  resume?: boolean;
 }
 export type TopologySaved =
   | { id: number; configurations: number; warnings: { vertex: VertexId; message: string }[] }
@@ -357,6 +373,7 @@ export interface FailoverPreview {
 export interface ConfigsList {
   configs: (TopologyConfig | ExternalConfig)[];     // topology configs first (topology order, then id), then external (display order)
   groups: (Group & { source: 'topology' | 'external' })[];
+  quota?: { used: number; limit: number | null };
 }
 export interface TopologyConfig extends ConfigView {       // deleted ones are excluded
   source: 'topology';

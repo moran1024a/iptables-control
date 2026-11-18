@@ -82,8 +82,8 @@ export function addressesOf(g: Graph, v: Vertex | undefined, cat: Catalog): Addr
   return live ?? Object.values(g.address_book?.[v.id] ?? {});
 }
 
-/** `host[:port]` of an address row. */
-export const addressText = (a: AddressRow) => (a.port ? `${a.host}:${a.port}` : a.host);
+/** `host[:port]` or the server-provided label for a hidden address. */
+export const addressText = (a: AddressRow) => a.host ? (a.port ? `${a.host}:${a.port}` : a.host) : a.name;
 
 export const cardWidth = (v: Vertex) => (v.kind === 'direct' ? DIRECT_WIDTH : CARD_WIDTH);
 /** Rows on a card: one per address (at least one) plus the automatic egress row of entries and relays. */

@@ -23,8 +23,8 @@ class Monitor:
         self.streams = {}
         self.last_tick = None
 
-    async def view(self, body):
-        return await q.view(self, body)
+    async def view(self, body, authorize=None):
+        return await q.view(self, body, authorize)
 
     def unavailable(self, nodes, pair):
         reason = q.stopped(nodes, pair)
@@ -80,7 +80,7 @@ class Monitor:
                         pair=pair,
                     )
                 )
-        for topo in c.execute("SELECT * FROM topologies WHERE deleted=0"):
+        for topo in c.execute("SELECT * FROM topologies WHERE deleted=0 AND suspended=0"):
             for section in link_quality.sections(c, topo, nodes):
                 for spec in section["probes"]:
                     spec.update(

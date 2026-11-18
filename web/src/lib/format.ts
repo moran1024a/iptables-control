@@ -50,6 +50,8 @@ export function bytes(value: number | string | bigint | null | undefined): strin
 export const rate = (value: number | null | undefined) =>
   value === null || value === undefined ? '-' : bytes(Math.round(value)) + '/s';
 
+export const gigabytes = (value: string) => (Number(value) / 1e9).toLocaleString('zh-CN', { maximumFractionDigits: 2 }) + ' GB';
+
 export const percent = (value: number | null | undefined) =>
   value === null || value === undefined || Number.isNaN(Number(value)) ? '-' : Number(value).toFixed(1) + '%';
 

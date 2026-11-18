@@ -2,6 +2,7 @@
 import base64
 import json
 import secrets
+import accounts
 import database
 import errors
 import configurations as configs
@@ -9,15 +10,15 @@ import proxy_formats
 import validation
 
 
-def get(c, ident):
-    row = c.execute("SELECT * FROM subscriptions WHERE id=?", (ident,)).fetchone()
+def get(c, ident, account_id=None):
+    row = c.execute("SELECT * FROM subscriptions WHERE id=? AND account_id IS ?", (ident, account_id)).fetchone()
     if row is None:
         raise errors.UserError("订阅不存在", status=404)
     return row
 
 
-def catalog(c):
-    listing = configs.configs(c)
+def catalog(c, account_id=None):
+    listing = configs.configs(c, account_id)
     items = []
     for item in listing['configs']:
         connection = item['connection']
@@ -55,10 +56,10 @@ def selected(items, ids):
     return [x for x in items if x['id'] in wanted[x['source']]]
 
 
-def listing(c):
-    items, groups = catalog(c)
+def listing(c, account_id=None):
+    items, groups = catalog(c, account_id)
     rows = []
-    for row in c.execute('SELECT * FROM subscriptions ORDER BY id'):
+    for row in c.execute('SELECT * FROM subscriptions WHERE account_id IS ? ORDER BY id', (account_id,)):
         ids = selections(c, row['id'])
         members = selected(items, ids)
         rows.append(dict(row, **ids, enabled=bool(row['enabled']), path='/sub/'+row['token'],
@@ -68,8 +69,8 @@ def listing(c):
                 groups=groups, public_url=database.setting(c,'public_url',''))
 
 
-def save(c, body, ident=None):
-    old = get(c, ident) if ident is not None else None
+def save(c, body, ident=None, account_id=None):
+    old = get(c, ident, account_id) if ident is not None else None
     name = validation.check_remark(body.get('name', old['name'] if old else ''), 'name', '名称')
     enabled = body.get('enabled', bool(old['enabled']) if old else True)
     if type(enabled) is not bool:
@@ -83,8 +84,14 @@ def save(c, body, ident=None):
         values = body[field]
         if not isinstance(values,list) or len(values)>512 or any(type(v) is not int for v in values) or len(set(values))!=len(values):
             raise errors.UserError('请选择不重复的配置，最多 512 项',field)
-        target = 'configurations' if source == 'topology' else 'external_configurations'
-        available = {r[0] for r in c.execute(f'SELECT id FROM {target}' + (' WHERE deleted=0' if source=='topology' else ''))}
+        if source == 'topology':
+            rows = c.execute(
+                "SELECT f.id FROM configurations f JOIN topologies t ON t.id=f.topology_id "
+                "JOIN item_groups g ON g.id=t.group_id WHERE f.deleted=0 AND g.account_id IS ?", (account_id,),
+            )
+            available = {r[0] for r in rows}
+        else:
+            available = {r["id"] for r in database.owned_rows(c, "external_configurations", account_id)}
         if not set(values) <= available:
             raise errors.UserError('配置已删除，请刷新后重试',field)
         ids[field] = values
@@ -94,7 +101,8 @@ def save(c, body, ident=None):
         token = secrets.token_hex(32) if body.get('reset_token') else old['token']
         c.execute('UPDATE subscriptions SET name=?,enabled=?,token=? WHERE id=?',(name,int(enabled),token,ident))
     else:
-        ident = c.execute('INSERT INTO subscriptions(name,token,enabled) VALUES (?,?,?)',(name,secrets.token_hex(32),int(enabled))).lastrowid
+        ident = c.execute('INSERT INTO subscriptions(name,token,enabled,account_id) VALUES (?,?,?,?)',
+                         (name,secrets.token_hex(32),int(enabled),account_id)).lastrowid
     for source,field,table,column in MEMBERS:
         if field in body:
             c.execute(f'DELETE FROM {table} WHERE subscription_id=?',(ident,))
@@ -103,10 +111,13 @@ def save(c, body, ident=None):
 
 
 def export(c, token, fmt):
-    row = c.execute('SELECT * FROM subscriptions WHERE token=? AND enabled=1',(token,)).fetchone()
+    row = c.execute(
+        'SELECT s.* FROM subscriptions s LEFT JOIN accounts a ON a.id=s.account_id '
+        f'WHERE s.token=? AND s.enabled=1 AND (s.account_id IS NULL OR ({accounts.ACTIVE_SQL}))', (token,),
+    ).fetchone()
     if row is None:
         return None
-    items, _ = catalog(c)
+    items, _ = catalog(c, row["account_id"])
     names = {'DIRECT','REJECT','REJECT-DROP','PASS','COMPATIBLE','GLOBAL','订阅节点'}
     links, proxies = [], []
     for item in selected(items,selections(c,row['id'])):

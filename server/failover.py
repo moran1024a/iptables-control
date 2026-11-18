@@ -10,6 +10,7 @@ import database
 import errors
 import execution
 import node_addresses
+import quotas
 import topology
 import target_addresses
 import wake
@@ -29,7 +30,7 @@ def offline_timeout(c):
     return value if 30 <= value <= 3600 else OFFLINE
 
 
-def select_path(c, graph, current, nodes, bad, healthy, now, attempts=()):
+def select_path(c, graph, current, nodes, bad, healthy, now, attempts=(), *, exhausted=()):
     """Read-only selector shared by recovery and hypothetical node failures."""
     by = {v["id"]: v for v in current["graph"]["vertices"]}
     graph_by = {v["id"]: v for v in graph["vertices"]}
@@ -46,7 +47,7 @@ def select_path(c, graph, current, nodes, bad, healthy, now, attempts=()):
         if nid not in node_ok:
             n = nodes.get(nid)
             node_ok[nid] = False
-            if n and nid not in bad and n["state"] == "ok":
+            if n and nid not in bad and nid not in exhausted and n["state"] == "ok":
                 try:
                     execution.ready(c, nid, now)
                     node_ok[nid] = (nid in old_nodes and bool(wake.eligible(n))
@@ -129,11 +130,13 @@ class Engine:
         bad, healthy = self.health(nodes, now, offline_timeout(c))
         if now-self.started < RECOVERY:
             return
-        for parent in c.execute("SELECT * FROM topologies WHERE failover_enabled=1 AND deleted=0").fetchall():
+        exhausted = quotas.exhausted_nodes(c)
+        for parent in c.execute("SELECT * FROM topologies WHERE failover_enabled=1 AND deleted=0 AND suspended=0").fetchall():
+            blocked = exhausted.get(database.group_owner(c, parent["group_id"]), ())
             for config in configurations.members(c, parent["id"]):
                 try:
                     with database.atomic(c):
-                        self.recover(c, dict(parent), config, nodes, bad, healthy, now)
+                        self.recover(c, dict(parent), config, nodes, bad, healthy, now, exhausted=blocked)
                 except errors.UserError as exc:
                     status = json.loads(config["failover"])
                     status.update(phase="unavailable", message=str(exc), next_try=now+10)
@@ -166,7 +169,9 @@ class Engine:
         node = nodes.get(v["node_id"])
         result = dict(vertex=vertex, node_id=v["node_id"], revision=parent["revision"],
                       at=now, offline_seconds=offline_timeout(c), paths=[], message="", graph=raw)
-        if parent["deleted"]:
+        if parent["suspended"]:
+            result["message"] = "链路已停用"
+        elif parent["deleted"]:
             result["message"] = "链路正在删除"
         elif not node or node["desired_mode"] != "active":
             result["message"] = "被动节点不参与失联自动判定"
@@ -178,7 +183,9 @@ class Engine:
             result["message"] = "服务端正在观察节点健康状态"
         if result["message"]:
             return result
-        graph = topology.validate(c, raw)
+        account_id = database.group_owner(c, parent["group_id"])
+        graph = topology.validate(c, raw, account_id=account_id)
+        exhausted = quotas.exhausted_nodes(c).get(account_id, ())
         result["graph"] = graph
         bad, healthy = self.health(nodes, now, result["offline_seconds"], observe=False)
         bad[node["id"]] = "假设失联"
@@ -215,7 +222,7 @@ class Engine:
                 row["message"] = "候选尝试次数已达上限，等待手动处理"
                 continue
             try:
-                chosen = select_path(c, graph, current, nodes, bad, healthy, now, attempts)
+                chosen = select_path(c, graph, current, nodes, bad, healthy, now, attempts, exhausted=exhausted)
                 if not chosen:
                     row.update(state="unavailable", message="无可用备用路径")
                     continue
@@ -236,8 +243,8 @@ class Engine:
             result["message"] = "当前没有使用此节点的配置"
         return result
 
-    def recover(self, c, parent, config, nodes, bad, healthy, now):
-        if config["deleted"] or not config["applied"] or not config["desired"]:
+    def recover(self, c, parent, config, nodes, bad, healthy, now, *, exhausted=()):
+        if config["deleted"] or config["state"] == "quota" or not config["applied"] or not config["desired"]:
             return
         status = json.loads(config["failover"])
         if status.get("phase") == "paused":
@@ -270,7 +277,8 @@ class Engine:
             if status.get("phase") == "unavailable":
                 self.record(c, config, {})
             return
-        if automatic and all(v["node_id"] in healthy for v in by.values() if v["kind"] == "node"):
+        if automatic and all(v["node_id"] in healthy and v["node_id"] not in exhausted
+                             for v in by.values() if v["kind"] == "node"):
             # An explicitly failed attempt is already rolled back by execution.
             # Keep the recovered original route instead of starting another switch.
             c.execute("UPDATE configurations SET desired=?,state='pending',error='',revision=revision+1 WHERE id=?",
@@ -283,8 +291,8 @@ class Engine:
             self.record(c, config, dict(phase="paused", attempts=attempts,
                         message="连续 3 条候选下发失败，等待手动处理", at=now))
             return
-        graph = topology.validate(c, json.loads(parent["graph"]))
-        chosen = select_path(c, graph, current, nodes, bad, healthy, now, attempts)
+        graph = topology.validate(c, json.loads(parent["graph"]), account_id=database.group_owner(c, parent["group_id"]))
+        chosen = select_path(c, graph, current, nodes, bad, healthy, now, attempts, exhausted=exhausted)
         if not chosen:
             self.record(c, config, dict(phase="unavailable", attempts=attempts,
                         message="没有可同步的备用路径，等待节点恢复或手动处理", next_try=now+10))

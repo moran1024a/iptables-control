@@ -1,9 +1,20 @@
+CREATE TABLE accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  password_hash TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+  revision INTEGER NOT NULL DEFAULT 1,
+  max_configs INTEGER CHECK(max_configs >= 0),
+  expires_at INTEGER,
+  expiring INTEGER NOT NULL DEFAULT 0 CHECK(expiring IN (0,1))
+);
 CREATE TABLE item_groups (
   id INTEGER PRIMARY KEY,
   kind TEXT NOT NULL,
   name TEXT NOT NULL,
   builtin INTEGER NOT NULL DEFAULT 0,
-  sort INTEGER NOT NULL DEFAULT 0
+  sort INTEGER NOT NULL DEFAULT 0,
+  account_id INTEGER REFERENCES accounts(id)
 );
 CREATE TABLE settings (
   k TEXT PRIMARY KEY,
@@ -11,7 +22,8 @@ CREATE TABLE settings (
 );
 CREATE TABLE sessions (
   token_hash TEXT PRIMARY KEY,
-  expires INTEGER NOT NULL
+  expires INTEGER NOT NULL,
+  account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE
 );
 CREATE TABLE nodes (
   id INTEGER PRIMARY KEY,
@@ -59,10 +71,28 @@ CREATE TABLE nodes (
 CREATE TABLE targets (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL,
  host TEXT NOT NULL, port INTEGER NOT NULL, params TEXT NOT NULL DEFAULT '{}',
- addresses TEXT NOT NULL DEFAULT '[]',
+ addresses TEXT NOT NULL DEFAULT '[]', pins TEXT NOT NULL DEFAULT '{}',
  group_id INTEGER NOT NULL, sort INTEGER NOT NULL DEFAULT 0,
  CHECK(type IN ('endpoint','shadowsocks','vless-enc')),
  CHECK(port BETWEEN 1 AND 65535)
+);
+CREATE TABLE account_nodes (
+ account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+ node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+ hide_addresses INTEGER NOT NULL DEFAULT 0 CHECK(hide_addresses IN (0,1)),
+ PRIMARY KEY(account_id,node_id)
+);
+CREATE TABLE account_node_traffic (
+ account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+ node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+ limit_gb INTEGER CHECK(limit_gb >= 0),
+ total TEXT NOT NULL DEFAULT '0', baseline TEXT,
+ PRIMARY KEY(account_id,node_id)
+);
+CREATE TABLE traffic_rule_owners (
+ rule_id INTEGER PRIMARY KEY,
+ node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+ account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE
 );
 CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, color TEXT NOT NULL);
 CREATE TABLE node_tags (
@@ -131,7 +161,7 @@ CREATE TABLE wake_jobs (
             state TEXT NOT NULL DEFAULT 'waiting', error TEXT NOT NULL DEFAULT '');
 CREATE TABLE subscriptions (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, token TEXT NOT NULL UNIQUE,
- enabled INTEGER NOT NULL DEFAULT 1
+ enabled INTEGER NOT NULL DEFAULT 1, account_id INTEGER REFERENCES accounts(id)
 );
 CREATE TABLE probe_tasks (
  id TEXT PRIMARY KEY, identity TEXT NOT NULL
@@ -152,7 +182,7 @@ CREATE TABLE node_addresses(node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON 
 CREATE TABLE topologies (
  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, group_id INTEGER NOT NULL REFERENCES item_groups(id),
  sort INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1, graph TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
- failover_enabled INTEGER NOT NULL DEFAULT 0
+ failover_enabled INTEGER NOT NULL DEFAULT 0, suspended INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE configurations (
  id INTEGER PRIMARY KEY AUTOINCREMENT, topology_id INTEGER NOT NULL REFERENCES topologies(id),

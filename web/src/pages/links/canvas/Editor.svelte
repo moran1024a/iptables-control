@@ -205,7 +205,7 @@
 
   function fail(err: unknown) {
     if (!(err instanceof ApiError)) throw err;
-    failure = { message: err.message, conflict: err.status === 409 };
+    failure = { message: err.message, conflict: err.status === 409 && err.field !== 'max_configs' };
     const field = err.field ?? '';
     if (field === 'name') nameInvalid = err.message;
     if (field.startsWith('vertex:')) {
@@ -221,6 +221,7 @@
 
   function add(item: LibraryItem, at?: { x: number; y: number }) {
     if (busy || !viewport) return;
+    if (item.kind === 'entry' && cat.nodes.get(item.id ?? -1)?.addresses_hidden) return say('隐藏地址的节点只能用作中转');
     const id = newVertexId();
     const centre = at ?? viewport.centre();
     apply(addVertex(doc.graph, cat, { id, kind: item.kind, resource: item.id, x: centre.x, y: centre.y, centre: !at }));
@@ -476,6 +477,7 @@
         group_id: doc.group,
         graph: outgoing(doc.graph),
         revision,
+        ...(link?.suspended ? { resume: true } : {}),
       });
       done = true;
       toast.ok(`已保存 · ${result.configurations} 个配置${result.warnings.length ? ' · 部分节点未形成完整路径' : ''}`);
@@ -549,7 +551,7 @@
     <span class="flex-1"></span>
     {#if dirty}<span class="hidden text-xs text-fg-muted sm:inline">有未保存的修改</span>{/if}
     <Button onclick={exit} disabled={busy}>取消</Button>
-    <Button variant="primary" loading={saving} disabled={busy} onclick={save} title="保存并开始同步到节点 (Ctrl/⌘ S)">保存</Button>
+    <Button variant="primary" loading={saving} disabled={busy} onclick={save} title="保存并开始同步到节点 (Ctrl/⌘ S)">{link?.suspended ? '保存并恢复' : '保存'}</Button>
   </div>
 
   <div class="flex flex-wrap items-center gap-x-2 gap-y-1.5 border-b bg-surface-2/60 px-3 py-1.5">

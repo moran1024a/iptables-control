@@ -1,13 +1,13 @@
 <script lang="ts">
-  import { ago, signed } from '$lib/format';
+  import { ago, gigabytes, signed } from '$lib/format';
   import { href } from '$lib/router.svelte';
   import { MODE_LABEL } from '$lib/status';
-  import type { NodeBar, NodeBrief } from '$lib/types';
+  import type { NodeSummary } from '$lib/types';
   import NodeStatusBadge from '$ui/NodeStatusBadge.svelte';
   import StatusBar from '$ui/StatusBar.svelte';
   import TagList from '$ui/TagList.svelte';
 
-  let { node, now }: { node: NodeBrief & { bar: NodeBar }; now: number } = $props();
+  let { node, now }: { node: NodeSummary; now: number } = $props();
   const extra = $derived(node.addresses.filter((address) => !address.primary));
   const note = $derived(node.note.replace(/\s*\n\s*/g, ' '));
 </script>
@@ -29,12 +29,17 @@
       <TagList tags={node.tags} />
     </div>
     <div class="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-fg-muted">
-      <code class="shrink-0 text-fg-muted">{node.addr}</code>
+      {#if node.addresses_hidden}<span class="shrink-0">仅中转</span>
+      {:else}<code class="shrink-0 text-fg-muted">{node.addr}</code>{/if}
       {#if extra.length}
         <span class="shrink-0 rounded-sm bg-surface-3 px-1 text-2xs" title={extra.map((address) => address.host).join('、')}>＋{extra.length} IP</span>
       {/if}
       {#if note}<span class="truncate" title={node.note}>· {note}</span>{/if}
     </div>
+    {#if node.traffic_quota}
+      {@const quota = node.traffic_quota}
+      <p class="mt-0.5 text-xs {quota.exhausted ? 'text-warn-text' : 'text-fg-muted'}">已用 {gigabytes(quota.used)}{quota.limit_gb === null ? '' : ` / ${quota.limit_gb} GB`}{quota.exhausted ? ' · 额度已用完' : ''}</p>
+    {/if}
   </div>
   <StatusBar bar={node.bar} size="xs" class="hidden md:block" />
   <div class="flex items-center justify-end gap-3 max-sm:flex-col max-sm:items-end max-sm:gap-1">

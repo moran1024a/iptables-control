@@ -4,7 +4,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from test_server import Fixture, ROOT, fields
+from test_server import Fixture, ROOT, fields, strip_account_schema
 from test_imports import reality_uri, ss_uri
 import configurations, database, migrations, node_sync, proxy_formats, settings, target_config
 
@@ -12,7 +12,7 @@ import configurations, database, migrations, node_sync, proxy_formats, settings,
 class RC7MigrationTests(Fixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
-        groups = [tuple(r) for r in self.db.execute("SELECT * FROM item_groups WHERE kind!='external_configurations'")]
+        groups = [tuple(r) for r in self.db.execute("SELECT id,kind,name,builtin,sort FROM item_groups WHERE kind!='external_configurations'")]
         values = [tuple(r) for r in self.db.execute('SELECT * FROM settings')]
         self.db.close()
         Path(settings.DB_PATH).unlink()
@@ -21,6 +21,10 @@ class RC7MigrationTests(Fixture, unittest.TestCase):
         self.db.executemany('INSERT INTO item_groups VALUES (?,?,?,?,?)',groups)
         self.db.executemany('INSERT INTO settings VALUES (?,?)',values)
         self.db.execute('PRAGMA user_version=602')
+        migrations.upgrade_604(self.db)
+        migrations.upgrade_605(self.db)
+        migrations.upgrade_606(self.db)
+        migrations.upgrade_607(self.db)
         self.db.commit()
 
     def reality(self):
@@ -33,6 +37,11 @@ class RC7MigrationTests(Fixture, unittest.TestCase):
                                    (parsed['host'],parsed['port'],json.dumps(p),database.default_group(self.db,'targets'))).lastrowid
 
     def upgrade(self):
+        if self.db.execute("PRAGMA user_version").fetchone()[0] == 602 and self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='accounts'"
+        ).fetchone():
+            with self.db:
+                strip_account_schema(self.db)
         self.db.close()
         self.db = migrations.init_db()
 
@@ -49,7 +58,7 @@ class RC7MigrationTests(Fixture, unittest.TestCase):
         rules=[dict(r) for r in self.db.execute('SELECT * FROM rules WHERE configuration_id=?',(keep['id'],))]
         retired={(r['node_id'],r['port']) for r in self.db.execute('SELECT * FROM rules WHERE configuration_id=?',(doomed['id'],))}
         with self.db:
-            self.db.execute("INSERT INTO subscriptions VALUES (1,'test','token',1)")
+            self.db.execute("INSERT INTO subscriptions(id,name,token,enabled) VALUES (1,'test','token',1)")
             self.db.executemany('INSERT INTO subscription_configurations VALUES (1,?)',[(doomed['id'],),(keep['id'],)])
             self.db.execute("INSERT INTO probe_tasks VALUES ('shared','{}')")
             self.db.execute("INSERT INTO probe_samples(task_id,slot,status,rtt) VALUES ('shared',1,'ok',5)")
@@ -125,6 +134,8 @@ class RC7MigrationTests(Fixture, unittest.TestCase):
 
     def test_migration_failure_is_atomic(self):
         real=self.reality()
+        with self.db:
+            strip_account_schema(self.db)
         self.db.close()
         with patch.object(node_sync,'finish_mutation',side_effect=RuntimeError('test rollback')):
             with self.assertRaises(RuntimeError):migrations.init_db()
@@ -133,4 +144,4 @@ class RC7MigrationTests(Fixture, unittest.TestCase):
         self.assertEqual(database.get_target(self.db,real)['type'],'vless-reality')
         self.assertIsNone(self.db.execute("SELECT 1 FROM sqlite_master WHERE name='external_configurations'").fetchone())
         self.upgrade()
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],603)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],settings.DATABASE_VERSION)

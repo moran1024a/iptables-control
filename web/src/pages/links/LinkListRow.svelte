@@ -77,7 +77,7 @@
       >
         {link.name}
       </a>
-      {#if link.failover_enabled}
+      {#if link.failover_enabled && !link.suspended}
         <span
           class="inline-flex h-[1.125rem] shrink-0 items-center gap-1 rounded-sm bg-accent-soft px-1.5 text-2xs font-medium text-accent-text"
           title="自动灾备已开启：路径上的节点失联后自动切换到备用路径"
@@ -112,7 +112,7 @@
       <Menu
         label="{link.name} 的更多操作"
         items={[
-          { label: '网络质量', icon: Activity, onselect: () => router.go(`quality/topologies/${link.id}`) },
+          { label: '网络质量', icon: Activity, disabled: !!link.suspended, onselect: () => router.go(`quality/topologies/${link.id}`) },
           'separator',
           { label: deleting ? '正在删除' : '删除', icon: Trash2, danger: true, disabled: deleting || busy, onselect: remove },
         ]}

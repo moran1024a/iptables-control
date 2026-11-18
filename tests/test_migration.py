@@ -4,7 +4,7 @@ import sqlite3
 import time
 import unittest
 from unittest.mock import patch
-from test_server import Fixture, ROOT
+from test_server import Fixture, ROOT, strip_account_schema
 import agent_v3, database, errors, migrations, node_sync, security, settings
 
 
@@ -128,6 +128,7 @@ class MigrationTests(Fixture, unittest.TestCase):
             self.db.execute('DROP TABLE node_tags')
             self.db.execute('DROP TABLE tags')
             self.drop_external()
+            strip_account_schema(self.db)
             self.db.execute('PRAGMA user_version=600')
         self.db.close()
         self.db = migrations.init_db()
@@ -168,6 +169,7 @@ class MigrationTests(Fixture, unittest.TestCase):
             self.db.execute('DROP TABLE tags')
             self.db.execute('ALTER TABLE targets DROP COLUMN addresses')
             self.drop_external()
+            strip_account_schema(self.db)
             self.db.execute('PRAGMA user_version=601')
         rules = [tuple(r) for r in self.db.execute('SELECT * FROM rules')]
         generations = [tuple(r) for r in self.db.execute('SELECT id,desired_generation FROM nodes')]

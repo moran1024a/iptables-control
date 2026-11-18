@@ -133,6 +133,34 @@ def init_db():
             if conn.execute("PRAGMA foreign_key_check").fetchall():
                 raise errors.UserError("升级外键检查失败，数据库未修改")
             conn.execute("PRAGMA user_version=603")
+        version = 603
+    if version == 603:
+        database.backup_database(conn, str(path) + ".pre-0.6.4.bak")
+        with database.atomic(conn):
+            upgrade_604(conn)
+            if conn.execute("PRAGMA foreign_key_check").fetchall():
+                raise errors.UserError("升级外键检查失败，数据库未修改")
+            conn.execute("PRAGMA user_version=604")
+        version = 604
+    if version == 604:
+        database.backup_database(conn, str(path) + ".pre-0.6.4-rc.2.bak")
+        with database.atomic(conn):
+            upgrade_605(conn)
+            if conn.execute("PRAGMA foreign_key_check").fetchall():
+                raise errors.UserError("升级外键检查失败，数据库未修改")
+            conn.execute("PRAGMA user_version=605")
+        version = 605
+    if version == 605:
+        database.backup_database(conn, str(path) + ".pre-0.6.4-rc.3.bak")
+        with database.atomic(conn):
+            upgrade_606(conn)
+            conn.execute("PRAGMA user_version=606")
+        version = 606
+    if version == 606:
+        database.backup_database(conn, str(path) + ".pre-607.bak")
+        with database.atomic(conn):
+            upgrade_607(conn)
+            conn.execute("PRAGMA user_version=607")
         return conn
     if version != 504:
         conn.close()
@@ -162,6 +190,59 @@ def init_db():
             os.unlink(temporary)
         raise
     return database.db()
+
+
+def upgrade_604(conn):
+    conn.execute("""CREATE TABLE accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        password_hash TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+        revision INTEGER NOT NULL DEFAULT 1)""")
+    conn.execute("""CREATE TABLE account_nodes (
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, PRIMARY KEY(account_id,node_id))""")
+    for table in ("sessions", "item_groups", "subscriptions"):
+        suffix = " ON DELETE CASCADE" if table == "sessions" else ""
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN account_id INTEGER REFERENCES accounts(id){suffix}")
+    conn.execute("ALTER TABLE topologies ADD COLUMN suspended INTEGER NOT NULL DEFAULT 0")
+    conn.execute("ALTER TABLE targets ADD COLUMN pins TEXT NOT NULL DEFAULT '{}'")
+    conn.execute("DELETE FROM sessions")
+
+
+def upgrade_605(conn):
+    conn.execute("ALTER TABLE accounts ADD COLUMN max_configs INTEGER CHECK(max_configs >= 0)")
+    schema = Path(__file__).with_name("schema.sql").read_text()
+    for table in ("account_node_traffic", "traffic_rule_owners"):
+        ddl = schema.split(f"CREATE TABLE {table} (", 1)[1].split(";", 1)[0]
+        conn.execute(f"CREATE TABLE {table} (" + ddl)
+    # Attribute existing rules and in-flight snapshots without re-billing their
+    # saved counters. Usage starts with new deltas after the migration.
+    conn.execute(
+        "INSERT INTO traffic_rule_owners "
+        "SELECT r.id,r.node_id,g.account_id FROM rules r "
+        "JOIN configurations f ON f.id=r.configuration_id JOIN topologies t ON t.id=f.topology_id "
+        "JOIN item_groups g ON g.id=t.group_id WHERE g.account_id IS NOT NULL"
+    )
+    nodes = {r[0] for r in conn.execute("SELECT id FROM nodes")}
+    for row in conn.execute(
+        "SELECT g.account_id,f.applied,j.payload FROM configurations f "
+        "JOIN topologies t ON t.id=f.topology_id JOIN item_groups g ON g.id=t.group_id "
+        "LEFT JOIN jobs j ON j.configuration_id=f.id WHERE g.account_id IS NOT NULL"
+    ):
+        applied = json.loads(row["applied"]) if row["applied"] else {}
+        job = json.loads(row["payload"]) if row["payload"] else {}
+        rules = applied.get("rules", []) + job.get("old", []) + job.get("new", [])
+        conn.executemany("INSERT OR IGNORE INTO traffic_rule_owners VALUES (?,?,?)",
+                         [(r["id"], r["node_id"], row["account_id"]) for r in rules if r["node_id"] in nodes])
+
+
+def upgrade_606(conn):
+    conn.execute("ALTER TABLE account_nodes ADD COLUMN hide_addresses INTEGER NOT NULL DEFAULT 0 "
+                 "CHECK(hide_addresses IN (0,1))")
+
+
+def upgrade_607(conn):
+    conn.execute("ALTER TABLE accounts ADD COLUMN expires_at INTEGER")
+    conn.execute("ALTER TABLE accounts ADD COLUMN expiring INTEGER NOT NULL DEFAULT 0 CHECK(expiring IN (0,1))")
 
 
 def upgrade_603(conn):

@@ -117,7 +117,9 @@
 
 <Page title="配置" subtitle="客户端实际填写的入口地址和分享链接，点击即可复制。">
   {#snippet meta()}
-    {#if configs.length}
+    {#if data?.quota?.limit != null}
+      <span class="tabular text-sm text-fg-subtle" title="账户配置额度">{data.quota.used} / {data.quota.limit} 项</span>
+    {:else if configs.length}
       <span class="tabular text-sm text-fg-subtle">{filtering ? `${shownCount} / ${configs.length}` : configs.length}</span>
     {/if}
   {/snippet}
@@ -155,6 +157,7 @@
             { value: 'active', label: '已生效' },
             { value: 'pending', label: '同步中' },
             { value: 'error', label: '异常' },
+            { value: 'quota', label: '流量额度' },
           ]}
         />
       {/if}

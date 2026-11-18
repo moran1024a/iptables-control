@@ -10,6 +10,7 @@
   import { anyFilter, clearFilters, filtersFor } from '$lib/lists.svelte';
   import { usePoll } from '$lib/poll.svelte';
   import { router } from '$lib/router.svelte';
+  import { session } from '$lib/session.svelte';
   import { NODE_STATUS, NODE_STATUS_ORDER } from '$lib/status';
   import type { NodesList } from '$lib/types';
   import Alert from '$ui/Alert.svelte';
@@ -52,14 +53,14 @@
   let groupOpen = $state(false);
 </script>
 
-<Page title="节点" subtitle="运行转发的服务器。入口和中转都在这里接入。">
+<Page title="节点" subtitle={session.admin ? "运行转发的服务器。入口和中转都在这里接入。" : undefined}>
   {#snippet meta()}
     {#if nodes.length}
       <span class="tabular text-sm text-fg-subtle">{shown.length !== nodes.length ? `${shown.length} / ${nodes.length}` : nodes.length}</span>
     {/if}
   {/snippet}
   {#snippet actions()}
-    {#if !sorting}
+    {#if session.admin && !sorting}
       {#if canSort}
         <Button onclick={() => (sorting = true)} disabled={filtering} title={filtering ? '搜索或筛选时不能排序' : undefined}>
           <ArrowUpDown />排序
@@ -128,8 +129,8 @@
     </SortList>
   {:else if !nodes.length && data.groups.length <= 1}
     <div class="rounded-lg border border-dashed bg-surface">
-      <EmptyState icon={Server} title="还没有节点" text="新增节点后，在对应服务器执行一键接入命令即可完成安装。">
-        <Button variant="primary" onclick={() => (formOpen = true)}><Plus />新增节点</Button>
+      <EmptyState icon={Server} title={session.admin ? "还没有节点" : "还没有分配节点"} text={session.admin ? "新增节点后，在对应服务器执行一键接入命令即可完成安装。" : undefined}>
+        {#if session.admin}<Button variant="primary" onclick={() => (formOpen = true)}><Plus />新增节点</Button>{/if}
       </EmptyState>
     </div>
   {:else if !shown.length && filtering}
@@ -139,7 +140,7 @@
       </EmptyState>
     </div>
   {:else}
-    <GroupedList kind="nodes" label="节点" groups={data.groups} items={shown} {totals} {filtering} onchange={list.refresh}>
+    <GroupedList kind="nodes" label="节点" groups={data.groups} items={shown} editable={session.admin} {totals} {filtering} onchange={list.refresh}>
       {#snippet row(node)}<NodeRow {node} now={data.now} />{/snippet}
       {#snippet summary(members)}
         {@const offline = members.filter((node) => node.status === 'offline').length}
@@ -151,8 +152,8 @@
   {/if}
 </Page>
 
-{#if data}
+{#if session.admin && data}
   <NodeForm bind:open={formOpen} groups={data.groups} tags={data.tags} onsaved={(id) => router.go(`nodes/${id}`)} />
+  <TagsManager bind:open={tagsOpen} onchange={list.refresh} />
+  <GroupDialog bind:open={groupOpen} kind="nodes" label="节点" onsaved={list.refresh} />
 {/if}
-<TagsManager bind:open={tagsOpen} onchange={list.refresh} />
-<GroupDialog bind:open={groupOpen} kind="nodes" label="节点" onsaved={list.refresh} />

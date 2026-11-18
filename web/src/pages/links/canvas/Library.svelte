@@ -54,10 +54,10 @@
         tags: [],
         used: graph.vertices.filter((v) => v.target_id === t.id).length,
       }));
-    return resources.nodes.map((n) => ({
+    return resources.nodes.filter((n) => kind !== 'entry' || !n.addresses_hidden).map((n) => ({
       id: n.id,
       name: n.name,
-      address: n.addr,
+      address: n.addresses_hidden ? '仅中转' : n.addr,
       group: n.group_id,
       tags: n.tags,
       dot: dots[NODE_STATUS[n.status].tone],
@@ -105,7 +105,7 @@
       </button>
       <p class="mt-2.5 px-1 text-xs leading-relaxed text-fg-muted">direct 放在一条连线上，只用来给这条线加减权重。也可以选中连线后点「＋ direct」直接插入。</p>
     {:else if !tiles.length}
-      <p class="px-1 py-6 text-center text-xs text-fg-muted">{kind === 'target' ? '还没有目标，请先到「目标」页添加。' : '还没有节点，请先到「节点」页添加。'}</p>
+      <p class="px-1 py-6 text-center text-xs text-fg-muted">{kind === 'target' ? '还没有目标，请先到「目标」页添加。' : kind === 'entry' ? '没有可用的入口节点。' : '没有可用的中转节点。'}</p>
     {:else if !shown.length}
       <p class="px-1 py-6 text-center text-xs text-fg-muted">没有匹配「{query}」的{kind === 'target' ? '目标' : '节点'}</p>
     {:else}

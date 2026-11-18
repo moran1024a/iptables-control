@@ -120,6 +120,7 @@ export function validate(g: Graph, cat: Catalog): Issue[] {
     }
     if (node.status === 'deleting') error(`节点「${name}」正在删除`, { vertex: v.id });
     if (v.kind === 'entry') {
+      if (node.addresses_hidden) error('隐藏地址的节点只能用作中转', { vertex: v.id });
       const addresses = addressesOf(g, v, cat);
       const chosen = v.address && addresses.some((a) => a.id === v.address);
       if (!chosen && addresses.length !== 1) error(`请选择「${name}」的接收 IP`, { vertex: v.id });

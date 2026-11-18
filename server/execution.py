@@ -11,6 +11,8 @@ import errors
 import forwarding
 import node_addresses
 import node_sync
+import quotas
+import accounts
 import settings
 import topology
 import target_addresses
@@ -102,7 +104,7 @@ def confirmed(c, nodes):
     return True
 
 
-def ready(c, nid, now):
+def ready(c, nid, now, *, shared=False):
     n = database.get_node(c, nid)
     if n["deleting"] or n["manual_required"]:
         raise errors.WaitingError(f"{n['name']} 等待本机确认")
@@ -118,7 +120,8 @@ def ready(c, nid, now):
     if n["applied_generation"] != n["desired_generation"]:
         raise errors.WaitingError(f"{n['name']} 正在同步其他配置")
     if n["state"] == "error":
-        raise errors.WaitingError(f"{n['name']}：{n['err'] or '节点异常'}")
+        detail = "节点异常" if shared else n["err"] or "节点异常"
+        raise errors.WaitingError(f"{n['name']}：{detail}")
     return n
 
 
@@ -152,6 +155,88 @@ def retire(c, ident, rules):
         )
 
 
+def possibly_live_rules(c, ident, job=None):
+    rules = {r["id"]: dict(r) for r in c.execute("SELECT * FROM rules WHERE configuration_id=?", (ident,))}
+    if job:
+        payload = json.loads(job["payload"])
+        # A rollback can have removed the ingress from the ledger before the agent
+        # acknowledged it. In prepare, the new ingress has not been sent yet.
+        staged = payload["new"][1:] if job["phase"] == "prepare" else payload["new"]
+        rules.update({r["id"]: r for r in payload["old"] + staged})
+    return list(rules.values())
+
+
+def withdraw(c, ident, rules, *, state="pending", error=""):
+    retire(c, ident, rules)
+    c.execute("DELETE FROM jobs WHERE configuration_id=?", (ident,))
+    c.execute(
+        "UPDATE configurations SET applied=NULL,error=?,failover='{}',revision=revision+1,"
+        "state=CASE WHEN deleted=1 THEN 'deleting' ELSE ? END WHERE id=?",
+        (error, state, ident),
+    )
+
+
+def plan_nodes(plan):
+    if not plan:
+        return set()
+    doc = json.loads(plan)
+    chosen = set(doc["graph_path"])
+    return {v["node_id"] for v in doc["graph"]["vertices"] if v["id"] in chosen and v.get("node_id")}
+
+
+def quota_gate(c, config, job, exhausted, now):
+    if config["suspended"] or (not exhausted and config["state"] != "quota"):
+        return False
+    ident = config["id"]
+    desired_nodes = plan_nodes(config["desired"])
+    blocked = desired_nodes & exhausted
+    if exhausted:
+        live = possibly_live_rules(c, ident, job)
+        used = {r["node_id"] for r in live}
+        payload = json.loads(job["payload"]) if job else None
+        if payload:
+            used.update(r["node_id"] for r in payload["new"])
+        unsafe = used & exhausted
+        if unsafe or blocked:
+            names = "、".join(database.get_node(c, nid)["name"] for nid in sorted(unsafe or blocked))
+            error = f"{names} 的流量额度已用完"
+            old_is_safe = payload and payload["old"] and not config["deleted"] and not any(
+                r["node_id"] in exhausted for r in payload["old"]
+            )
+            if unsafe and old_is_safe:
+                if job["phase"] == "commit":
+                    payload["quota_rollback"] = True
+                    start_rollback(c, ident, payload, now)
+                    return True
+                if job["phase"] == "rollback":
+                    return False  # Let progress wait for the restored ingress receipt.
+                # During prepare the old ingress still serves the confirmed path.
+                retire(c, ident, payload["new"][1:])
+                c.execute("DELETE FROM jobs WHERE configuration_id=?", (ident,))
+                c.execute("UPDATE configurations SET state=?,error=? WHERE id=?",
+                          ("quota" if blocked else "pending", error if blocked else "", ident))
+            elif unsafe:
+                withdraw(c, ident, live, state="quota", error=error)
+            elif job:
+                return False  # A safe in-flight job must finish or cancel its superseded intent.
+            elif config["state"] != "quota" or config["error"] != error:
+                # A pending choice can be over quota while the already applied
+                # path stays within quota. Keep that applied path online.
+                c.execute("UPDATE configurations SET state='quota',error=? WHERE id=?", (error, ident))
+            return True
+    if config["state"] == "quota":
+        if config["deleted"]:
+            return False
+        if c.execute("SELECT 1 FROM retirements WHERE configuration_id=?", (ident,)).fetchone():
+            return True
+        allowed = database.allowed_nodes(c, config["account_id"])
+        if not config["account_enabled"] or allowed is None or not desired_nodes <= allowed:
+            return True
+        c.execute("UPDATE configurations SET state='pending',error='' WHERE id=?", (ident,))
+        config.update(state="pending", error="")
+    return False
+
+
 def forget_node(c, nid):
     """Drop cleanup work that only a permanently lost node could confirm."""
     for row in c.execute(
@@ -182,7 +267,11 @@ def make_rules(c, config, plan, now):
         other = json.loads(row[0])
         if wanted & {r["node_id"] for r in other["new"] + other["old"]}:
             raise errors.WaitingError("共享节点正在同步其他配置")
-    nodes = [ready(c, by[i]["node_id"], now) for i in path[:-1]]
+    target = target_addresses.resolve(c, plan)
+    shared = database.group_owner(c, target["group_id"]) is not None
+    if shared and target["host"] in target_addresses.protected_hosts(c):
+        raise errors.UserError("目标 IP 已用于节点或服务端，请重新保存目标", "host")
+    nodes = [ready(c, by[i]["node_id"], now, shared=shared) for i in path[:-1]]
     for vid in path[:-1]:
         out = g["bindings"][vid + "/" + path[path.index(vid) + 1]]["from"][vid]
         if out == "@auto":
@@ -200,7 +289,6 @@ def make_rules(c, config, plan, now):
         g["address_book"][vid][out] = resolved
     plan["graph"]["address_book"] = g["address_book"]
     plan.update(topology.compile_routing(g, path))
-    target = target_addresses.resolve(c, plan)
     applied = json.loads(config["applied"]) if config["applied"] else None
     old = applied["rules"] if applied else []
     rules = []
@@ -249,7 +337,7 @@ def queue(c, config, now):
         retire(c, config["id"], old)
         c.execute("UPDATE configurations SET state='deleting' WHERE id=?", (config["id"],))
         return
-    if not config["desired"] or config["state"] == "error":
+    if config.get("suspended") or not config["desired"] or config["state"] == "error":
         return
     if config["applied"] and not applied_rules_present(c, config):
         # A restored design may refer to a snapshot already removed from the ledger.
@@ -305,6 +393,7 @@ def queue(c, config, now):
     try:
         with database.atomic(c):
             actual, target, old, new = make_rules(c, config, plan, now)
+            quotas.register_rules(c, config.get("account_id"), new)
             for r in new[1:]:
                 put_rule(c, config["id"], r, "stage")
             job = dict(
@@ -356,6 +445,19 @@ def sync_timed_out(c, nodes, started, now):
     return False
 
 
+def start_rollback(c, ident, job, now):
+    # Keep both downstream paths until the old ingress is confirmed again.
+    for r in job["new"][:1]:
+        c.execute("DELETE FROM rules WHERE id=?", (r["id"],))
+    for r in job["old"][:1]:
+        if not c.execute("SELECT 1 FROM rules WHERE id=?", (r["id"],)).fetchone():
+            put_rule(c, ident, r, "live")
+    job["wait"] = sorted({r["node_id"] for r in job["new"][:1] + job["old"][:1]})
+    c.execute("UPDATE jobs SET phase='rollback',payload=?,started=? WHERE configuration_id=?",
+              (dump(job), now, ident))
+    c.execute("UPDATE configurations SET state='waiting',error='等待入口回退确认' WHERE id=?", (ident,))
+
+
 def progress(c, config, row, now):
     ident = config["id"]
     phase = row["phase"]
@@ -383,18 +485,7 @@ def progress(c, config, row, now):
         return
     if not confirmed(c, job["wait"]):
         if phase == "commit" and (failed(c, job["wait"]) or timed_out):
-            # Restore the previous ingress before retiring newly prepared rules.
-            for r in job["new"][:1]:
-                c.execute("DELETE FROM rules WHERE id=?", (r["id"],))
-            for r in job["old"][:1]:
-                if not c.execute("SELECT 1 FROM rules WHERE id=?", (r["id"],)).fetchone():
-                    put_rule(c, ident, r, "live")
-            job["wait"] = sorted({r["node_id"] for r in job["new"][:1] + job["old"][:1]})
-            c.execute(
-                "UPDATE jobs SET phase=?,payload=?,started=? WHERE configuration_id=?",
-                ("rollback", dump(job), now, ident),
-            )
-            c.execute("UPDATE configurations SET state='waiting',error='等待入口回退确认' WHERE id=?", (ident,))
+            start_rollback(c, ident, job, now)
             return
         if now - row["started"] >= 30:
             c.execute(
@@ -405,9 +496,11 @@ def progress(c, config, row, now):
     if phase == "rollback":
         retire(c, ident, job["new"])
         c.execute("DELETE FROM jobs WHERE configuration_id=?", (ident,))
+        retry = superseded or job.get("quota_rollback")
         c.execute(
             "UPDATE configurations SET state=?,error=? WHERE id=?",
-            ("pending" if superseded else "error", "入口更新失败，原路径已恢复" if job["old"] else "入口更新失败，新配置已撤销", ident),
+            ("pending" if retry else "error", "" if retry else
+             "入口更新失败，原路径已恢复" if job["old"] else "入口更新失败，新配置已撤销", ident),
         )
         return
     if phase == "prepare":
@@ -447,7 +540,7 @@ def progress(c, config, row, now):
 
 def tick(c, now=None):
     now = int(time.time()) if now is None else now
-    changed = False
+    changed = accounts.expire_due(c, now)
     for r in c.execute("SELECT * FROM retirements").fetchall():
         if (
             confirmed(c, [r["node_id"]])
@@ -460,13 +553,21 @@ def tick(c, now=None):
                 "DELETE FROM retirements WHERE configuration_id=? AND node_id=? AND port=?",
                 tuple(r),
             )
+    exhausted = quotas.exhausted_nodes(c)
     for config in [
-        dict(r) for r in c.execute("SELECT * FROM configurations ORDER BY id").fetchall()
+        dict(r) for r in c.execute(
+            "SELECT f.*,t.suspended,g.account_id,a.enabled AS account_enabled FROM configurations f "
+            "JOIN topologies t ON t.id=f.topology_id JOIN item_groups g ON g.id=t.group_id "
+            "LEFT JOIN accounts a ON a.id=g.account_id ORDER BY f.id"
+        ).fetchall()
     ]:
         before = node_sync.mutation_snapshot(c)
         job = c.execute(
             "SELECT * FROM jobs WHERE configuration_id=?", (config["id"],)
         ).fetchone()
+        if quota_gate(c, config, job, exhausted.get(config["account_id"], set()), now):
+            changed = node_sync.finish_mutation(c, before) or changed
+            continue
         if job:
             progress(c, config, job, now)
         else:
@@ -488,6 +589,7 @@ def tick(c, now=None):
     c.execute(
         "DELETE FROM topologies WHERE deleted=1 AND id NOT IN (SELECT topology_id FROM configurations)"
     )
+    accounts.finish_expirations(c)
     return changed
 
 

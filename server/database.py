@@ -60,30 +60,33 @@ def set_setting(conn, k, v):
     conn.execute("INSERT OR REPLACE INTO settings VALUES (?, ?)", (k, v))
 
 
-def default_group(conn, kind):
+def default_group(conn, kind, account_id=None):
     return conn.execute(
-        "SELECT id FROM item_groups WHERE kind = ? AND builtin = 1", (kind,)
+        "SELECT id FROM item_groups WHERE kind=? AND builtin=1 AND account_id IS ?",
+        (kind, account_id),
     ).fetchone()[0]
 
 
-def get_groups(conn, kind):
+def get_groups(conn, kind, account_id=None):
     return [
         dict(r)
         for r in conn.execute(
-            "SELECT id, name, builtin FROM item_groups WHERE kind = ? ORDER BY sort, id", (kind,)
+            "SELECT id,name,builtin FROM item_groups WHERE kind=? AND account_id IS ? ORDER BY sort,id",
+            (kind, account_id),
         )
     ]
 
 
-def check_group(conn, kind, group_id):
+def check_group(conn, kind, group_id, account_id=None):
     """校验所选分组；未选择时为默认分组。"""
     if group_id in (None, ""):
-        return default_group(conn, kind)
+        return default_group(conn, kind, account_id)
     if (
         isinstance(group_id, int)
         and 0 < group_id < 2**63
         and conn.execute(
-            "SELECT 1 FROM item_groups WHERE id = ? AND kind = ?", (group_id, kind)
+            "SELECT 1 FROM item_groups WHERE id=? AND kind=? AND account_id IS ?",
+            (group_id, kind, account_id),
         ).fetchone()
     ):
         return group_id
@@ -93,6 +96,46 @@ def check_group(conn, kind, group_id):
 def ordered(kind, where=""):
     """按分组顺序、再按组内顺序查询节点或转发。"""
     return f"SELECT t.* FROM {kind} t JOIN item_groups g ON g.id = t.group_id\n               {where} ORDER BY g.sort, g.id, t.sort, t.id"
+
+
+def owned_rows(conn, kind, account_id):
+    return conn.execute(ordered(kind, "WHERE g.account_id IS ?"), (account_id,))
+
+
+def require_owner(conn, kind, ident, account_id):
+    if type(ident) is not int or not 0 < ident < 2**63 or not conn.execute(
+        f"SELECT 1 FROM {kind} t JOIN item_groups g ON g.id=t.group_id "
+        "WHERE t.id=? AND g.account_id IS ?", (ident, account_id),
+    ).fetchone():
+        raise errors.UserError("对象不存在", status=404)
+
+
+def allowed_nodes(conn, account_id):
+    if account_id is None:
+        return None
+    return {row[0] for row in conn.execute(
+        "SELECT node_id FROM account_nodes WHERE account_id=?", (account_id,),
+    )}
+
+
+def hidden_nodes(conn, account_id):
+    if account_id is None:
+        return set()
+    return {row[0] for row in conn.execute(
+        "SELECT node_id FROM account_nodes WHERE account_id=? AND hide_addresses=1", (account_id,),
+    )}
+
+def visible_address_nodes(conn, account_id):
+    """Only current, explicit address grants may disclose even a historical snapshot."""
+    if account_id is None:
+        return None
+    return {row[0] for row in conn.execute(
+        "SELECT node_id FROM account_nodes WHERE account_id=? AND hide_addresses=0", (account_id,),
+    )}
+
+
+def group_owner(conn, group_id):
+    return conn.execute("SELECT account_id FROM item_groups WHERE id=?", (group_id,)).fetchone()[0]
 
 
 def get_node(conn, node_id):

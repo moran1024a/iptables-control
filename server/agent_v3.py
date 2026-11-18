@@ -10,6 +10,7 @@ import errors
 import forwarding
 import node_sync
 import node_addresses
+import quotas
 import settings
 
 
@@ -238,6 +239,8 @@ def accept_traffic(conn, nid, rows):
         raise errors.UserError("无效统计批次")
     keys = ("up", "down", "up_packets", "down_packets")
     acknowledgments = []
+    deltas = {}
+    owners = {}
     for item in rows:
         if (
             not isinstance(item, dict)
@@ -264,6 +267,15 @@ def accept_traffic(conn, nid, rows):
         ).fetchone()
         if old:
             values = [max(value, int(old[key])) for key, value in zip(keys, values)]
+        delta = values[0] + values[1] - (int(old["up"]) + int(old["down"]) if old else 0)
+        if delta:
+            rid = item["rule_id"]
+            if rid not in owners:
+                owner = conn.execute("SELECT account_id FROM traffic_rule_owners WHERE rule_id=? AND node_id=?",
+                                     (rid, nid)).fetchone()
+                owners[rid] = owner["account_id"] if owner else None
+            if (account_id := owners[rid]) is not None:
+                deltas[account_id] = deltas.get(account_id, 0) + delta
         quality = str(item.get("quality", "ok"))[:160]
         conn.execute(
             "INSERT OR REPLACE INTO traffic_epochs VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -277,6 +289,7 @@ def accept_traffic(conn, nid, rows):
                 **dict(zip(keys, map(str, values))),
             }
         )
+    quotas.add_usage(conn, nid, deltas)
     return acknowledgments
 
 

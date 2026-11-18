@@ -41,7 +41,7 @@ def snapshot(graph):
     return out
 
 
-def validate(c, raw, complete=True):
+def validate(c, raw, complete=True, *, account_id=None):
     if not isinstance(raw, dict) or raw.get("version") != 2 or raw.get("routing_version") != 2:
         fail("请使用新版节点拓扑")
     vertices, edges = raw.get("vertices"), raw.get("edges")
@@ -59,6 +59,8 @@ def validate(c, raw, complete=True):
         ports={},
     )
     ids = set()
+    allowed = database.allowed_nodes(c, account_id)
+    hidden = database.hidden_nodes(c, account_id)
     for raw_v in vertices:
         if not isinstance(raw_v, dict):
             fail("无效节点")
@@ -83,12 +85,18 @@ def validate(c, raw, complete=True):
                 fail("画布坐标无效")
             v[axis] = value
         if kind == "target":
+            database.require_owner(c, "targets", raw_v.get("target_id"), account_id)
             target = database.get_target(c, raw_v.get("target_id"))
             v["target_id"] = target["id"]
             graph["address_book"][ident] = {a["id"]: a for a in target_addresses.listing(target)}
         elif kind == "direct":
             v["weight"] = validation.check_weight(raw_v.get("weight", 0), "vertex:" + ident)
         else:
+            nid = raw_v.get("node_id")
+            if allowed is not None and (type(nid) is not int or nid not in allowed):
+                fail("此节点不可使用", "vertex:" + ident)
+            if kind == "entry" and hidden and nid in hidden:
+                fail("隐藏地址的节点只能用作中转", "vertex:" + ident)
             n = database.get_node(c, raw_v.get("node_id"))
             if n["deleting"]:
                 fail(f"节点「{n['name']}」正在删除", "vertex:" + ident)
@@ -378,13 +386,18 @@ def compile_plan(graph, path, port=None):
     )
 
 
-def documents(c, include_pending=True, live_only=False):
+def documents(c, include_pending=True, live_only=False, include_suspended=True):
     # live_only skips topologies and configurations that are already being deleted.
-    live = " WHERE deleted=0" if live_only else ""
+    conditions = (["t.deleted=0"] if live_only else []) + ([] if include_suspended else ["t.suspended=0"])
     if include_pending:
-        for r in c.execute("SELECT name,graph FROM topologies" + live):
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        for r in c.execute("SELECT t.name,t.graph FROM topologies t" + where):
             yield r["name"], dict(graph=json.loads(r["graph"]))
-    for r in c.execute("SELECT name,desired,applied FROM configurations" + live):
+    conditions = (["f.deleted=0"] if live_only else []) + ([] if include_suspended else ["t.suspended=0"])
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    for r in c.execute(
+        "SELECT f.name,f.desired,f.applied FROM configurations f JOIN topologies t ON t.id=f.topology_id" + where
+    ):
         for k in (("desired", "applied") if include_pending else ("applied",)):
             if r[k]:
                 d = json.loads(r[k])
@@ -403,7 +416,7 @@ def references(c, nid, live_only=False):
     return list(
         dict.fromkeys(
             name
-            for name, d in documents(c, live_only=live_only)
+            for name, d in documents(c, live_only=live_only, include_suspended=False)
             if any(v.get("node_id") == nid for v in d.get("graph", {}).get("vertices", []))
         )
     )

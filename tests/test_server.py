@@ -25,6 +25,29 @@ import settings
 import topology
 
 
+def strip_expiry_schema(c):
+    c.execute("ALTER TABLE accounts DROP COLUMN expiring")
+    c.execute("ALTER TABLE accounts DROP COLUMN expires_at")
+
+
+def strip_quota_schema(c):
+    strip_expiry_schema(c)
+    c.execute("ALTER TABLE account_nodes DROP COLUMN hide_addresses")
+    c.execute("DROP TABLE traffic_rule_owners")
+    c.execute("DROP TABLE account_node_traffic")
+    c.execute("ALTER TABLE accounts DROP COLUMN max_configs")
+
+
+def strip_account_schema(c):
+    """Rebuild the account-related part of a pre-604 schema for migration tests."""
+    strip_quota_schema(c)
+    for table, column in (("topologies", "suspended"), ("targets", "pins"), ("subscriptions", "account_id"),
+                          ("sessions", "account_id"), ("item_groups", "account_id")):
+        c.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    c.execute("DROP TABLE account_nodes")
+    c.execute("DROP TABLE accounts")
+
+
 class Fixture:
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -192,7 +215,7 @@ class ServerTests(Fixture, unittest.TestCase):
         with self.db:
             database.set_setting(self.db, "must_change", "0")
             self.db.execute(
-                "INSERT OR REPLACE INTO sessions VALUES (?,?)",
+                "INSERT OR REPLACE INTO sessions(token_hash,expires) VALUES (?,?)",
                 (hashlib.sha256(b"test-session").hexdigest(), int(time.time()) + 3600),
             )
         panel = database.setting(self.db, "panel_path")

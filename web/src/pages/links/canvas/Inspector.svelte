@@ -54,19 +54,21 @@
     }));
   const resourceOptions = $derived.by(() => {
     if (!vertex || vertex.kind === 'direct') return [];
-    const options = vertex.kind === 'target' ? grouped(resources.targets, resources.target_groups) : grouped(resources.nodes, resources.node_groups);
+    const options = vertex.kind === 'target' ? grouped(resources.targets, resources.target_groups)
+      : grouped(resources.nodes.filter((item) => vertex?.kind !== 'entry' || !item.addresses_hidden), resources.node_groups);
     const current = vertex.kind === 'target' ? vertex.target_id : vertex.node_id;
     return options.some((o) => o.value === current) ? options : [{ value: current ?? -1, label: '已删除' }, ...options];
   });
 
   /** Why an address cannot be forced as the source of outgoing traffic yet. */
   function egressProblem(a: NodeAddress, network: PaletteNode['network'] | undefined): boolean {
+    if (!a.host) return false;
     const local = a.local || a.host;
     if (network?.complete && !network.addresses.some((n) => n.local === local)) return true;
     if (!a.local || !a.device) return true;
     return !!network?.complete && !network.addresses.some((n) => n.local === local && n.device === a.device);
   }
-  const addressLabel = (a: AddressRow) => addressText(a) + (a.name ? ` · ${a.name}` : a.primary ? ' · 主 IP' : '');
+  const addressLabel = (a: AddressRow) => addressText(a) + (a.host && a.name ? ` · ${a.name}` : a.host && a.primary ? ' · 主 IP' : '');
   const receiveOptions = (rows: AddressRow[], chosen: string | null) => [
     ...(chosen && rows.some((a) => a.id === chosen) ? [] : [{ value: '', label: '选择地址' }]),
     ...rows.map((a) => ({ value: a.id, label: addressLabel(a) })),

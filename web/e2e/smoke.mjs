@@ -159,6 +159,64 @@ try {
   await heading('设置').waitFor();
   await page.getByText(/0\.6\.\d/).first().waitFor();
 
+  step = 'subaccount';
+  await page.getByRole('button', { name: '新建子账户' }).click();
+  const accountDialog = page.getByRole('dialog', { name: '新建子账户' });
+  await accountDialog.getByLabel('用户名').fill('smoke-member');
+  await accountDialog.getByRole('button', { name: '生成', exact: true }).click();
+  assert((await accountDialog.getByLabel('密码', { exact: false }).inputValue()).length >= 16, 'password generation');
+  await accountDialog.getByRole('button', { name: '隐藏', exact: true }).click();
+  await accountDialog.getByLabel('密码').fill('smoke-member-password');
+  const expiry = new Date();
+  expiry.setDate(expiry.getDate() + 7);
+  const localExpiry = new Date(expiry.getTime() - expiry.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+  await accountDialog.getByLabel('到期时间').fill(localExpiry);
+  await accountDialog.getByLabel('配置数量上限').fill('2');
+  await accountDialog.getByRole('checkbox', { name: /香港入口/ }).check();
+  await accountDialog.getByLabel('香港入口 流量额度（GB）').fill('10');
+  await accountDialog.getByRole('checkbox', { name: /东京中转/ }).check();
+  await accountDialog.getByLabel('隐藏 东京中转 地址', { exact: true }).check();
+  await accountDialog.getByRole('button', { name: '保存' }).click();
+  await page.getByText('smoke-member', { exact: true }).waitFor();
+  const accounts = await (await page.request.get(server.url + 'api/accounts')).json();
+  assert(accounts.accounts.find((a) => a.username === 'smoke-member')?.expires_at === Math.floor(expiry.getTime() / 1000),
+    'account expiry is saved in epoch seconds');
+  const member = await browser.newPage();
+  try {
+    await member.goto(server.url);
+    await member.getByLabel('用户名').fill('smoke-member');
+    await member.getByLabel('密码').fill('smoke-member-password');
+    await member.getByRole('button', { name: '登录' }).click();
+    await member.getByRole('heading', { name: '总览', level: 1 }).waitFor();
+    await member.evaluate(() => (location.hash = '#/nodes'));
+    await member.getByRole('link', { name: /香港入口/ }).click();
+    await member.getByRole('heading', { name: '连接地址' }).waitFor();
+    await member.getByText(/剩余 10 GB/).waitFor();
+    assert(!(await member.getByText('接入信息').count()), 'shared node has read-only details');
+    await member.evaluate(() => (location.hash = '#/nodes'));
+    await member.getByRole('link', { name: /东京中转/ }).click();
+    await member.getByText('地址已隐藏 · 仅中转').waitFor();
+    assert(!(await member.getByText('192.0.2.2', { exact: true }).count()), 'relay IP is hidden');
+    await member.evaluate(() => (location.hash = '#/targets'));
+    await member.getByRole('heading', { name: '目标', level: 1 }).waitFor();
+    const targets = await member.request.get(server.url + 'api/targets');
+    assert(targets.ok() && (await targets.json()).targets.length === 0, 'subaccount has independent targets');
+    await member.evaluate(() => (location.hash = '#/configs'));
+    await member.getByText('0 / 2 项', { exact: true }).waitFor();
+    await member.evaluate(() => (location.hash = '#/settings'));
+    await member.getByRole('heading', { name: '账号', exact: true }).waitFor();
+    assert(!(await member.getByRole('button', { name: '新建子账户' }).count()), 'subaccount cannot manage accounts');
+    await member.evaluate(() => (location.hash = '#/routes/new'));
+    await member.getByRole('heading', { name: '资源库' }).waitFor();
+    await member.getByRole('tab', { name: '入口', exact: true }).click();
+    assert(!(await member.getByRole('button', { name: /东京中转/ }).count()), 'private relay stays out of entry picker');
+    await member.getByRole('tab', { name: '节点', exact: true }).click();
+    await member.getByRole('button', { name: /东京中转/ }).click();
+    await member.getByText('地址 1', { exact: true }).first().waitFor();
+  } finally {
+    await member.close();
+  }
+
   step = 'unknown route';
   await go('#/does-not-exist');
   await heading('总览').waitFor();

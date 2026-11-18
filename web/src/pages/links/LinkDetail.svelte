@@ -56,6 +56,8 @@
   const data = $derived(poll.data);
   const link = $derived(data?.link);
   const deleting = $derived(link?.state === 'deleting');
+  const suspended = $derived(!!link?.suspended);
+  const cleaning = $derived(suspended && !!link?.cleanup.length);
   const design = $derived(link?.view_graph ?? link?.graph);
   const cat = $derived(catalogOf(data));
   const styles = $derived(design ? entryStyles(design) : new Map());
@@ -63,13 +65,13 @@
     entries: design?.vertices.filter((v) => v.kind === 'entry' && !v.runtime_only).length ?? 0,
     targets: design?.vertices.filter((v) => v.kind === 'target' && !v.runtime_only).length ?? 0,
   });
-  const waiting = $derived(link?.configurations.filter((c) => c.state !== 'active' && c.state !== 'error').length ?? 0);
+  const waiting = $derived(link?.configurations.filter((c) => ['pending', 'preparing', 'switching', 'waiting'].includes(c.state)).length ?? 0);
   const failed = $derived(link?.configurations.filter((c) => c.state === 'error').length ?? 0);
   const strays = $derived((link?.warnings ?? []).map((w) => vertexName(vertexOf(link!.graph, w.vertex), cat)));
 
   // While configurations are being applied, follow the progress closely instead of every 5 s.
   $effect(() => {
-    if (!link || editing || link.state === 'active' || link.state === 'error') return;
+    if (!link || editing || ['active', 'error', 'quota', 'quota_waiting'].includes(link.state) || (suspended && !cleaning)) return;
     const timer = setInterval(() => !document.hidden && !overlays.open && !busy && void poll.refresh(), 1500);
     return () => clearInterval(timer);
   });
@@ -198,6 +200,7 @@
     {/snippet}
     {#snippet actions()}
       {#if link && !editing}
+        {#if !suspended}
         <Tooltip text="节点失联超过设定时间后，自动把经过它的配置切到备用路径">
           <label class="flex h-8 items-center gap-2 rounded-md border border-border-strong/70 bg-surface px-2.5 text-sm font-medium shadow-sm {deleting ? 'opacity-60' : ''}">
             自动灾备
@@ -206,7 +209,8 @@
           </label>
         </Tooltip>
         <Button href={href(`routes/${link.id}/quality`)}><Activity />网络质量</Button>
-        <Button onclick={() => (editing = true)} disabled={deleting || !!busy} title={deleting ? '链路正在删除' : undefined}><Pencil />编辑</Button>
+        {/if}
+        <Button onclick={() => (editing = true)} disabled={deleting || cleaning || !!busy}><Pencil />{suspended ? '编辑并恢复' : '编辑'}</Button>
         <Menu items={menu} />
       {/if}
     {/snippet}
@@ -217,7 +221,7 @@
       {#if editing}
         <Editor {link} resources={data} bind:fullscreen onclose={closed} onsaved={saved} {latest} />
       {:else if link}
-        <ViewCanvas {link} resources={data} busy={!!busy} bind:fullscreen onchanged={() => poll.refresh()} />
+        <ViewCanvas {link} resources={data} busy={!!busy || suspended} bind:fullscreen onchanged={() => poll.refresh()} />
       {/if}
     </section>
 
@@ -226,7 +230,8 @@
         <Alert tone={link.state === 'error' ? 'danger' : link.state === 'active' ? 'info' : 'warn'}>
           <ul class="flex flex-col gap-0.5">
             {#if deleting}<li>正在删除：等待节点确认规则清理，完成后链路会自动消失。</li>{/if}
-            {#if waiting && !deleting}<li>{waiting} 项配置等待生效</li>{/if}
+            {#if suspended}<li>{cleaning ? '链路已停用，等待节点确认清理旧规则。' : '链路已停用。请检查可用节点，然后编辑并保存以恢复转发。'}</li>{/if}
+            {#if waiting && !deleting && !suspended}<li>{waiting} 项配置等待生效</li>{/if}
             {#if failed}<li>{failed} 项配置异常{link.error ? `：${link.error}` : ''}</li>{:else if link.error}<li>{link.error}</li>{/if}
             {#if strays.length}<li>{strays.length} 个节点没有可达的入口—目标路径：{strays.join('、')}</li>{/if}
           </ul>

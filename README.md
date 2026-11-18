@@ -2,7 +2,7 @@
 
 轻量的 IPv4 端口转发管理工具。通过 Web 面板管理多台服务器，也可使用 `ipt.sh` 独立管理单机转发。
 
-**当前版本：0.6.3**。支持可视化拓扑、多入口与多目标、主副 IP、权重灾备、订阅和 7 天网络质量图。主动节点使用 Go + nftables，被动节点使用 Bash + iptables。
+**当前版本为 0.6.4**，支持子账户、可视化拓扑、多入口与多目标、权重灾备、订阅和 7 天网络质量图。主动节点使用 Go + nftables，被动节点使用 Bash + iptables。
 
 [下载版本](https://github.com/moran1024a/iptables-control/releases) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/moran1024a/iptables-control/issues)
 
@@ -25,7 +25,7 @@
 在已安装并启动 Docker 的 Linux 服务器上执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.3/install-server.sh | bash
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.4/install-server.sh | bash
 ```
 
 打开安装结果中的**完整面板地址**，使用 `admin` / `admin_pass` 登录并按提示修改账号密码。
@@ -55,7 +55,7 @@ curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6
 不需要服务端或 Agent，在使用 systemd 的 Linux 服务器执行：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.3/ipt.sh -o ipt.sh.download &&
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.4/ipt.sh -o ipt.sh.download &&
 sudo install -m 755 ipt.sh.download /root/ipt.sh.new &&
 sudo mv -f /root/ipt.sh.new /root/ipt.sh &&
 sudo bash /root/ipt.sh
@@ -67,7 +67,7 @@ sudo bash /root/ipt.sh
 
 **先升级服务端，再升级节点。** 服务端重新执行安装命令即可；安装器保留升级前数据库备份，启动失败时尝试回退。相同版本需要重建时追加 `--force`。自定义 Docker Compose 部署请沿用原配置更换镜像版本。
 
-主动节点开启自动更新后会升级到 **0.6.3**。被动 Agent 也更新为 **0.6.3**；被动节点，或关闭自动更新的主动节点，需在本机执行：
+从 0.6.3 升级只需更新服务端，主动和被动 Agent 均继续使用 **0.6.3**。更早的主动节点可开启自动更新。需要手动更新旧版 Agent 时，在节点上执行以下命令。
 
 ```bash
 sudo ictl --update
@@ -85,9 +85,10 @@ sudo env GODEBUG=http2client=0 ictl --update
 
 **升级数据说明：**
 
-- **0.6.0／0.6.1／0.6.2／0.6.0-rc.7 → 0.6.3**：保留全部数据，数据库仍为 603。
-- **0.6.0 RC1～RC6 → 0.6.3**：移除受管 VLESS Reality 目标及关联配置，其他数据保留。旧规则在节点同步成功后清理。
-- **0.5.3 → 0.6.3**：仅保留节点身份、IP、分组、模式、接入设置和管理员设置；目标、链路、配置、订阅及历史记录会清空。被动节点首次迁移需执行 `sudo ictl --sync`。更早版本请先升级至 0.5.3。
+- **0.6.0-rc.7、0.6.0 至 0.6.3 → 0.6.4** 保留节点、链路和转发规则，原有业务数据归管理员。数据库升级至 607，面板需要重新登录。
+- **0.6.4 RC → 0.6.4** 保留现有账户、授权和登录会话。已有账户沿用各自的到期设置，未设置期限的账户长期有效。
+- **0.6.0 RC1～RC6 → 0.6.4**：移除受管 VLESS Reality 目标及关联配置，其他数据保留。旧规则在节点同步成功后清理。
+- **0.5.3 → 0.6.4**：仅保留节点身份、IP、分组、模式、接入设置和管理员设置；目标、链路、配置、订阅及历史记录会清空。被动节点首次迁移需执行 `sudo ictl --sync`。更早版本请先升级至 0.5.3。
 
 Docker 升级备份位于数据卷内的 `/data/ictl.db.pre-deploy-*.bak`。回退须同时恢复旧数据库与旧镜像；详细变更见 [CHANGELOG](CHANGELOG.md)。
 
@@ -102,7 +103,7 @@ sudo ictl --uninstall
 **服务端：** 删除容器和镜像，保留数据卷：
 
 ```bash
-curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.3/install-server.sh | bash -s -- --uninstall
+curl -fsSL https://github.com/moran1024a/iptables-control/releases/download/v0.6.4/install-server.sh | bash -s -- --uninstall
 ```
 
 追加 `--purge` 会永久删除默认数据卷。卸载服务端不会清理远端节点规则。
@@ -124,6 +125,18 @@ sudo systemctl disable --now ipt-forward-selfcheck.timer ipt-forward-selfcheck.s
 5. **配置**：显示“已应用”后，复制入口地址或导入链接使用，也可加入订阅。
 
 每个入口只为沿连线可达的目标生成配置，不可达的组合不生成。节点离线不影响保存，但需要同步成功才能生效。
+
+### 子账户
+
+管理员在「设置 → 子账户」中创建账户并分配节点。子账户自行管理目标、链路、配置和订阅。子账户目标使用公网 IPv4，域名在保存时解析，地址变化后可重新保存目标。请在服务端设置中填写面板的对外地址，以便将其排除在子账户的转发目标之外。
+
+分配节点时可勾选「隐藏地址（仅中转）」。子账户仍可查看状态和用量，连线时用地址编号选择。已经用作入口的节点需先更换入口并等待同步。
+
+撤权后，相关链路先停用，等节点清理旧规则后可编辑恢复。停用账户还会使它的旧订阅链接失效。被动节点等待清理时，可在节点上手动同步。
+
+可为子账户设置到期时间，按浏览器本地时间填写，留空表示长期有效。到期前可续期或取消期限。到期后登录和订阅立即失效，节点确认清除该账户的规则后，系统自动删除账户及其业务数据。离线节点恢复同步前，管理员会看到「到期清理中」。
+
+管理员可在同一处设置子账户的配置总数上限，以及每台主动节点的流量额度（GB，上下行合计）。流量超额会暂停相关配置，增加额度或重置用量后自动恢复仍可用的路径。配额根据节点上报和规则确认生效，节点断线时可能超额。重置以服务端最近收到的用量为基线。
 
 ### IP 与路径切换
 
@@ -194,6 +207,8 @@ cd web && npm ci && npm run build      # 构建面板
 npm run check && npm test              # 类型检查与单元测试
 npm run e2e                            # 用演示数据和本机 Chrome 走一遍主要流程
 python3 dev/demo_server.py             # 带样例数据和模拟节点的演示服务端，仅用于开发
-```欢迎提交 Issue 或 PR，请隐去密钥、密码和订阅链接。
+```
 
-全部组件版本统一为 **0.6.3**；组件清单见 [components.json](server/components.json)。项目采用 [MIT 许可证](LICENSE)。
+欢迎提交 Issue 或 PR，请隐去密钥、密码和订阅链接。
+
+服务端版本为 **0.6.4**，节点 Agent、管理器、唤醒组件和单机脚本均为 **0.6.3**。详见 [组件清单](server/components.json)。项目采用 [MIT 许可证](LICENSE)。

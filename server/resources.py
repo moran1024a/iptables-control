@@ -1,6 +1,7 @@
 import json
 import re
 import time
+import accounts
 import agent_v3
 import database
 import errors
@@ -9,8 +10,10 @@ import lifecycle
 import network_quality
 import node_state
 import node_addresses
+import node_visibility
 import node_tags
 import node_sync
+import quotas
 import configurations
 import external_configurations
 import execution
@@ -28,9 +31,31 @@ import wake
 class Resources:
     """Resource use cases; no HTTP transport or authentication dependency."""
 
-    def __init__(self, query=None, failover_engine=None):
+    def __init__(self, query=None, failover_engine=None, account_id=None):
         self.query = query or {}
         self.failover_engine = failover_engine
+        self.account_id = account_id
+        self.resolved_targets = None
+
+    def shared_node(self, conn, n, now, traffic, hidden):
+        private = n["id"] in hidden
+        return dict(
+            id=n["id"], name=n["name"], note="", weight=n["weight"], addr="" if private else n["addr"],
+            addresses_hidden=private,
+            addresses=[] if private else [{k: a[k] for k in ("id", "name", "host", "primary")}
+                                          for a in node_addresses.listing(conn, n)],
+            group_id=n["group_id"], tags=node_tags.listing(conn, n["id"]),
+            status=node_state.node_status(conn, n, now), desired_mode=n["desired_mode"],
+            last_seen=n["last_seen"], bar=node_state.node_bar(conn, n, now),
+            traffic_quota=traffic.get(n["id"], dict(limit_gb=None, used="0", remaining=None, exhausted=False))
+                          if n["desired_mode"] == "active" else None,
+        )
+
+    def api_accounts(self, conn, body):
+        return accounts.listing(conn)
+
+    def api_account_save(self, conn, body, ident=None):
+        return accounts.save(conn, body, ident)
 
     def node_brief(self, conn, n, now):
         return {
@@ -66,16 +91,22 @@ class Resources:
         now = int(time.time())
         kind = self.query.get("kind", ["forward"])[0]
         table = database.node_table(kind)
-        nodes = [
-            {**self.node_brief(conn, n, now), "bar": node_state.node_bar(conn, n, now)}
-            for n in conn.execute(database.ordered(table)).fetchall()
-        ]
+        allowed = database.allowed_nodes(conn, self.account_id)
+        hidden = database.hidden_nodes(conn, self.account_id)
+        traffic = quotas.node_view(conn, self.account_id) if allowed is not None else {}
+        nodes = []
+        for n in conn.execute(database.ordered(table)):
+            if allowed is None:
+                nodes.append({**self.node_brief(conn, n, now), "bar": node_state.node_bar(conn, n, now)})
+            elif n["id"] in allowed:
+                nodes.append(self.shared_node(conn, n, now, traffic, hidden))
+        group_ids = {n["group_id"] for n in nodes}
         return {
             "now": now,
             "kind": kind,
-            "groups": database.get_groups(conn, table),
+            "groups": [g for g in database.get_groups(conn, table) if allowed is None or g["id"] in group_ids],
             "nodes": nodes,
-            "tags": node_tags.catalog(conn),
+            "tags": self.api_tags(conn, body)["tags"],
         }
 
     @node_sync.track_mutation
@@ -141,6 +172,13 @@ class Resources:
 
     def api_node_get(self, conn, body, node_id):
         now = int(time.time())
+        allowed = database.allowed_nodes(conn, self.account_id)
+        if allowed is not None:
+            if node_id not in allowed:
+                raise errors.UserError("节点不存在", status=404)
+            return dict(now=now, node=self.shared_node(conn, database.get_node(conn, node_id), now,
+                                                      quotas.node_view(conn, self.account_id),
+                                                      database.hidden_nodes(conn, self.account_id)))
         n = database.get_node(conn, node_id)
         version = settings.COMPONENTS[n["desired_mode"] + "_agent"]
         if n["installed_agent"] == "unknown":
@@ -323,24 +361,22 @@ class Resources:
         return {"deleted": False}
 
     def api_subscriptions(self, conn, body):
-        return subscriptions.listing(conn)
+        return subscriptions.listing(conn, self.account_id)
 
     def api_subscription_save(self, conn, body, ident=None):
-        return subscriptions.save(conn, body, ident)
+        return subscriptions.save(conn, body, ident, self.account_id)
 
     def api_subscription_delete(self, conn, body, ident):
-        subscriptions.get(conn, ident)
+        subscriptions.get(conn, ident, self.account_id)
         conn.execute("DELETE FROM subscriptions WHERE id=?", (ident,))
         return {"deleted": True}
 
     def api_order(self, conn, body, kind):
         """保存顺序：groups 为分组顺序，ids 为全部对象按显示顺序排列（只能在组内调整，不改变所属分组）。"""
         groups, ids = (body.get("groups"), body.get("ids"))
-        existing_groups = {
-            r[0] for r in conn.execute("SELECT id FROM item_groups WHERE kind = ?", (kind,))
-        }
-        query = f"SELECT id FROM {kind}"
-        existing = {r[0] for r in conn.execute(query)}
+        self.check_group_kind(kind)
+        existing_groups = {r["id"] for r in database.get_groups(conn, kind, self.account_id)}
+        existing = {r["id"] for r in database.owned_rows(conn, kind, self.account_id)}
         if (
             not isinstance(groups, list)
             or not isinstance(ids, list)
@@ -358,19 +394,26 @@ class Resources:
         return {}
 
     def get_group(self, conn, group_id):
-        g = conn.execute("SELECT * FROM item_groups WHERE id = ?", (group_id,)).fetchone()
+        g = conn.execute("SELECT * FROM item_groups WHERE id=? AND account_id IS ?",
+                         (group_id, self.account_id)).fetchone()
         if not g:
             raise errors.UserError("分组不存在", status=404)
         return g
 
-    def api_group_add(self, conn, body):
-        kind = body.get("kind")
+    def check_group_kind(self, kind):
         if kind not in settings.KINDS:
             raise errors.UserError("请求格式错误")
+        if kind == "nodes" and self.account_id is not None:
+            raise errors.UserError("仅管理员可操作节点分组", status=403)
+
+    def api_group_add(self, conn, body):
+        kind = body.get("kind")
+        self.check_group_kind(kind)
         name = validation.check_remark(body.get("name"), "name", "分组名称")
         cur = conn.execute(
-            "INSERT INTO item_groups (kind, name, sort)\n                   VALUES (?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM item_groups WHERE kind = ?))",
-            (kind, name, kind),
+            "INSERT INTO item_groups(kind,name,account_id,sort) VALUES (?,?,?,"
+            "(SELECT COALESCE(MAX(sort),0)+1 FROM item_groups WHERE kind=? AND account_id IS ?))",
+            (kind, name, self.account_id, kind, self.account_id),
         )
         return {"id": cur.lastrowid}
 
@@ -386,17 +429,18 @@ class Resources:
         if g["builtin"]:
             raise errors.UserError("默认分组不能删除")
         kind = g["kind"]
-        base = conn.execute(f"SELECT COALESCE(MAX(sort), 0) FROM {kind}").fetchone()[0]
+        default = database.default_group(conn, kind, self.account_id)
+        base = conn.execute(f"SELECT COALESCE(MAX(sort),0) FROM {kind} WHERE group_id=?", (default,)).fetchone()[0]
         conn.execute(
             f"UPDATE {kind} SET group_id = ?, sort = sort + ? WHERE group_id = ?",
-            (database.default_group(conn, kind), base, group_id),
+            (default, base, group_id),
         )
         conn.execute("DELETE FROM item_groups WHERE id = ?", (group_id,))
         return {}
 
     def api_targets(self, conn, body):
         targets = []
-        for t in conn.execute(database.ordered("targets")):
+        for t in database.owned_rows(conn, "targets", self.account_id):
             refs = [
                 dict(id=r["id"], remark=r["name"])
                 for r in conn.execute("SELECT id,name,desired,applied FROM configurations")
@@ -415,11 +459,9 @@ class Resources:
                     "uri": target_config.connection(t, t["host"], t["port"], t["name"])["uri"],
                 }
             )
-        return {"targets": targets, "groups": database.get_groups(conn, "targets")}
+        return {"targets": targets, "groups": database.get_groups(conn, "targets", self.account_id)}
 
-    @node_sync.track_mutation
-    def api_target_save(self, conn, body, target_id=None):
-        old = database.get_target(conn, target_id) if target_id is not None else None
+    def target_values(self, body, old):
         if "uri" in body:
             try:
                 parsed = target_config.import_uri(body["uri"])
@@ -448,9 +490,29 @@ class Resources:
             host = validation.check_host(body.get("host", old["host"] if old else None), "host")
             port = validation.check_port(body.get("port", old["port"] if old else None), "port")
             kind, params, fallback = ("endpoint", "{}", old["name"] if old else host)
+        return host, port, kind, params, fallback
+
+    def target_lookup(self, conn, body, target_id, account_id):
+        if target_id is not None:
+            database.require_owner(conn, "targets", target_id, account_id)
+        old = database.get_target(conn, target_id) if target_id is not None else None
+        host = self.target_values(body, old)[0]
+        addresses = body.get("addresses", json.loads(old["addresses"]) if old else [])
+        if not isinstance(addresses, list) or len(addresses) > 32 or any(not isinstance(a, dict) for a in addresses):
+            raise errors.UserError("目标地址格式无效", "addresses")
+        hosts = {host, *(validation.check_host(a.get("host"), "addresses") for a in addresses)}
+        hosts.update(target_addresses.protected_hosts(conn))
+        return hosts
+
+    @node_sync.track_mutation
+    def api_target_save(self, conn, body, target_id=None):
+        if target_id is not None:
+            database.require_owner(conn, "targets", target_id, self.account_id)
+        old = database.get_target(conn, target_id) if target_id is not None else None
+        host, port, kind, params, fallback = self.target_values(body, old)
         name = validation.check_remark(body.get("name") or fallback, "name", "名称")
         group_id = database.check_group(
-            conn, "targets", body.get("group_id", old["group_id"] if old else None)
+            conn, "targets", body.get("group_id", old["group_id"] if old else None), self.account_id,
         )
         if old:
             conn.execute(
@@ -465,13 +527,20 @@ class Resources:
                 (name, host, port, kind, params, group_id),
             ).lastrowid
         target = database.get_target(conn, target_id)
-        target_addresses.save(conn, target, body.get("addresses", json.loads(target["addresses"])))
+        resolved = self.resolved_targets
+        if self.account_id is not None and resolved is None:
+            raise errors.UserError("目标地址未经校验，请刷新后重试", "host")
+        target_addresses.save(conn, target, body.get("addresses", json.loads(target["addresses"])), resolved)
         if old:
             target_addresses.refresh(conn, old, database.get_target(conn, target_id))
         return {"id": target_id}
 
     def api_tags(self, conn, body):
-        return {"tags": node_tags.catalog(conn)}
+        allowed = database.allowed_nodes(conn, self.account_id)
+        if allowed is None:
+            return {"tags": node_tags.catalog(conn)}
+        tags = {tag["id"]: tag for nid in allowed for tag in node_tags.listing(conn, nid)}
+        return {"tags": [tags[i] for i in sorted(tags)]}
 
     def api_tag_save(self, conn, body, ident=None):
         return node_tags.save(conn, body, ident)
@@ -482,7 +551,7 @@ class Resources:
 
     @node_sync.track_mutation
     def api_target_del(self, conn, body, target_id):
-        database.get_target(conn, target_id)
+        database.require_owner(conn, "targets", target_id, self.account_id)
         for name, doc in topology.documents(conn):
             if doc.get("target") == target_id or any(
                 v.get("target_id") == target_id for v in doc.get("graph", {}).get("vertices", [])
@@ -520,6 +589,7 @@ class Resources:
         return {"public_url": url, "failover_offline_seconds": timeout}
 
     def api_failover_preview(self, conn, body, ident):
+        database.require_owner(conn, "topologies", ident, self.account_id)
         vertices, revisions = self.query.get("vertex", []), self.query.get("revision", [])
         if (len(vertices) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", vertices[0])
                 or len(revisions) != 1 or not re.fullmatch(r"[0-9]{1,15}", revisions[0])):
@@ -528,40 +598,48 @@ class Resources:
             raise errors.UserError("灾备监测尚未就绪", status=503)
         if not conn.in_transaction:
             conn.execute("BEGIN")
-        return self.failover_engine.preview(conn, ident, vertices[0], int(revisions[0]))
+        result = self.failover_engine.preview(conn, ident, vertices[0], int(revisions[0]))
+        visible = database.visible_address_nodes(conn, self.account_id)
+        result["graph"] = node_visibility.graph(result["graph"], visible)
+        if visible is not None:
+            for path in result["paths"]:
+                if path["state"] == "unavailable":
+                    path["message"] = "无可用备用路径"
+        return result
 
     def api_topologies(self, conn, body):
-        return configurations.listing(conn)
+        return configurations.listing(conn, self.account_id)
 
     def api_topology_get(self, conn, body, ident):
-        return dict(configurations.resources(conn), link=configurations.detail(conn, ident))
+        return dict(configurations.resources(conn, self.account_id), link=configurations.detail(conn, ident, self.account_id))
 
     def api_topology_save(self, conn, body, ident=None):
-        return configurations.save_topology(conn, body, ident)
+        return configurations.save_topology(conn, body, ident, account_id=self.account_id)
 
     def api_topology_preview(self, conn, body):
-        return configurations.preview(conn, body)
+        return configurations.preview(conn, body, self.account_id)
 
     def api_topology_delete(self, conn, body, ident):
-        return configurations.delete(conn, ident)
+        return configurations.delete(conn, ident, self.account_id)
 
     def api_topology_action(self, conn, body, ident):
-        return configurations.action(conn, body, ident)
+        return configurations.action(conn, body, ident, self.account_id)
 
     def api_configs(self, conn, body):
-        return configurations.configs(conn)
+        return configurations.configs(conn, self.account_id)
 
     def api_external_preview(self, conn, body):
         return external_configurations.preview(body)
 
     def api_external_save(self, conn, body, ident=None):
-        return external_configurations.save(conn, body, ident)
+        return external_configurations.save(conn, body, ident, self.account_id)
 
     def api_external_delete(self, conn, body, ident):
-        return external_configurations.delete(conn, ident)
+        return external_configurations.delete(conn, ident, self.account_id)
 
     def api_config_rename(self, conn, body, ident):
         config = execution.get(conn, ident)
+        database.require_owner(conn, "topologies", config["topology_id"], self.account_id)
         if config["deleted"]:
             raise errors.UserError("配置正在删除", status=409)
         name = validation.check_remark(body.get("name"), "name", "配置名称")

@@ -415,7 +415,7 @@
 
     {#each g.vertices as vertex (vertex.id)}
       {@const id = vertex.id}
-      {@const clickable = !deleting && vertex.kind !== 'target'}
+      {@const clickable = !deleting && !link.suspended && vertex.kind !== 'target'}
       <GraphCard
         {vertex}
         {cat}
